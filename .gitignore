@@ -1,0 +1,60 @@
+**/*.env
+
+# Python and FastAPI
+*.env
+*.pyc
+__pycache__/
+*.egg-info/
+dist/
+build/
+.mypy_cache/
+.venv/
+
+# React and Vite
+ui/node_modules/
+ui/vite/dist/
+ui/vite/.cache/
+ui/vite/.temp/
+
+# IDE and editor files
+.vscode/
+.idea/
+*.iml
+
+# Operating system files
+.DS_Store
+Thumbs.db
+
+# Miscellaneous
+*.log
+*.tmp
+*.bak
+*.swp
+*.swo
+*.zip
+*.tar
+*.gz
+*.bz2
+*.xz
+*.lzma
+*.7z
+*.jar
+*.war
+*.ear
+*.class
+*.orig
+*.rej
+*.rej.*
+
+# Vite-specific files
+vite.config.js.local
+vite.config.ts.local
+
+# React-specific files
+ui/public/build/
+ui/public/static/
+ui/public/media/
+
+# FastAPI-specific files
+fastapi.log
+uvicorn.log

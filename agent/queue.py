@@ -1,5 +1,6 @@
+import random
 import traceback
-from typing import Any
+from typing import Any, cast
 import redis.asyncio as redis
 import secrets
 import time
@@ -7,22 +8,27 @@ import json
 import asyncio
 from redis.commands.core import AsyncScript
 
-from agent.context import Task, AgentContext
-from agent.llms import MultiClient
-from agent.agent import DummyAgent
+from agent.context import Task
+from agent.agent import BaseAgent, EventPublisher, AgentEvent, EventType, TurnCompletion
+from agent.logging import get_logger
 
+logger = get_logger("agent.queue")
 
-MAIN_QUEUE = "requests:main"  # List: task_json
-FAILED_QUEUE = "requests:failed"  # List: task_json
-PROCESSING_TIMES = (
-    "requests:processing:times"  # Sorted set: processing_key -> timestamp
-)
-PROCESSING_TASKS = "requests:processing:data"  # Hash: processing_key -> task_json
-UPDATE_CHANNEL = "updates:{user_id}"
+# List: task_json
+MAIN_QUEUE = "requests:{agent}:main"
+# List: task_json
+FAILED_QUEUE = "requests:{agent}:failed"
+# Sorted set: processing_key -> timestamp
+PROCESSING_HEARTBEATS = "requests:{agent}:processing:heartbeats"
+# Hash: processing_key -> task_json
+PROCESSING_TASKS = "requests:{agent}:processing:data"
+# PubSub
+UPDATE_CHANNEL = "updates:{owner_id}"
 
 BATCH_SIZE = 25
 MAX_RETRIES = 3
 STALE_THRESHOLD = 120
+HEARTBEAT_INTERVAL = 5  # seconds
 
 
 """
@@ -45,7 +51,7 @@ def create_batch_move_script(redis_client: redis.Redis) -> AsyncScript:
     return redis_client.register_script(
         """
         local main_queue = KEYS[1]
-        local processing_times = KEYS[2]
+        local processing_heartbeats = KEYS[2]
         local processing_tasks = KEYS[3]
         local batch_size = tonumber(ARGV[1])
         local worker_id = ARGV[2]
@@ -62,8 +68,8 @@ def create_batch_move_script(redis_client: redis.Redis) -> AsyncScript:
                 -- Generate processing key: worker_id:batch_id:task_index
                 local processing_key = worker_id .. ":" .. batch_id .. ":" .. i
                 
-                -- Add to sorted set with processing_key and timestamp
-                redis.call('ZADD', processing_times, timestamp, processing_key)
+                -- Add initial heartbeat to sorted set with processing_key and timestamp
+                redis.call('ZADD', processing_heartbeats, timestamp, processing_key)
                 -- Store task data in hash
                 redis.call('HSET', processing_tasks, processing_key, task)
             else
@@ -76,12 +82,27 @@ def create_batch_move_script(redis_client: redis.Redis) -> AsyncScript:
     )
 
 
+def create_heartbeat_script(redis_client: redis.Redis) -> AsyncScript:
+    """Simple heartbeat update"""
+    return redis_client.register_script(
+        """
+        local processing_heartbeats = KEYS[1]
+        local processing_key = ARGV[1]
+        local timestamp = tonumber(ARGV[2])
+        
+        -- Update heartbeat timestamp
+        redis.call('ZADD', processing_heartbeats, timestamp, processing_key)
+        return true
+        """
+    )
+
+
 def create_task_completion_script(redis_client: redis.Redis) -> AsyncScript:
     """Create atomic script for handling task completion, continuation, or failure"""
     return redis_client.register_script(
         """
         local main_queue = KEYS[1]
-        local processing_times = KEYS[2]
+        local processing_heartbeats = KEYS[2]
         local processing_tasks = KEYS[3]
         local failed_queue = KEYS[4]
         
@@ -97,7 +118,7 @@ def create_task_completion_script(redis_client: redis.Redis) -> AsyncScript:
         end
         
         -- Always remove from processing structures first
-        redis.call('ZREM', processing_times, processing_key)
+        redis.call('ZREM', processing_heartbeats, processing_key)
         redis.call('HDEL', processing_tasks, processing_key)
         
         if action == "complete" then
@@ -133,15 +154,15 @@ def create_stale_recovery_script(redis_client: redis.Redis) -> AsyncScript:
     return redis_client.register_script(
         """
         local main_queue = KEYS[1]
-        local processing_times = KEYS[2] 
+        local processing_heartbeats = KEYS[2] 
         local processing_tasks = KEYS[3]
         local failed_queue = KEYS[4]
         local cutoff_timestamp = tonumber(ARGV[1])
         local max_recovery_batch = tonumber(ARGV[2] or 100)
-        local max_retries = tonumber(ARGV[3])  -- Add max retries param
+        local max_retries = tonumber(ARGV[3])
         
         -- Get stale processing keys (limited batch to avoid long-running operations)
-        local stale_keys = redis.call('ZRANGEBYSCORE', processing_times, 0, cutoff_timestamp, 'LIMIT', 0, max_recovery_batch)
+        local stale_keys = redis.call('ZRANGEBYSCORE', processing_heartbeats, 0, cutoff_timestamp, 'LIMIT', 0, max_recovery_batch)
         
         local recovered_count = 0
         local failed_count = 0
@@ -159,7 +180,7 @@ def create_stale_recovery_script(redis_client: redis.Redis) -> AsyncScript:
                 task.retries = (task.retries or 0) + 1
                 
                 -- Remove from processing structures first (safer order)
-                redis.call('ZREM', processing_times, processing_key)
+                redis.call('ZREM', processing_heartbeats, processing_key)
                 redis.call('HDEL', processing_tasks, processing_key)
                 
                 -- Route based on retry count
@@ -175,13 +196,12 @@ def create_stale_recovery_script(redis_client: redis.Redis) -> AsyncScript:
                     failed_count = failed_count + 1
                 end
                 
-                table.insert(recovered_tasks, {
-                    key = processing_key,
-                    retries = task.retries
-                })
+                -- Add to recovered tasks
+                table.insert(recovered_tasks, processing_key)
+                table.insert(recovered_tasks, task.retries)
             else
                 -- Task data missing but key exists in sorted set - cleanup
-                redis.call('ZREM', processing_times, processing_key)
+                redis.call('ZREM', processing_heartbeats, processing_key)
             end
         end
         
@@ -190,234 +210,464 @@ def create_stale_recovery_script(redis_client: redis.Redis) -> AsyncScript:
     )
 
 
-async def enqueue_task(redis_client: redis.Redis, task: Task) -> None:
-    await redis_client.lpush(MAIN_QUEUE, task.to_json())  # type: ignore
+async def enqueue_task(
+    redis_client: redis.Redis, task: Task[Any], agent: BaseAgent[Any]
+) -> None:
+    agent_main_queue = MAIN_QUEUE.format(agent=agent.name)
+    await redis_client.lpush(agent_main_queue, task.to_json())  # type: ignore
 
 
 async def publish_update(
-    redis_client: redis.Redis, user_id: str, payload: dict[str, Any]
+    redis_client: redis.Redis, owner_id: str, payload: dict[str, Any]
 ) -> None:
-    user_update_channel = UPDATE_CHANNEL.format(user_id=user_id)
+    user_update_channel = UPDATE_CHANNEL.format(owner_id=owner_id)
     await redis_client.publish(user_update_channel, json.dumps(payload))  # type: ignore
 
 
 async def get_task_batch(
-    batch_script: AsyncScript, worker_id: str
-) -> list[tuple[Task, str]]:
+    batch_script: AsyncScript,
+    worker_id: str,
+    agent: BaseAgent[Any],
+    batch_size: int,
+) -> list[tuple[Task[Any], str]]:
     """Get batch of tasks atomically"""
     batch_id = secrets.token_hex(3)
     timestamp = time.time()
 
+    agent_main_queue = MAIN_QUEUE.format(agent=agent.name)
+    agent_processing_heartbeats = PROCESSING_HEARTBEATS.format(agent=agent.name)
+    agent_processing_tasks = PROCESSING_TASKS.format(agent=agent.name)
+
     task_jsons: list[str] = await batch_script(
-        keys=[MAIN_QUEUE, PROCESSING_TIMES, PROCESSING_TASKS],
-        args=[BATCH_SIZE, worker_id, batch_id, timestamp],
+        keys=[agent_main_queue, agent_processing_heartbeats, agent_processing_tasks],
+        args=[batch_size, worker_id, batch_id, timestamp],
     )  # type: ignore
     if not task_jsons:
         return []
 
     return [
-        (Task.from_json(task_json), f"{worker_id}:{batch_id}:{i + 1}")
+        (agent.deserialize_task(task_json), f"{worker_id}:{batch_id}:{i + 1}")
         for i, task_json in enumerate(task_jsons)
     ]
 
 
-async def process_task(
-    redis_client: redis.Redis,
-    llm_client: MultiClient,
-    task: Task,
+async def heartbeat_loop(
+    heartbeat_script: AsyncScript,
     processing_key: str,
-    completion_script: AsyncScript,
+    agent: BaseAgent[Any],
+    stop_event: asyncio.Event,
+    interval: int,
 ) -> None:
-    """Process a single task"""
-    print(f"Processing task: {task.id}")
+    """Simple heartbeat loop that runs until stopped"""
+    agent_heartbeats = PROCESSING_HEARTBEATS.format(agent=agent.name)
 
     try:
-        agent = DummyAgent(client=llm_client)
-        is_done, updated_context = await agent.run_turn(task.payload)
-        result: tuple[str, str]
+        while not stop_event.is_set():
+            try:
+                # Send heartbeat
+                await heartbeat_script(
+                    keys=[agent_heartbeats],
+                    args=[processing_key, time.time()],
+                )
 
-        if is_done:
-            # Task completed successfully
-            await publish_update(
-                redis_client,
-                task.user_id,
-                {
-                    "task_id": task.id,
-                    "event": "complete",
-                    "content": updated_context.messages[-1]["content"],
-                },
+                # Wait for next interval
+                try:
+                    await asyncio.wait_for(stop_event.wait(), timeout=interval)
+                    break  # Stop event was set
+                except asyncio.TimeoutError:
+                    continue  # Normal timeout, send next heartbeat
+
+            except Exception as e:
+                # Log but don't crash - missing one heartbeat shouldn't kill the task
+                logger.error(f"Heartbeat error for {processing_key}: {e}")
+                # Small backoff to avoid hammering Redis if it's having issues
+                await asyncio.sleep(1)
+    except asyncio.CancelledError:
+        # Task was cancelled, exit cleanly
+        logger.debug(f"Heartbeat loop for {processing_key} cancelled")
+        raise
+
+
+async def process_task(
+    redis_client: redis.Redis,
+    task: Task[Any],
+    processing_key: str,
+    heartbeat_script: AsyncScript,
+    completion_script: AsyncScript,
+    agent: BaseAgent[Any],
+    max_retries: int,
+    heartbeat_interval: int,
+    task_timeout: int = 90,
+) -> None:
+    """Process a single task"""
+    logger.info(f"Processing task: {task.id}")
+
+    agent_main_queue = MAIN_QUEUE.format(agent=agent.name)
+    agent_processing_heartbeats = PROCESSING_HEARTBEATS.format(agent=agent.name)
+    agent_processing_tasks = PROCESSING_TASKS.format(agent=agent.name)
+    agent_failed_queue = FAILED_QUEUE.format(agent=agent.name)
+
+    stop_heartbeat = asyncio.Event()
+    heartbeat_task = asyncio.create_task(
+        heartbeat_loop(
+            heartbeat_script=heartbeat_script,
+            processing_key=processing_key,
+            agent=agent,
+            stop_event=stop_heartbeat,
+            interval=heartbeat_interval,
+        )
+    )
+
+    event_publisher = EventPublisher(
+        redis_client=redis_client,
+        channel_template=UPDATE_CHANNEL.format(owner_id=task.owner_id),
+    )
+
+    task_failed = False
+
+    try:
+        if task.payload.turn == 0 and task.retries == 0:
+            await event_publisher.publish_event(
+                AgentEvent(
+                    event_type=EventType.RUN_STARTED,
+                    task_id=task.id,
+                    owner_id=task.owner_id,
+                    agent_name=agent.name,
+                )
             )
 
+        agent.set_event_publisher(event_publisher)
+
+        turn_completion = await asyncio.wait_for(
+            agent.execute_turn(task), timeout=task_timeout
+        )
+        result: tuple[str, str]
+
+        if turn_completion.is_done:
             result = await completion_script(
-                keys=[MAIN_QUEUE, PROCESSING_TIMES, PROCESSING_TASKS, FAILED_QUEUE],
-                args=[processing_key, "complete", "", MAX_RETRIES],
+                keys=[
+                    agent_main_queue,
+                    agent_processing_heartbeats,
+                    agent_processing_tasks,
+                    agent_failed_queue,
+                ],
+                args=[processing_key, "complete", "", max_retries],
             )  # type: ignore
 
             _, status = result
-            print(f"Task {task.id} completed: {status}")
+            logger.info(f"Task {task.id} completed: {status}")
+
+            await event_publisher.publish_event(
+                AgentEvent(
+                    event_type=EventType.RUN_COMPLETED,
+                    task_id=task.id,
+                    owner_id=task.owner_id,
+                    agent_name=agent.name,
+                )
+            )
 
         else:
             # Task needs to continue processing
-            task.payload = updated_context
-
-            await publish_update(
-                redis_client,
-                task.user_id,
-                {
-                    "task_id": task.id,
-                    "event": "progress",
-                    "context": updated_context.to_dict(),
-                },
-            )
+            task.payload = turn_completion.context
 
             result = await completion_script(
-                keys=[MAIN_QUEUE, PROCESSING_TIMES, PROCESSING_TASKS, FAILED_QUEUE],
-                args=[processing_key, "continue", task.to_json(), MAX_RETRIES],
+                keys=[
+                    agent_main_queue,
+                    agent_processing_heartbeats,
+                    agent_processing_tasks,
+                    agent_failed_queue,
+                ],
+                args=[processing_key, "continue", task.to_json(), max_retries],
             )  # type: ignore
 
             _, status = result
-            print(f"Task {task.id} continued: {status}")
+            logger.info(f"Task {task.id} continued: {status}")
+
+    except asyncio.TimeoutError:
+        task_failed = True
+        logger.error(f"Task {task.id} timed out after {task_timeout} seconds")
+
+        await event_publisher.publish_event(
+            AgentEvent(
+                event_type=EventType.TASK_FAILED,
+                task_id=task.id,
+                owner_id=task.owner_id,
+                agent_name=agent.name,
+                error=f"Task {task.id} timed out after {task_timeout} seconds",
+            )
+        )
+
+        # Increment retry count for timeouts
+        task.retries += 1
+
+        result = await completion_script(
+            keys=[
+                agent_main_queue,
+                agent_processing_heartbeats,
+                agent_processing_tasks,
+                agent_failed_queue,
+            ],
+            args=[processing_key, "fail", task.to_json(), max_retries],
+        )  # type: ignore
+
+        _, status = result
+        logger.error(f"Task {task.id} failed due to timeout: {status}")
 
     except Exception as e:
-        print(f"Task {task.id} failed with exception: {e}", traceback.format_exc())
+        task_failed = True
+        logger.error(
+            f"Task {task.id} failed with exception: {e}\n{traceback.format_exc()}"
+        )
+
+        await event_publisher.publish_event(
+            AgentEvent(
+                event_type=EventType.TASK_FAILED,
+                task_id=task.id,
+                owner_id=task.owner_id,
+                agent_name=agent.name,
+                error=str(e),
+            )
+        )
 
         # Increment retry count for failures
         task.retries += 1
 
         result = await completion_script(
-            keys=[MAIN_QUEUE, PROCESSING_TIMES, PROCESSING_TASKS, FAILED_QUEUE],
-            args=[processing_key, "fail", task.to_json(), MAX_RETRIES],
+            keys=[
+                agent_main_queue,
+                agent_processing_heartbeats,
+                agent_processing_tasks,
+                agent_failed_queue,
+            ],
+            args=[processing_key, "fail", task.to_json(), max_retries],
         )  # type: ignore
 
         _, status = result
-        print(f"Task {task.id} failed: {status}")
+        logger.error(f"Task {task.id} failed: {status}")
+    finally:
+        # Stop heartbeat
+        stop_heartbeat.set()
+        heartbeat_task.cancel()
+
+        # Only emit retry/failure events if the task actually failed
+        if task_failed:
+            if task.retries >= max_retries:
+                await event_publisher.publish_event(
+                    AgentEvent(
+                        event_type=EventType.RUN_FAILED,
+                        task_id=task.id,
+                        owner_id=task.owner_id,
+                        agent_name=agent.name,
+                        error=f"Agent {agent.name} failed to complete task {task.id} due to max retries ({max_retries})",
+                    )
+                )
+            else:
+                await event_publisher.publish_event(
+                    AgentEvent(
+                        event_type=EventType.TASK_RETRIED,
+                        task_id=task.id,
+                        owner_id=task.owner_id,
+                        agent_name=agent.name,
+                    )
+                )
+
+        try:
+            await heartbeat_task
+        except asyncio.CancelledError:
+            pass
 
 
 async def recover_stale_tasks(
-    redis_client: redis.Redis, recovery_script: AsyncScript
+    recovery_script: AsyncScript,
+    agent: BaseAgent[Any],
+    heartbeat_timeout: int,
+    max_retries: int,
+    batch_size: int,
 ) -> int:
     """Atomically move stale tasks back to main queue"""
-    cutoff = time.time() - STALE_THRESHOLD
-    max_batch = 100
+    cutoff = time.time() - heartbeat_timeout
+
+    agent_main_queue = MAIN_QUEUE.format(agent=agent.name)
+    agent_processing_heartbeats = PROCESSING_HEARTBEATS.format(agent=agent.name)
+    agent_processing_tasks = PROCESSING_TASKS.format(agent=agent.name)
+    agent_failed_queue = FAILED_QUEUE.format(agent=agent.name)
 
     try:
-        result: tuple[int, int, list[dict[str, Any]]] = await recovery_script(
-            keys=[MAIN_QUEUE, PROCESSING_TIMES, PROCESSING_TASKS, FAILED_QUEUE],
-            args=[cutoff, max_batch, MAX_RETRIES],
-        )  # type: ignore
+        result = cast(
+            tuple[int, int, list[Any]],
+            await recovery_script(
+                keys=[
+                    agent_main_queue,
+                    agent_processing_heartbeats,
+                    agent_processing_tasks,
+                    agent_failed_queue,
+                ],
+                args=[cutoff, batch_size, max_retries],
+            ),
+        )
 
-        recovered_count, _, recovered_tasks = result
+        recovered_count, failed_count, recovered_tasks_flat = result
 
         if recovered_count > 0:
-            print(f"Recovered {recovered_count} stale tasks: {recovered_tasks}")
+            logger.warning(
+                f"⚠️ Found {recovered_count + failed_count} tasks with stale heartbeats (>{heartbeat_timeout}s)"
+            )
+            if recovered_count > 0:
+                logger.info(
+                    f"✅ Recovered {recovered_count} stale tasks back to main queue"
+                )
+            if failed_count > 0:
+                logger.error(
+                    f"❌ Moved {failed_count} tasks to failed queue (max retries exceeded)"
+                )
+
+            # Parse the flat list back into key-value pairs
+            for i in range(0, len(recovered_tasks_flat), 2):
+                if i + 1 < len(recovered_tasks_flat):
+                    task_key = recovered_tasks_flat[i]
+                    retries = recovered_tasks_flat[i + 1]
+                    logger.info(f"   Task key: {task_key}, retries: {retries}")
 
         return recovered_count
 
     except Exception as e:
-        print(f"Error during stale task recovery: {e}")
+        logger.error(f"Error during stale task recovery: {e}")
         return 0
 
 
 async def stale_task_monitor(
-    shutdown_event: asyncio.Event, redis_pool: redis.ConnectionPool
+    shutdown_event: asyncio.Event,
+    redis_pool: redis.ConnectionPool,
+    agent: BaseAgent[Any],
+    heartbeat_timeout: int,
+    max_retries: int,
+    batch_size: int,
+    interval: int,
 ) -> None:
     """Background task to periodically recover stale tasks"""
     redis_client = redis.Redis(connection_pool=redis_pool)
     recovery_script = create_stale_recovery_script(redis_client)
 
-    print("Stale task monitor started")
+    logger.info(
+        f"Stale task monitor started (checking every {interval}s for heartbeats >{heartbeat_timeout}s old)"
+    )
 
     try:
         while not shutdown_event.is_set():
             try:
-                await recover_stale_tasks(redis_client, recovery_script)
+                await recover_stale_tasks(
+                    recovery_script=recovery_script,
+                    agent=agent,
+                    heartbeat_timeout=heartbeat_timeout,
+                    max_retries=max_retries,
+                    batch_size=batch_size,
+                )
 
                 # Wait before next check, but allow early exit on shutdown
                 try:
-                    await asyncio.wait_for(shutdown_event.wait(), timeout=30.0)
+                    jitter = random.uniform(-0.2, 0.2)  # ±20% jitter
+                    jittered_interval = interval * (1 + jitter)
+                    await asyncio.wait_for(
+                        shutdown_event.wait(), timeout=jittered_interval
+                    )
                     break  # Shutdown requested
                 except asyncio.TimeoutError:
                     continue  # Normal timeout, continue monitoring
 
             except Exception as e:
-                print(f"Error in stale task monitor: {e}")
+                logger.error(f"Error in stale task monitor: {e}")
                 # Wait a bit before retrying to avoid tight error loops
                 try:
-                    await asyncio.wait_for(shutdown_event.wait(), timeout=10.0)
+                    await asyncio.wait_for(
+                        shutdown_event.wait(), timeout=interval * 1.5
+                    )
                     break
                 except asyncio.TimeoutError:
                     continue
 
     except asyncio.CancelledError:
-        print("Stale task monitor cancelled")
+        logger.info("Stale task monitor cancelled")
         raise
     finally:
-        # Properly close the Redis client
         await redis_client.close()
-        print("Stale task monitor finished")
+        logger.info("Stale task monitor finished")
 
 
 async def worker_loop(
     shutdown_event: asyncio.Event,
     redis_pool: redis.ConnectionPool,
-    llm_client: MultiClient,
     worker_id: str,
+    agent: BaseAgent[Any],
+    batch_size: int,
+    max_retries: int,
+    heartbeat_interval: int,
+    task_timeout: int = 90,
 ) -> None:
     """Main worker loop"""
     redis_client = redis.Redis(connection_pool=redis_pool)
     batch_script = create_batch_move_script(redis_client)
+    heartbeat_script = create_heartbeat_script(redis_client)
     completion_script = create_task_completion_script(redis_client)
 
-    print(f"Worker {worker_id} started")
+    logger.info(f"Worker {worker_id} started")
+    current_tasks: list[asyncio.Task[Any]] = []
 
     try:
         while not shutdown_event.is_set():
-            batch = await get_task_batch(batch_script, worker_id)
+            batch = await get_task_batch(
+                batch_script=batch_script,
+                worker_id=worker_id,
+                agent=agent,
+                batch_size=batch_size,
+            )
 
             if batch:
-                print(f"Worker {worker_id} got {len(batch)} tasks")
+                logger.info(f"Worker {worker_id} got {len(batch)} tasks")
 
-                # Process all tasks in batch concurrently
-                tasks = [
+                current_tasks = [
                     asyncio.create_task(
                         process_task(
                             redis_client=redis_client,
-                            llm_client=llm_client,
                             task=task_data,
                             processing_key=processing_key,
+                            heartbeat_script=heartbeat_script,
                             completion_script=completion_script,
+                            agent=agent,
+                            max_retries=max_retries,
+                            heartbeat_interval=heartbeat_interval,
+                            task_timeout=task_timeout,
                         )
                     )
                     for task_data, processing_key in batch
                 ]
 
-                # Process tasks but check if we should shutdown while waiting
-                _, pending = await asyncio.wait(
-                    tasks, return_when=asyncio.FIRST_EXCEPTION
-                )
-
-                # Complete any remaining tasks
-                if pending:
-                    await asyncio.gather(*pending, return_exceptions=True)
+                await asyncio.gather(*current_tasks, return_exceptions=True)
+                current_tasks = []
 
                 # Check if we should exit after completing batch
                 if shutdown_event.is_set():
-                    print(f"Worker {worker_id} shutting down after completing batch")
+                    logger.info(
+                        f"Worker {worker_id} shutting down after completing batch"
+                    )
                     break
             else:
                 # No tasks, wait a bit but check for shutdown
+                sleep_time = 0.25 + random.uniform(0, 0.5)  # 0.25s to 0.75s
                 try:
-                    await asyncio.wait_for(shutdown_event.wait(), timeout=1.0)
-                    # If we get here, shutdown was triggered
+                    await asyncio.wait_for(shutdown_event.wait(), timeout=sleep_time)
                     break
                 except asyncio.TimeoutError:
-                    # Normal timeout, continue loop
                     pass
 
     except asyncio.CancelledError:
-        print(f"Worker {worker_id} cancelled")
+        # Cancel any running tasks
+        for task in current_tasks:
+            if not task.done():
+                task.cancel()
+        if current_tasks:
+            await asyncio.gather(*current_tasks, return_exceptions=True)
+        logger.info(f"Worker {worker_id} cancelled")
         raise
     finally:
-        # Properly close the Redis client connection
         await redis_client.close()
-        print(f"Worker {worker_id} finished")
+        logger.info(f"Worker {worker_id} finished")

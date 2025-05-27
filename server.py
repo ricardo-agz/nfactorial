@@ -12,6 +12,10 @@ from starlette.websockets import WebSocket, WebSocketDisconnect
 
 from agent.context import Task, AgentContext
 from agent.queue import enqueue_task
+from agent.multi_agent import MultiAgent
+from agent.logging import get_logger
+
+logger = get_logger("server")
 
 UPDATE_CHANNEL = "updates:{user_id}"
 
@@ -29,16 +33,16 @@ async def lifespan(app: FastAPI):
 
     try:
         await redis_client.ping()  # type: ignore
-        print("Connected to Redis successfully")
+        logger.info("Connected to Redis successfully")
     except redis.ConnectionError:
-        print("Failed to connect to Redis")
+        logger.error("Failed to connect to Redis")
         raise
 
     yield
 
     if redis_client:
         await redis_client.close()
-        print("Redis connection closed")
+        logger.info("Redis connection closed")
 
 
 app = FastAPI(lifespan=lifespan)
@@ -94,7 +98,7 @@ class EnqueueRequest(BaseModel):
 async def enqueue(request: EnqueueRequest):
     task = Task(
         id=str(uuid.uuid4()),
-        user_id=request.user_id,
+        owner_id=request.user_id,
         retries=0,
         created_at=datetime.utcnow(),
         payload=AgentContext(
@@ -103,7 +107,10 @@ async def enqueue(request: EnqueueRequest):
             turn=0,
         ),
     )
-    await enqueue_task(redis_client, task)
+
+    agent = MultiAgent()
+
+    await enqueue_task(redis_client=redis_client, task=task, agent=agent)
     return {"task_id": task.id}
 
 

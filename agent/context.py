@@ -1,7 +1,10 @@
-from dataclasses import dataclass, asdict
-from datetime import datetime
+from dataclasses import dataclass, asdict, field
+from datetime import datetime, timezone
 import typing
 import json
+from typing import TypeVar, Generic, Type
+
+ContextType = TypeVar("ContextType", bound="AgentContext")
 
 
 @dataclass
@@ -13,19 +16,23 @@ class AgentContext:
     def to_dict(self):
         return asdict(self)
 
+    @classmethod
+    def from_dict(cls, data: dict[str, typing.Any]):
+        return cls(**data)
+
 
 @dataclass
-class Task:
+class Task(Generic[ContextType]):
     id: str
-    user_id: str
-    payload: AgentContext
+    owner_id: str
+    payload: ContextType
     retries: int
-    created_at: datetime
+    created_at: datetime = datetime.now(timezone.utc)
 
     def to_dict(self):
         return {
             "id": self.id,
-            "user_id": self.user_id,
+            "owner_id": self.owner_id,
             "payload": self.payload.to_dict() if self.payload else None,
             "retries": self.retries,
             "created_at": self.created_at.isoformat(),
@@ -35,12 +42,18 @@ class Task:
         return json.dumps(self.to_dict())
 
     @classmethod
-    def from_dict(cls, data: dict[str, typing.Any]):
+    def from_dict(
+        cls,
+        data: dict[str, typing.Any],
+        context_class: Type[ContextType],
+    ):
         data["created_at"] = datetime.fromisoformat(data["created_at"])
-        data["payload"] = AgentContext(**data["payload"]) if data["payload"] else None
+        data["payload"] = (
+            context_class.from_dict(data["payload"]) if data["payload"] else None
+        )
         return cls(**data)
 
     @classmethod
-    def from_json(cls, json_str: str):
+    def from_json(cls, json_str: str, context_class: Type[ContextType]):
         data = json.loads(json_str)
-        return cls.from_dict(data)
+        return cls.from_dict(data, context_class)

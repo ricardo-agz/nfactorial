@@ -22,7 +22,7 @@ if __name__ == "__main__":
     control_plane.register_runner(
         agent=agent,
         agent_worker_config=AgentWorkerConfig(
-            workers=5,
+            workers=100,
             batch_size=25,
             max_retries=3,
             heartbeat_interval=2,

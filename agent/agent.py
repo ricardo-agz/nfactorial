@@ -1,16 +1,20 @@
+import random
 from typing import (
     Any,
     Callable,
+    Awaitable,
     cast,
     final,
     Generic,
     TypeVar,
 )
+from functools import wraps
 from dataclasses import dataclass
 from pydantic import BaseModel
 import json
 import asyncio
-from typing import Any, cast
+import inspect
+from contextvars import ContextVar
 from openai import (
     RateLimitError,
     InternalServerError,
@@ -26,11 +30,16 @@ import os
 
 from agent.context import Task, AgentContext, ContextType
 from agent.llms import Model, MultiClient, grok_3_mini, gpt_41_nano
-from agent.utils import to_snake_case
-from agent.events import EventPublisher, AgentEvent, EventType
+from agent.utils import serialize_data, to_snake_case
+from agent.events import EventPublisher, AgentEvent
+from agent.logging import get_logger
 
-# Add a type variable for the context type in ModelSettings
+
+logger = get_logger(__name__)
+
+
 ContextT = TypeVar("ContextT", bound=AgentContext)
+T = TypeVar("T")
 
 
 class RetryableError(Exception):
@@ -45,12 +54,134 @@ class NonRetryableError(Exception):
     pass
 
 
+execution_context: ContextVar["ExecutionContext"] = ContextVar("execution_context")
+
+
+RETRYABLE_EXCEPTIONS = (
+    RateLimitError,
+    InternalServerError,
+    APIConnectionError,
+    APITimeoutError,
+    RetryableError,
+)
+
+
+class ToolActionResponse(BaseModel):
+    tool_call: ChatCompletionMessageToolCall
+    output_str: str
+    output_data: Any
+
+
 @dataclass
-class TurnMeta:
+class ExecutionContext:
+    """Per-request context (not stored on agent)"""
+
     task_id: str
     owner_id: str
     retries: int
-    turn: int
+    iterations: int
+    events: EventPublisher
+
+    @classmethod
+    def current(cls) -> "ExecutionContext":
+        """Get current execution context"""
+        return execution_context.get()
+
+
+def retry(
+    max_attempts: int = 3,
+    delay: float = 1.0,
+):
+    def decorator(func: Callable[..., Awaitable[T]]) -> Callable[..., Awaitable[T]]:
+        @wraps(func)
+        async def wrapper(self: "BaseAgent[Any]", *args: Any, **kwargs: Any) -> T:
+            if max_attempts <= 0:
+                raise ValueError("max_attempts must be greater than 0")
+
+            last_exception: Exception | None = None
+
+            for attempt in range(max_attempts):
+                try:
+                    return await func(self, *args, **kwargs)
+                except Exception as e:
+                    if isinstance(e, RETRYABLE_EXCEPTIONS):
+                        last_exception = e
+                        if attempt < max_attempts - 1:
+                            await asyncio.sleep(
+                                delay * (2**attempt) * random.uniform(0.8, 1.2)
+                            )
+                    else:
+                        raise e
+
+            raise last_exception or Exception("Retry failed")
+
+        return wrapper
+
+    return decorator
+
+
+def publish_progress(
+    include_context: bool = True,
+    include_args: bool = True,
+    include_result: bool = True,
+):
+    def decorator(func: Callable[..., Awaitable[T]]) -> Callable[..., Awaitable[T]]:
+        @wraps(func)
+        async def wrapper(self: "BaseAgent[Any]", *args: Any, **kwargs: Any) -> T:
+            async def publish(
+                event_suffix: str,
+                data: dict[str, Any] | None = None,
+                error: str | None = None,
+            ) -> None:
+                try:
+                    ctx = ExecutionContext.current()
+
+                    event_data: dict[str, Any] = {}
+                    if data:
+                        event_data.update(data)
+                    if include_context and ctx:
+                        event_data["context"] = ctx
+
+                    await ctx.events.publish_event(
+                        AgentEvent(
+                            event_type=f"progress_update_{func.__name__}_{event_suffix}",
+                            task_id=ctx.task_id,
+                            owner_id=ctx.owner_id,
+                            agent_name=self.name,
+                            data=serialize_data(event_data) if event_data else None,
+                            error=error,
+                        )
+                    )
+                except Exception:
+                    logger.exception("Failed to publish progress update", exc_info=True)
+                    pass
+
+            start_data: dict[str, Any] = {}
+            if include_args:
+                start_data.update(
+                    {
+                        "args": args,
+                        "kwargs": kwargs,
+                    }
+                )
+            await publish("started", start_data)
+
+            try:
+                result = await func(self, *args, **kwargs)
+
+                completion_data: dict[str, Any] = {}
+                if include_result:
+                    completion_data["result"] = serialize_data(result)
+
+                await publish("completed", completion_data if completion_data else None)
+                return result
+            except Exception as e:
+                await publish("failed", error=str(e))
+                raise
+
+        return wrapper
+
+    return decorator
 
 
 @dataclass
@@ -119,24 +250,18 @@ class BaseAgent(Generic[ContextType]):
         self.parse_tool_args = parse_tool_args
         self.context_class = context_class
         self.output_type = output_type
-        if not all(
-            tool["function"]["name"] in self.tool_actions for tool in self.tools
-        ):
-            raise ValueError(
-                "All tools must have a corresponding action registered in the `tool_actions` argument."
-            )
 
         if self.output_type:
-            final_output_tool = create_final_output_tool(self.output_type)
-            # self.tools = list(self.tools)
-            self.tools.append(final_output_tool)
+            self.tools.append(create_final_output_tool(self.output_type))
 
-    def set_event_publisher(self, publisher: EventPublisher):
-        self.event_publisher = publisher
-
-    async def _publish_event(self, event: AgentEvent):
-        if self.event_publisher:
-            await self.event_publisher.publish_event(event)
+        missing = [
+            t["function"]["name"]
+            for t in self.tools
+            if t["function"]["name"] not in self.tool_actions
+            and t["function"]["name"] != "final_output"
+        ]
+        if missing:
+            raise ValueError(f"Missing tool actions for: {missing}")
 
     def create_task(
         self,
@@ -158,295 +283,190 @@ class BaseAgent(Generic[ContextType]):
 
     # ===== Overridable Methods ===== #
 
-    def _prepare_messages(self, context: ContextType) -> list[dict[str, Any]]:
-        """Prepare messages for LLM request. Override to customize message preparation."""
-        if context.turn == 0:
-            messages = [{"role": "system", "content": self.instructions}]
-            if context.messages:
-                messages.extend(
-                    [message for message in context.messages if message["content"]]
-                )
-            messages.append({"role": "user", "content": context.query})
-        else:
-            messages = context.messages
-
-        return messages
-
+    @retry(max_attempts=3, delay=0.5)
+    @publish_progress()
     async def completion(
         self,
-        model: Model,
         messages: list[dict[str, Any]],
-        tools: list[dict[str, Any]] = [],
-        context: ContextType | None = None,
+        tools: list[dict[str, Any]] | None = None,
         temperature: float | None = None,
         max_completion_tokens: int | None = None,
         tool_choice: str | dict[str, Any] | None = None,
         parallel_tool_calls: bool | None = None,
+        model: Model | None = None,
+        agent_ctx: ContextType | None = None,
         **kwargs: Any,
     ) -> ChatCompletion:
-        """Execute LLM completion. Override to customize LLM interaction."""
-
-        completion_kwargs: dict[str, Any] = {}
-        if temperature is not None:
-            completion_kwargs["temperature"] = temperature
-        if max_completion_tokens is not None:
-            completion_kwargs["max_completion_tokens"] = max_completion_tokens
-        if tool_choice is not None:
-            completion_kwargs["tool_choice"] = tool_choice
-        if parallel_tool_calls is not None:
-            completion_kwargs["parallel_tool_calls"] = parallel_tool_calls
+        """Execute LLM completion. Override to customize."""
+        if agent_ctx:
+            model_settings = self._resolve_model_settings(agent_ctx)
+            temperature = temperature or model_settings.get("temperature")
+            max_completion_tokens = max_completion_tokens or model_settings.get(
+                "max_completion_tokens"
+            )
+            tool_choice = tool_choice or model_settings.get("tool_choice")
+            parallel_tool_calls = parallel_tool_calls or model_settings.get(
+                "parallel_tool_calls"
+            )
 
         response = cast(
             ChatCompletion,
             await self.client.completion(
-                model,
-                messages,
-                tools=tools,
-                **completion_kwargs,
+                model=model or self.model,
+                messages=messages,
+                tools=tools or self.tools,
+                temperature=temperature,
+                max_completion_tokens=max_completion_tokens,
+                tool_choice=tool_choice,
+                parallel_tool_calls=parallel_tool_calls,
+                **kwargs,
             ),
         )
 
         return response
 
-    async def _completion_with_retry(
-        self,
-        model: Model,
-        messages: list[dict[str, Any]],
-        tools: list[dict[str, Any]] = [],
-        meta: TurnMeta | None = None,
-        **kwargs: Any,
-    ) -> ChatCompletion:
-        """Execute LLM completion with retry logic and error handling."""
-        last_exception = None
-
-        for attempt in range(self.max_llm_retries + 1):
-            try:
-                response = await self.completion(
-                    model,
-                    messages,
-                    tools=tools,
-                    **kwargs,
-                )
-                return response
-
-            except Exception as e:
-                last_exception = e
-
-                is_retryable = isinstance(
-                    e,
-                    (
-                        RateLimitError,
-                        InternalServerError,
-                        APITimeoutError,
-                        APIConnectionError,
-                        RetryableError,
-                    ),
-                )
-
-                if is_retryable and attempt < self.max_llm_retries:
-                    delay = self.llm_retry_delay * (2**attempt)
-
-                    await self._publish_event(
-                        AgentEvent(
-                            event_type=EventType.LLM_REQUEST_RETRIED,
-                            task_id=meta.task_id if meta else None,
-                            owner_id=meta.owner_id if meta else None,
-                            agent_name=self.name,
-                            data={
-                                "attempt": attempt + 1,
-                                "max_retries": self.max_llm_retries,
-                                "delay": delay,
-                                "model": (
-                                    model.provider_model_id
-                                    if hasattr(model, "value")
-                                    else str(model)
-                                ),
-                            },
-                            error=str(e),
-                        )
-                    )
-
-                    await asyncio.sleep(delay)
-                else:
-                    break
-
-        raise last_exception or Exception("LLM completion failed after all retries")
-
+    @retry(max_attempts=2, delay=0.25)
+    @publish_progress()
     async def tool_action(
-        self, tool_name: str, tool_args: dict[str, Any] | str
-    ) -> tuple[str, Any]:
-        """Execute a tool action. Override to customize individual tool execution."""
-        action = self.tool_actions[tool_name]
-
-        if asyncio.iscoroutinefunction(action):
-            if isinstance(tool_args, str):
-                return await action(tool_args)
-            else:
-                return await action(**tool_args)
-        else:
-            if isinstance(tool_args, str):
-                return action(tool_args)  # type: ignore
-            else:
-                return action(**tool_args)  # type: ignore
-
-    async def _tool_action_with_retry(
-        self,
-        tool_name: str,
-        tool_args: dict[str, Any] | str,
-        meta: TurnMeta | None = None,
-    ) -> tuple[str, Any]:
-        """Execute a tool action with retry logic and error handling."""
-        last_exception = None
-
-        for attempt in range(self.max_tool_retries + 1):
-            try:
-                result = await self.tool_action(tool_name, tool_args)
-                return result
-
-            except Exception as e:
-                last_exception = e
-
-                if attempt < self.max_tool_retries:
-                    delay = self.tool_retry_delay * (2**attempt)
-
-                    await self._publish_event(
-                        AgentEvent(
-                            event_type=EventType.TOOL_CALL_RETRIED,
-                            task_id=meta.task_id if meta else None,
-                            owner_id=meta.owner_id if meta else None,
-                            agent_name=self.name,
-                            data={
-                                "tool_name": tool_name,
-                                "attempt": attempt + 1,
-                                "max_retries": self.max_tool_retries,
-                                "delay": delay,
-                                "arguments": tool_args,
-                            },
-                            error=str(e),
-                        )
-                    )
-
-                    await asyncio.sleep(delay)
-                else:
-                    break
-
-        raise last_exception or Exception(f"Tool {tool_name} failed after all retries")
-
-    def _is_final_turn(self, response: ChatCompletion) -> bool:
-        """Check if this turn should be the final one."""
-        tool_calls = response.choices[0].message.tool_calls
-        if not tool_calls:
-            return True
-
-        return any(
-            tool_call.function.name == "final_output" for tool_call in tool_calls
-        )
-
-    def _extract_output(
-        self,
-        response: ChatCompletion,
-    ) -> str | dict[str, Any] | None:
-        """Extract the final output from response content or tool calls."""
-        content = response.choices[0].message.content
-        tool_calls = response.choices[0].message.tool_calls
-
-        if content:
-            return content
-
-        if tool_calls:
-            for tool_call in tool_calls:
-                if tool_call.function.name == "final_output":
-                    if self.parse_tool_args:
-                        return json.loads(tool_call.function.arguments)
-                    else:
-                        return tool_call.function.arguments
-
-        return None
-
-    async def run_turn(
-        self,
-        context: ContextType,
-        meta: TurnMeta | None = None,
-    ) -> TurnCompletion[ContextType]:
-        """
-        Run a turn of the agent.
-
-        Args:
-        - context (ContextType): The agent context.
-
-        Returns:
-        - is_done (bool): Indicates if the turn is complete.
-        - context (ContextType): The updated agent context.
-        """
-
-        messages = self._prepare_messages(context)
-        response = await self._execute_completion(context, messages, meta)
-        response_tool_calls = response.choices[0].message.tool_calls
-        response_content = response.choices[0].message.content
-
-        messages.append(
-            {
-                "role": "assistant",
-                "content": response_content,
-                "tool_calls": [
-                    tool_call.model_dump() for tool_call in response_tool_calls
-                ]
-                if response_tool_calls
-                else None,
-            }
-        )
-
-        is_final_turn = self._is_final_turn(response)
-        if is_final_turn:
-            output = self._extract_output(response)
-            context.messages = messages
-            return TurnCompletion(is_done=True, context=context, output=output)
-
-        if response_tool_calls:
-            messages = await self._handle_tool_response(
-                messages, response_tool_calls, meta
-            )
-
-        context.messages = messages
-        context.turn += 1
-
-        return TurnCompletion(is_done=False, context=context)
-
-    def create_tool_result_message(
         self,
         tool_call: ChatCompletionMessageToolCall,
-        result: tuple[str, Any] | Exception,
-    ) -> dict[str, Any]:
-        """Format tool result into message. Override to customize tool result formatting."""
-        tool_output_message = {
-            "role": "tool",
-            "tool_call_id": tool_call.id,
-        }
+        agent_ctx: ContextType,
+    ) -> ToolActionResponse:
+        """Execute a tool action. Override to customize."""
         tool_name = tool_call.function.name
+        tool_args = tool_call.function.arguments
+        action = self.tool_actions[tool_name]
 
-        if isinstance(result, Exception):
-            tool_output_message["content"] = (
-                f'<tool_call_error tool="{tool_name}">\nError running tool:\n{result}\n</tool_call_error>'
+        if not self.parse_tool_args:
+            output_str, output_data = (
+                await action(tool_args, agent_ctx)
+                if asyncio.iscoroutinefunction(action)
+                else action(tool_args, agent_ctx)
             )
         else:
-            tool_output_message["content"] = (
-                f'<tool_call_output tool="{tool_name}">\n{result[0]}\n</tool_call_output>'
+            parsed_tool_args = json.loads(tool_args)
+
+            # Check if function expects agent context
+            sig = inspect.signature(action)
+            for param_name, param in sig.parameters.items():
+                # Case 1: Parameter named 'agent_ctx'
+                if param_name == "agent_ctx":
+                    parsed_tool_args[param_name] = agent_ctx
+                    break
+                # Case 2: Parameter with AgentContext subclass type annotation
+                elif (
+                    param.annotation
+                    and param.annotation != inspect.Parameter.empty
+                    and isinstance(param.annotation, type)
+                    and issubclass(param.annotation, AgentContext)
+                ):
+                    parsed_tool_args[param_name] = agent_ctx
+                    break
+
+            output_str, output_data = (
+                await action(**parsed_tool_args)
+                if asyncio.iscoroutinefunction(action)
+                else action(**parsed_tool_args)
             )
 
-        return tool_output_message
+        return ToolActionResponse(
+            tool_call=tool_call, output_str=output_str, output_data=output_data
+        )
 
-    # ===== Internal Methods ===== #
+    async def execute_tools(
+        self,
+        messages: list[dict[str, Any]],
+        tool_calls: list[ChatCompletionMessageToolCall],
+        agent_ctx: ContextType,
+    ) -> list[dict[str, Any]]:
+        """Execute tool calls and add results to messages"""
+        updated_messages = messages.copy()
 
-    def _should_complete(self, context: ContextType, response: ChatCompletion) -> bool:
-        """Check if the agent should complete."""
-        response_tool_calls = response.choices[0].message.tool_calls
-        should_complete = not response_tool_calls or "final_output" in [
-            tool_call.function.name for tool_call in response_tool_calls
+        # Run tools in parallel
+        tasks = [
+            self.tool_action(
+                tc,
+                agent_ctx,
+            )
+            for tc in tool_calls
         ]
-        return should_complete
+        results = await asyncio.gather(*tasks, return_exceptions=True)
 
-    def _last_turn(self, context: ContextType) -> bool:
-        return context.turn == self.max_turns
+        # Add results to messages
+        for tc, result in zip(tool_calls, results):
+            if isinstance(result, Exception):
+                logger.error(
+                    f"Tool {tc.function.name} failed: {result}", exc_info=result
+                )
+                content = f'<tool_call_error tool="{tc.function.name}">\nError running tool:\n{result}\n</tool_call_error>'
+            elif isinstance(result, tuple):
+                tool_result = cast(tuple[str, Any], result)
+                content = f'<tool_call_result tool="{tc.function.name}">\n{tool_result[0]}\n</tool_call_result>'
+            else:
+                content = f'<tool_call_result tool="{tc.function.name}">\n{result}\n</tool_call_result>'
+
+            updated_messages.append(
+                {"role": "tool", "tool_call_id": tc.id, "content": content}
+            )
+
+        return updated_messages
+
+    @publish_progress()
+    async def run_turn(
+        self,
+        agent_ctx: ContextType,
+    ) -> TurnCompletion[ContextType]:
+        """Run a single turn. Override for custom logic."""
+
+        messages = self._prepare_messages(agent_ctx)
+
+        # Run completion and append response to messages
+        response = await self.completion(
+            messages,
+            agent_ctx=agent_ctx,
+        )
+
+        assistant_msg = {
+            "role": "assistant",
+            "content": response.choices[0].message.content,
+            "tool_calls": (
+                [
+                    tc.model_dump()  # type: ignore
+                    for tc in response.choices[0].message.tool_calls
+                ]
+                if response.choices[0].message.tool_calls
+                else None
+            ),
+        }
+        messages.append(assistant_msg)
+
+        if self._is_done(response):
+            agent_ctx.messages = messages
+            return TurnCompletion(
+                is_done=True,
+                context=agent_ctx,
+                output=self._extract_output(response),
+            )
+
+        # Handle tool calls and append results to messages
+        if response.choices[0].message.tool_calls:
+            messages = await self.execute_tools(
+                messages,
+                response.choices[0].message.tool_calls,
+                agent_ctx,
+            )
+
+        agent_ctx.messages = messages
+        agent_ctx.turn += 1
+        return TurnCompletion(is_done=False, context=agent_ctx)
+
+    # ===== Helper Methods ===== #
+    def _is_done(self, response: ChatCompletion) -> bool:
+        """Check if agent should complete"""
+        tool_calls = response.choices[0].message.tool_calls
+        return not tool_calls or any(
+            tc.function.name == "final_output" for tc in tool_calls
+        )
 
     def _resolve_model_settings(self, context: ContextType) -> dict[str, Any]:
         """Get resolved model settings for the current context."""
@@ -496,259 +516,80 @@ class BaseAgent(Generic[ContextType]):
 
         return resolved_settings
 
-    @final
-    async def execute_turn(
-        self, task: Task[ContextType]
-    ) -> TurnCompletion[ContextType]:
-        await self._publish_event(
-            AgentEvent(
-                event_type=EventType.TURN_STARTED,
-                task_id=task.id,
-                owner_id=task.owner_id,
-                agent_name=self.name,
-                turn=task.payload.turn,
-            )
-        )
+    def _prepare_messages(self, agent_context: ContextType) -> list[dict[str, Any]]:
+        """Prepare messages for LLM request. Override to customize message preparation."""
+        if agent_context.turn == 0:
+            messages = [{"role": "system", "content": self.instructions}]
+            if agent_context.messages:
+                messages.extend(
+                    [
+                        message
+                        for message in agent_context.messages
+                        if message["content"]
+                    ]
+                )
+            messages.append({"role": "user", "content": agent_context.query})
+        else:
+            messages = agent_context.messages
 
-        meta = TurnMeta(
-            task_id=task.id,
-            owner_id=task.owner_id,
-            retries=task.retries,
-            turn=task.payload.turn,
-        )
+        return messages
+
+    def _extract_output(
+        self,
+        response: ChatCompletion,
+    ) -> str | dict[str, Any] | None:
+        """Extract the final output from response content or tool calls."""
+        content = response.choices[0].message.content
+        tool_calls = response.choices[0].message.tool_calls
+
+        if content:
+            return content
+
+        if tool_calls:
+            for tool_call in tool_calls:
+                if tool_call.function.name == "final_output":
+                    if self.parse_tool_args:
+                        return json.loads(tool_call.function.arguments)
+                    else:
+                        return tool_call.function.arguments
+
+        return None
+
+    # ===== Core logic ===== #
+
+    @final
+    async def execute(
+        self,
+        agent_ctx: ContextType,
+        execution_ctx: ExecutionContext,
+    ) -> TurnCompletion[ContextType]:
+        token = execution_context.set(execution_ctx)
 
         try:
-            response = await self.run_turn(context=task.payload, meta=meta)
-
-            await self._publish_event(
-                AgentEvent(
-                    event_type=EventType.TURN_COMPLETED,
-                    task_id=task.id,
-                    owner_id=task.owner_id,
-                    agent_name=self.name,
-                    turn=task.payload.turn,
-                )
-            )
+            response = await self.run_turn(agent_ctx=agent_ctx)
 
             if response.is_done:
-                await self._publish_event(
+                await execution_ctx.events.publish_event(
                     AgentEvent(
-                        event_type=EventType.AGENT_OUTPUT,
-                        task_id=task.id,
-                        owner_id=task.owner_id,
+                        event_type="agent_output",
+                        task_id=execution_ctx.task_id,
+                        owner_id=execution_ctx.owner_id,
                         agent_name=self.name,
-                        turn=task.payload.turn,
+                        turn=agent_ctx.turn,
                         data=response.output,
                     )
                 )
-                return response
 
             return response
 
         except Exception as e:
-            await self._publish_event(
-                AgentEvent(
-                    event_type=EventType.TURN_FAILED,
-                    task_id=task.id,
-                    owner_id=task.owner_id,
-                    agent_name=self.name,
-                    turn=task.payload.turn,
-                    error=str(e),
-                )
+            logger.error(
+                f"Agent {self.name} failed to execute turn {agent_ctx.turn}", exc_info=e
             )
-
-            # Re-raise the exception to be handled by the task system
             raise e
 
-    @final
-    async def _execute_completion(
-        self,
-        context: ContextType,
-        messages: list[dict[str, Any]],
-        meta: TurnMeta | None = None,
-    ) -> ChatCompletion:
-        await self._publish_event(
-            AgentEvent(
-                event_type=EventType.LLM_REQUEST_STARTED,
-                task_id=meta.task_id if meta else None,
-                owner_id=meta.owner_id if meta else None,
-                agent_name=self.name,
-                turn=context.turn,
-            )
-        )
-
-        try:
-            model_settings = self._resolve_model_settings(context)
-
-            resolved_tool_choice = model_settings.get("tool_choice")
-            if self.output_type and resolved_tool_choice in ["none", "auto", None]:
-                model_settings["tool_choice"] = "required"
-
-            if self._last_turn(context):
-                model_settings["tool_choice"] = (
-                    {"type": "function", "function": {"name": "final_output"}}
-                    if self.output_type
-                    else "none"
-                )
-                model_settings["parallel_tool_calls"] = False
-
-            response = await self._completion_with_retry(
-                self.model,
-                messages,
-                tools=self.tools,
-                meta=meta,
-                **model_settings,
-            )
-
-            await self._publish_event(
-                AgentEvent(
-                    event_type=EventType.LLM_RESPONSE_RECEIVED,
-                    task_id=meta.task_id if meta else None,
-                    owner_id=meta.owner_id if meta else None,
-                    agent_name=self.name,
-                    turn=context.turn,
-                    data=response.model_dump(),  # type: ignore
-                )
-            )
-
-            return response
-
-        except Exception as e:
-            await self._publish_event(
-                AgentEvent(
-                    event_type=EventType.LLM_REQUEST_FAILED,
-                    task_id=meta.task_id if meta else None,
-                    owner_id=meta.owner_id if meta else None,
-                    agent_name=self.name,
-                    data={
-                        "total_attempts": self.max_llm_retries + 1,
-                        "model": (
-                            self.model.provider_model_id
-                            if hasattr(self.model, "value")
-                            else str(self.model)
-                        ),
-                    },
-                    error=str(e),
-                )
-            )
-
-            raise e
-
-    @final
-    async def _execute_tool_call(
-        self, tool_call: ChatCompletionMessageToolCall, meta: TurnMeta | None = None
-    ) -> Any | Exception:
-        """Execute a single tool call. Override to customize tool execution."""
-        await self._publish_event(
-            AgentEvent(
-                event_type=EventType.TOOL_CALL_STARTED,
-                task_id=meta.task_id if meta else None,
-                owner_id=meta.owner_id if meta else None,
-                agent_name=self.name,
-                turn=meta.turn if meta else None,
-                data={
-                    "tool_name": tool_call.function.name,
-                    "tool_call_id": tool_call.id,
-                    "arguments": tool_call.function.arguments,
-                },
-            )
-        )
-
-        try:
-            tool_args = (
-                json.loads(tool_call.function.arguments)
-                if self.parse_tool_args
-                else tool_call.function.arguments
-            )
-        except json.JSONDecodeError as e:
-            error_msg = f"Invalid JSON in tool arguments: {e}"
-            await self._publish_event(
-                AgentEvent(
-                    event_type=EventType.TOOL_CALL_FAILED,
-                    task_id=meta.task_id if meta else None,
-                    owner_id=meta.owner_id if meta else None,
-                    agent_name=self.name,
-                    turn=meta.turn if meta else None,
-                    data={
-                        "tool_name": tool_call.function.name,
-                        "tool_call_id": tool_call.id,
-                        "failure_reason": "json_parse_error",
-                    },
-                    error=error_msg,
-                )
-            )
-            return Exception(error_msg)
-
-        # Execute the tool action (which now includes retry logic)
-        result = await self._tool_action_with_retry(
-            tool_call.function.name, tool_args, meta
-        )
-
-        # Check if the result is an exception (indicating failure after retries)
-        if isinstance(result, Exception):
-            await self._publish_event(
-                AgentEvent(
-                    event_type=EventType.TOOL_CALL_FAILED,
-                    task_id=meta.task_id if meta else None,
-                    owner_id=meta.owner_id if meta else None,
-                    agent_name=self.name,
-                    turn=meta.turn if meta else None,
-                    data={
-                        "tool_name": tool_call.function.name,
-                        "tool_call_id": tool_call.id,
-                        "failure_reason": "execution_failed_after_retries",
-                        "total_attempts": self.max_tool_retries + 1,
-                    },
-                    error=str(result),
-                )
-            )
-            return result
-        else:
-            # Success case
-            await self._publish_event(
-                AgentEvent(
-                    event_type=EventType.TOOL_CALL_COMPLETED,
-                    task_id=meta.task_id if meta else None,
-                    owner_id=meta.owner_id if meta else None,
-                    agent_name=self.name,
-                    turn=meta.turn if meta else None,
-                    data={
-                        "tool_name": tool_call.function.name,
-                        "tool_call_id": tool_call.id,
-                        "result": result[1],
-                    },
-                )
-            )
-            return result
-
-    @final
-    async def _execute_tool_calls(
-        self,
-        tool_calls: list[ChatCompletionMessageToolCall],
-        meta: TurnMeta | None = None,
-    ) -> list[tuple[ChatCompletionMessageToolCall, Any | Exception]]:
-        results: list[Any | Exception] = await asyncio.gather(
-            *[self._execute_tool_call(tool_call, meta) for tool_call in tool_calls],
-            return_exceptions=True,
-        )
-
-        return list(zip(tool_calls, results))
-
-    @final
-    async def _handle_tool_response(
-        self,
-        messages: list[dict[str, Any]],
-        tool_calls: list[ChatCompletionMessageToolCall],
-        meta: TurnMeta | None = None,
-    ) -> list[dict[str, Any]]:
-        """Handle response with tool calls. Override to customize tool response handling."""
-        tool_call_results = await self._execute_tool_calls(tool_calls, meta)
-
-        for tool_call, result in tool_call_results:
-            tool_message = self.create_tool_result_message(tool_call, result)
-            messages.append(tool_message)
-
-        return messages
+        finally:
+            execution_context.reset(token)
 
 
 class Agent(BaseAgent[AgentContext]):
@@ -810,11 +651,13 @@ tools = [
 ]
 
 
-def plan(overview: str, steps: list[str]) -> tuple[str, dict[str, Any]]:
+def plan(
+    overview: str, steps: list[str], agent_ctx: AgentContext
+) -> tuple[str, dict[str, Any]]:
     return f"{overview}\n{' -> '.join(steps)}", {"overview": overview, "steps": steps}
 
 
-def reflect(reflection: str) -> tuple[str, str]:
+def reflect(reflection: str, agent_ctx: AgentContext) -> tuple[str, str]:
     return reflection, reflection
 
 
@@ -862,12 +705,14 @@ class DummyAgent(Agent):
             tool_actions=tool_actions,
             model_settings=ModelSettings[AgentContext](
                 temperature=0.0,
-                tool_choice=lambda context: {
-                    "type": "function",
-                    "function": {"name": "plan"},
-                }
-                if context.turn == 0
-                else "auto",
+                tool_choice=lambda context: (
+                    {
+                        "type": "function",
+                        "function": {"name": "plan"},
+                    }
+                    if context.turn == 0
+                    else "auto"
+                ),
             ),
             output_type=FinalOutput,
             max_llm_retries=2,  # Fewer retries for demo agent
@@ -946,6 +791,6 @@ class MultiAgent(BaseAgent[MultiAgentContext]):
         return Task.from_json(task_json, context_class=MultiAgentContext)
 
     async def run_turn(
-        self, context: MultiAgentContext, meta: TurnMeta | None = None
-    ) -> tuple[bool, MultiAgentContext]:
-        return await super().run_turn(context, meta)
+        self, context: MultiAgentContext
+    ) -> TurnCompletion[MultiAgentContext]:
+        return await super().run_turn(context)

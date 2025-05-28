@@ -1,3 +1,4 @@
+import json
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 import redis.asyncio as redis
@@ -12,12 +13,12 @@ from starlette.websockets import WebSocket, WebSocketDisconnect
 
 from agent.context import Task, AgentContext
 from agent.queue import enqueue_task
-from agent.multi_agent import MultiAgent
+from agent.agent import DummyAgent, MultiAgent
 from agent.logging import get_logger
 
 logger = get_logger("server")
 
-UPDATE_CHANNEL = "updates:{user_id}"
+UPDATE_CHANNEL = "updates:{owner_id}"
 
 redis_client: RedisType
 
@@ -65,7 +66,10 @@ WS_REDIS_SUB_TIMEOUT = 5.0  # seconds
 async def websocket_updates(websocket: WebSocket, user_id: str):
     await websocket.accept()
     pubsub: PubSub = redis_client.pubsub()  # type: ignore
-    channel = UPDATE_CHANNEL.format(user_id=user_id)
+    channel = UPDATE_CHANNEL.format(owner_id=user_id)
+    logger.info(
+        f"WebSocket connection established for user_id={user_id}, subscribing to channel={channel}"
+    )
     await pubsub.subscribe(channel)  # type: ignore
 
     try:
@@ -77,10 +81,13 @@ async def websocket_updates(websocket: WebSocket, user_id: str):
             if msg and msg["type"] == "message":
                 await websocket.send_text(msg["data"].decode())
     except WebSocketDisconnect:
-        pass
+        logger.info(f"WebSocket disconnected for user_id={user_id}")
     finally:
         await pubsub.unsubscribe(channel)  # type: ignore
-        await pubsub.close()
+        await pubsub.aclose()
+        logger.info(
+            f"WebSocket cleanup completed for user_id={user_id}, unsubscribed from channel={channel}"
+        )
 
 
 @app.get("/")
@@ -108,7 +115,8 @@ async def enqueue(request: EnqueueRequest):
         ),
     )
 
-    agent = MultiAgent()
+    agent = DummyAgent()
+    # agent = MultiAgent()
 
     await enqueue_task(redis_client=redis_client, task=task, agent=agent)
     return {"task_id": task.id}

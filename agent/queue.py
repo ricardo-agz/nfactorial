@@ -9,8 +9,14 @@ import asyncio
 from redis.commands.core import AsyncScript
 
 from agent.context import Task
-from agent.agent import BaseAgent, EventPublisher, AgentEvent, EventType, TurnCompletion
-from agent.logging import get_logger
+from agent.agent import (
+    BaseAgent,
+    EventPublisher,
+    AgentEvent,
+    ExecutionContext,
+)
+from agent.events import QueueEvent
+from agent.logging import get_logger, colored
 
 logger = get_logger("agent.queue")
 
@@ -238,11 +244,20 @@ async def get_task_batch(
     agent_processing_heartbeats = PROCESSING_HEARTBEATS.format(agent=agent.name)
     agent_processing_tasks = PROCESSING_TASKS.format(agent=agent.name)
 
-    task_jsons: list[str] = await batch_script(
-        keys=[agent_main_queue, agent_processing_heartbeats, agent_processing_tasks],
-        args=[batch_size, worker_id, batch_id, timestamp],
-    )  # type: ignore
-    if not task_jsons:
+    try:
+        task_jsons: list[str] = await batch_script(
+            keys=[
+                agent_main_queue,
+                agent_processing_heartbeats,
+                agent_processing_tasks,
+            ],
+            args=[batch_size, worker_id, batch_id, timestamp],
+        )  # type: ignore
+        if not task_jsons:
+            return []
+    except Exception as e:
+        logger.error(f"Failed to get task batch: {e}")
+        await asyncio.sleep(0.15 + random.random() * 0.1)  # backoff with jitter
         return []
 
     return [
@@ -281,7 +296,7 @@ async def heartbeat_loop(
                 # Log but don't crash - missing one heartbeat shouldn't kill the task
                 logger.error(f"Heartbeat error for {processing_key}: {e}")
                 # Small backoff to avoid hammering Redis if it's having issues
-                await asyncio.sleep(1)
+                await asyncio.sleep(0.25 + random.random() * 0.5)
     except asyncio.CancelledError:
         # Task was cancelled, exit cleanly
         logger.debug(f"Heartbeat loop for {processing_key} cancelled")
@@ -300,7 +315,7 @@ async def process_task(
     task_timeout: int = 90,
 ) -> None:
     """Process a single task"""
-    logger.info(f"Processing task: {task.id}")
+    logger.info(f"▶️  Task started   {colored(f'[{task.id}]', 'dim')}")
 
     agent_main_queue = MAIN_QUEUE.format(agent=agent.name)
     agent_processing_heartbeats = PROCESSING_HEARTBEATS.format(agent=agent.name)
@@ -320,31 +335,35 @@ async def process_task(
 
     event_publisher = EventPublisher(
         redis_client=redis_client,
-        channel_template=UPDATE_CHANNEL.format(owner_id=task.owner_id),
+        channel=UPDATE_CHANNEL.format(owner_id=task.owner_id),
     )
 
     task_failed = False
-
     try:
         if task.payload.turn == 0 and task.retries == 0:
             await event_publisher.publish_event(
                 AgentEvent(
-                    event_type=EventType.RUN_STARTED,
+                    event_type="run_started",
                     task_id=task.id,
                     owner_id=task.owner_id,
                     agent_name=agent.name,
                 )
             )
 
-        agent.set_event_publisher(event_publisher)
-
-        turn_completion = await asyncio.wait_for(
-            agent.execute_turn(task), timeout=task_timeout
+        execution_ctx = ExecutionContext(
+            task_id=task.id,
+            owner_id=task.owner_id,
+            retries=task.retries,
+            iterations=task.payload.turn,
+            events=event_publisher,
         )
-        result: tuple[str, str]
+        turn_completion = await asyncio.wait_for(
+            agent.execute(task.payload, execution_ctx),
+            timeout=task_timeout,
+        )
 
         if turn_completion.is_done:
-            result = await completion_script(
+            await completion_script(
                 keys=[
                     agent_main_queue,
                     agent_processing_heartbeats,
@@ -354,12 +373,10 @@ async def process_task(
                 args=[processing_key, "complete", "", max_retries],
             )  # type: ignore
 
-            _, status = result
-            logger.info(f"Task {task.id} completed: {status}")
-
+            logger.info(f"✅ Task completed {colored(f'[{task.id}]', 'dim')}")
             await event_publisher.publish_event(
                 AgentEvent(
-                    event_type=EventType.RUN_COMPLETED,
+                    event_type="run_completed",
                     task_id=task.id,
                     owner_id=task.owner_id,
                     agent_name=agent.name,
@@ -369,8 +386,9 @@ async def process_task(
         else:
             # Task needs to continue processing
             task.payload = turn_completion.context
+            logger.info(f"⏩ Task continued {colored(f'[{task.id}]', 'dim')}")
 
-            result = await completion_script(
+            await completion_script(
                 keys=[
                     agent_main_queue,
                     agent_processing_heartbeats,
@@ -380,16 +398,15 @@ async def process_task(
                 args=[processing_key, "continue", task.to_json(), max_retries],
             )  # type: ignore
 
-            _, status = result
-            logger.info(f"Task {task.id} continued: {status}")
-
     except asyncio.TimeoutError:
         task_failed = True
-        logger.error(f"Task {task.id} timed out after {task_timeout} seconds")
+        logger.error(
+            f"❌ Task timed out after {task_timeout} seconds {colored(f'[{task.id}]', 'dim')}"
+        )
 
         await event_publisher.publish_event(
-            AgentEvent(
-                event_type=EventType.TASK_FAILED,
+            QueueEvent(
+                event_type="task_failed",
                 task_id=task.id,
                 owner_id=task.owner_id,
                 agent_name=agent.name,
@@ -400,7 +417,7 @@ async def process_task(
         # Increment retry count for timeouts
         task.retries += 1
 
-        result = await completion_script(
+        await completion_script(
             keys=[
                 agent_main_queue,
                 agent_processing_heartbeats,
@@ -410,18 +427,13 @@ async def process_task(
             args=[processing_key, "fail", task.to_json(), max_retries],
         )  # type: ignore
 
-        _, status = result
-        logger.error(f"Task {task.id} failed due to timeout: {status}")
-
     except Exception as e:
         task_failed = True
-        logger.error(
-            f"Task {task.id} failed with exception: {e}\n{traceback.format_exc()}"
-        )
+        logger.error(f"❌ Task failed {colored(f'[{task.id}]', 'dim')}", exc_info=e)
 
         await event_publisher.publish_event(
-            AgentEvent(
-                event_type=EventType.TASK_FAILED,
+            QueueEvent(
+                event_type="task_failed",
                 task_id=task.id,
                 owner_id=task.owner_id,
                 agent_name=agent.name,
@@ -432,7 +444,7 @@ async def process_task(
         # Increment retry count for failures
         task.retries += 1
 
-        result = await completion_script(
+        await completion_script(
             keys=[
                 agent_main_queue,
                 agent_processing_heartbeats,
@@ -441,9 +453,6 @@ async def process_task(
             ],
             args=[processing_key, "fail", task.to_json(), max_retries],
         )  # type: ignore
-
-        _, status = result
-        logger.error(f"Task {task.id} failed: {status}")
     finally:
         # Stop heartbeat
         stop_heartbeat.set()
@@ -454,7 +463,7 @@ async def process_task(
             if task.retries >= max_retries:
                 await event_publisher.publish_event(
                     AgentEvent(
-                        event_type=EventType.RUN_FAILED,
+                        event_type="run_failed",
                         task_id=task.id,
                         owner_id=task.owner_id,
                         agent_name=agent.name,
@@ -462,9 +471,12 @@ async def process_task(
                     )
                 )
             else:
+                logger.info(
+                    f"🔄 Task set back for retry {colored(f'[{task.id}]', 'dim')}"
+                )
                 await event_publisher.publish_event(
-                    AgentEvent(
-                        event_type=EventType.TASK_RETRIED,
+                    QueueEvent(
+                        event_type="task_retried",
                         task_id=task.id,
                         owner_id=task.owner_id,
                         agent_name=agent.name,
@@ -526,7 +538,7 @@ async def recover_stale_tasks(
                 if i + 1 < len(recovered_tasks_flat):
                     task_key = recovered_tasks_flat[i]
                     retries = recovered_tasks_flat[i + 1]
-                    logger.info(f"   Task key: {task_key}, retries: {retries}")
+                    logger.info(colored(f"    [{task_key}]: {retries} retries", "dim"))
 
         return recovered_count
 
@@ -668,6 +680,7 @@ async def worker_loop(
             await asyncio.gather(*current_tasks, return_exceptions=True)
         logger.info(f"Worker {worker_id} cancelled")
         raise
+
     finally:
         await redis_client.close()
         logger.info(f"Worker {worker_id} finished")

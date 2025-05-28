@@ -40,25 +40,29 @@ class MultiClient:
     async def completion(
         self,
         model: Model,
-        messages: list[dict[str, str]],
-        tools: list[dict[str, Any]] = [],
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
         tool_choice: str | dict[str, Any] | None = None,
         max_completion_tokens: int | None = None,
         temperature: float | None = None,
         stream: bool = False,
+        parallel_tool_calls: bool | None = None,
         **kwargs: Any,
     ) -> ChatCompletion | AsyncStream[ChatCompletionChunk]:
         kwargs["model"] = model.provider_model_id
         kwargs["messages"] = messages
         kwargs["stream"] = stream
-        kwargs["tools"] = tools
 
+        if tools:
+            kwargs["tools"] = tools
         if max_completion_tokens:
             kwargs["max_completion_tokens"] = max_completion_tokens
         if temperature:
             kwargs["temperature"] = temperature
         if tool_choice:
             kwargs["tool_choice"] = tool_choice
+        if parallel_tool_calls is not None:
+            kwargs["parallel_tool_calls"] = parallel_tool_calls
 
         if model.provider == Provider.OPENAI:
             return await self.openai.chat.completions.create(**kwargs)

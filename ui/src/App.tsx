@@ -44,12 +44,7 @@ const generateUserId = (): string => {
 };
 
 const getUserId = (): string => {
-  const existingId = sessionStorage.getItem('userId');
-  if (existingId) return existingId;
-  
-  const newId = generateUserId();
-  sessionStorage.setItem('userId', newId);
-  return newId;
+  return generateUserId();
 };
 
 const getToolIcon = (toolName: string) => {
@@ -271,8 +266,10 @@ const App: React.FC = () => {
     console.log("Received event:", event);
     
     switch (event.event_type) {
-      case 'tool_call_started':
-        if (event.data) {
+      case 'progress_update_tool_action_started':
+        if (event.data && event.data.args && event.data.args.length > 0) {
+          // Extract tool call data from the first argument (tool_call)
+          const toolCall = event.data.args[0];
           setCurrentThinking(prev => {
             const thinking = prev || {
               task_id: event.task_id,
@@ -284,10 +281,10 @@ const App: React.FC = () => {
               ...thinking,
               tool_calls: {
                 ...thinking.tool_calls,
-                [event.data.tool_call_id]: {
-                  id: event.data.tool_call_id,
-                  tool_name: event.data.tool_name,
-                  arguments: event.data.arguments,
+                [toolCall.id]: {
+                  id: toolCall.id,
+                  tool_name: toolCall.function.name,
+                  arguments: toolCall.function.arguments,
                   status: 'started'
                 }
               }
@@ -296,8 +293,12 @@ const App: React.FC = () => {
         }
         break;
         
-      case 'tool_call_completed':
-        if (event.data) {
+      case 'progress_update_tool_action_completed':
+        if (event.data && event.data.result) {
+          // The result contains the ToolActionResponse with tool_call and output_data
+          const toolActionResponse = event.data.result;
+          const toolCall = toolActionResponse.tool_call;
+          
           setCurrentThinking(prev => {
             if (!prev) return null;
             
@@ -305,10 +306,10 @@ const App: React.FC = () => {
               ...prev,
               tool_calls: {
                 ...prev.tool_calls,
-                [event.data.tool_call_id]: {
-                  ...prev.tool_calls[event.data.tool_call_id],
+                [toolCall.id]: {
+                  ...prev.tool_calls[toolCall.id],
                   status: 'completed',
-                  result: event.data.result
+                  result: toolActionResponse.output_data
                 }
               }
             };
@@ -316,8 +317,10 @@ const App: React.FC = () => {
         }
         break;
         
-      case 'tool_call_failed':
-        if (event.data) {
+      case 'progress_update_tool_action_failed':
+        if (event.data && event.data.args && event.data.args.length > 0) {
+          // Extract tool call data from the first argument
+          const toolCall = event.data.args[0];
           setCurrentThinking(prev => {
             if (!prev) return null;
             
@@ -325,8 +328,8 @@ const App: React.FC = () => {
               ...prev,
               tool_calls: {
                 ...prev.tool_calls,
-                [event.data.tool_call_id]: {
-                  ...prev.tool_calls[event.data.tool_call_id],
+                [toolCall.id]: {
+                  ...prev.tool_calls[toolCall.id],
                   status: 'failed',
                   error: event.error
                 }
@@ -334,6 +337,22 @@ const App: React.FC = () => {
             };
           });
         }
+        break;
+
+      case 'progress_update_completion_started':
+        // LLM completion started - we can show this in the thinking if needed
+        console.log("LLM completion started");
+        break;
+
+      case 'progress_update_completion_completed':
+        // LLM completion finished - we can show this in the thinking if needed
+        console.log("LLM completion completed");
+        break;
+
+      case 'progress_update_completion_failed':
+        // LLM completion failed
+        console.log("LLM completion failed:", event.error);
+        setCurrentThinking(prev => prev ? { ...prev, error: event.error } : null);
         break;
         
       case 'agent_output':
@@ -348,11 +367,30 @@ const App: React.FC = () => {
             role: 'assistant', 
             content: finalOutput, 
             timestamp: new Date(),
-            thinking: currentThinking ? { ...currentThinking, is_complete: true, final_output: event.data } : undefined
+            thinking: undefined // We'll set this with the current thinking state
           },
         ]);
         
-        setCurrentThinking(null);
+        // Set the thinking data for the message after we have access to current thinking
+        setCurrentThinking(prevThinking => {
+          if (prevThinking) {
+            setMessages(prevMessages => {
+              const lastMessage = prevMessages[prevMessages.length - 1];
+              if (lastMessage && lastMessage.role === 'assistant') {
+                return [
+                  ...prevMessages.slice(0, -1),
+                  {
+                    ...lastMessage,
+                    thinking: { ...prevThinking, is_complete: true, final_output: event.data }
+                  }
+                ];
+              }
+              return prevMessages;
+            });
+          }
+          return null;
+        });
+        
         setLoading(false);
         break;
         
@@ -367,7 +405,7 @@ const App: React.FC = () => {
         // Log other events for debugging
         console.log("Unhandled event type:", event.event_type);
     }
-  }, [currentThinking]);
+  }, []); // Remove currentThinking dependency
 
   /** open WS once on mount */
   useEffect(() => {
@@ -375,7 +413,7 @@ const App: React.FC = () => {
     ws.onmessage = handleWSMessage;
     wsRef.current = ws;
     return () => ws.close();
-  }, [userId, handleWSMessage]);
+  }, [userId]); // Remove handleWSMessage dependency
 
   const renderedMessages = useMemo(() => (
     messages.map(m => (
@@ -400,6 +438,9 @@ const App: React.FC = () => {
 
   return (
     <div className="flex flex-col h-screen bg-gray-50">
+      <div className="text-center text-gray-500 my-2">
+          <p className="mt-2">{userId}</p>
+      </div>
       <div className="flex-1 overflow-y-auto">
         <div className="max-w-3xl mx-auto px-4 py-8">
           {messages.length === 0 && (

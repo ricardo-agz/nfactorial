@@ -13,6 +13,7 @@ class ColoredFormatter(logging.Formatter):
         "CRITICAL": "\033[35m",  # Magenta
         "RESET": "\033[0m",  # Reset
         "DIM": "\033[2m",  # Dim
+        "GRAY": "\033[90m",  # Gray
     }
 
     def format(self, record: logging.LogRecord) -> str:
@@ -28,6 +29,13 @@ class ColoredFormatter(logging.Formatter):
             log_line += f"\n{self.formatException(record.exc_info)}"
 
         return log_line
+
+
+def colored(text: str, color: str) -> str:
+    color = color.upper()
+    if color not in ColoredFormatter.COLORS:
+        raise ValueError(f"Invalid color: {color}")
+    return f"{ColoredFormatter.COLORS[color]}{text}{ColoredFormatter.COLORS['RESET']}"
 
 
 def get_logger(name: str) -> logging.Logger:

@@ -5,40 +5,7 @@ import json
 from redis.asyncio import Redis
 from agent.logging import get_logger
 
-logger = get_logger("agent.events")
-
-
-# class EventType(str, Enum):
-#     # Queue Run-level events
-#     RUN_STARTED = "run_started"
-#     RUN_COMPLETED = "run_completed"
-#     RUN_FAILED = "run_failed"
-
-#     # Queue Task-level events
-#     TASK_STARTED = "task_started"
-#     TASK_COMPLETED = "task_completed"
-#     TASK_RETRIED = "task_retried"
-#     TASK_FAILED = "task_failed"
-
-#     # Agent events
-#     TURN_STARTED = "turn_started"
-#     TURN_COMPLETED = "turn_completed"
-#     TURN_FAILED = "turn_failed"
-#     TOOL_CALLED = "tool_called"
-#     TOOL_RESULT = "tool_result"
-#     AGENT_OUTPUT = "agent_output"
-
-#     # LLM interactions
-#     LLM_REQUEST_STARTED = "llm_request_started"
-#     LLM_RESPONSE_RECEIVED = "llm_response_received"
-#     LLM_REQUEST_FAILED = "llm_request_failed"
-#     LLM_REQUEST_RETRIED = "llm_request_retried"
-
-#     # Tool execution
-#     TOOL_CALL_STARTED = "tool_call_started"
-#     TOOL_CALL_COMPLETED = "tool_call_completed"
-#     TOOL_CALL_FAILED = "tool_call_failed"
-#     TOOL_CALL_RETRIED = "tool_call_retried"
+logger = get_logger(__name__)
 
 
 @dataclass

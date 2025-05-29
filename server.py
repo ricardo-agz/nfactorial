@@ -12,8 +12,8 @@ from contextlib import asynccontextmanager
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
 from agent.context import Task, AgentContext
-from agent.queue import enqueue_task
-from agent.agent import DummyAgent, MultiAgent
+from agent.queue import enqueue_task, cancel_task, steer_task
+from agent.agent import DummyAgent, MultiAgent, FreeAgent
 from agent.logging import get_logger
 
 logger = get_logger("server")
@@ -101,6 +101,17 @@ class EnqueueRequest(BaseModel):
     query: str
 
 
+class CancelRequest(BaseModel):
+    user_id: str
+    task_id: str
+
+
+class SteerRequest(BaseModel):
+    user_id: str
+    task_id: str
+    messages: list[dict[str, str]]
+
+
 @app.post("/api/enqueue")
 async def enqueue(request: EnqueueRequest):
     task = Task(
@@ -115,11 +126,53 @@ async def enqueue(request: EnqueueRequest):
         ),
     )
 
-    agent = DummyAgent()
+    # agent = DummyAgent()
     # agent = MultiAgent()
+    agent = FreeAgent()
 
     await enqueue_task(redis_client=redis_client, task=task, agent=agent)
     return {"task_id": task.id}
+
+
+@app.post("/api/steer")
+async def steer_task_endpoint(request: SteerRequest):
+    try:
+        await steer_task(
+            redis_client=redis_client,
+            task_id=request.task_id,
+            messages=request.messages,
+        )
+
+        logger.info(
+            f"Steering messages sent for task {request.task_id} by user {request.user_id}"
+        )
+        return {
+            "success": True,
+            "message": f"Steering messages sent for task {request.task_id}",
+        }
+    except Exception as e:
+        logger.error(f"Failed to steer task {request.task_id}: {e}")
+        return {"success": False, "error": str(e)}
+
+
+@app.post("/api/cancel")
+async def cancel_task_endpoint(request: CancelRequest):
+    try:
+        await cancel_task(
+            redis_client=redis_client,
+            task_id=request.task_id,
+        )
+
+        logger.info(
+            f"Task {request.task_id} marked for cancellation by user {request.user_id}"
+        )
+        return {
+            "success": True,
+            "message": f"Task {request.task_id} marked for cancellation",
+        }
+    except Exception as e:
+        logger.error(f"Failed to cancel task {request.task_id}: {e}")
+        return {"success": False, "error": str(e)}
 
 
 if __name__ == "__main__":

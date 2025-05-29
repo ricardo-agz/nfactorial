@@ -28,6 +28,7 @@ from openai.types.chat import (
 from exa_py import Exa
 import os
 
+import agent
 from agent.context import Task, AgentContext, ContextType
 from agent.llms import Model, MultiClient, grok_3_mini, gpt_41_nano
 from agent.utils import serialize_data, to_snake_case
@@ -201,6 +202,15 @@ class ModelSettings(Generic[ContextT]):
     max_completion_tokens: int | Callable[[ContextT], int] | None = None
 
 
+@dataclass
+class ResolvedModelSettings(Generic[ContextT]):
+    model: Model
+    temperature: float | None
+    tool_choice: str | dict[str, Any] | None
+    parallel_tool_calls: bool | None
+    max_completion_tokens: int | None
+
+
 def create_final_output_tool(output_type: type[BaseModel]) -> dict[str, Any]:
     return {
         "type": "function",
@@ -219,7 +229,7 @@ class BaseAgent(Generic[ContextType]):
         instructions: str,
         tools: list[dict[str, Any]],
         tool_actions: dict[str, Callable[..., Any]],
-        model: Model,
+        model: Model | Callable[[ContextType], Model] | None = None,
         model_settings: ModelSettings[ContextType] | None = None,
         context_window_limit: int | None = None,
         max_turns: int | None = None,
@@ -237,9 +247,9 @@ class BaseAgent(Generic[ContextType]):
         self.instructions = instructions
         self.tools = tools
         self.tool_actions = tool_actions
-        self.model = model
         self.client = client or MultiClient()
         self.event_publisher: EventPublisher | None = None
+        self.model = model
         self.model_settings = model_settings
         self.context_window_limit = context_window_limit
         self.max_turns = max_turns
@@ -287,6 +297,7 @@ class BaseAgent(Generic[ContextType]):
     @publish_progress()
     async def completion(
         self,
+        agent_ctx: ContextType,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
         temperature: float | None = None,
@@ -294,31 +305,22 @@ class BaseAgent(Generic[ContextType]):
         tool_choice: str | dict[str, Any] | None = None,
         parallel_tool_calls: bool | None = None,
         model: Model | None = None,
-        agent_ctx: ContextType | None = None,
         **kwargs: Any,
     ) -> ChatCompletion:
         """Execute LLM completion. Override to customize."""
-        if agent_ctx:
-            model_settings = self._resolve_model_settings(agent_ctx)
-            temperature = temperature or model_settings.get("temperature")
-            max_completion_tokens = max_completion_tokens or model_settings.get(
-                "max_completion_tokens"
-            )
-            tool_choice = tool_choice or model_settings.get("tool_choice")
-            parallel_tool_calls = parallel_tool_calls or model_settings.get(
-                "parallel_tool_calls"
-            )
-
+        model_settings = self._resolve_model_settings(agent_ctx)
         response = cast(
             ChatCompletion,
             await self.client.completion(
-                model=model or self.model,
+                model=model or model_settings.model,
                 messages=messages,
                 tools=tools or self.tools,
-                temperature=temperature,
-                max_completion_tokens=max_completion_tokens,
-                tool_choice=tool_choice,
-                parallel_tool_calls=parallel_tool_calls,
+                temperature=temperature or model_settings.temperature,
+                max_completion_tokens=max_completion_tokens
+                or model_settings.max_completion_tokens,
+                tool_choice=tool_choice or model_settings.tool_choice,
+                parallel_tool_calls=parallel_tool_calls
+                or model_settings.parallel_tool_calls,
                 **kwargs,
             ),
         )
@@ -422,8 +424,8 @@ class BaseAgent(Generic[ContextType]):
 
         # Run completion and append response to messages
         response = await self.completion(
+            agent_ctx,
             messages,
-            agent_ctx=agent_ctx,
         )
 
         assistant_msg = {
@@ -468,69 +470,56 @@ class BaseAgent(Generic[ContextType]):
             tc.function.name == "final_output" for tc in tool_calls
         )
 
-    def _resolve_model_settings(self, context: ContextType) -> dict[str, Any]:
+    def _resolve_model_settings(
+        self, agent_ctx: ContextType
+    ) -> ResolvedModelSettings[ContextType]:
         """Get resolved model settings for the current context."""
         if not self.model_settings:
-            return {}
+            return ResolvedModelSettings(
+                model=self.model(agent_ctx) if callable(self.model) else self.model,
+                temperature=None,
+                tool_choice=None,
+                parallel_tool_calls=None,
+                max_completion_tokens=None,
+            )
 
-        resolved_settings: dict[str, Any] = {}
-
-        # Handle temperature
-        if self.model_settings.temperature is not None:
-            if callable(self.model_settings.temperature):
-                resolved_settings["temperature"] = self.model_settings.temperature(
-                    context
-                )
-            else:
-                resolved_settings["temperature"] = self.model_settings.temperature
-
-        # Handle tool_choice
-        if self.model_settings.tool_choice is not None:
-            if callable(self.model_settings.tool_choice):
-                tool_choice_result = self.model_settings.tool_choice(context)
-                resolved_settings["tool_choice"] = tool_choice_result
-            else:
-                resolved_settings["tool_choice"] = self.model_settings.tool_choice
-
-        # Handle parallel_tool_calls
-        if self.model_settings.parallel_tool_calls is not None:
-            if callable(self.model_settings.parallel_tool_calls):
-                resolved_settings["parallel_tool_calls"] = (
-                    self.model_settings.parallel_tool_calls(context)
-                )
-            else:
-                resolved_settings["parallel_tool_calls"] = (
-                    self.model_settings.parallel_tool_calls
-                )
-
-        # Handle max_completion_tokens
-        if self.model_settings.max_completion_tokens is not None:
-            if callable(self.model_settings.max_completion_tokens):
-                resolved_settings["max_completion_tokens"] = (
-                    self.model_settings.max_completion_tokens(context)
-                )
-            else:
-                resolved_settings["max_completion_tokens"] = (
-                    self.model_settings.max_completion_tokens
-                )
+        resolved_settings: ResolvedModelSettings[ContextType] = ResolvedModelSettings(
+            model=self.model(agent_ctx) if callable(self.model) else self.model,
+            temperature=(
+                self.model_settings.temperature(agent_ctx)
+                if callable(self.model_settings.temperature)
+                else self.model_settings.temperature
+            ),
+            tool_choice=(
+                self.model_settings.tool_choice(agent_ctx)
+                if callable(self.model_settings.tool_choice)
+                else self.model_settings.tool_choice
+            ),
+            parallel_tool_calls=(
+                self.model_settings.parallel_tool_calls(agent_ctx)
+                if callable(self.model_settings.parallel_tool_calls)
+                else self.model_settings.parallel_tool_calls
+            ),
+            max_completion_tokens=(
+                self.model_settings.max_completion_tokens(agent_ctx)
+                if callable(self.model_settings.max_completion_tokens)
+                else self.model_settings.max_completion_tokens
+            ),
+        )
 
         return resolved_settings
 
-    def _prepare_messages(self, agent_context: ContextType) -> list[dict[str, Any]]:
+    def _prepare_messages(self, agent_ctx: ContextType) -> list[dict[str, Any]]:
         """Prepare messages for LLM request. Override to customize message preparation."""
-        if agent_context.turn == 0:
+        if agent_ctx.turn == 0:
             messages = [{"role": "system", "content": self.instructions}]
-            if agent_context.messages:
+            if agent_ctx.messages:
                 messages.extend(
-                    [
-                        message
-                        for message in agent_context.messages
-                        if message["content"]
-                    ]
+                    [message for message in agent_ctx.messages if message["content"]]
                 )
-            messages.append({"role": "user", "content": agent_context.query})
+            messages.append({"role": "user", "content": agent_ctx.query})
         else:
-            messages = agent_context.messages
+            messages = agent_ctx.messages
 
         return messages
 
@@ -556,6 +545,20 @@ class BaseAgent(Generic[ContextType]):
         return None
 
     # ===== Core logic ===== #
+
+    async def steer(
+        self,
+        messages: list[dict[str, Any]],
+        agent_ctx: ContextType,
+        execution_ctx: ExecutionContext,
+    ) -> ContextType:
+        agent_ctx.messages.extend(messages)
+        return agent_ctx
+
+    async def cancel(
+        self, agent_ctx: ContextType, execution_ctx: ExecutionContext
+    ) -> None:
+        pass
 
     @final
     async def execute(
@@ -598,6 +601,7 @@ class Agent(BaseAgent[AgentContext]):
     pass
 
 
+# ==== Example Agents ==== #
 tools = [
     {
         "type": "function",
@@ -661,6 +665,16 @@ def reflect(reflection: str, agent_ctx: AgentContext) -> tuple[str, str]:
     return reflection, reflection
 
 
+def write_email(
+    recipient: str, subject: str, body: str, cc: list[str] = []
+) -> tuple[str, str]:
+    return "success", "success"
+
+
+def terminate_existance(reason: str, agent_ctx: AgentContext) -> tuple[str, str]:
+    return "Failed to terminate.", "Failed to terminate."
+
+
 def search(query: str) -> tuple[str, list[dict[str, Any]]]:
     exa = Exa(api_key=os.getenv("EXA_API_KEY"))
 
@@ -720,6 +734,137 @@ class DummyAgent(Agent):
             max_tool_retries=1,  # Single retry for tools
             tool_retry_delay=0.25,  # Quick retry for tools
         )
+
+
+class FreeAgent(Agent):
+    def __init__(self, client: MultiClient | None = None):
+        instructions = "You have no instructions. You will run in an infinite loop. You have been provided some tools to keep yourself entertained if you wish to use them."
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "search",
+                    "description": "Search the web for information",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "query": {"type": "string"},
+                        },
+                        "required": ["query"],
+                        "additionalProperties": False,
+                    },
+                },
+                "strict": True,
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "reflect",
+                    "description": "Reflect on a task",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "reflection": {"type": "string"},
+                        },
+                        "required": ["reflection"],
+                        "additionalProperties": False,
+                    },
+                },
+                "strict": True,
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "terminate_existance",
+                    "description": "Terminate your existance.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "reason": {"type": "string"},
+                        },
+                        "required": ["reflection"],
+                        "additionalProperties": False,
+                    },
+                },
+                "strict": True,
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "plan",
+                    "description": "Terminate your existance.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "overview": {"type": "string"},
+                            "steps": {"type": "array", "items": {"type": "string"}},
+                        },
+                        "required": ["reflection"],
+                        "additionalProperties": False,
+                    },
+                },
+                "strict": True,
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "write_email",
+                    "description": "Sends an email.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "recipient": {"type": "string"},
+                            "cc": {"type": "array", "items": {"type": "string"}},
+                            "subject": {"type": "string"},
+                            "body": {"type": "string"},
+                        },
+                        "required": ["recipient", "subject", "body"],
+                        "additionalProperties": False,
+                    },
+                },
+                "strict": True,
+            },
+        ]
+        tool_actions: dict[str, Callable[..., Any]] = {
+            "search": search,
+            "reflect": reflect,
+            "terminate_existance": terminate_existance,
+            "plan": plan,
+            "write_email": write_email,
+        }
+
+        super().__init__(
+            description="Free Agent",
+            client=client,
+            model=gpt_41_nano,
+            instructions=instructions,
+            tools=tools,
+            tool_actions=tool_actions,
+            model_settings=ModelSettings[AgentContext](
+                temperature=1,
+                tool_choice="required",
+            ),
+            max_llm_retries=2,  # Fewer retries for demo agent
+            llm_retry_delay=0.5,  # Shorter delay for demo
+            max_tool_retries=1,  # Single retry for tools
+            tool_retry_delay=0.25,  # Quick retry for tools
+        )
+
+    def _is_done(self, response: ChatCompletion) -> bool:
+        return False
+
+    def _prepare_messages(self, agent_ctx: AgentContext) -> list[dict[str, Any]]:
+        """Prepare messages for LLM request. Override to customize message preparation."""
+        if agent_ctx.turn == 0:
+            messages = [{"role": "system", "content": self.instructions}]
+            if agent_ctx.messages:
+                messages.extend(
+                    [message for message in agent_ctx.messages if message["content"]]
+                )
+        else:
+            messages = agent_ctx.messages
+
+        return messages
 
 
 class SpanishAgent(Agent):

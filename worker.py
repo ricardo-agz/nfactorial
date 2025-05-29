@@ -5,7 +5,7 @@ from agent.manager import (
     AgentWorkerConfig,
     RecoveryWorkerConfig,
 )
-from agent.agent import DummyAgent
+from agent.agent import DummyAgent, FreeAgent
 
 if __name__ == "__main__":
     control_plane = ControlPlane(
@@ -17,7 +17,8 @@ if __name__ == "__main__":
         xai_api_key=os.getenv("XAI_API_KEY"),
     )
 
-    agent = DummyAgent(client=control_plane.llm_client)
+    # agent = DummyAgent(client=control_plane.llm_client)
+    agent = FreeAgent(client=control_plane.llm_client)
 
     control_plane.register_runner(
         agent=agent,

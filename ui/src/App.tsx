@@ -1,101 +1,110 @@
-import React, { useState, useRef, useEffect, useCallback, useMemo } from 'react';
-import { Send, Brain, Search, ChevronDown, ChevronRight, ExternalLink } from 'lucide-react';
+import React, {
+  useState,
+  useRef,
+  useEffect,
+  useCallback,
+  useMemo,
+} from 'react';
+import {
+  Send,
+  Brain,
+  Search,
+  ChevronDown,
+  ChevronRight,
+  ExternalLink,
+  X,
+  Loader2,
+  MessageSquare,
+} from 'lucide-react';
 
-const REST_ENDPOINT = 'http://localhost:8000/api/enqueue';
-const WS_ROOT       = 'ws://localhost:8000/ws';
+const REST_ENDPOINT   = 'http://localhost:8000/api/enqueue';
+const CANCEL_ENDPOINT = 'http://localhost:8000/api/cancel';
+const STEER_ENDPOINT  = 'http://localhost:8000/api/steer';
+const WS_ROOT         = 'ws://localhost:8000/ws';
 
+/* -------------------------------------------------------------------------- */
+/*                               Type Helpers                                 */
+/* -------------------------------------------------------------------------- */
 interface AgentEvent {
-  event_type: string;
-  task_id: string;
+  event_type : string;
+  task_id    : string;
   agent_name?: string;
-  turn?: number;
-  data?: any;
-  error?: string;
-  timestamp: string;
+  turn?      : number;
+  data?      : any;
+  error?     : string;
+  timestamp  : string;
 }
 
 interface ToolCall {
-  id: string;
-  tool_name: string;
-  arguments: any;
-  status: 'started' | 'completed' | 'failed';
-  result?: any;
-  error?: string;
+  id        : string;
+  tool_name : string;
+  arguments : any;
+  status    : 'started' | 'completed' | 'failed';
+  result?   : any;
+  error?    : string;
 }
 
 interface ThinkingProgress {
-  task_id: string;
-  tool_calls: Record<string, ToolCall>;
-  is_complete: boolean;
+  task_id     : string;
+  tool_calls  : Record<string, ToolCall>;
+  is_complete : boolean;
   final_output?: any;
-  error?: string;
+  error?       : string;
 }
 
 interface Message {
-  id: number;
-  role: 'user' | 'assistant';
-  content: string;
-  timestamp: Date;
-  thinking?: ThinkingProgress;
+  id        : number;
+  role      : 'user' | 'assistant';
+  content   : string;
+  timestamp : Date;
+  thinking ?: ThinkingProgress;
 }
 
-const generateUserId = (): string => {
-  return Math.random().toString(36).substring(2, 15) + Math.random().toString(36).substring(2, 15);
-};
+/* -------------------------------------------------------------------------- */
+/*                                Utilities                                   */
+/* -------------------------------------------------------------------------- */
+const generateUserId = () =>
+  Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
 
-const getUserId = (): string => {
-  return generateUserId();
-};
-
-const getToolIcon = (toolName: string) => {
-  switch (toolName) {
-    case 'plan':
-      return <Brain className="w-4 h-4" />;
-    case 'search':
-      return <Search className="w-4 h-4" />;
-    default:
-      return <div className="w-4 h-4 rounded-full bg-gray-400" />;
+const getToolIcon = (name: string) => {
+  switch (name) {
+    case 'plan'  : return <Brain  className="w-4 h-4" />;
+    case 'search': return <Search className="w-4 h-4" />;
+    default      : return <div    className="w-4 h-4 rounded-full bg-gray-400" />;
   }
 };
 
-const formatToolArguments = (toolName: string, args: any) => {
+const formatToolArguments = (name: string, args: any) => {
   const parsed = typeof args === 'string' ? JSON.parse(args) : args;
-  
-  switch (toolName) {
-    case 'search':
-      return `Searching: "${parsed.query}"`;
-    case 'plan':
-      return 'Creating plan...';
-    case 'reflect':
-      return 'Reflecting...';
-    default:
-      return JSON.stringify(parsed);
+  switch (name) {
+    case 'search' : return `Searching: "${parsed.query}"`;
+    case 'plan'   : return 'Creating plan...';
+    case 'reflect': return 'Reflecting...';
+    default       : return JSON.stringify(parsed);
   }
 };
 
-const formatToolResult = (toolName: string, result: any) => {
-  if (toolName === 'search' && Array.isArray(result)) {
+const formatToolResult = (name: string, result: any) => {
+  if (name === 'search' && Array.isArray(result)) {
     return (
       <div className="mt-3 space-y-2">
         <div className="text-xs text-gray-400 mb-3">{result.length} results</div>
         {result.slice(0, 6).map((item, idx) => (
-          <a 
+          <a
             key={idx}
-            href={item.url} 
-            target="_blank" 
+            href={item.url}
+            target="_blank"
             rel="noopener noreferrer"
             className="flex items-center gap-3 p-2 rounded-lg hover:bg-gray-50 transition-colors group"
           >
-            <img 
+            <img
               src={`https://www.google.com/s2/favicons?domain=${new URL(item.url).hostname}&sz=16`}
               alt=""
               className="w-4 h-4 flex-shrink-0"
-              onError={(e) => {
-                e.currentTarget.style.display = 'none';
-              }}
+              onError={e => { (e.currentTarget as HTMLImageElement).style.display = 'none'; }}
             />
             <div className="min-w-0 flex-1">
-              <div className="text-sm text-gray-900 group-hover:text-blue-600 font-medium truncate">
+              <div className="text-sm font-medium truncate text-gray-900 group-hover:text-blue-600">
                 {item.title}
               </div>
               <div className="text-xs text-gray-500 truncate">
@@ -109,14 +118,14 @@ const formatToolResult = (toolName: string, result: any) => {
     );
   }
 
-  if (toolName === 'plan' && result?.overview && Array.isArray(result.steps)) {
+  if (name === 'plan' && result?.overview && Array.isArray(result.steps)) {
     return (
       <div className="mt-3 space-y-3">
         <div className="text-sm text-gray-700">{result.overview}</div>
         <div className="space-y-1.5">
           {result.steps.map((step: string, idx: number) => (
             <div key={idx} className="flex gap-3">
-              <div className="w-5 h-5 rounded-full bg-blue-100 flex items-center justify-center flex-shrink-0 mt-0.5">
+              <div className="w-5 h-5 mt-0.5 rounded-full bg-blue-100 flex items-center justify-center flex-shrink-0">
                 <span className="text-xs font-medium text-blue-600">{idx + 1}</span>
               </div>
               <span className="text-sm text-gray-600">{step}</span>
@@ -127,9 +136,9 @@ const formatToolResult = (toolName: string, result: any) => {
     );
   }
 
-  if (toolName === 'reflect') {
+  if (name === 'reflect') {
     return (
-      <div className="mt-3 p-3 bg-amber-50 rounded-lg border border-amber-100">
+      <div className="mt-3 p-3 bg-amber-50 border border-amber-100 rounded-lg">
         <div className="text-sm text-amber-900">{String(result)}</div>
       </div>
     );
@@ -137,68 +146,85 @@ const formatToolResult = (toolName: string, result: any) => {
 
   return (
     <div className="mt-3 text-sm text-gray-600">
-      {String(result).substring(0, 150)}...
+      {String(result).slice(0, 150)}...
     </div>
   );
 };
 
-const ThinkingDropdown: React.FC<{ thinking: ThinkingProgress }> = ({ thinking }) => {
-  const [isExpanded, setIsExpanded] = useState(true);
-  const toolCallsArray = Object.values(thinking.tool_calls);
-  const hasActiveCalls = toolCallsArray.some(call => call.status === 'started');
-  
+/* -------------------------------------------------------------------------- */
+/*                       Thinking Progress Dropdown UI                        */
+/* -------------------------------------------------------------------------- */
+const ThinkingDropdown: React.FC<{ thinking: ThinkingProgress }> = ({
+  thinking,
+}) => {
+  const [open, setOpen] = useState(true);
+  const calls = Object.values(thinking.tool_calls);
+  const hasActive = calls.some(c => c.status === 'started');
+
   return (
     <div className="bg-gray-50 rounded-xl p-4 mb-4 border border-gray-100">
       <button
-        onClick={() => setIsExpanded(!isExpanded)}
         className="flex items-center gap-2 w-full text-left group"
+        onClick={() => setOpen(!open)}
       >
-        {isExpanded ? <ChevronDown className="w-4 h-4 text-gray-400" /> : <ChevronRight className="w-4 h-4 text-gray-400" />}
+        {open ? (
+          <ChevronDown className="w-4 h-4 text-gray-400" />
+        ) : (
+          <ChevronRight className="w-4 h-4 text-gray-400" />
+        )}
         <span className="text-sm font-medium text-gray-600">
           {thinking.is_complete ? 'Thinking complete' : 'Thinking...'}
         </span>
-        {hasActiveCalls && <div className="w-1.5 h-1.5 bg-blue-500 rounded-full animate-pulse" />}
+        {hasActive && (
+          <div className="w-1.5 h-1.5 bg-blue-500 rounded-full animate-pulse" />
+        )}
       </button>
-      
-      {isExpanded && (
+
+      {open && (
         <div className="mt-4 space-y-3">
-          {toolCallsArray.map((toolCall) => (
-            <div key={toolCall.id} className="bg-white rounded-lg border border-gray-100 p-3">
+          {calls.map(call => (
+            <div
+              key={call.id}
+              className="bg-white rounded-lg border border-gray-100 p-3"
+            >
               <div className="flex items-start gap-3">
-                <div className="flex-shrink-0 mt-0.5">
-                  {getToolIcon(toolCall.tool_name)}
-                </div>
-                
+                <div className="flex-shrink-0 mt-0.5">{getToolIcon(call.tool_name)}</div>
                 <div className="flex-1 min-w-0">
                   <div className="flex items-center gap-2 mb-2">
-                    <span className="text-sm font-medium capitalize text-gray-700">{toolCall.tool_name}</span>
-                    <span className={`text-xs px-2 py-0.5 rounded-full font-medium ${
-                      toolCall.status === 'completed' ? 'bg-green-100 text-green-700' :
-                      toolCall.status === 'failed' ? 'bg-red-100 text-red-700' :
-                      'bg-blue-100 text-blue-700'
-                    }`}>
-                      {toolCall.status}
+                    <span className="text-sm font-medium capitalize text-gray-700">
+                      {call.tool_name}
+                    </span>
+                    <span
+                      className={`text-xs px-2 py-0.5 rounded-full font-medium ${
+                        call.status === 'completed'
+                          ? 'bg-green-100 text-green-700'
+                          : call.status === 'failed'
+                          ? 'bg-red-100 text-red-700'
+                          : 'bg-blue-100 text-blue-700'
+                      }`}
+                    >
+                      {call.status}
                     </span>
                   </div>
-                  
+
                   <div className="text-xs text-gray-500 mb-3">
-                    {formatToolArguments(toolCall.tool_name, toolCall.arguments)}
+                    {formatToolArguments(call.tool_name, call.arguments)}
                   </div>
-                  
-                  {toolCall.status === 'completed' && toolCall.result && (
-                    <div>{formatToolResult(toolCall.tool_name, toolCall.result)}</div>
+
+                  {call.status === 'completed' && call.result && (
+                    <div>{formatToolResult(call.tool_name, call.result)}</div>
                   )}
-                  
-                  {toolCall.status === 'failed' && toolCall.error && (
-                    <div className="text-xs text-red-600 p-2 bg-red-50 rounded border border-red-100">
-                      {toolCall.error}
+
+                  {call.status === 'failed' && call.error && (
+                    <div className="text-xs text-red-600 p-2 bg-red-50 border border-red-100 rounded">
+                      {call.error}
                     </div>
                   )}
                 </div>
               </div>
             </div>
           ))}
-          
+
           {thinking.error && (
             <div className="p-3 bg-red-50 border border-red-100 rounded-lg text-sm text-red-700">
               {thinking.error}
@@ -210,237 +236,371 @@ const ThinkingDropdown: React.FC<{ thinking: ThinkingProgress }> = ({ thinking }
   );
 };
 
+/* -------------------------------------------------------------------------- */
+/*                            Main App Component                              */
+/* -------------------------------------------------------------------------- */
 const App: React.FC = () => {
+  /* ----------------------------- local state ----------------------------- */
   const [messages, setMessages] = useState<Message[]>([]);
-  const [input, setInput] = useState('');
-  const [loading, setLoading] = useState(false);
-  const [userId] = useState<string>(getUserId());
-  const [currentThinking, setCurrentThinking] = useState<ThinkingProgress | null>(null);
-  const wsRef = useRef<WebSocket | null>(null);
-  const messagesEndRef = useRef<HTMLDivElement>(null);
-  const inputRef = useRef<HTMLTextAreaElement>(null);
+  const [input, setInput]       = useState('');
+  const [loading, setLoading]   = useState(false);
+  const [cancelling, setCancelling] = useState(false);
+  const [steering, setSteering]     = useState(false);
+  const [steerMode, setSteerMode]   = useState(false);
+  const [steeringStatus, setSteeringStatus] =
+    useState<'idle' | 'sending' | 'applied' | 'failed' | null>(null);
 
-  /** auto-scroll every render */
-  useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [messages, currentThinking]);
+  const [userId] = useState(generateUserId);
+  const [currentThinking, setCurrentThinking] =
+    useState<ThinkingProgress | null>(null);
+  const [currentTaskId, setCurrentTaskId] = useState<string | null>(null);
 
-  /** focus input after sending a message */
-  useEffect(() => {
-    if (!loading && messages.length > 0) {
-      inputRef.current?.focus();
-    }
-  }, [loading, messages.length]);
+  /* refs */
+  const wsRef            = useRef<WebSocket | null>(null);
+  const messagesEndRef   = useRef<HTMLDivElement>(null);
+  const inputRef         = useRef<HTMLTextAreaElement>(null);
+  const thinkingRef      = useRef<ThinkingProgress | null>(null); // <— NEW
 
+  /* keep ref in sync with state */
+  useEffect(() => { thinkingRef.current = currentThinking; }, [currentThinking]);
+
+  /* --------------------------- helper callbacks -------------------------- */
   const sendPrompt = useCallback(async () => {
     if (!input.trim()) return;
-    const prevMessages = messages;
+    const prev = messages;
+
     const userMsg: Message = {
       id: Date.now(),
       role: 'user',
       content: input,
       timestamp: new Date(),
     };
-    setMessages(prev => [...prev, userMsg]);
+
+    setMessages(p => [...p, userMsg]);
     setInput('');
     setLoading(true);
     setCurrentThinking(null);
-    
+
     const res = await fetch(REST_ENDPOINT, {
-      method: 'POST',
+      method : 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ 
-        user_id: userId, 
-        query: input,
-        message_history: prevMessages.filter(m => m.content).map(m => ({
-          role: m.role,
-          content: m.content,
-        })),
+      body   : JSON.stringify({
+        user_id : userId,
+        query   : input,
+        message_history: prev
+          .filter(m => m.content)
+          .map(({ role, content }) => ({ role, content })),
       }),
     });
-    if (!res.ok) console.error('enqueue failed');
+
+    if (res.ok) {
+      const { task_id } = await res.json();
+      setCurrentTaskId(task_id);
+    } else {
+      console.error('enqueue failed');
+      setLoading(false);
+    }
   }, [input, messages, userId]);
 
+  const cancelCurrentTask = useCallback(async () => {
+    if (!currentTaskId || cancelling) return;
+    setCancelling(true);
+
+    try {
+      const res = await fetch(CANCEL_ENDPOINT, {
+        method : 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body   : JSON.stringify({ user_id: userId, task_id: currentTaskId }),
+      });
+      if (!res.ok) setCancelling(false);
+    } catch (err) {
+      console.error('Error cancelling task:', err);
+      setCancelling(false);
+    }
+  }, [currentTaskId, userId, cancelling]);
+
+  const sendSteeringMessage = useCallback(async () => {
+    if (!input.trim() || !currentTaskId || steering) return;
+    setSteering(true);
+    setSteeringStatus('sending');
+
+    try {
+      const res = await fetch(STEER_ENDPOINT, {
+        method : 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body   : JSON.stringify({
+          user_id: userId,
+          task_id: currentTaskId,
+          messages: [{ role: 'user', content: input }],
+        }),
+      });
+      if (res.ok) {
+        setInput('');
+        setSteerMode(false);
+      } else {
+        setSteeringStatus('failed');
+        setSteering(false);
+      }
+    } catch (err) {
+      console.error('Error steering:', err);
+      setSteeringStatus('failed');
+      setSteering(false);
+    }
+  }, [input, currentTaskId, userId, steering]);
+
+  /* ------------------------ websocket message handler ------------------- */
   const handleWSMessage = useCallback((evt: MessageEvent) => {
     const event: AgentEvent = JSON.parse(evt.data);
-    console.log("Received event:", event);
-    
+    console.log('WS event:', event);
+
+    const updateThinking = (updater: (prev: ThinkingProgress | null) => ThinkingProgress | null) => {
+      setCurrentThinking(prev => {
+        const next = updater(prev);
+        /* keep ref aligned */
+        thinkingRef.current = next;
+        return next;
+      });
+    };
+
     switch (event.event_type) {
-      case 'progress_update_tool_action_started':
-        if (event.data && event.data.args && event.data.args.length > 0) {
-          // Extract tool call data from the first argument (tool_call)
-          const toolCall = event.data.args[0];
-          setCurrentThinking(prev => {
-            const thinking = prev || {
-              task_id: event.task_id,
-              tool_calls: {},
-              is_complete: false
-            };
-            
-            return {
-              ...thinking,
-              tool_calls: {
-                ...thinking.tool_calls,
-                [toolCall.id]: {
-                  id: toolCall.id,
-                  tool_name: toolCall.function.name,
-                  arguments: toolCall.function.arguments,
-                  status: 'started'
-                }
-              }
-            };
-          });
-        }
-        break;
-        
-      case 'progress_update_tool_action_completed':
-        if (event.data && event.data.result) {
-          // The result contains the ToolActionResponse with tool_call and output_data
-          const toolActionResponse = event.data.result;
-          const toolCall = toolActionResponse.tool_call;
-          
-          setCurrentThinking(prev => {
-            if (!prev) return null;
-            
-            return {
-              ...prev,
-              tool_calls: {
-                ...prev.tool_calls,
-                [toolCall.id]: {
-                  ...prev.tool_calls[toolCall.id],
-                  status: 'completed',
-                  result: toolActionResponse.output_data
-                }
-              }
-            };
-          });
-        }
-        break;
-        
-      case 'progress_update_tool_action_failed':
-        if (event.data && event.data.args && event.data.args.length > 0) {
-          // Extract tool call data from the first argument
-          const toolCall = event.data.args[0];
-          setCurrentThinking(prev => {
-            if (!prev) return null;
-            
-            return {
-              ...prev,
-              tool_calls: {
-                ...prev.tool_calls,
-                [toolCall.id]: {
-                  ...prev.tool_calls[toolCall.id],
-                  status: 'failed',
-                  error: event.error
-                }
-              }
-            };
-          });
-        }
-        break;
+      /* ----- tool events ----- */
+      case 'progress_update_tool_action_started': {
+        const toolCall = event.data?.args?.[0];
+        if (!toolCall) break;
 
-      case 'progress_update_completion_started':
-        // LLM completion started - we can show this in the thinking if needed
-        console.log("LLM completion started");
+        updateThinking(prev => {
+          const base: ThinkingProgress = prev ?? {
+            task_id    : event.task_id,
+            tool_calls : {},
+            is_complete: false,
+          };
+          return {
+            ...base,
+            tool_calls: {
+              ...base.tool_calls,
+              [toolCall.id]: {
+                id       : toolCall.id,
+                tool_name: toolCall.function.name,
+                arguments: toolCall.function.arguments,
+                status   : 'started',
+              },
+            },
+          };
+        });
         break;
+      }
 
-      case 'progress_update_completion_completed':
-        // LLM completion finished - we can show this in the thinking if needed
-        console.log("LLM completion completed");
+      case 'progress_update_tool_action_completed': {
+        const resp      = event.data?.result;
+        const toolCall  = resp?.tool_call;
+        if (!toolCall) break;
+
+        updateThinking(prev => {
+          if (!prev) return null;
+          return {
+            ...prev,
+            tool_calls: {
+              ...prev.tool_calls,
+              [toolCall.id]: {
+                ...prev.tool_calls[toolCall.id],
+                status: 'completed',
+                result: resp.output_data,
+              },
+            },
+          };
+        });
         break;
+      }
 
+      case 'progress_update_tool_action_failed': {
+        const toolCall = event.data?.args?.[0];
+        if (!toolCall) break;
+
+        updateThinking(prev => {
+          if (!prev) return null;
+          return {
+            ...prev,
+            tool_calls: {
+              ...prev.tool_calls,
+              [toolCall.id]: {
+                ...prev.tool_calls[toolCall.id],
+                status: 'failed',
+                error : event.error,
+              },
+            },
+          };
+        });
+        break;
+      }
+
+      /* ----- completion events (optional) ----- */
       case 'progress_update_completion_failed':
-        // LLM completion failed
-        console.log("LLM completion failed:", event.error);
-        setCurrentThinking(prev => prev ? { ...prev, error: event.error } : null);
+        updateThinking(prev => (prev ? { ...prev, error: event.error } : null));
         break;
-        
-      case 'agent_output':
-        // Final output received
-        const finalOutput = typeof event.data === 'string' ? event.data : 
-                           event.data?.final_output || JSON.stringify(event.data, null, 2);
-        
+
+      /* ----- steering status ----- */
+      case 'run_steering_applied':
+        setSteeringStatus('applied');
+        setSteering(false);
+        setTimeout(() => setSteeringStatus(null), 2000);
+        break;
+
+      case 'run_steering_failed':
+        setSteeringStatus('failed');
+        setSteering(false);
+        setSteerMode(false);
+        setTimeout(() => setSteeringStatus(null), 3000);
+        break;
+
+      /* ----- final answer ----- */
+      case 'agent_output': {
+        const content =
+          typeof event.data === 'string'
+            ? event.data
+            : event.data?.final_output ?? JSON.stringify(event.data, null, 2);
+
         setMessages(prev => [
           ...prev,
-          { 
-            id: Date.now(), 
-            role: 'assistant', 
-            content: finalOutput, 
+          {
+            id: Date.now(),
+            role: 'assistant',
+            content,
             timestamp: new Date(),
-            thinking: undefined // We'll set this with the current thinking state
           },
         ]);
-        
-        // Set the thinking data for the message after we have access to current thinking
-        setCurrentThinking(prevThinking => {
-          if (prevThinking) {
-            setMessages(prevMessages => {
-              const lastMessage = prevMessages[prevMessages.length - 1];
-              if (lastMessage && lastMessage.role === 'assistant') {
-                return [
-                  ...prevMessages.slice(0, -1),
-                  {
-                    ...lastMessage,
-                    thinking: { ...prevThinking, is_complete: true, final_output: event.data }
-                  }
-                ];
-              }
-              return prevMessages;
-            });
-          }
-          return null;
-        });
-        
+
+        const finished = thinkingRef.current
+          ? { ...thinkingRef.current, is_complete: true, final_output: event.data }
+          : null;
+
+        if (finished) {
+          setMessages(prev => {
+            const last = prev[prev.length - 1];
+            return [
+              ...prev.slice(0, -1),
+              { ...last, thinking: finished },
+            ];
+          });
+        }
+
+        setCurrentThinking(null);
         setLoading(false);
+        setCurrentTaskId(null);
+        setSteering(false);
+        setSteerMode(false);
+        setSteeringStatus(null);
         break;
-        
+      }
+
+      /* ----- cancellation ----- */
+      case 'run_cancelled': {
+        const snap = thinkingRef.current;
+        let message = 'Task was cancelled.';
+        let snapshotThinking: ThinkingProgress | undefined;
+
+        if (snap && Object.keys(snap.tool_calls).length) {
+          const completed = Object.values(snap.tool_calls).filter(
+            c => c.status === 'completed'
+          ).length;
+          message = "Task was cancelled."
+
+          snapshotThinking = {
+            ...snap,
+            is_complete: true,
+            error: 'Task cancelled by user',
+          };
+        }
+
+        setMessages(prev => [
+          ...prev,
+          {
+            id: Date.now(),
+            role: 'assistant',
+            content: message,
+            timestamp: new Date(),
+            thinking: snapshotThinking,
+          },
+        ]);
+
+        setCurrentThinking(null);
+        setLoading(false);
+        setCancelling(false);
+        setCurrentTaskId(null);
+        setSteering(false);
+        setSteerMode(false);
+        setSteeringStatus(null);
+        break;
+      }
+
+      /* ----- generic failure ----- */
       case 'run_failed':
       case 'task_failed':
-        // Handle errors
-        setCurrentThinking(prev => prev ? { ...prev, is_complete: true, error: event.error } : null);
+        updateThinking(prev =>
+          prev ? { ...prev, is_complete: true, error: event.error } : null
+        );
         setLoading(false);
+        setCancelling(false);
+        setCurrentTaskId(null);
+        setSteering(false);
+        setSteerMode(false);
+        setSteeringStatus(null);
         break;
-        
-      default:
-        // Log other events for debugging
-        console.log("Unhandled event type:", event.event_type);
-    }
-  }, []); // Remove currentThinking dependency
 
-  /** open WS once on mount */
+      default:
+        console.log('Unhandled event:', event);
+    }
+  }, []);
+
+  /* ------------------------------ side-effects --------------------------- */
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [messages, currentThinking]);
+
+  useEffect(() => {
+    if (!loading && messages.length) inputRef.current?.focus();
+  }, [loading, messages.length]);
+
+  /* open websocket once */
   useEffect(() => {
     const ws = new WebSocket(`${WS_ROOT}/${userId}`);
     ws.onmessage = handleWSMessage;
     wsRef.current = ws;
     return () => ws.close();
-  }, [userId]); // Remove handleWSMessage dependency
+  }, [userId, handleWSMessage]);
 
-  const renderedMessages = useMemo(() => (
-    messages.map(m => (
-      <div key={m.id} className="mb-6">
-        {m.role === 'user' ? (
-          <div className="flex justify-end">
-            <div className="bg-gray-800 text-white rounded-2xl px-4 py-2 max-w-[80%]">
-              <p className="text-sm">{m.content}</p>
+  /* ------------------------------ rendering ------------------------------ */
+  const renderedMessages = useMemo(
+    () =>
+      messages.map(m => (
+        <div key={m.id} className="mb-6">
+          {m.role === 'user' ? (
+            <div className="flex justify-end">
+              <div className="bg-gray-800 text-white rounded-2xl px-4 py-2 max-w-[80%]">
+                <p className="text-sm">{m.content}</p>
+              </div>
             </div>
-          </div>
-        ) : (
-          <div className="flex flex-col gap-3">
-            {m.thinking && <ThinkingDropdown thinking={m.thinking} />}
-            <div className="bg-white border border-gray-200 rounded-2xl px-4 py-3">
-              <p className="text-sm text-gray-800">{m.content}</p>
+          ) : (
+            <div className="flex flex-col gap-3">
+              {m.thinking && <ThinkingDropdown thinking={m.thinking} />}
+              <div className="bg-white border border-gray-200 rounded-2xl px-4 py-3">
+                <p className="text-sm text-gray-800">{m.content}</p>
+              </div>
             </div>
-          </div>
-        )}
-      </div>
-    ))
-  ), [messages]);
+          )}
+        </div>
+      )),
+    [messages]
+  );
 
+  /* ---------------------------------------------------------------------- */
+  /*                                  JSX                                   */
+  /* ---------------------------------------------------------------------- */
   return (
     <div className="flex flex-col h-screen bg-gray-50">
       <div className="text-center text-gray-500 my-2">
-          <p className="mt-2">{userId}</p>
+        <p className="mt-2">{userId}</p>
       </div>
+
       <div className="flex-1 overflow-y-auto">
         <div className="max-w-3xl mx-auto px-4 py-8">
           {messages.length === 0 && (
@@ -448,62 +608,170 @@ const App: React.FC = () => {
               <p className="mt-2">Start a new conversation</p>
             </div>
           )}
+
           {renderedMessages}
-          
-          {/* Show current thinking progress */}
-          {loading && currentThinking && (
+
+          {(loading && currentThinking) ||
+          (currentThinking && currentThinking.is_complete) ? (
             <div className="mb-6">
-              <ThinkingDropdown thinking={currentThinking} />
+              <ThinkingDropdown thinking={currentThinking as ThinkingProgress} />
             </div>
-          )}
-          
+          ) : null}
+
           {loading && !currentThinking && (
             <p className="text-gray-500 text-sm">Starting...</p>
           )}
-          
+
+          {steeringStatus === 'applied' && (
+            <div className="mb-4 text-center">
+              <span className="inline-flex items-center gap-1 text-xs text-green-600 bg-green-50 px-2 py-1 rounded-full">
+                <div className="w-1.5 h-1.5 bg-green-500 rounded-full" />
+                Steering applied
+              </span>
+            </div>
+          )}
+
+          {steeringStatus === 'failed' && (
+            <div className="mb-4 text-center">
+              <span className="inline-flex items-center gap-1 text-xs text-red-600 bg-red-50 px-2 py-1 rounded-full">
+                <div className="w-1.5 h-1.5 bg-red-500 rounded-full" />
+                Steering failed
+              </span>
+            </div>
+          )}
+
           <div ref={messagesEndRef} />
         </div>
       </div>
 
-      {/* input */}
+      {/* --------------------------- Input Area --------------------------- */}
       <div className="border-t border-gray-200 bg-white">
         <div className="max-w-3xl mx-auto px-4 py-4">
-          <div className="relative bg-gray-50 rounded-[26px] shadow-sm border border-gray-200">
+          <div
+            className={`relative rounded-[26px] shadow-sm border transition-all duration-200 ${
+              steerMode
+                ? 'bg-blue-50 border-blue-200 ring-1 ring-blue-200'
+                : 'bg-gray-50 border-gray-200'
+            }`}
+          >
             <form
               className="flex items-center min-h-[52px]"
               onSubmit={e => {
                 e.preventDefault();
-                sendPrompt();
-                inputRef.current?.focus();
+                if (steerMode && !steering) {
+                  sendSteeringMessage();
+                } else if (!loading) {
+                  sendPrompt();
+                }
               }}
             >
+              {steerMode && (
+                <div className="flex items-center pl-4 pr-2">
+                  <span className="inline-flex items-center gap-1 text-xs font-medium text-blue-600 bg-blue-100 px-2 py-1 rounded-full">
+                    <MessageSquare className="w-3 h-3" />
+                    Steer
+                  </span>
+                </div>
+              )}
+
               <textarea
                 ref={inputRef}
                 value={input}
                 onChange={e => {
                   setInput(e.target.value);
-                  e.target.style.height = 'auto';
-                  e.target.style.height = Math.max(e.target.scrollHeight, 24) + 'px';
+                  const el = e.target;
+                  el.style.height = 'auto';
+                  el.style.height = Math.max(el.scrollHeight, 24) + 'px';
                 }}
                 onKeyDown={e => {
                   if (e.key === 'Enter' && !e.shiftKey) {
                     e.preventDefault();
-                    sendPrompt();
+                    if (steerMode && !steering) {
+                      sendSteeringMessage();
+                    } else if (!loading) {
+                      sendPrompt();
+                    }
+                  }
+                  if (e.key === 'Escape' && steerMode) {
+                    setSteerMode(false);
+                    setInput('');
                   }
                 }}
-                placeholder="Ask anything"
+                placeholder={
+                  steerMode ? "Guide the agent's next actions..." : 'Ask anything'
+                }
                 rows={1}
-                className="w-full bg-transparent px-6 py-3 text-sm focus:outline-none placeholder:text-gray-500 text-black resize-none overflow-hidden leading-6 min-h-6"
-                disabled={loading}
+                className={`flex-1 bg-transparent py-3 text-sm leading-6 resize-none overflow-hidden min-h-6 focus:outline-none placeholder:text-gray-500 text-black ${
+                  steerMode ? 'pl-2 pr-6' : 'px-6'
+                }`}
+                disabled={loading && !steerMode}
               />
-              <div className="absolute bottom-2.5 right-2">
-                <button
-                  type="submit"
-                  disabled={!input.trim() || loading}
-                  className="p-2 bg-gray-800 rounded-full disabled:opacity-50 text-white"
-                >
-                  <Send className="w-4 h-4" />
-                </button>
+
+              <div className="absolute bottom-2.5 right-2 flex gap-2">
+                {steerMode ? (
+                  <>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setSteerMode(false);
+                        setInput('');
+                      }}
+                      className="p-2 rounded-full bg-gray-200 hover:bg-gray-300 text-gray-600 transition-colors"
+                      title="Cancel steering (Esc)"
+                    >
+                      <X className="w-4 h-4" />
+                    </button>
+
+                    <button
+                      type="submit"
+                      disabled={!input.trim() || steering}
+                      className="p-2 rounded-full bg-blue-500 hover:bg-blue-600 text-white disabled:bg-blue-400 disabled:opacity-50 transition-colors"
+                      title="Send steering message"
+                    >
+                      {steering ? (
+                        <Loader2 className="w-4 h-4 animate-spin" />
+                      ) : (
+                        <Send className="w-4 h-4" />
+                      )}
+                    </button>
+                  </>
+                ) : loading && currentTaskId ? (
+                  <>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setSteerMode(true);
+                        setTimeout(() => inputRef.current?.focus(), 100);
+                      }}
+                      className="p-2 rounded-full bg-blue-500 hover:bg-blue-600 text-white transition-colors"
+                      title="Steer agent"
+                    >
+                      <MessageSquare className="w-4 h-4" />
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={cancelCurrentTask}
+                      disabled={cancelling}
+                      className="p-2 rounded-full bg-gray-200 hover:bg-gray-300 text-gray-600 disabled:text-gray-400 disabled:bg-gray-300 transition-colors"
+                      title="Cancel task"
+                    >
+                      {cancelling ? (
+                        <Loader2 className="w-4 h-4 animate-spin" />
+                      ) : (
+                        <X className="w-4 h-4" />
+                      )}
+                    </button>
+                  </>
+                ) : (
+                  <button
+                    type="submit"
+                    disabled={!input.trim() || loading}
+                    className="p-2 rounded-full bg-black hover:bg-blue-600 text-white disabled:bg-gray-300 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                  >
+                    <Send className="w-4 h-4" />
+                  </button>
+                )}
               </div>
             </form>
           </div>

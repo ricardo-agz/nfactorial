@@ -836,7 +836,7 @@ class FreeAgent(Agent):
         super().__init__(
             description="Free Agent",
             client=client,
-            model=gpt_41_nano,
+            model=grok_3_mini,
             instructions=instructions,
             tools=tools,
             tool_actions=tool_actions,

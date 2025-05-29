@@ -15,6 +15,7 @@ import {
   X,
   Loader2,
   MessageSquare,
+  Sparkles,
 } from 'lucide-react';
 
 const REST_ENDPOINT   = 'http://localhost:8000/api/enqueue';
@@ -68,9 +69,10 @@ const generateUserId = () =>
 
 const getToolIcon = (name: string) => {
   switch (name) {
-    case 'plan'  : return <Brain  className="w-4 h-4" />;
-    case 'search': return <Search className="w-4 h-4" />;
-    default      : return <div    className="w-4 h-4 rounded-full bg-gray-400" />;
+    case 'plan'  : return <Brain className="w-3 h-3 text-blue-600" />;
+    case 'search': return <Search className="w-3 h-3 text-blue-600" />;
+    case 'reflect': return <Sparkles className="w-3 h-3 text-blue-600" />;
+    default      : return <div className="w-3 h-3 rounded-full bg-gray-300" />;
   }
 };
 
@@ -87,27 +89,29 @@ const formatToolArguments = (name: string, args: any) => {
 const formatToolResult = (name: string, result: any) => {
   if (name === 'search' && Array.isArray(result)) {
     return (
-      <div className="mt-3 space-y-2">
-        <div className="text-xs text-gray-400 mb-3">{result.length} results</div>
+      <div className="mt-2 space-y-1">
+        <div className="text-xs text-gray-500 mb-2">
+          {result.length} results
+        </div>
         {result.slice(0, 6).map((item, idx) => (
           <a
             key={idx}
             href={item.url}
             target="_blank"
             rel="noopener noreferrer"
-            className="flex items-center gap-3 p-2 rounded-lg hover:bg-gray-50 transition-colors group"
+            className="flex items-center gap-2 p-2 rounded hover:bg-gray-50 transition-colors group text-xs"
           >
             <img
               src={`https://www.google.com/s2/favicons?domain=${new URL(item.url).hostname}&sz=16`}
               alt=""
-              className="w-4 h-4 flex-shrink-0"
+              className="w-3 h-3 flex-shrink-0"
               onError={e => { (e.currentTarget as HTMLImageElement).style.display = 'none'; }}
             />
             <div className="min-w-0 flex-1">
-              <div className="text-sm font-medium truncate text-gray-900 group-hover:text-blue-600">
+              <div className="font-medium truncate text-gray-900 group-hover:text-blue-600">
                 {item.title}
               </div>
-              <div className="text-xs text-gray-500 truncate">
+              <div className="text-gray-500 truncate">
                 {new URL(item.url).hostname}
               </div>
             </div>
@@ -120,15 +124,17 @@ const formatToolResult = (name: string, result: any) => {
 
   if (name === 'plan' && result?.overview && Array.isArray(result.steps)) {
     return (
-      <div className="mt-3 space-y-3">
-        <div className="text-sm text-gray-700">{result.overview}</div>
-        <div className="space-y-1.5">
+      <div className="mt-2 space-y-2">
+        <div className="text-xs text-gray-700">
+          {result.overview}
+        </div>
+        <div className="space-y-1">
           {result.steps.map((step: string, idx: number) => (
-            <div key={idx} className="flex gap-3">
-              <div className="w-5 h-5 mt-0.5 rounded-full bg-blue-100 flex items-center justify-center flex-shrink-0">
+            <div key={idx} className="flex gap-2 text-xs">
+              <div className="w-4 h-4 mt-0.5 rounded-full bg-blue-100 flex items-center justify-center flex-shrink-0">
                 <span className="text-xs font-medium text-blue-600">{idx + 1}</span>
               </div>
-              <span className="text-sm text-gray-600">{step}</span>
+              <span className="text-gray-600">{step}</span>
             </div>
           ))}
         </div>
@@ -138,14 +144,14 @@ const formatToolResult = (name: string, result: any) => {
 
   if (name === 'reflect') {
     return (
-      <div className="mt-3 p-3 bg-amber-50 border border-amber-100 rounded-lg">
-        <div className="text-sm text-amber-900">{String(result)}</div>
+      <div className="mt-2 p-2 bg-amber-50 border border-amber-200 rounded text-xs">
+        <div className="text-amber-900">{String(result)}</div>
       </div>
     );
   }
 
   return (
-    <div className="mt-3 text-sm text-gray-600">
+    <div className="mt-2 text-xs text-gray-600">
       {String(result).slice(0, 150)}...
     </div>
   );
@@ -162,7 +168,7 @@ const ThinkingDropdown: React.FC<{ thinking: ThinkingProgress }> = ({
   const hasActive = calls.some(c => c.status === 'started');
 
   return (
-    <div className="bg-gray-50 rounded-xl p-4 mb-4 border border-gray-100">
+    <div className="bg-gray-50 rounded-lg p-3 mb-3 border border-gray-200">
       <button
         className="flex items-center gap-2 w-full text-left group"
         onClick={() => setOpen(!open)}
@@ -172,7 +178,7 @@ const ThinkingDropdown: React.FC<{ thinking: ThinkingProgress }> = ({
         ) : (
           <ChevronRight className="w-4 h-4 text-gray-400" />
         )}
-        <span className="text-sm font-medium text-gray-600">
+        <span className="text-sm font-medium text-gray-700">
           {thinking.is_complete ? 'Thinking complete' : 'Thinking...'}
         </span>
         {hasActive && (
@@ -181,21 +187,23 @@ const ThinkingDropdown: React.FC<{ thinking: ThinkingProgress }> = ({
       </button>
 
       {open && (
-        <div className="mt-4 space-y-3">
+        <div className="mt-3 space-y-2">
           {calls.map(call => (
             <div
               key={call.id}
-              className="bg-white rounded-lg border border-gray-100 p-3"
+              className="bg-white rounded border border-gray-200 p-2"
             >
-              <div className="flex items-start gap-3">
-                <div className="flex-shrink-0 mt-0.5">{getToolIcon(call.tool_name)}</div>
+              <div className="flex items-start gap-2">
+                <div className="flex-shrink-0 mt-1">
+                  {getToolIcon(call.tool_name)}
+                </div>
                 <div className="flex-1 min-w-0">
-                  <div className="flex items-center gap-2 mb-2">
-                    <span className="text-sm font-medium capitalize text-gray-700">
+                  <div className="flex items-center gap-2 mb-1">
+                    <span className="text-xs font-medium capitalize text-gray-700">
                       {call.tool_name}
                     </span>
                     <span
-                      className={`text-xs px-2 py-0.5 rounded-full font-medium ${
+                      className={`text-xs px-1.5 py-0.5 rounded font-medium ${
                         call.status === 'completed'
                           ? 'bg-green-100 text-green-700'
                           : call.status === 'failed'
@@ -207,7 +215,7 @@ const ThinkingDropdown: React.FC<{ thinking: ThinkingProgress }> = ({
                     </span>
                   </div>
 
-                  <div className="text-xs text-gray-500 mb-3">
+                  <div className="text-xs text-gray-500 mb-2">
                     {formatToolArguments(call.tool_name, call.arguments)}
                   </div>
 
@@ -216,7 +224,7 @@ const ThinkingDropdown: React.FC<{ thinking: ThinkingProgress }> = ({
                   )}
 
                   {call.status === 'failed' && call.error && (
-                    <div className="text-xs text-red-600 p-2 bg-red-50 border border-red-100 rounded">
+                    <div className="text-xs text-red-600 p-1 bg-red-50 border border-red-200 rounded">
                       {call.error}
                     </div>
                   )}
@@ -226,7 +234,7 @@ const ThinkingDropdown: React.FC<{ thinking: ThinkingProgress }> = ({
           ))}
 
           {thinking.error && (
-            <div className="p-3 bg-red-50 border border-red-100 rounded-lg text-sm text-red-700">
+            <div className="p-2 bg-red-50 border border-red-200 rounded text-xs text-red-700">
               {thinking.error}
             </div>
           )}
@@ -259,7 +267,7 @@ const App: React.FC = () => {
   const wsRef            = useRef<WebSocket | null>(null);
   const messagesEndRef   = useRef<HTMLDivElement>(null);
   const inputRef         = useRef<HTMLTextAreaElement>(null);
-  const thinkingRef      = useRef<ThinkingProgress | null>(null); // <— NEW
+  const thinkingRef      = useRef<ThinkingProgress | null>(null);
 
   /* keep ref in sync with state */
   useEffect(() => { thinkingRef.current = currentThinking; }, [currentThinking]);
@@ -572,17 +580,17 @@ const App: React.FC = () => {
   const renderedMessages = useMemo(
     () =>
       messages.map(m => (
-        <div key={m.id} className="mb-6">
+        <div key={m.id} className="mb-4">
           {m.role === 'user' ? (
             <div className="flex justify-end">
-              <div className="bg-gray-800 text-white rounded-2xl px-4 py-2 max-w-[80%]">
+              <div className="bg-gray-800 text-white rounded-lg px-3 py-2 max-w-[80%]">
                 <p className="text-sm">{m.content}</p>
               </div>
             </div>
           ) : (
-            <div className="flex flex-col gap-3">
+            <div className="flex flex-col gap-2">
               {m.thinking && <ThinkingDropdown thinking={m.thinking} />}
-              <div className="bg-white border border-gray-200 rounded-2xl px-4 py-3">
+              <div className="bg-white border border-gray-200 rounded-lg px-3 py-2">
                 <p className="text-sm text-gray-800">{m.content}</p>
               </div>
             </div>
@@ -597,15 +605,27 @@ const App: React.FC = () => {
   /* ---------------------------------------------------------------------- */
   return (
     <div className="flex flex-col h-screen bg-gray-50">
-      <div className="text-center text-gray-500 my-2">
-        <p className="mt-2">{userId}</p>
+      {/* Header */}
+      <div className="text-center border-b border-gray-200 bg-white py-2">
+        <div className="text-xs font-mono text-gray-500">
+          {userId}
+        </div>
       </div>
 
+      {/* Messages Area */}
       <div className="flex-1 overflow-y-auto">
-        <div className="max-w-3xl mx-auto px-4 py-8">
+        <div className="max-w-3xl mx-auto px-4 py-6">
           {messages.length === 0 && (
-            <div className="text-center text-gray-500 my-8">
-              <p className="mt-2">Start a new conversation</p>
+            <div className="text-center my-12">
+              <div className="w-12 h-12 mx-auto mb-4 rounded-lg bg-gray-700 flex items-center justify-center">
+                <MessageSquare className="w-6 h-6 text-white" />
+              </div>
+              <h2 className="text-lg font-medium text-gray-900 mb-1">
+                Start a conversation
+              </h2>
+              <p className="text-gray-500 text-sm">
+                Ask me anything and I'll help you think through it
+              </p>
             </div>
           )}
 
@@ -613,18 +633,21 @@ const App: React.FC = () => {
 
           {(loading && currentThinking) ||
           (currentThinking && currentThinking.is_complete) ? (
-            <div className="mb-6">
+            <div className="mb-4">
               <ThinkingDropdown thinking={currentThinking as ThinkingProgress} />
             </div>
           ) : null}
 
           {loading && !currentThinking && (
-            <p className="text-gray-500 text-sm">Starting...</p>
+            <div className="flex items-center gap-2 text-gray-500 text-sm">
+              <Loader2 className="w-4 h-4 animate-spin" />
+              <span>Starting...</span>
+            </div>
           )}
 
           {steeringStatus === 'applied' && (
             <div className="mb-4 text-center">
-              <span className="inline-flex items-center gap-1 text-xs text-green-600 bg-green-50 px-2 py-1 rounded-full">
+              <span className="inline-flex items-center gap-1 text-xs text-green-600 bg-green-50 px-2 py-1 rounded">
                 <div className="w-1.5 h-1.5 bg-green-500 rounded-full" />
                 Steering applied
               </span>
@@ -633,7 +656,7 @@ const App: React.FC = () => {
 
           {steeringStatus === 'failed' && (
             <div className="mb-4 text-center">
-              <span className="inline-flex items-center gap-1 text-xs text-red-600 bg-red-50 px-2 py-1 rounded-full">
+              <span className="inline-flex items-center gap-1 text-xs text-red-600 bg-red-50 px-2 py-1 rounded">
                 <div className="w-1.5 h-1.5 bg-red-500 rounded-full" />
                 Steering failed
               </span>
@@ -644,18 +667,18 @@ const App: React.FC = () => {
         </div>
       </div>
 
-      {/* --------------------------- Input Area --------------------------- */}
+      {/* Input Area */}
       <div className="border-t border-gray-200 bg-white">
-        <div className="max-w-3xl mx-auto px-4 py-4">
+        <div className="max-w-3xl mx-auto px-4 py-3">
           <div
-            className={`relative rounded-[26px] shadow-sm border transition-all duration-200 ${
+            className={`relative rounded-lg border transition-colors ${
               steerMode
-                ? 'bg-blue-50 border-blue-200 ring-1 ring-blue-200'
+                ? 'bg-blue-50 border-blue-200'
                 : 'bg-gray-50 border-gray-200'
             }`}
           >
             <form
-              className="flex items-center min-h-[52px]"
+              className="flex items-center min-h-[44px]"
               onSubmit={e => {
                 e.preventDefault();
                 if (steerMode && !steering) {
@@ -666,8 +689,8 @@ const App: React.FC = () => {
               }}
             >
               {steerMode && (
-                <div className="flex items-center pl-4 pr-2">
-                  <span className="inline-flex items-center gap-1 text-xs font-medium text-blue-600 bg-blue-100 px-2 py-1 rounded-full">
+                <div className="flex items-center pl-3 pr-2">
+                  <span className="inline-flex items-center gap-1 text-xs font-medium text-blue-600 bg-blue-100 px-2 py-1 rounded">
                     <MessageSquare className="w-3 h-3" />
                     Steer
                   </span>
@@ -698,16 +721,16 @@ const App: React.FC = () => {
                   }
                 }}
                 placeholder={
-                  steerMode ? "Guide the agent's next actions..." : 'Ask anything'
+                  steerMode ? "Guide the agent's next actions..." : 'Ask anything...'
                 }
                 rows={1}
-                className={`flex-1 bg-transparent py-3 text-sm leading-6 resize-none overflow-hidden min-h-6 focus:outline-none placeholder:text-gray-500 text-black ${
-                  steerMode ? 'pl-2 pr-6' : 'px-6'
+                className={`flex-1 bg-transparent py-2.5 text-sm resize-none overflow-hidden min-h-6 focus:outline-none placeholder:text-gray-500 text-gray-900 ${
+                  steerMode ? 'pl-2 pr-4' : 'px-3'
                 }`}
                 disabled={loading && !steerMode}
               />
 
-              <div className="absolute bottom-2.5 right-2 flex gap-2">
+              <div className="absolute bottom-2 right-2 flex gap-1">
                 {steerMode ? (
                   <>
                     <button
@@ -716,7 +739,7 @@ const App: React.FC = () => {
                         setSteerMode(false);
                         setInput('');
                       }}
-                      className="p-2 rounded-full bg-gray-200 hover:bg-gray-300 text-gray-600 transition-colors"
+                      className="p-1.5 rounded bg-gray-200 hover:bg-gray-300 text-gray-600 transition-colors"
                       title="Cancel steering (Esc)"
                     >
                       <X className="w-4 h-4" />
@@ -725,7 +748,7 @@ const App: React.FC = () => {
                     <button
                       type="submit"
                       disabled={!input.trim() || steering}
-                      className="p-2 rounded-full bg-blue-500 hover:bg-blue-600 text-white disabled:bg-blue-400 disabled:opacity-50 transition-colors"
+                      className="p-1.5 rounded bg-blue-500 hover:bg-blue-600 text-white disabled:bg-blue-400 disabled:opacity-50 transition-colors"
                       title="Send steering message"
                     >
                       {steering ? (
@@ -743,7 +766,7 @@ const App: React.FC = () => {
                         setSteerMode(true);
                         setTimeout(() => inputRef.current?.focus(), 100);
                       }}
-                      className="p-2 rounded-full bg-blue-500 hover:bg-blue-600 text-white transition-colors"
+                      className="p-1.5 rounded bg-blue-500 hover:bg-blue-600 text-white transition-colors"
                       title="Steer agent"
                     >
                       <MessageSquare className="w-4 h-4" />
@@ -753,7 +776,7 @@ const App: React.FC = () => {
                       type="button"
                       onClick={cancelCurrentTask}
                       disabled={cancelling}
-                      className="p-2 rounded-full bg-gray-200 hover:bg-gray-300 text-gray-600 disabled:text-gray-400 disabled:bg-gray-300 transition-colors"
+                      className="p-1.5 rounded bg-gray-200 hover:bg-gray-300 text-gray-600 disabled:text-gray-400 disabled:bg-gray-300 transition-colors"
                       title="Cancel task"
                     >
                       {cancelling ? (
@@ -767,7 +790,7 @@ const App: React.FC = () => {
                   <button
                     type="submit"
                     disabled={!input.trim() || loading}
-                    className="p-2 rounded-full bg-black hover:bg-blue-600 text-white disabled:bg-gray-300 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                    className="p-1.5 rounded bg-gray-700 hover:bg-gray-800 text-white disabled:bg-gray-300 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
                   >
                     <Send className="w-4 h-4" />
                   </button>

@@ -30,6 +30,16 @@ local failed_cutoff_timestamp = tonumber(ARGV[2])
 local cancelled_cutoff_timestamp = tonumber(ARGV[3])
 local max_cleanup_batch = tonumber(ARGV[4])
 
+-- Input validation
+if not max_cleanup_batch or max_cleanup_batch <= 0 then
+    return {0, 0, 0, {}}
+end
+
+-- Early exit if no cutoff timestamps are provided
+if not completed_cutoff_timestamp and not failed_cutoff_timestamp and not cancelled_cutoff_timestamp then
+    return {0, 0, 0, {}}
+end
+
 local completed_cleaned = 0
 local failed_cleaned = 0
 local cancelled_cleaned = 0
@@ -37,34 +47,34 @@ local cleaned_task_ids = {}
 
 -- Helper function to clean expired tasks from a queue
 local function clean_expired_tasks(queue_key, cutoff_timestamp, max_batch)
-    if not queue_key or not cutoff_timestamp then
+    if not queue_key or not cutoff_timestamp or not max_batch or max_batch <= 0 then
         return 0, {}
     end
     
-    -- Get tasks older than cutoff timestamp
     -- Get tasks older than cutoff timestamp, limited by max_batch
     local expired_tasks = redis.call('ZRANGEBYSCORE', queue_key, '-inf', cutoff_timestamp, 'LIMIT', 0, max_batch)
     
     if #expired_tasks == 0 then
         return 0, {}
     end
-    
-    -- IMPORTANT: We only remove the specific tasks we retrieved (limited by max_batch)
-    -- rather than all expired tasks to maintain consistency between queue cleanup
-    -- and task data deletion. Using ZREMRANGEBYSCORE with the full range would
-    -- remove ALL expired tasks from the queue, but we only delete task data for
-    -- the limited batch we retrieved above, leaving orphaned queue entries.
+
     for i = 1, #expired_tasks do
         redis.call('ZREM', queue_key, expired_tasks[i])
     end
     
-    -- Delete task data for each expired task
+    -- Prepare task data keys for batch deletion
+    local task_data_keys = {}
     local task_ids = {}
     for i = 1, #expired_tasks do
         local task_id = expired_tasks[i]
         local task_data_key = string.gsub(task_data_key_template, '{task_id}', task_id)
-        redis.call('DEL', task_data_key)
+        table.insert(task_data_keys, task_data_key)
         table.insert(task_ids, task_id)
+    end
+    
+    -- Batch delete all task data
+    if #task_data_keys > 0 then
+        redis.call('DEL', unpack(task_data_keys))
     end
     
     return #expired_tasks, task_ids

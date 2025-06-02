@@ -6,6 +6,7 @@ from agent.manager import (
     RecoveryWorkerConfig,
 )
 from agent.agent import DummyAgent, FreeAgent
+from example_agents.video_gen_agent import VideoGenAgent
 
 if __name__ == "__main__":
     control_plane = ControlPlane(
@@ -19,6 +20,7 @@ if __name__ == "__main__":
 
     # agent = DummyAgent(client=control_plane.llm_client)
     agent = FreeAgent(client=control_plane.llm_client)
+    # agent = VideoGenAgent(client=control_plane.llm_client)
 
     control_plane.register_runner(
         agent=agent,

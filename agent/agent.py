@@ -9,7 +9,7 @@ from typing import (
     TypeVar,
 )
 from functools import wraps
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pydantic import BaseModel
 import json
 import asyncio
@@ -28,8 +28,7 @@ from openai.types.chat import (
 from exa_py import Exa
 import os
 
-import agent
-from agent.context import Task, AgentContext, ContextType
+from agent.context import Task, AgentContext, ContextType, TaskStatus
 from agent.llms import Model, MultiClient, grok_3_mini, gpt_41_nano
 from agent.utils import serialize_data, to_snake_case
 from agent.events import EventPublisher, AgentEvent
@@ -65,6 +64,21 @@ RETRYABLE_EXCEPTIONS = (
     APITimeoutError,
     RetryableError,
 )
+
+
+def requires_input(
+    input_schema: type[BaseModel],
+) -> Callable[[Callable[..., Awaitable[T]]], Callable[..., Awaitable[T]]]:
+    def decorator(func: Callable[..., Awaitable[T]]) -> Callable[..., Awaitable[T]]:
+        @wraps(func)
+        async def wrapper(self: "BaseAgent[Any]", *args: Any, **kwargs: Any) -> T:
+            func.input_schema = input_schema.model_json_schema()
+            func.requires_input = True
+            return await func(self, *args, **kwargs)
+
+        return wrapper
+
+    return decorator
 
 
 class ToolActionResponse(BaseModel):
@@ -122,11 +136,15 @@ def retry(
 
 
 def publish_progress(
+    func_name: str | None = None,
     include_context: bool = True,
     include_args: bool = True,
     include_result: bool = True,
 ):
     def decorator(func: Callable[..., Awaitable[T]]) -> Callable[..., Awaitable[T]]:
+        nonlocal func_name
+        func_name = func_name or func.__name__
+
         @wraps(func)
         async def wrapper(self: "BaseAgent[Any]", *args: Any, **kwargs: Any) -> T:
             async def publish(
@@ -145,7 +163,7 @@ def publish_progress(
 
                     await ctx.events.publish_event(
                         AgentEvent(
-                            event_type=f"progress_update_{func.__name__}_{event_suffix}",
+                            event_type=f"progress_update_{func_name}_{event_suffix}",
                             task_id=ctx.task_id,
                             owner_id=ctx.owner_id,
                             agent_name=self.name,
@@ -186,10 +204,18 @@ def publish_progress(
 
 
 @dataclass
+class PendingInput:
+    tool_name: str
+    tool_call_id: str
+    input_schema: dict[str, Any]
+
+
+@dataclass
 class TurnCompletion(Generic[ContextType]):
     is_done: bool
     context: ContextType
     output: Any = None
+    pending_on: list[PendingInput] = field(default_factory=list)
 
 
 @dataclass
@@ -275,26 +301,21 @@ class BaseAgent(Generic[ContextType]):
 
     def create_task(
         self,
-        task_id: str,
         owner_id: str,
         payload: ContextType,
-        retries: int = 0,
     ) -> Task[ContextType]:
         """Create a task with the correct context type for this agent"""
-        return Task(
-            id=task_id,
+        return Task.create(
             owner_id=owner_id,
+            agent=self.name,
             payload=payload,
-            retries=retries,
         )
 
     def deserialize_task(self, task_json: str) -> Task[ContextType]:
-        return Task.from_json(task_json, context_class=self.context_class)
+        return Task.from_json(task_json)
 
     # ===== Overridable Methods ===== #
 
-    @retry(max_attempts=3, delay=0.5)
-    @publish_progress()
     async def completion(
         self,
         agent_ctx: ContextType,
@@ -327,8 +348,6 @@ class BaseAgent(Generic[ContextType]):
 
         return response
 
-    @retry(max_attempts=2, delay=0.25)
-    @publish_progress()
     async def tool_action(
         self,
         tool_call: ChatCompletionMessageToolCall,
@@ -375,6 +394,14 @@ class BaseAgent(Generic[ContextType]):
             tool_call=tool_call, output_str=output_str, output_data=output_data
         )
 
+    def format_tool_result(self, tool_call_id: str, result: Any) -> str:
+        if isinstance(result, Exception):
+            return f'<tool_call_error tool="{tool_call_id}">\nError running tool:\n{result}\n</tool_call_error>'
+        elif isinstance(result, tuple):
+            return f'<tool_call_result tool="{tool_call_id}">\n{result[0]}\n</tool_call_result>'
+        else:
+            return f'<tool_call_result tool="{tool_call_id}">\n{result}\n</tool_call_result>'
+
     async def execute_tools(
         self,
         messages: list[dict[str, Any]],
@@ -386,7 +413,7 @@ class BaseAgent(Generic[ContextType]):
 
         # Run tools in parallel
         tasks = [
-            self.tool_action(
+            self._tool_action_with_retry_and_progress(
                 tc,
                 agent_ctx,
             )
@@ -400,20 +427,14 @@ class BaseAgent(Generic[ContextType]):
                 logger.error(
                     f"Tool {tc.function.name} failed: {result}", exc_info=result
                 )
-                content = f'<tool_call_error tool="{tc.function.name}">\nError running tool:\n{result}\n</tool_call_error>'
-            elif isinstance(result, tuple):
-                tool_result = cast(tuple[str, Any], result)
-                content = f'<tool_call_result tool="{tc.function.name}">\n{tool_result[0]}\n</tool_call_result>'
-            else:
-                content = f'<tool_call_result tool="{tc.function.name}">\n{result}\n</tool_call_result>'
 
+            content = self.format_tool_result(tc.id, result)
             updated_messages.append(
                 {"role": "tool", "tool_call_id": tc.id, "content": content}
             )
 
         return updated_messages
 
-    @publish_progress()
     async def run_turn(
         self,
         agent_ctx: ContextType,
@@ -422,8 +443,7 @@ class BaseAgent(Generic[ContextType]):
 
         messages = self._prepare_messages(agent_ctx)
 
-        # Run completion and append response to messages
-        response = await self.completion(
+        response = await self._completion_with_retry_and_progress(
             agent_ctx,
             messages,
         )
@@ -462,12 +482,28 @@ class BaseAgent(Generic[ContextType]):
         agent_ctx.turn += 1
         return TurnCompletion(is_done=False, context=agent_ctx)
 
+    def process_queued_tool_results(
+        self, agent_ctx: ContextType, tool_call_results: list[tuple[str, Any]]
+    ) -> TurnCompletion[ContextType]:
+        updated_messages = agent_ctx.messages.copy()
+        for tool_call_id, result in tool_call_results:
+            if isinstance(result, Exception):
+                logger.error(f"Tool {tool_call_id} failed: {result}", exc_info=result)
+
+            content = self.format_tool_result(tool_call_id, result)
+            updated_messages.append(
+                {"role": "tool", "tool_call_id": tool_call_id, "content": content}
+            )
+        agent_ctx.messages = updated_messages
+
+        return TurnCompletion(is_done=False, context=agent_ctx)
+
     # ===== Helper Methods ===== #
     def _is_done(self, response: ChatCompletion) -> bool:
         """Check if agent should complete"""
         tool_calls = response.choices[0].message.tool_calls
-        return not tool_calls or any(
-            tc.function.name == "final_output" for tc in tool_calls
+        return (not tool_calls and self.output_type is None) or any(
+            tc.function.name == "final_output" for tc in tool_calls or []
         )
 
     def _resolve_model_settings(
@@ -546,6 +582,51 @@ class BaseAgent(Generic[ContextType]):
 
     # ===== Core logic ===== #
 
+    @retry(max_attempts=3, delay=0.5)
+    @publish_progress(func_name="completion")
+    async def _completion_with_retry_and_progress(
+        self,
+        agent_ctx: ContextType,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        temperature: float | None = None,
+        max_completion_tokens: int | None = None,
+        tool_choice: str | dict[str, Any] | None = None,
+        parallel_tool_calls: bool | None = None,
+        model: Model | None = None,
+        **kwargs: Any,
+    ) -> ChatCompletion:
+        """Internal method that wraps completion with retry and progress publishing"""
+        return await self.completion(
+            agent_ctx,
+            messages,
+            tools,
+            temperature,
+            max_completion_tokens,
+            tool_choice,
+            parallel_tool_calls,
+            model,
+            **kwargs,
+        )
+
+    @retry(max_attempts=2, delay=0.25)
+    @publish_progress(func_name="tool_action")
+    async def _tool_action_with_retry_and_progress(
+        self,
+        tool_call: ChatCompletionMessageToolCall,
+        agent_ctx: ContextType,
+    ) -> ToolActionResponse:
+        """Internal method that wraps tool_action with retry and progress publishing"""
+        return await self.tool_action(tool_call, agent_ctx)
+
+    @publish_progress(func_name="run_turn")
+    async def _run_turn_with_progress(
+        self,
+        agent_ctx: ContextType,
+    ) -> TurnCompletion[ContextType]:
+        """Internal method that wraps run_turn with progress publishing"""
+        return await self.run_turn(agent_ctx)
+
     async def steer(
         self,
         messages: list[dict[str, Any]],
@@ -569,7 +650,7 @@ class BaseAgent(Generic[ContextType]):
         token = execution_context.set(execution_ctx)
 
         try:
-            response = await self.run_turn(agent_ctx=agent_ctx)
+            response = await self._run_turn_with_progress(agent_ctx)
 
             if response.is_done:
                 await execution_ctx.events.publish_event(
@@ -782,7 +863,7 @@ class FreeAgent(Agent):
                         "properties": {
                             "reason": {"type": "string"},
                         },
-                        "required": ["reflection"],
+                        "required": ["reason"],
                         "additionalProperties": False,
                     },
                 },
@@ -792,14 +873,14 @@ class FreeAgent(Agent):
                 "type": "function",
                 "function": {
                     "name": "plan",
-                    "description": "Terminate your existance.",
+                    "description": "Plan a task",
                     "parameters": {
                         "type": "object",
                         "properties": {
                             "overview": {"type": "string"},
                             "steps": {"type": "array", "items": {"type": "string"}},
                         },
-                        "required": ["reflection"],
+                        "required": ["overview", "steps"],
                         "additionalProperties": False,
                     },
                 },
@@ -907,16 +988,23 @@ class EnglishAgent(Agent):
 
 @dataclass
 class MultiAgentContext(AgentContext):
-    messages_by_agent: dict[str, list[dict[str, Any]]]
+    sub_agent_contexts: dict[str, AgentContext]
+    completed_agents: set[str] = field(default_factory=set)
 
 
 class MultiAgent(BaseAgent[MultiAgentContext]):
     def __init__(
         self,
-        sub_agents: dict[str, Agent] | None = None,
+        sub_agents: list[Agent],
         client: MultiClient | None = None,
     ):
-        self.sub_agents = sub_agents or {}
+        if not sub_agents:
+            raise ValueError("No sub-agents provided")
+
+        self.sub_agents: dict[str, Agent] = {}
+        for sub_agent in sub_agents:
+            self.sub_agents[sub_agent.name] = sub_agent
+
         super().__init__(
             description="Multi-Agent Orchestrator",
             client=client,
@@ -931,11 +1019,152 @@ class MultiAgent(BaseAgent[MultiAgentContext]):
             tool_retry_delay=0.25,
         )
 
-    def deserialize_task(self, task_json: str) -> Task[MultiAgentContext]:
-        """Deserialize a task with MultiAgentContext"""
-        return Task.from_json(task_json, context_class=MultiAgentContext)
+    def create_multi_agent_context(
+        self,
+        query: str,
+        messages: list[dict[str, Any]] | None = None,
+    ) -> MultiAgentContext:
+        """Create a MultiAgentContext with properly initialized sub-agent contexts"""
+        sub_agent_contexts = {}
+
+        for sub_agent_name in self.sub_agents:
+            sub_agent_contexts[sub_agent_name] = AgentContext(
+                query=query,
+                messages=messages.copy() if messages else [],
+                turn=0,
+            )
+
+        return MultiAgentContext(
+            query=query,
+            messages=messages or [],
+            turn=0,
+            sub_agent_contexts=sub_agent_contexts,
+            completed_agents=set(),
+        )
 
     async def run_turn(
-        self, context: MultiAgentContext
+        self,
+        agent_ctx: MultiAgentContext,
     ) -> TurnCompletion[MultiAgentContext]:
-        return await super().run_turn(context)
+        incomplete_agents = {
+            name: sub_ctx
+            for name, sub_ctx in agent_ctx.sub_agent_contexts.items()
+            if name not in agent_ctx.completed_agents
+        }
+
+        if not incomplete_agents:
+            # All agents are complete
+            return TurnCompletion(
+                is_done=True, context=agent_ctx, output="All sub-agents completed"
+            )
+
+        # Execute incomplete sub agents in parallel
+        execution_ctx = ExecutionContext.current()
+        sub_agent_tasks = [
+            self.sub_agents[sub_agent_name].execute(sub_agent_ctx, execution_ctx)
+            for sub_agent_name, sub_agent_ctx in incomplete_agents.items()
+        ]
+
+        # Wait for all sub agents to complete their turns
+        results = await asyncio.gather(*sub_agent_tasks, return_exceptions=True)
+
+        # Process results and update contexts
+        for (sub_agent_name, _), result in zip(incomplete_agents.items(), results):
+            if isinstance(result, Exception):
+                logger.error(
+                    f"Sub-agent {sub_agent_name} failed: {result}", exc_info=result
+                )
+                # You might want to handle this differently based on your needs
+                continue
+
+            if isinstance(result, TurnCompletion):
+                # Update the sub agent context
+                agent_ctx.sub_agent_contexts[sub_agent_name] = result.context
+
+                # Mark as completed if the sub agent is done
+                if result.is_done:
+                    agent_ctx.completed_agents.add(sub_agent_name)
+
+        # Increment turn counter
+        agent_ctx.turn += 1
+
+        # Check if all agents are now complete
+        all_complete = len(agent_ctx.completed_agents) == len(
+            agent_ctx.sub_agent_contexts
+        )
+
+        return TurnCompletion(
+            is_done=all_complete,
+            context=agent_ctx,
+            output=f"Completed turn {agent_ctx.turn}. {len(agent_ctx.completed_agents)}/{len(agent_ctx.sub_agent_contexts)} agents finished.",
+        )
+
+    async def completion(
+        self,
+        agent_ctx: MultiAgentContext,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        temperature: float | None = None,
+        max_completion_tokens: int | None = None,
+        tool_choice: str | dict[str, Any] | None = None,
+        parallel_tool_calls: bool | None = None,
+        model: Model | None = None,
+        **kwargs: Any,
+    ) -> ChatCompletion:
+        return await super().completion(
+            agent_ctx,
+            messages,
+            tools,
+            temperature,
+            max_completion_tokens,
+            tool_choice,
+            parallel_tool_calls,
+            model,
+            **kwargs,
+        )
+
+    async def tool_action(
+        self,
+        tool_call: ChatCompletionMessageToolCall,
+        agent_ctx: MultiAgentContext,
+    ) -> ToolActionResponse:
+        # Custom logic for multi-agent tool execution could go here
+        return await super().tool_action(tool_call, agent_ctx)
+
+    def get_agent_status(
+        self, agent_ctx: MultiAgentContext
+    ) -> dict[str, dict[str, Any]]:
+        """Get the status of all sub-agents"""
+        status = {}
+        for name, sub_ctx in agent_ctx.sub_agent_contexts.items():
+            status[name] = {
+                "completed": name in agent_ctx.completed_agents,
+                "turn": sub_ctx.turn,
+                "query": sub_ctx.query,
+                "message_count": len(sub_ctx.messages),
+            }
+        return status
+
+
+# Example usage:
+"""
+# Create sub-agents
+spanish_agent = SpanishAgent()
+english_agent = EnglishAgent()
+
+# Create multi-agent
+multi_agent = MultiAgent([spanish_agent, english_agent])
+
+# Create context with different queries for each sub-agent
+context = multi_agent.create_multi_agent_context(
+    query="Explain quantum computing",
+    sub_agent_queries={
+        "spanish_agent": "Explica la computación cuántica en español",
+        "english_agent": "Explain quantum computing in English"
+    }
+)
+
+# Execute the multi-agent (this would be done in the framework)
+# execution_ctx = ExecutionContext(task_id="1", owner_id="user", retries=0, iterations=0, events=...)
+# result = await multi_agent.execute(context, execution_ctx)
+"""

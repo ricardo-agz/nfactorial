@@ -5,7 +5,9 @@ from typing import Any
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
 from openai.types.chat import ChatCompletion, ChatCompletionChunk
+from openai.types.chat.completion_create_params import ResponseFormat
 from openai._streaming import AsyncStream
+from pydantic import BaseModel
 
 load_dotenv()
 
@@ -47,6 +49,7 @@ class MultiClient:
         temperature: float | None = None,
         stream: bool = False,
         parallel_tool_calls: bool | None = None,
+        response_format: ResponseFormat | type[BaseModel] | None = None,
         **kwargs: Any,
     ) -> ChatCompletion | AsyncStream[ChatCompletionChunk]:
         kwargs["model"] = model.provider_model_id
@@ -63,6 +66,8 @@ class MultiClient:
             kwargs["tool_choice"] = tool_choice
         if parallel_tool_calls is not None:
             kwargs["parallel_tool_calls"] = parallel_tool_calls
+        if response_format:
+            kwargs["response_format"] = response_format
 
         if model.provider == Provider.OPENAI:
             return await self.openai.chat.completions.create(**kwargs)

@@ -1,14 +1,14 @@
 import random
 from typing import Any, cast
+import uuid
 import redis.asyncio as redis
 import secrets
 import time
 import json
 import asyncio
 from dataclasses import replace
-from redis.commands.core import AsyncScript
 
-from agent.context import Task
+from agent.context import Task, TaskStatus, ContextType
 from agent.agent import (
     BaseAgent,
     EventPublisher,
@@ -17,266 +17,211 @@ from agent.agent import (
 )
 from agent.events import QueueEvent
 from agent.logging import get_logger, colored
+from agent.scripts import (
+    BatchMoveScript,
+    TaskSteeringScript,
+    TaskCompletionScript,
+    StaleRecoveryScript,
+    create_batch_move_script,
+    create_task_steering_script,
+    create_task_completion_script,
+    create_stale_recovery_script,
+    create_tool_completion_script,
+    create_enqueue_task_script,
+    BatchMoveScriptResult,
+    StaleRecoveryScriptResult,
+)
 
 logger = get_logger("agent.queue")
 
-# List: task_json
-MAIN_QUEUE = "requests:{agent}:main"
-# List: task_json
-FAILED_QUEUE = "requests:{agent}:failed"
-# Sorted set: processing_key -> timestamp
-PROCESSING_HEARTBEATS = "requests:{agent}:processing:heartbeats"
-# Hash: processing_key -> task_json
-PROCESSING_TASKS = "requests:{agent}:processing:data"
-# Set: task_ids
-CANCELLED_TASKS = "cancellations"
-# PubSub
-UPDATE_CHANNEL = "updates:{owner_id}"
-# Hash: message_id -> message
-TASK_STEERING = "steering:{task_id}"
+# ***** REDIS KEY SPACE *****
 
-BATCH_SIZE = 25
-MAX_RETRIES = 3
-STALE_THRESHOLD = 120
-HEARTBEAT_INTERVAL = 5  # seconds
+# HASH: task data {id, status, retries, owner_id, payload}
+TASKS_DATA = "tasks:{task_id}"
+
+# ===== QUEUE MANAGEMENT =====
+# LIST: task_ids waiting to be processed
+QUEUE_MAIN = "queue:{agent}:main"
+# ZSET: task_id -> timestamp of failure
+QUEUE_FAILED = "queue:{agent}:failed"
+# ZSET: task_id -> timestamp of completion
+QUEUE_COMPLETIONS = "queue:{agent}:completed"
+# ZSET: task_id -> timestamp of cancellation
+QUEUE_CANCELLED = "queue:{agent}:cancelled"
+
+# ===== ACTIVE TASK PROCESSING =====
+# ZSET: task_id -> timestamp of last heartbeat
+PROCESSING_HEARTBEATS = "processing:{agent}:heartbeats"
+
+# ===== STEERING & CONTROL =====
+# SET: task_ids marked for cancellation
+TASK_CANCELLATIONS = "cancel:pending"
+# HASH: message_id -> steering_message_json
+TASK_STEERING = "steer:{task_id}:messages"
+
+# ===== PENDING TOOL EXECUTION =====
+# HASH: tool_call_id -> input_schema_json
+PENDING_TOOL_INPUTS = "tool:{agent}:{task_id}:inputs"
+# HASH: tool_call_id -> result_json
+PENDING_TOOL_RESULTS = "tool:{agent}:{task_id}:results"
+
+# ===== COMMUNICATION =====
+# PUBSUB: real-time updates to task owners
+UPDATES_CHANNEL = "updates:{owner_id}"
+
+# ===== SENTINEL VALUES =====
+PENDING_SENTINEL = "<|PENDING|>"
 
 
 """
 Workflow:
 
-1. Worker pops a batch of tasks from the main queue and puts them in processing
-    * processing times: task_id -> started_at timestamp
-    * processing data: task_id -> task_json
-2. Same worker processes tasks concurrently in a batch
-3. Once tasks are completed:
-    * Finished tasks get removed from processing
-    * Failed tasks get moved back to the front of the main queue
-    * Incomple tasks get moved back to the front of the main queue to be picked up again by another worker
-5. Optional retry mechanism to move stale tasks back to the front of the main queue
-    * Checks for task in processing sorted set that are older than X seconds
+1. Enqueue a task:
+    * (atomic): 
+    Store task data in TASKS:task_id, set status to "queued", retries to 0, etc.
+    Push the task_id to AGENT_QUEUE
+
+2. Worker picks up a batch of tasks from the main queue
+    * (atomic):
+    Pop up to BATCH_SIZE task ids from AGENT_QUEUE
+    For each task ID:
+        * If task ID is in PENDING_CANCELLATIONS set:
+            Remove from PENDING_CANCELLATIONS
+            Set status = "cancelled" in TASKS:{task_id}
+            Add to CANCELLED sorted set with score = current timestamp
+        * Otherwise:
+            Add task_id to PROCESSING ZSET with score = current timestamp
+            Set status = "processing" in TASKS:{task_id}
+
+3. Same worker processes tasks concurrently in a batch
+    Start a heartbeat loop: every HEARTBEAT_INTERVAL, update timestamp in PROCESSING.
+    Before executing a task:
+        * Check for STEERING:{task_id} hash:
+            If steering messages exist, pass them to agent.steer() to update task payload.
+            Apply updated payload to TASKS:{task_id} and clear used messages from STEERING.
+    Execute the task with agent.execute()
+
+4. Once tasks are completed:
+    * (atomic):
+    Remove task_id from PROCESSING.
+    Normal completion (not dependent on queued tool results):
+        Update TASKS:{task_id} with:
+            * status = "completed" if successful
+            * status = "failed" if max retries exceeded
+            * status = "active" otherwise (for continuation or retry)
+        Depending on result:
+            * Add task id to COMPLETIONS with score = current timestamp (successfully completed)
+            * Add task id to FAILED with score = current timestamp (max retries exceeded)
+            * Push back to front of AGENT_QUEUE (continue or retry)
+    Task dependent on queued tool results:
+        * Add task id to PENDING_TOOL_RESULTS with set of tool call ids that need to be awaited
+
+5. (Optional) Await tool results:
+    Seperate consumer or webhook listens for tool result completions
+    complete_async_tool(tool_call_id, result)
+    Update set the result in the PENDING_TOOL_RESULTS key
+    If all tool calls have completed, update the task context with the completed results and move task back to queue
+
+Recovery Mechanism:
+1. Detect stale tasks and move them back to the front of the queue to be retried
+    * (atomic):
+    Get tasks in PROCESSING sorted set that are older than X seconds (heartbeat has not been updated for a while)
+    For each task:
+        * Increment retries field in TASKS:{task_id}.
+        * If retries < MAX_RETRIES:
+            Set status = "queued" and push back to front of AGENT_QUEUE
+        * Else:
+            Set status = "failed" and push to FAILED queue
+        * Remove the task ID from PROCESSING
 """
 
 
-def create_batch_move_script(redis_client: redis.Redis) -> AsyncScript:
-    """
-    Create atomic script for moving tasks from main queue to processing
+class TaskNotFoundError(Exception):
+    """Exception raised when a task is not found"""
 
-    Returns:
-        * List of tasks
-        * List of tasks to cancel
-    """
-    return redis_client.register_script(
-        """
-        local main_queue = KEYS[1]
-        local processing_heartbeats = KEYS[2]
-        local processing_tasks = KEYS[3]
-        local cancelled_set = KEYS[4]
-        local batch_size = tonumber(ARGV[1])
-        local worker_id = ARGV[2]
-        local batch_id = ARGV[3]
-        local timestamp = tonumber(ARGV[4])
-        
-        local tasks = {}
-        local tasks_to_cancel = {}
-        
-        -- Try to get more tasks than requested to account for cancelled ones
-        local attempts = batch_size * 2
-        
-        for i = 1, attempts do
-            local task_json = redis.call('LPOP', main_queue)
-            if not task_json then
-                break
-            end
+    def __init__(self, task_id: str):
+        self.task_id = task_id
+        super().__init__(f"Task {task_id} not found")
 
-            local task = cjson.decode(task_json)
 
-            -- Check if cancelled
-            if redis.call('SISMEMBER', cancelled_set, task.id) == 1 then
-                -- Add to cancelled list with info needed for event
-                table.insert(tasks_to_cancel, task_json)
-                -- Remove from cancelled set
-                redis.call('SREM', cancelled_set, task.id)
+class InvalidTaskIdError(Exception):
+    """Exception raised when a task ID is invalid"""
 
-            else
-                -- Not cancelled, add to batch
-                table.insert(tasks, task_json)
-                
-                -- Generate processing key
-                local task_index = #tasks
-                local processing_key = worker_id .. ":" .. batch_id .. ":" .. task_index
-                
-                -- Add to processing structures
-                redis.call('ZADD', processing_heartbeats, timestamp, processing_key)
-                redis.call('HSET', processing_tasks, processing_key, task_json)
-                
-                -- Stop if we have enough tasks
-                if #tasks >= batch_size then
-                    break
-                end
-            end
-        end
-        
-        return {tasks, tasks_to_cancel}
-    """
+    def __init__(self, task_id: str):
+        self.task_id = task_id
+        super().__init__(f"Invalid task ID format: {task_id}")
+
+
+class InactiveTaskError(Exception):
+    """Exception raised when trying to control a task that is not active"""
+
+    def __init__(self, task_id: str):
+        self.task_id = task_id
+        super().__init__(f"Task {task_id} is not active")
+
+
+def is_valid_task_id(task_id: str) -> bool:
+    try:
+        uuid.UUID(task_id)
+    except ValueError:
+        return False
+    return True
+
+
+async def get_task_data(redis_client: redis.Redis, task_id: str) -> dict[str, Any]:
+    task_data_key = TASKS_DATA.format(task_id=task_id)
+    raw_task_data = await redis_client.hgetall(task_data_key)  # type: ignore
+
+    # Convert bytes keys and values to strings if needed
+    task_data: dict[str, Any] = {}
+    for key, value in raw_task_data.items():
+        # Convert key to string if it's bytes
+        str_key = key.decode("utf-8") if isinstance(key, bytes) else str(key)
+        # Convert value to string if it's bytes
+        str_value = value.decode("utf-8") if isinstance(value, bytes) else value
+        task_data[str_key] = str_value
+
+    return task_data
+
+
+async def get_task_status(redis_client: redis.Redis, task_id: str) -> TaskStatus:
+    if not is_valid_task_id(task_id):
+        raise InvalidTaskIdError(task_id)
+
+    task_status_raw: str | bytes = await redis_client.hget(
+        TASKS_DATA.format(task_id=task_id), "status"
+    )  # type: ignore
+    if not task_status_raw:
+        raise TaskNotFoundError(task_id)
+
+    task_status = (
+        task_status_raw.decode("utf-8")
+        if isinstance(task_status_raw, bytes)
+        else task_status_raw
     )
 
-
-def create_heartbeat_script(redis_client: redis.Redis) -> AsyncScript:
-    """Simple heartbeat update"""
-    return redis_client.register_script(
-        """
-        local processing_heartbeats = KEYS[1]
-        local processing_key = ARGV[1]
-        local timestamp = tonumber(ARGV[2])
-        
-        -- Update heartbeat timestamp
-        redis.call('ZADD', processing_heartbeats, timestamp, processing_key)
-        return true
-        """
-    )
-
-
-def create_steering_script(redis_client: redis.Redis) -> AsyncScript:
-    """
-    Create atomic script for to handle updating a task with steering messages.
-    Updates a task with the updated task json and clears the steering messages.
-    """
-    return redis_client.register_script(
-        """
-        local processing_tasks = KEYS[1]
-        local steering_messages = KEYS[2]
-        local processing_key = ARGV[1]
-        local steering_message_ids = ARGV[2]
-        local updated_task_json = ARGV[3]
-        
-        -- Update task with steering message
-        redis.call('HSET', processing_tasks, processing_key, updated_task_json)
-        -- Delete each steering message
-        for _, id in ipairs(cjson.decode(steering_message_ids)) do
-            redis.call('HDEL', steering_messages, id)
-        end
-        """
-    )
-
-
-def create_task_completion_script(redis_client: redis.Redis) -> AsyncScript:
-    """Create atomic script for handling task completion, continuation, or failure"""
-    return redis_client.register_script(
-        """
-        local main_queue = KEYS[1]
-        local processing_heartbeats = KEYS[2]
-        local processing_tasks = KEYS[3]
-        local failed_queue = KEYS[4]
-        
-        local processing_key = ARGV[1]
-        local action = ARGV[2]  -- "complete", "continue", or "fail"
-        local updated_task_json = ARGV[3]  -- Only used for continue/fail
-        local max_retries = tonumber(ARGV[4])
-        
-        -- Verify the task exists in processing
-        local task_exists = redis.call('HEXISTS', processing_tasks, processing_key)
-        if task_exists == 0 then
-            return {false, "task_not_found"}
-        end
-        
-        -- Always remove from processing structures first
-        redis.call('ZREM', processing_heartbeats, processing_key)
-        redis.call('HDEL', processing_tasks, processing_key)
-        
-        if action == "complete" then
-            -- Task finished successfully
-            return {true, "completed"}
-            
-        elseif action == "continue" then
-            -- Task needs more processing, put back at front of main queue
-            redis.call('LPUSH', main_queue, updated_task_json)
-            return {true, "continued"}
-            
-        elseif action == "fail" then
-            -- Task failed, parse to check retry count
-            local task = cjson.decode(updated_task_json)
-            local retries = task.retries or 0
-            
-            if retries < max_retries then
-                redis.call('LPUSH', main_queue, updated_task_json)
-                return {true, "retried"}
-            else
-                redis.call('LPUSH', failed_queue, updated_task_json)
-                return {true, "failed_permanently"}
-            end
-        else
-            return {false, "invalid_action"}
-        end
-        """
-    )
-
-
-def create_stale_recovery_script(redis_client: redis.Redis) -> AsyncScript:
-    """Create atomic script for recovering stale tasks with retry increment"""
-    return redis_client.register_script(
-        """
-        local main_queue = KEYS[1]
-        local processing_heartbeats = KEYS[2] 
-        local processing_tasks = KEYS[3]
-        local failed_queue = KEYS[4]
-        local cutoff_timestamp = tonumber(ARGV[1])
-        local max_recovery_batch = tonumber(ARGV[2] or 100)
-        local max_retries = tonumber(ARGV[3])
-        
-        -- Get stale processing keys (limited batch to avoid long-running operations)
-        local stale_keys = redis.call('ZRANGEBYSCORE', processing_heartbeats, 0, cutoff_timestamp, 'LIMIT', 0, max_recovery_batch)
-        
-        local recovered_count = 0
-        local failed_count = 0
-        local recovered_tasks = {}
-        
-        for i = 1, #stale_keys do
-            local processing_key = stale_keys[i]
-            
-            -- Atomically check if task data still exists and remove from processing
-            local task_json = redis.call('HGET', processing_tasks, processing_key)
-            
-            if task_json then
-                -- Parse task to check/increment retries
-                local task = cjson.decode(task_json)
-                task.retries = (task.retries or 0) + 1
-                
-                -- Remove from processing structures first (safer order)
-                redis.call('ZREM', processing_heartbeats, processing_key)
-                redis.call('HDEL', processing_tasks, processing_key)
-                
-                -- Route based on retry count
-                if task.retries < max_retries then
-                    -- Re-encode with incremented retry count
-                    local updated_task_json = cjson.encode(task)
-                    redis.call('LPUSH', main_queue, updated_task_json)
-                    recovered_count = recovered_count + 1
-                else
-                    -- Max retries exceeded, send to failed queue
-                    local updated_task_json = cjson.encode(task)
-                    redis.call('LPUSH', failed_queue, updated_task_json)
-                    failed_count = failed_count + 1
-                end
-                
-                -- Add to recovered tasks
-                table.insert(recovered_tasks, processing_key)
-                table.insert(recovered_tasks, task.retries)
-            else
-                -- Task data missing but key exists in sorted set - cleanup
-                redis.call('ZREM', processing_heartbeats, processing_key)
-            end
-        end
-        
-        return {recovered_count, failed_count, recovered_tasks}
-        """
-    )
+    return TaskStatus(task_status)
 
 
 async def enqueue_task(
-    redis_client: redis.Redis, task: Task[Any], agent: BaseAgent[Any]
+    redis_client: redis.Redis, agent: BaseAgent[Any], task: Task[ContextType]
 ) -> None:
-    agent_main_queue = MAIN_QUEUE.format(agent=agent.name)
-    await redis_client.lpush(agent_main_queue, task.to_json())  # type: ignore
+    queue_main_key = QUEUE_MAIN.format(agent=agent.name)
+    tasks_data_key = TASKS_DATA.format(task_id=task.id)
+
+    task.status = TaskStatus.QUEUED
+    task_data = task.to_dict()
+
+    if not is_valid_task_id(task.id):
+        raise InvalidTaskIdError(task.id)
+
+    enqueue_script = create_enqueue_task_script(redis_client)
+    await enqueue_script.execute(
+        queue_main_key=queue_main_key,
+        tasks_data_key=tasks_data_key,
+        task_id=task.id,
+        task_data=json.dumps(task_data),
+    )  # type: ignore
 
 
 async def cancel_task(
@@ -284,8 +229,11 @@ async def cancel_task(
     task_id: str,
 ) -> None:
     """Add a task to the cancellation set"""
-    await redis_client.sadd(CANCELLED_TASKS, task_id)  # type: ignore
-    await redis_client.expire(CANCELLED_TASKS, 60 * 5)  # type: ignore
+    task_status = await get_task_status(redis_client, task_id)
+    if task_status in [TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED]:
+        raise InactiveTaskError(task_id)
+
+    await redis_client.sadd(TASK_CANCELLATIONS, task_id)  # type: ignore
 
 
 async def steer_task(
@@ -294,12 +242,17 @@ async def steer_task(
     messages: list[dict[str, Any]],
 ) -> None:
     """Steer a task"""
-    steering_key = TASK_STEERING.format(task_id=task_id)
+    task_status = await get_task_status(redis_client, task_id)
+    if task_status in [TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED]:
+        raise InactiveTaskError(task_id)
+
+    task_steering_key = TASK_STEERING.format(task_id=task_id)
+    # message id format: {timestamp_ms}_{random_hex} e.g. 1717234200000_a3f4b5c6
     message_mapping = {
         f"{int(time.time() * 1000)}_{secrets.token_hex(3)}": json.dumps(message)
         for message in messages
     }
-    await redis_client.hset(steering_key, mapping=message_mapping)  # type: ignore
+    await redis_client.hset(task_steering_key, mapping=message_mapping)  # type: ignore
 
 
 async def get_steering_messages(
@@ -307,9 +260,17 @@ async def get_steering_messages(
     task_id: str,
 ) -> list[tuple[str, dict[str, Any]]]:
     """Get steering messages for a task"""
+    await get_task_status(redis_client, task_id)  # Raise if task does not exist
+
     steering_key = TASK_STEERING.format(task_id=task_id)
     message_data: list[tuple[str, dict[str, Any]]] = []
-    steering_messages = await redis_client.hgetall(steering_key)  # type: ignore
+    steering_messages = cast(
+        dict[str, str | bytes],
+        await redis_client.hgetall(steering_key),  # type: ignore
+    )
+    if not steering_messages:
+        return []
+
     for message_id, message in steering_messages.items():
         message_id_str = (
             message_id.decode("utf-8") if isinstance(message_id, bytes) else message_id
@@ -320,56 +281,118 @@ async def get_steering_messages(
     return message_data
 
 
+async def complete_async_tool(
+    redis_client: redis.Redis,
+    agent: BaseAgent[Any],
+    task_id: str,
+    tool_call_id: str,
+    result: Any,
+) -> bool:
+    """Complete a tool call"""
+    task_status = await get_task_status(redis_client, task_id)
+    if task_status in [TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED]:
+        raise InactiveTaskError(task_id)
+
+    tasks_key = TASKS_DATA.format(task_id=task_id)
+    tool_results_key = PENDING_TOOL_RESULTS.format(agent=agent.name, task_id=task_id)
+    agent_queue_key = QUEUE_MAIN.format(agent=agent.name)
+
+    task_dict = await get_task_data(redis_client, task_id)
+    if not task_dict:
+        logger.error(f"Failed to process task {task_id}: Task data not found")
+        return False
+
+    try:
+        task = Task.from_dict(task_dict, context_class=agent.context_class)
+    except Exception as e:
+        logger.error(
+            f"Failed to process task {task_id}: Task data is invalid", exc_info=e
+        )
+        return False
+
+    # Set the result
+    await redis_client.hset(tool_results_key, tool_call_id, json.dumps(result))  # type: ignore
+
+    # Get all results and check if any are still pending
+    all_results = cast(
+        dict[str, Any],
+        await redis_client.hgetall(tool_results_key),  # type: ignore
+    )
+    if not all_results:
+        return False
+
+    # Check if any results are still pending (sentinel value)
+    completed_results: list[tuple[str, Any]] = []
+
+    for tcid, result_json in all_results.items():
+        tcid_str = tcid.decode("utf-8") if isinstance(tcid, bytes) else tcid
+        result_str = (
+            result_json.decode("utf-8")
+            if isinstance(result_json, bytes)
+            else result_json
+        )
+
+        if result_str == PENDING_SENTINEL:
+            return False
+        else:
+            completed_results.append((tcid_str, json.loads(result_str)))
+
+    # Update the task context with the completed results
+    updated_context = agent.process_queued_tool_results(
+        task.payload, completed_results
+    ).context
+
+    # Move task back to queue
+    tool_completion_script = create_tool_completion_script(redis_client)
+    success = await tool_completion_script.execute(
+        pending_tool_results_key=tool_results_key,
+        queue_main_key=agent_queue_key,
+        tasks_data_key=tasks_key,
+        task_id=task.id,
+        updated_task_context_json=updated_context.to_json(),
+    )
+
+    if success:
+        return True
+    else:
+        return False
+
+
 async def publish_update(
     redis_client: redis.Redis, owner_id: str, payload: dict[str, Any]
 ) -> None:
-    user_update_channel = UPDATE_CHANNEL.format(owner_id=owner_id)
+    user_update_channel = UPDATES_CHANNEL.format(owner_id=owner_id)
     await redis_client.publish(user_update_channel, json.dumps(payload))  # type: ignore
 
 
 async def get_task_batch(
-    batch_script: AsyncScript,
-    worker_id: str,
+    batch_script: BatchMoveScript,
     agent: BaseAgent[Any],
     batch_size: int,
-) -> tuple[list[tuple[Task[Any], str]], list[Task[Any]]]:
+) -> tuple[list[str], list[str]]:
     """
     Get batch of tasks atomically
 
     Returns:
-        * List of (task, processing_key) tuples
-        * List of tasks to cancel
+        * List of task ids to process
+        * List of task ids to cancel
     """
-    batch_id = secrets.token_hex(3)
-    timestamp = time.time()
-
-    agent_main_queue = MAIN_QUEUE.format(agent=agent.name)
-    agent_processing_heartbeats = PROCESSING_HEARTBEATS.format(agent=agent.name)
-    agent_processing_tasks = PROCESSING_TASKS.format(agent=agent.name)
-    cancelled_tasks = CANCELLED_TASKS
+    task_data_key_template = TASKS_DATA
+    queue_main_key = QUEUE_MAIN.format(agent=agent.name)
+    processing_heartbeats_key = PROCESSING_HEARTBEATS.format(agent=agent.name)
+    task_cancellations_key = TASK_CANCELLATIONS
 
     try:
-        result: tuple[list[str], list[str]] = await batch_script(
-            keys=[
-                agent_main_queue,
-                agent_processing_heartbeats,
-                agent_processing_tasks,
-                cancelled_tasks,
-            ],
-            args=[batch_size, worker_id, batch_id, timestamp],
-        )  # type: ignore
-        if not result:
-            return [], []
+        result: BatchMoveScriptResult = await batch_script.execute(
+            task_data_key_template=task_data_key_template,
+            queue_main_key=queue_main_key,
+            queue_cancelled_key=task_cancellations_key,
+            processing_heartbeats_key=processing_heartbeats_key,
+            task_cancellations_key=task_cancellations_key,
+            batch_size=batch_size,
+        )
 
-        task_jsons, tasks_to_cancel_jsons = result
-        tasks = [agent.deserialize_task(task_json) for task_json in task_jsons]
-        tasks_to_cancel = [
-            agent.deserialize_task(task_json) for task_json in tasks_to_cancel_jsons
-        ]
-        tasks_with_processing_keys = [
-            (task, f"{worker_id}:{batch_id}:{i + 1}") for i, task in enumerate(tasks)
-        ]
-        return tasks_with_processing_keys, tasks_to_cancel
+        return result.tasks_to_process_ids, result.tasks_to_cancel_ids
 
     except Exception as e:
         logger.error(f"Failed to get task batch: {e}")
@@ -378,8 +401,8 @@ async def get_task_batch(
 
 
 async def heartbeat_loop(
-    heartbeat_script: AsyncScript,
-    processing_key: str,
+    redis_client: redis.Redis,
+    task_id: str,
     agent: BaseAgent[Any],
     stop_event: asyncio.Event,
     interval: int,
@@ -390,10 +413,9 @@ async def heartbeat_loop(
     try:
         while not stop_event.is_set():
             try:
-                # Send heartbeat
-                await heartbeat_script(
-                    keys=[agent_heartbeats],
-                    args=[processing_key, time.time()],
+                await redis_client.zadd(
+                    agent_heartbeats,
+                    {task_id: time.time()},
                 )
 
                 # Wait for next interval
@@ -405,26 +427,41 @@ async def heartbeat_loop(
 
             except Exception as e:
                 # Log but don't crash - missing one heartbeat shouldn't kill the task
-                logger.error(f"Heartbeat error for {processing_key}: {e}")
+                logger.error(f"Heartbeat error for {task_id}: {e}")
                 # Small backoff to avoid hammering Redis if it's having issues
                 await asyncio.sleep(0.25 + random.random() * 0.5)
     except asyncio.CancelledError:
         # Task was cancelled, exit cleanly
-        logger.debug(f"Heartbeat loop for {processing_key} cancelled")
+        logger.debug(f"Heartbeat loop for {task_id} cancelled")
         raise
 
 
 async def handle_cancelled_tasks(
     redis_client: redis.Redis,
-    cancelled_tasks: list[Task[Any]],
+    cancelled_task_ids: list[str],
     agent: BaseAgent[Any],
 ) -> None:
     """Send cancellation events for cancelled tasks concurrently"""
 
-    async def handle_single_task(task: Task[Any]) -> None:
+    async def cancel_task(task_id: str) -> None:
+        task_data = await get_task_data(redis_client, task_id)
+        if not task_data:
+            logger.error(
+                f"Failed to complete task cancellation for {task_id}: Task data not found"
+            )
+            return
+
+        try:
+            task = Task.from_dict(task_data, context_class=agent.context_class)
+        except Exception as e:
+            logger.error(
+                f"Failed to process task {task_id}: Task data is invalid", exc_info=e
+            )
+            return
+
         event_publisher = EventPublisher(
             redis_client=redis_client,
-            channel=UPDATE_CHANNEL.format(owner_id=task.owner_id),
+            channel=UPDATES_CHANNEL.format(owner_id=task.owner_id),
         )
 
         try:
@@ -449,36 +486,48 @@ async def handle_cancelled_tasks(
         except Exception as e:
             logger.error(f"Error sending cancellation event for {task.id}", exc_info=e)
 
-    tasks = [handle_single_task(task) for task in cancelled_tasks]
+    tasks = [cancel_task(task_id) for task_id in cancelled_task_ids]
     await asyncio.gather(*tasks)
 
 
 async def process_task(
     redis_client: redis.Redis,
-    task: Task[Any],
-    processing_key: str,
-    heartbeat_script: AsyncScript,
-    completion_script: AsyncScript,
-    steering_script: AsyncScript,
-    agent: BaseAgent[Any],
+    task_id: str,
+    completion_script: TaskCompletionScript,
+    steering_script: TaskSteeringScript,
+    agent: BaseAgent[ContextType],
     max_retries: int,
     heartbeat_interval: int,
     task_timeout: int = 90,
 ) -> None:
     """Process a single task"""
-    logger.info(f"▶️  Task started   {colored(f'[{task.id}]', 'dim')}")
+    logger.info(f"▶️  Task started   {colored(f'[{task_id}]', 'dim')}")
 
-    agent_main_queue = MAIN_QUEUE.format(agent=agent.name)
-    agent_processing_heartbeats = PROCESSING_HEARTBEATS.format(agent=agent.name)
-    agent_processing_tasks = PROCESSING_TASKS.format(agent=agent.name)
-    agent_failed_queue = FAILED_QUEUE.format(agent=agent.name)
-    agent_steering_messages = TASK_STEERING.format(task_id=task.id)
+    tasks_data_key = TASKS_DATA.format(task_id=task_id)
+    queue_main_key = QUEUE_MAIN.format(agent=agent.name)
+    processing_heartbeats_key = PROCESSING_HEARTBEATS.format(agent=agent.name)
+    queue_failed_key = QUEUE_FAILED.format(agent=agent.name)
+    queue_completions_key = QUEUE_COMPLETIONS.format(agent=agent.name)
+    task_steering_key = TASK_STEERING.format(task_id=task_id)
+
+    task_data = await get_task_data(redis_client, task_id)
+    if not task_data:
+        logger.error(f"Failed to process task {task_id}: Task data not found")
+        return
+
+    try:
+        task = Task.from_dict(task_data, context_class=agent.context_class)
+    except Exception as e:
+        logger.error(
+            f"Failed to process task {task_id}: Task data is invalid", exc_info=e
+        )
+        return
 
     stop_heartbeat = asyncio.Event()
     heartbeat_task = asyncio.create_task(
         heartbeat_loop(
-            heartbeat_script=heartbeat_script,
-            processing_key=processing_key,
+            redis_client=redis_client,
+            task_id=task_id,
             agent=agent,
             stop_event=stop_heartbeat,
             interval=heartbeat_interval,
@@ -487,7 +536,7 @@ async def process_task(
 
     event_publisher = EventPublisher(
         redis_client=redis_client,
-        channel=UPDATE_CHANNEL.format(owner_id=task.owner_id),
+        channel=UPDATES_CHANNEL.format(owner_id=task.owner_id),
     )
 
     task_failed = False
@@ -515,7 +564,7 @@ async def process_task(
             task_id=task.id,
         )
 
-        def extract_timestamp(message_tuple):
+        def extract_timestamp(message_tuple: tuple[str, dict[str, Any]]) -> int:
             try:
                 message_id = message_tuple[0]
                 return int(message_id.split("_")[0])
@@ -535,14 +584,13 @@ async def process_task(
             )
 
             try:
-                await steering_script(
-                    keys=[agent_processing_tasks, agent_steering_messages],
-                    args=[
-                        processing_key,
-                        json.dumps(steering_message_ids),
-                        steered_task.to_json(),
-                    ],
-                )  # type: ignore
+                await steering_script.execute(
+                    task_data_key=tasks_data_key,
+                    steering_messages_key=task_steering_key,
+                    steering_message_ids=steering_message_ids,
+                    updated_task_payload_json=steered_task.to_json(),
+                )
+
                 task = steered_task
                 await event_publisher.publish_event(
                     AgentEvent(
@@ -570,15 +618,16 @@ async def process_task(
         )
 
         if turn_completion.is_done:
-            await completion_script(
-                keys=[
-                    agent_main_queue,
-                    agent_processing_heartbeats,
-                    agent_processing_tasks,
-                    agent_failed_queue,
-                ],
-                args=[processing_key, "complete", "", max_retries],
-            )  # type: ignore
+            await completion_script.execute(
+                tasks_data_key=tasks_data_key,
+                processing_heartbeats_key=processing_heartbeats_key,
+                queue_main_key=queue_main_key,
+                queue_completions_key=queue_completions_key,
+                queue_failed_key=queue_failed_key,
+                task_id=task.id,
+                action="complete",
+                updated_task_payload_json=task.payload.to_json(),
+            )
 
             logger.info(f"✅ Task completed {colored(f'[{task.id}]', 'dim')}")
             await event_publisher.publish_event(
@@ -595,15 +644,16 @@ async def process_task(
             task.payload = turn_completion.context
             logger.info(f"⏩ Task continued {colored(f'[{task.id}]', 'dim')}")
 
-            await completion_script(
-                keys=[
-                    agent_main_queue,
-                    agent_processing_heartbeats,
-                    agent_processing_tasks,
-                    agent_failed_queue,
-                ],
-                args=[processing_key, "continue", task.to_json(), max_retries],
-            )  # type: ignore
+            await completion_script.execute(
+                tasks_data_key=tasks_data_key,
+                processing_heartbeats_key=processing_heartbeats_key,
+                queue_main_key=queue_main_key,
+                queue_completions_key=queue_completions_key,
+                queue_failed_key=queue_failed_key,
+                task_id=task.id,
+                action="continue",
+                updated_task_payload_json=task.payload.to_json(),
+            )
 
     except asyncio.TimeoutError:
         task_failed = True
@@ -621,18 +671,17 @@ async def process_task(
             )
         )
 
-        # Increment retry count for timeouts
-        task.retries += 1
-
-        await completion_script(
-            keys=[
-                agent_main_queue,
-                agent_processing_heartbeats,
-                agent_processing_tasks,
-                agent_failed_queue,
-            ],
-            args=[processing_key, "fail", task.to_json(), max_retries],
-        )  # type: ignore
+        action = "fail" if task.retries >= max_retries else "retry"
+        await completion_script.execute(
+            tasks_data_key=tasks_data_key,
+            processing_heartbeats_key=processing_heartbeats_key,
+            queue_main_key=queue_main_key,
+            queue_completions_key=queue_completions_key,
+            queue_failed_key=queue_failed_key,
+            task_id=task.id,
+            action=action,
+            updated_task_payload_json=task.payload.to_json(),
+        )
 
     except Exception as e:
         task_failed = True
@@ -648,18 +697,18 @@ async def process_task(
             )
         )
 
-        # Increment retry count for failures
-        task.retries += 1
+        action = "fail" if task.retries >= max_retries else "retry"
+        await completion_script.execute(
+            tasks_data_key=tasks_data_key,
+            processing_heartbeats_key=processing_heartbeats_key,
+            queue_main_key=queue_main_key,
+            queue_completions_key=queue_completions_key,
+            queue_failed_key=queue_failed_key,
+            task_id=task.id,
+            action=action,
+            updated_task_payload_json=task.payload.to_json(),
+        )
 
-        await completion_script(
-            keys=[
-                agent_main_queue,
-                agent_processing_heartbeats,
-                agent_processing_tasks,
-                agent_failed_queue,
-            ],
-            args=[processing_key, "fail", task.to_json(), max_retries],
-        )  # type: ignore
     finally:
         # Stop heartbeat
         stop_heartbeat.set()
@@ -697,36 +746,33 @@ async def process_task(
 
 
 async def recover_stale_tasks(
-    recovery_script: AsyncScript,
+    recovery_script: StaleRecoveryScript,
     agent: BaseAgent[Any],
     heartbeat_timeout: int,
     max_retries: int,
     batch_size: int,
 ) -> int:
     """Atomically move stale tasks back to main queue"""
-    cutoff = time.time() - heartbeat_timeout
+    cutoff_timestamp = time.time() - heartbeat_timeout
 
-    agent_main_queue = MAIN_QUEUE.format(agent=agent.name)
-    agent_processing_heartbeats = PROCESSING_HEARTBEATS.format(agent=agent.name)
-    agent_processing_tasks = PROCESSING_TASKS.format(agent=agent.name)
-    agent_failed_queue = FAILED_QUEUE.format(agent=agent.name)
+    task_data_key_template = TASKS_DATA
+    queue_main_key = QUEUE_MAIN.format(agent=agent.name)
+    processing_heartbeats_key = PROCESSING_HEARTBEATS.format(agent=agent.name)
+    queue_failed_key = QUEUE_FAILED.format(agent=agent.name)
 
     try:
-        result = cast(
-            tuple[int, int, list[Any]],
-            await recovery_script(
-                keys=[
-                    agent_main_queue,
-                    agent_processing_heartbeats,
-                    agent_processing_tasks,
-                    agent_failed_queue,
-                ],
-                args=[cutoff, batch_size, max_retries],
-            ),
+        result: StaleRecoveryScriptResult = await recovery_script.execute(
+            task_data_key_template=task_data_key_template,
+            queue_main_key=queue_main_key,
+            processing_heartbeats_key=processing_heartbeats_key,
+            queue_failed_key=queue_failed_key,
+            cutoff_timestamp=cutoff_timestamp,
+            max_recovery_batch=batch_size,
+            max_retries=max_retries,
         )
-
-        recovered_count, failed_count, recovered_tasks_flat = result
-
+        recovered_count = result.recovered_count
+        failed_count = result.failed_count
+        stale_task_actions = result.stale_task_actions
         if recovered_count > 0:
             logger.warning(
                 f"⚠️ Found {recovered_count + failed_count} tasks with stale heartbeats (>{heartbeat_timeout}s)"
@@ -740,12 +786,11 @@ async def recover_stale_tasks(
                     f"❌ Moved {failed_count} tasks to failed queue (max retries exceeded)"
                 )
 
-            # Parse the flat list back into key-value pairs
-            for i in range(0, len(recovered_tasks_flat), 2):
-                if i + 1 < len(recovered_tasks_flat):
-                    task_key = recovered_tasks_flat[i]
-                    retries = recovered_tasks_flat[i + 1]
-                    logger.info(colored(f"    [{task_key}]: {retries} retries", "dim"))
+            for task_id, action in stale_task_actions:
+                if action == "recovered":
+                    logger.info(colored(f"    [{task_id}]: recovered", "dim"))
+                elif action == "failed":
+                    logger.error(colored(f"    [{task_id}]: failed", "dim"))
 
         return recovered_count
 
@@ -764,7 +809,7 @@ async def stale_task_monitor(
     interval: int,
 ) -> None:
     """Background task to periodically recover stale tasks"""
-    redis_client = redis.Redis(connection_pool=redis_pool)
+    redis_client = redis.Redis(connection_pool=redis_pool, decode_responses=True)
     recovery_script = create_stale_recovery_script(redis_client)
 
     logger.info(
@@ -823,36 +868,38 @@ async def worker_loop(
     task_timeout: int = 90,
 ) -> None:
     """Main worker loop"""
-    redis_client = redis.Redis(connection_pool=redis_pool)
+    redis_client = redis.Redis(connection_pool=redis_pool, decode_responses=True)
     batch_script = create_batch_move_script(redis_client)
-    heartbeat_script = create_heartbeat_script(redis_client)
     completion_script = create_task_completion_script(redis_client)
-    steering_script = create_steering_script(redis_client)
+    steering_script = create_task_steering_script(redis_client)
 
     logger.info(f"Worker {worker_id} started")
     current_tasks: list[asyncio.Task[Any]] = []
 
     try:
         while not shutdown_event.is_set():
-            batch, tasks_to_cancel = await get_task_batch(
+            task_batch: tuple[list[str], list[str]] = await get_task_batch(
                 batch_script=batch_script,
-                worker_id=worker_id,
                 agent=agent,
                 batch_size=batch_size,
             )
+            tasks_to_process_ids: list[str] = task_batch[0]
+            tasks_to_cancel_ids: list[str] = task_batch[1]
 
-            if batch:
-                logger.info(f"Worker {worker_id} got {len(batch)} tasks")
+            if tasks_to_process_ids:
+                logger.info(
+                    f"Worker {worker_id} got {len(tasks_to_process_ids)} tasks to process"
+                )
 
                 cancel_task = (
                     asyncio.create_task(
                         handle_cancelled_tasks(
                             redis_client=redis_client,
-                            cancelled_tasks=tasks_to_cancel,
+                            cancelled_task_ids=tasks_to_cancel_ids,
                             agent=agent,
                         )
                     )
-                    if tasks_to_cancel
+                    if tasks_to_cancel_ids
                     else None
                 )
 
@@ -860,9 +907,7 @@ async def worker_loop(
                     asyncio.create_task(
                         process_task(
                             redis_client=redis_client,
-                            task=task_data,
-                            processing_key=processing_key,
-                            heartbeat_script=heartbeat_script,
+                            task_id=task_id,
                             completion_script=completion_script,
                             steering_script=steering_script,
                             agent=agent,
@@ -871,7 +916,7 @@ async def worker_loop(
                             task_timeout=task_timeout,
                         )
                     )
-                    for task_data, processing_key in batch
+                    for task_id in tasks_to_process_ids
                 ]
 
                 all_tasks = current_tasks + ([cancel_task] if cancel_task else [])
@@ -885,10 +930,10 @@ async def worker_loop(
                     )
                     break
             else:
-                if tasks_to_cancel:
+                if tasks_to_cancel_ids:
                     await handle_cancelled_tasks(
                         redis_client=redis_client,
-                        cancelled_tasks=tasks_to_cancel,
+                        cancelled_task_ids=tasks_to_cancel_ids,
                         agent=agent,
                     )
 

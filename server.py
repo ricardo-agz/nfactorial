@@ -14,6 +14,7 @@ from starlette.websockets import WebSocket, WebSocketDisconnect
 from agent.context import Task, AgentContext
 from agent.queue import enqueue_task, cancel_task, steer_task
 from agent.agent import DummyAgent, MultiAgent, FreeAgent
+from example_agents.video_gen_agent import VideoGenAgent
 from agent.logging import get_logger
 
 logger = get_logger("server")
@@ -30,6 +31,7 @@ async def lifespan(app: FastAPI):
         host=os.getenv("REDIS_HOST", "localhost"),
         port=6379,
         db=0,
+        decode_responses=True,
     )
 
     try:
@@ -79,7 +81,7 @@ async def websocket_updates(websocket: WebSocket, user_id: str):
                 timeout=WS_REDIS_SUB_TIMEOUT,
             )
             if msg and msg["type"] == "message":
-                await websocket.send_text(msg["data"].decode())
+                await websocket.send_text(msg["data"])
     except WebSocketDisconnect:
         logger.info(f"WebSocket disconnected for user_id={user_id}")
     finally:
@@ -114,21 +116,19 @@ class SteerRequest(BaseModel):
 
 @app.post("/api/enqueue")
 async def enqueue(request: EnqueueRequest):
-    task = Task(
-        id=str(uuid.uuid4()),
+    # agent = DummyAgent()
+    # agent = MultiAgent()
+    agent = FreeAgent()
+    # agent = VideoGenAgent()
+
+    task = agent.create_task(
         owner_id=request.user_id,
-        retries=0,
-        created_at=datetime.utcnow(),
         payload=AgentContext(
             messages=request.message_history,
             query=request.query,
             turn=0,
         ),
     )
-
-    # agent = DummyAgent()
-    # agent = MultiAgent()
-    agent = FreeAgent()
 
     await enqueue_task(redis_client=redis_client, task=task, agent=agent)
     return {"task_id": task.id}

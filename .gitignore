@@ -58,3 +58,5 @@ ui/public/media/
 # FastAPI-specific files
 fastapi.log
 uvicorn.log
+
+example_agents/

@@ -1,3 +1,4 @@
+import json
 import re
 from typing import Any
 from pydantic import BaseModel
@@ -25,3 +26,7 @@ def serialize_data(data: Any) -> Any:
         return data.to_dict()
     else:
         return str(data)
+
+
+def decode(data: bytes | str) -> str:
+    return data.decode("utf-8") if isinstance(data, bytes) else data

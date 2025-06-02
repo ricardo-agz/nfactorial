@@ -22,15 +22,20 @@ from agent.scripts import (
     TaskSteeringScript,
     TaskCompletionScript,
     StaleRecoveryScript,
+    GarbageCollectionScript,
     create_batch_move_script,
     create_task_steering_script,
     create_task_completion_script,
     create_stale_recovery_script,
+    create_garbage_collection_script,
     create_tool_completion_script,
     create_enqueue_task_script,
     BatchMoveScriptResult,
     StaleRecoveryScriptResult,
+    GarbageCollectionScriptResult,
 )
+from agent.utils import decode
+
 
 logger = get_logger("agent.queue")
 
@@ -170,16 +175,14 @@ def is_valid_task_id(task_id: str) -> bool:
 
 async def get_task_data(redis_client: redis.Redis, task_id: str) -> dict[str, Any]:
     task_data_key = TASKS_DATA.format(task_id=task_id)
-    raw_task_data = await redis_client.hgetall(task_data_key)  # type: ignore
+    raw_task_data = cast(
+        dict[str | bytes, str | bytes],
+        await redis_client.hgetall(task_data_key),  # type: ignore
+    )
 
-    # Convert bytes keys and values to strings if needed
-    task_data: dict[str, Any] = {}
-    for key, value in raw_task_data.items():
-        # Convert key to string if it's bytes
-        str_key = key.decode("utf-8") if isinstance(key, bytes) else str(key)
-        # Convert value to string if it's bytes
-        str_value = value.decode("utf-8") if isinstance(value, bytes) else value
-        task_data[str_key] = str_value
+    task_data: dict[str, Any] = {
+        decode(key): decode(value) for key, value in raw_task_data.items()
+    }
 
     return task_data
 
@@ -194,12 +197,7 @@ async def get_task_status(redis_client: redis.Redis, task_id: str) -> TaskStatus
     if not task_status_raw:
         raise TaskNotFoundError(task_id)
 
-    task_status = (
-        task_status_raw.decode("utf-8")
-        if isinstance(task_status_raw, bytes)
-        else task_status_raw
-    )
-
+    task_status = decode(task_status_raw)
     return TaskStatus(task_status)
 
 
@@ -265,17 +263,15 @@ async def get_steering_messages(
     steering_key = TASK_STEERING.format(task_id=task_id)
     message_data: list[tuple[str, dict[str, Any]]] = []
     steering_messages = cast(
-        dict[str, str | bytes],
+        dict[str | bytes, str | bytes],
         await redis_client.hgetall(steering_key),  # type: ignore
     )
     if not steering_messages:
         return []
 
     for message_id, message in steering_messages.items():
-        message_id_str = (
-            message_id.decode("utf-8") if isinstance(message_id, bytes) else message_id
-        )
-        message_str = message.decode("utf-8") if isinstance(message, bytes) else message
+        message_id_str = decode(message_id)
+        message_str = decode(message)
         message_data.append((message_id_str, json.loads(message_str)))
 
     return message_data
@@ -315,7 +311,7 @@ async def complete_async_tool(
 
     # Get all results and check if any are still pending
     all_results = cast(
-        dict[str, Any],
+        dict[str | bytes, str | bytes],
         await redis_client.hgetall(tool_results_key),  # type: ignore
     )
     if not all_results:
@@ -325,12 +321,8 @@ async def complete_async_tool(
     completed_results: list[tuple[str, Any]] = []
 
     for tcid, result_json in all_results.items():
-        tcid_str = tcid.decode("utf-8") if isinstance(tcid, bytes) else tcid
-        result_str = (
-            result_json.decode("utf-8")
-            if isinstance(result_json, bytes)
-            else result_json
-        )
+        tcid_str = decode(tcid)
+        result_str = decode(result_json)
 
         if result_str == PENDING_SENTINEL:
             return False
@@ -381,12 +373,13 @@ async def get_task_batch(
     queue_main_key = QUEUE_MAIN.format(agent=agent.name)
     processing_heartbeats_key = PROCESSING_HEARTBEATS.format(agent=agent.name)
     task_cancellations_key = TASK_CANCELLATIONS
+    queue_cancelled_key = QUEUE_CANCELLED.format(agent=agent.name)
 
     try:
         result: BatchMoveScriptResult = await batch_script.execute(
             task_data_key_template=task_data_key_template,
             queue_main_key=queue_main_key,
-            queue_cancelled_key=task_cancellations_key,
+            queue_cancelled_key=queue_cancelled_key,
             processing_heartbeats_key=processing_heartbeats_key,
             task_cancellations_key=task_cancellations_key,
             batch_size=batch_size,
@@ -799,7 +792,63 @@ async def recover_stale_tasks(
         return 0
 
 
-async def stale_task_monitor(
+async def garbage_collect_expired_tasks(
+    garbage_collection_script: GarbageCollectionScript,
+    agent: BaseAgent[Any],
+    task_ttl_config: Any,  # Will be TaskTTLConfig from manager.py
+    max_cleanup_batch: int,
+) -> int:
+    """Atomically remove expired tasks from completion, failed, and cancelled queues"""
+    current_time = time.time()
+
+    # Calculate cutoff timestamps for each queue
+    completed_cutoff = current_time - task_ttl_config.completed_ttl
+    failed_cutoff = current_time - task_ttl_config.failed_ttl
+    cancelled_cutoff = current_time - task_ttl_config.cancelled_ttl
+
+    task_data_key_template = TASKS_DATA
+    queue_completions_key = QUEUE_COMPLETIONS.format(agent=agent.name)
+    queue_failed_key = QUEUE_FAILED.format(agent=agent.name)
+    queue_cancelled_key = QUEUE_CANCELLED.format(agent=agent.name)
+
+    try:
+        result: GarbageCollectionScriptResult = await garbage_collection_script.execute(
+            task_data_key_template=task_data_key_template,
+            queue_completions_key=queue_completions_key,
+            queue_failed_key=queue_failed_key,
+            queue_cancelled_key=queue_cancelled_key,
+            completed_cutoff_timestamp=completed_cutoff,
+            failed_cutoff_timestamp=failed_cutoff,
+            cancelled_cutoff_timestamp=cancelled_cutoff,
+            max_cleanup_batch=max_cleanup_batch,
+        )
+
+        total_cleaned = (
+            result.completed_cleaned + result.failed_cleaned + result.cancelled_cleaned
+        )
+
+        if total_cleaned > 0:
+            logger.info(
+                f"🗑️  Garbage collected {total_cleaned} expired tasks "
+                f"(completed: {result.completed_cleaned}, "
+                f"failed: {result.failed_cleaned}, "
+                f"cancelled: {result.cancelled_cleaned})"
+            )
+
+            # Log details of cleaned tasks
+            for queue_type, task_id in result.cleaned_task_details:
+                logger.debug(
+                    colored(f"    [{task_id}]: cleaned from {queue_type} queue", "dim")
+                )
+
+        return total_cleaned
+
+    except Exception as e:
+        logger.error(f"Error during garbage collection: {e}")
+        return 0
+
+
+async def maintenance_loop(
     shutdown_event: asyncio.Event,
     redis_pool: redis.ConnectionPool,
     agent: BaseAgent[Any],
@@ -807,13 +856,16 @@ async def stale_task_monitor(
     max_retries: int,
     batch_size: int,
     interval: int,
+    task_ttl_config: Any,  # Will be TaskTTLConfig from manager.py
+    max_cleanup_batch: int,
 ) -> None:
-    """Background task to periodically recover stale tasks"""
+    """Background maintenance worker to periodically recover stale tasks and clean up expired tasks"""
     redis_client = redis.Redis(connection_pool=redis_pool, decode_responses=True)
     recovery_script = create_stale_recovery_script(redis_client)
+    garbage_collection_script = create_garbage_collection_script(redis_client)
 
     logger.info(
-        f"Stale task monitor started (checking every {interval}s for heartbeats >{heartbeat_timeout}s old)"
+        f"Maintenance worker started (checking every {interval}s for stale tasks >{heartbeat_timeout}s old and cleaning expired tasks)"
     )
 
     try:
@@ -825,6 +877,14 @@ async def stale_task_monitor(
                     heartbeat_timeout=heartbeat_timeout,
                     max_retries=max_retries,
                     batch_size=batch_size,
+                )
+
+                # Then, garbage collect expired finished tasks
+                await garbage_collect_expired_tasks(
+                    garbage_collection_script=garbage_collection_script,
+                    agent=agent,
+                    task_ttl_config=task_ttl_config,
+                    max_cleanup_batch=max_cleanup_batch,
                 )
 
                 # Wait before next check, but allow early exit on shutdown
@@ -839,7 +899,7 @@ async def stale_task_monitor(
                     continue  # Normal timeout, continue monitoring
 
             except Exception as e:
-                logger.error(f"Error in stale task monitor: {e}")
+                logger.error(f"Error in maintenance worker: {e}")
                 # Wait a bit before retrying to avoid tight error loops
                 try:
                     await asyncio.wait_for(
@@ -850,11 +910,11 @@ async def stale_task_monitor(
                     continue
 
     except asyncio.CancelledError:
-        logger.info("Stale task monitor cancelled")
+        logger.info("Maintenance worker cancelled")
         raise
     finally:
         await redis_client.close()
-        logger.info("Stale task monitor finished")
+        logger.info("Maintenance worker finished")
 
 
 async def worker_loop(

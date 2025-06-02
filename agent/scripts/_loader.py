@@ -280,6 +280,92 @@ def create_stale_recovery_script(redis_client: redis.Redis) -> StaleRecoveryScri
     return get_cached_script(redis_client, "stale_recovery", StaleRecoveryScript)
 
 
+@dataclass
+class GarbageCollectionScriptResult:
+    """Result of the garbage collection script"""
+
+    completed_cleaned: int
+    failed_cleaned: int
+    cancelled_cleaned: int
+    cleaned_task_details: list[tuple[str, str]]  # [(queue_type, task_id), ...]
+
+
+class GarbageCollectionScript(AsyncScript):
+    """
+    Handles garbage collection of expired tasks from completion, failed, and cancelled queues
+
+    Keys:
+    * KEYS[1] = task_data_key_template (str)
+    * KEYS[2] = queue_completions_key (str)
+    * KEYS[3] = queue_failed_key (str)
+    * KEYS[4] = queue_cancelled_key (str)
+
+    Args:
+    * ARGV[1] = completed_cutoff_timestamp (float)
+    * ARGV[2] = failed_cutoff_timestamp (float)
+    * ARGV[3] = cancelled_cutoff_timestamp (float)
+    * ARGV[4] = max_cleanup_batch (int)
+    """
+
+    async def execute(
+        self,
+        *,
+        task_data_key_template: str,
+        queue_completions_key: str,
+        queue_failed_key: str,
+        queue_cancelled_key: str,
+        completed_cutoff_timestamp: float,
+        failed_cutoff_timestamp: float,
+        cancelled_cutoff_timestamp: float,
+        max_cleanup_batch: int,
+    ) -> GarbageCollectionScriptResult:
+        result: tuple[int, int, int, list[tuple[str, str]]] = await super().__call__(  # type: ignore
+            keys=[
+                task_data_key_template,
+                queue_completions_key,
+                queue_failed_key,
+                queue_cancelled_key,
+            ],
+            args=[
+                completed_cutoff_timestamp,
+                failed_cutoff_timestamp,
+                cancelled_cutoff_timestamp,
+                max_cleanup_batch,
+            ],
+        )
+
+        # Ensure task details are strings, handling potential bytes objects
+        cleaned_task_details = [
+            (
+                (
+                    queue_type.decode("utf-8")
+                    if isinstance(queue_type, bytes)
+                    else str(queue_type)
+                ),
+                task_id.decode("utf-8") if isinstance(task_id, bytes) else str(task_id),
+            )
+            for queue_type, task_id in result[3]
+        ]
+
+        return GarbageCollectionScriptResult(
+            completed_cleaned=result[0],
+            failed_cleaned=result[1],
+            cancelled_cleaned=result[2],
+            cleaned_task_details=cleaned_task_details,
+        )
+
+
+def create_garbage_collection_script(
+    redis_client: redis.Redis,
+) -> GarbageCollectionScript:
+    """
+    Creates an atomic script for garbage collection of expired tasks
+    """
+    return get_cached_script(
+        redis_client, "garbage_collection", GarbageCollectionScript
+    )
+
+
 class ToolCompletionScript(AsyncScript):
     """
     Simple atomic script to move completed task back to queue and cleanup

@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import asyncio
 import os
 import signal
@@ -6,7 +6,7 @@ import redis.asyncio as redis
 from typing import Any
 
 from agent.agent import BaseAgent
-from agent.queue import enqueue_task, worker_loop, stale_task_monitor
+from agent.queue import enqueue_task, worker_loop, maintenance_loop
 from agent.llms import MultiClient
 from agent.utils import to_snake_case
 from agent.logging import get_logger
@@ -26,9 +26,22 @@ class AgentWorkerConfig:
 
 
 @dataclass
-class RecoveryWorkerConfig:
+class TaskTTLConfig:
+    """TTL configuration for finished tasks (in seconds)"""
+
+    completed_ttl: int = 3600  # 1 hour for completed tasks
+    failed_ttl: int = 86400  # 24 hours for failed tasks (longer for debugging)
+    cancelled_ttl: int = 1800  # 30 minutes for cancelled tasks
+
+
+@dataclass
+class MaintenanceWorkerConfig:
+    """Configuration for the maintenance worker that handles both stale recovery and garbage collection"""
+
     interval: int = 10
     workers: int = 1
+    task_ttl: TaskTTLConfig = field(default_factory=TaskTTLConfig)
+    max_cleanup_batch: int = 100  # Maximum tasks to clean up per queue per run
 
 
 class AgentRunner:
@@ -38,7 +51,7 @@ class AgentRunner:
         llm_client: MultiClient,
         agent: BaseAgent[Any],
         agent_worker_config: AgentWorkerConfig,
-        recovery_worker_config: RecoveryWorkerConfig,
+        maintenance_worker_config: MaintenanceWorkerConfig,
     ):
         self.shutdown_event = asyncio.Event()
         self.redis_pool = redis_pool
@@ -46,7 +59,7 @@ class AgentRunner:
         self.agent = agent
         self.queue = to_snake_case(agent.__class__.__name__)
         self.agent_worker_config = agent_worker_config
-        self.recovery_worker_config = recovery_worker_config
+        self.maintenance_worker_config = maintenance_worker_config
 
     def set_shutdown_event(self, shutdown_event: asyncio.Event):
         self.shutdown_event = shutdown_event
@@ -70,7 +83,7 @@ class AgentRunner:
             for i in range(self.agent_worker_config.workers)
         ] + [
             asyncio.create_task(
-                stale_task_monitor(
+                maintenance_loop(
                     shutdown_event=shutdown_event,
                     redis_pool=self.redis_pool,
                     agent=self.agent,
@@ -79,10 +92,12 @@ class AgentRunner:
                     + self.agent_worker_config.missed_heartbeats_grace_period,
                     max_retries=self.agent_worker_config.max_retries,
                     batch_size=self.agent_worker_config.batch_size,
-                    interval=self.recovery_worker_config.interval,
+                    interval=self.maintenance_worker_config.interval,
+                    task_ttl_config=self.maintenance_worker_config.task_ttl,
+                    max_cleanup_batch=self.maintenance_worker_config.max_cleanup_batch,
                 )
             )
-            for _ in range(self.recovery_worker_config.workers)
+            for _ in range(self.maintenance_worker_config.workers)
         ]
 
 
@@ -120,14 +135,14 @@ class ControlPlane:
         self,
         agent: BaseAgent[Any],
         agent_worker_config: AgentWorkerConfig,
-        recovery_worker_config: RecoveryWorkerConfig,
+        maintenance_worker_config: MaintenanceWorkerConfig,
     ):
         runner = AgentRunner(
             redis_pool=self.redis_pool,
             llm_client=self.llm_client,
             agent=agent,
             agent_worker_config=agent_worker_config,
-            recovery_worker_config=recovery_worker_config,
+            maintenance_worker_config=maintenance_worker_config,
         )
 
         runner.set_shutdown_event(self.shutdown_event)

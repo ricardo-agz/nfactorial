@@ -3,7 +3,8 @@ import os
 from agent.manager import (
     ControlPlane,
     AgentWorkerConfig,
-    RecoveryWorkerConfig,
+    MaintenanceWorkerConfig,
+    TaskTTLConfig,
 )
 from agent.agent import DummyAgent, FreeAgent
 from example_agents.video_gen_agent import VideoGenAgent
@@ -33,9 +34,14 @@ if __name__ == "__main__":
             missed_heartbeats_grace_period=1,
             turn_timeout=90,
         ),
-        recovery_worker_config=RecoveryWorkerConfig(
+        maintenance_worker_config=MaintenanceWorkerConfig(
             workers=1,
             interval=5,
+            task_ttl=TaskTTLConfig(
+                failed_ttl=90,
+                completed_ttl=60,
+                cancelled_ttl=30,
+            )
         ),
     )
 

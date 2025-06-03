@@ -65,9 +65,7 @@ TASK_CANCELLATIONS = "cancel:pending"
 TASK_STEERING = "steer:{task_id}:messages"
 
 # ===== PENDING TOOL EXECUTION =====
-# HASH: tool_call_id -> input_schema_json
-PENDING_TOOL_INPUTS = "tool:{agent}:{task_id}:inputs"
-# HASH: tool_call_id -> result_json
+# HASH: tool_call_id -> result_json or <|PENDING|>
 PENDING_TOOL_RESULTS = "tool:{agent}:{task_id}:results"
 
 # ===== COMMUNICATION =====
@@ -330,7 +328,7 @@ async def complete_async_tool(
             completed_results.append((tcid_str, json.loads(result_str)))
 
     # Update the task context with the completed results
-    updated_context = agent.process_queued_tool_results(
+    updated_context = agent.process_long_running_tool_results(
         task.payload, completed_results
     ).context
 
@@ -502,6 +500,9 @@ async def process_task(
     queue_failed_key = QUEUE_FAILED.format(agent=agent.name)
     queue_completions_key = QUEUE_COMPLETIONS.format(agent=agent.name)
     task_steering_key = TASK_STEERING.format(task_id=task_id)
+    pending_tool_results_key = PENDING_TOOL_RESULTS.format(
+        agent=agent.name, task_id=task_id
+    )
 
     task_data = await get_task_data(redis_client, task_id)
     if not task_data:
@@ -610,13 +611,43 @@ async def process_task(
             timeout=task_timeout,
         )
 
-        if turn_completion.is_done:
+        if turn_completion.pending_tool_call_ids:
             await completion_script.execute(
                 tasks_data_key=tasks_data_key,
                 processing_heartbeats_key=processing_heartbeats_key,
                 queue_main_key=queue_main_key,
                 queue_completions_key=queue_completions_key,
                 queue_failed_key=queue_failed_key,
+                pending_tool_results_key=pending_tool_results_key,
+                task_id=task.id,
+                action="pending_tool_call_results",
+                updated_task_payload_json=task.payload.to_json(),
+                pending_tool_call_result_sentinel=PENDING_SENTINEL,
+                pending_tool_call_ids_json=json.dumps(
+                    turn_completion.pending_tool_call_ids
+                ),
+            )
+
+            logger.info(
+                f"⏳ Task awaiting tool results {colored(f'[{task.id}]', 'dim')}"
+            )
+            await event_publisher.publish_event(
+                AgentEvent(
+                    event_type="task_pending_tool_call_results",
+                    task_id=task.id,
+                    owner_id=task.owner_id,
+                    agent_name=agent.name,
+                )
+            )
+
+        elif turn_completion.is_done:
+            await completion_script.execute(
+                tasks_data_key=tasks_data_key,
+                processing_heartbeats_key=processing_heartbeats_key,
+                queue_main_key=queue_main_key,
+                queue_completions_key=queue_completions_key,
+                queue_failed_key=queue_failed_key,
+                pending_tool_results_key=pending_tool_results_key,
                 task_id=task.id,
                 action="complete",
                 updated_task_payload_json=task.payload.to_json(),
@@ -643,6 +674,7 @@ async def process_task(
                 queue_main_key=queue_main_key,
                 queue_completions_key=queue_completions_key,
                 queue_failed_key=queue_failed_key,
+                pending_tool_results_key=pending_tool_results_key,
                 task_id=task.id,
                 action="continue",
                 updated_task_payload_json=task.payload.to_json(),
@@ -671,6 +703,7 @@ async def process_task(
             queue_main_key=queue_main_key,
             queue_completions_key=queue_completions_key,
             queue_failed_key=queue_failed_key,
+            pending_tool_results_key=pending_tool_results_key,
             task_id=task.id,
             action=action,
             updated_task_payload_json=task.payload.to_json(),
@@ -697,6 +730,7 @@ async def process_task(
             queue_main_key=queue_main_key,
             queue_completions_key=queue_completions_key,
             queue_failed_key=queue_failed_key,
+            pending_tool_results_key=pending_tool_results_key,
             task_id=task.id,
             action=action,
             updated_task_payload_json=task.payload.to_json(),

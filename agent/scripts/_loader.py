@@ -173,11 +173,14 @@ class TaskCompletionScript(AsyncScript):
     * KEYS[3] = queue_main_key (str)
     * KEYS[4] = queue_completions_key (str)
     * KEYS[5] = queue_failed_key (str)
+    * KEYS[6] = pending_tool_results_key (str)
 
     Args:
     * ARGV[1] = task_id (str)
     * ARGV[2] = action (str)
     * ARGV[3] = updated_task_payload_json (str)
+    * ARGV[4] = pending_tool_call_result_sentinel (str)
+    * ARGV[5] = pending_tool_call_ids_json (str)
     """
 
     async def execute(
@@ -188,10 +191,30 @@ class TaskCompletionScript(AsyncScript):
         queue_main_key: str,
         queue_completions_key: str,
         queue_failed_key: str,
+        pending_tool_results_key: str,
         task_id: str,
         action: str,
         updated_task_payload_json: str,
+        pending_tool_call_result_sentinel: str | None = None,
+        pending_tool_call_ids_json: str | None = None,
     ) -> bool:
+        args = [
+            task_id,
+            action,
+            updated_task_payload_json,
+        ]
+
+        if (
+            pending_tool_call_result_sentinel is not None
+            and pending_tool_call_ids_json is not None
+        ):
+            args.append(pending_tool_call_result_sentinel)
+            args.append(pending_tool_call_ids_json)
+        elif pending_tool_call_ids_json is not None:
+            raise ValueError(
+                "pending_tool_call_result_sentinel must be provided if pending_tool_call_ids_json is provided"
+            )
+
         return await super().__call__(  # type: ignore
             keys=[
                 tasks_data_key,
@@ -199,8 +222,9 @@ class TaskCompletionScript(AsyncScript):
                 queue_main_key,
                 queue_completions_key,
                 queue_failed_key,
+                pending_tool_results_key,
             ],
-            args=[task_id, action, updated_task_payload_json],
+            args=args,
         )
 
 

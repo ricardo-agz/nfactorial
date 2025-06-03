@@ -116,9 +116,9 @@ class SteerRequest(BaseModel):
 
 @app.post("/api/enqueue")
 async def enqueue(request: EnqueueRequest):
-    # agent = DummyAgent()
+    agent = DummyAgent()
     # agent = MultiAgent()
-    agent = FreeAgent()
+    # agent = FreeAgent()
     # agent = VideoGenAgent()
 
     task = agent.create_task(

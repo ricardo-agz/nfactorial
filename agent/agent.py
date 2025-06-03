@@ -66,6 +66,21 @@ RETRYABLE_EXCEPTIONS = (
 )
 
 
+def deferred_result(
+    timeout: float,
+) -> Callable[[Callable[..., Awaitable[T]]], Callable[..., Awaitable[T]]]:
+    def decorator(func: Callable[..., Awaitable[T]]) -> Callable[..., Awaitable[T]]:
+        @wraps(func)
+        async def wrapper(*args: Any, **kwargs: Any) -> T:
+            return await func(*args, **kwargs)
+
+        wrapper.deferred_result = True  # type: ignore
+        wrapper.timeout = timeout  # type: ignore
+        return wrapper
+
+    return decorator
+
+
 def requires_input(
     input_schema: type[BaseModel],
 ) -> Callable[[Callable[..., Awaitable[T]]], Callable[..., Awaitable[T]]]:
@@ -79,12 +94,6 @@ def requires_input(
         return wrapper
 
     return decorator
-
-
-class ToolActionResponse(BaseModel):
-    tool_call: ChatCompletionMessageToolCall
-    output_str: str
-    output_data: Any
 
 
 @dataclass
@@ -215,7 +224,7 @@ class TurnCompletion(Generic[ContextType]):
     is_done: bool
     context: ContextType
     output: Any = None
-    pending_on: list[PendingInput] = field(default_factory=list)
+    pending_tool_call_ids: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -235,6 +244,19 @@ class ResolvedModelSettings(Generic[ContextT]):
     tool_choice: str | dict[str, Any] | None
     parallel_tool_calls: bool | None
     max_completion_tokens: int | None
+
+
+class ToolActionResult(BaseModel):
+    output_str: str
+    output_data: Any
+    tool_call: ChatCompletionMessageToolCall | None = None
+    pending_result: bool = False
+
+
+@dataclass
+class ToolExecutionResults:
+    new_messages: list[dict[str, Any]]
+    pending_tool_call_ids: list[str]
 
 
 def create_final_output_tool(output_type: type[BaseModel]) -> dict[str, Any]:
@@ -352,18 +374,24 @@ class BaseAgent(Generic[ContextType]):
         self,
         tool_call: ChatCompletionMessageToolCall,
         agent_ctx: ContextType,
-    ) -> ToolActionResponse:
+    ) -> ToolActionResult:
         """Execute a tool action. Override to customize."""
         tool_name = tool_call.function.name
         tool_args = tool_call.function.arguments
-        action = self.tool_actions[tool_name]
+        action = self.tool_actions.get(tool_name)
+
+        if not action:
+            raise ValueError(f"Agent {self.name} has no tool action for {tool_name}")
+
+        is_deferred_result = getattr(action, "deferred_result", False)
 
         if not self.parse_tool_args:
-            output_str, output_data = (
+            result = (
                 await action(tool_args, agent_ctx)
                 if asyncio.iscoroutinefunction(action)
                 else action(tool_args, agent_ctx)
             )
+
         else:
             parsed_tool_args = json.loads(tool_args)
 
@@ -384,32 +412,57 @@ class BaseAgent(Generic[ContextType]):
                     parsed_tool_args[param_name] = agent_ctx
                     break
 
-            output_str, output_data = (
+            result = (
                 await action(**parsed_tool_args)
                 if asyncio.iscoroutinefunction(action)
                 else action(**parsed_tool_args)
             )
 
-        return ToolActionResponse(
-            tool_call=tool_call, output_str=output_str, output_data=output_data
-        )
+        if isinstance(result, ToolActionResult):
+            result.tool_call = tool_call
+            result.pending_result = is_deferred_result
+            return result
+        else:
+            if (
+                isinstance(result, tuple)
+                and len(cast(tuple[Any, ...], result)) == 2
+                and isinstance(result[0], str)
+            ):
+                result = cast(tuple[str, Any], result)
+                output_str, output_data = result
+            elif result is None:
+                output_str = ""
+                output_data = None
+            else:
+                result = cast(Any, result)
+                output_str = str(result)
+                output_data = result
 
-    def format_tool_result(self, tool_call_id: str, result: Any) -> str:
+            return ToolActionResult(
+                tool_call=tool_call,
+                output_str=output_str,
+                output_data=output_data,
+                pending_result=is_deferred_result,
+            )
+
+    def format_tool_result(
+        self, tool_call_id: str, result: Any | ToolActionResult | Exception
+    ) -> str:
         if isinstance(result, Exception):
             return f'<tool_call_error tool="{tool_call_id}">\nError running tool:\n{result}\n</tool_call_error>'
-        elif isinstance(result, tuple):
-            return f'<tool_call_result tool="{tool_call_id}">\n{result[0]}\n</tool_call_result>'
+        elif isinstance(result, ToolActionResult):
+            return f'<tool_call_result tool="{tool_call_id}">\n{result.output_str}\n</tool_call_result>'
         else:
-            return f'<tool_call_result tool="{tool_call_id}">\n{result}\n</tool_call_result>'
+            return f'<tool_call_result tool="{tool_call_id}">\n{str(result)}\n</tool_call_result>'
 
     async def execute_tools(
         self,
-        messages: list[dict[str, Any]],
         tool_calls: list[ChatCompletionMessageToolCall],
         agent_ctx: ContextType,
-    ) -> list[dict[str, Any]]:
+    ) -> ToolExecutionResults:
         """Execute tool calls and add results to messages"""
-        updated_messages = messages.copy()
+        new_messages: list[dict[str, Any]] = []
+        pending_tool_call_ids: list[str] = []
 
         # Run tools in parallel
         tasks = [
@@ -427,13 +480,18 @@ class BaseAgent(Generic[ContextType]):
                 logger.error(
                     f"Tool {tc.function.name} failed: {result}", exc_info=result
                 )
+            elif isinstance(result, ToolActionResult) and result.pending_result:
+                pending_tool_call_ids.append(tc.id)
+            else:
+                content = self.format_tool_result(tc.id, result)
+                new_messages.append(
+                    {"role": "tool", "tool_call_id": tc.id, "content": content}
+                )
 
-            content = self.format_tool_result(tc.id, result)
-            updated_messages.append(
-                {"role": "tool", "tool_call_id": tc.id, "content": content}
-            )
-
-        return updated_messages
+        return ToolExecutionResults(
+            new_messages=new_messages,
+            pending_tool_call_ids=pending_tool_call_ids,
+        )
 
     async def run_turn(
         self,
@@ -471,19 +529,27 @@ class BaseAgent(Generic[ContextType]):
             )
 
         # Handle tool calls and append results to messages
+        pending_tool_call_ids: list[str] = []
         if response.choices[0].message.tool_calls:
-            messages = await self.execute_tools(
-                messages,
+            results = await self.execute_tools(
                 response.choices[0].message.tool_calls,
                 agent_ctx,
             )
+            messages += results.new_messages
+            pending_tool_call_ids += results.pending_tool_call_ids
 
         agent_ctx.messages = messages
         agent_ctx.turn += 1
-        return TurnCompletion(is_done=False, context=agent_ctx)
+        return TurnCompletion(
+            is_done=False,
+            context=agent_ctx,
+            pending_tool_call_ids=pending_tool_call_ids,
+        )
 
-    def process_queued_tool_results(
-        self, agent_ctx: ContextType, tool_call_results: list[tuple[str, Any]]
+    def process_long_running_tool_results(
+        self,
+        agent_ctx: ContextType,
+        tool_call_results: list[tuple[str, Any]],
     ) -> TurnCompletion[ContextType]:
         updated_messages = agent_ctx.messages.copy()
         for tool_call_id, result in tool_call_results:
@@ -615,7 +681,7 @@ class BaseAgent(Generic[ContextType]):
         self,
         tool_call: ChatCompletionMessageToolCall,
         agent_ctx: ContextType,
-    ) -> ToolActionResponse:
+    ) -> ToolActionResult:
         """Internal method that wraps tool_action with retry and progress publishing"""
         return await self.tool_action(tool_call, agent_ctx)
 
@@ -806,7 +872,7 @@ class DummyAgent(Agent):
                         "function": {"name": "plan"},
                     }
                     if context.turn == 0
-                    else "auto"
+                    else "required"
                 ),
             ),
             output_type=FinalOutput,
@@ -1127,7 +1193,7 @@ class MultiAgent(BaseAgent[MultiAgentContext]):
         self,
         tool_call: ChatCompletionMessageToolCall,
         agent_ctx: MultiAgentContext,
-    ) -> ToolActionResponse:
+    ) -> ToolActionResult:
         # Custom logic for multi-agent tool execution could go here
         return await super().tool_action(tool_call, agent_ctx)
 
@@ -1144,27 +1210,3 @@ class MultiAgent(BaseAgent[MultiAgentContext]):
                 "message_count": len(sub_ctx.messages),
             }
         return status
-
-
-# Example usage:
-"""
-# Create sub-agents
-spanish_agent = SpanishAgent()
-english_agent = EnglishAgent()
-
-# Create multi-agent
-multi_agent = MultiAgent([spanish_agent, english_agent])
-
-# Create context with different queries for each sub-agent
-context = multi_agent.create_multi_agent_context(
-    query="Explain quantum computing",
-    sub_agent_queries={
-        "spanish_agent": "Explica la computación cuántica en español",
-        "english_agent": "Explain quantum computing in English"
-    }
-)
-
-# Execute the multi-agent (this would be done in the framework)
-# execution_ctx = ExecutionContext(task_id="1", owner_id="user", retries=0, iterations=0, events=...)
-# result = await multi_agent.execute(context, execution_ctx)
-"""

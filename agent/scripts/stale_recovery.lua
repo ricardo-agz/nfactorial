@@ -11,7 +11,8 @@ local stale_task_ids = redis.call('ZRANGEBYSCORE', processing_heartbeats_key, 0,
 
 local recovered_count = 0
 local failed_count = 0
-local curr_timestamp = redis.call('TIME')
+local time_result = redis.call('TIME')
+local curr_timestamp = tonumber(time_result[1]) + (tonumber(time_result[2]) / 1000000)
 local stale_task_actions = {}
 
 for i = 1, #stale_task_ids do
@@ -22,6 +23,13 @@ for i = 1, #stale_task_ids do
     local task_retries = tonumber(task_retries_str) or -1
 
     redis.call('ZREM', processing_heartbeats_key, task_id)
+
+    local task_status = redis.call('HGET', task_data_key, "status")
+    if task_status ~= "processing" then
+        -- orphaned heartbeat left task in processing set but has been continued/completed/failed/cancelled
+        table.insert(stale_task_actions, {task_id, "ignored"})
+        goto continue
+    end
 
     -- Check if task exists and route based on retry count
     if task_retries >= 0 then
@@ -34,12 +42,14 @@ for i = 1, #stale_task_ids do
             recovered_count = recovered_count + 1
         else
             -- Max retries exceeded, send to failed queue and set status to failed
-            redis.call('ZADD', queue_failed_key, curr_timestamp[1], task_id)
+            redis.call('ZADD', queue_failed_key, curr_timestamp, task_id)
             redis.call('HSET', task_data_key, "status", "failed")
             table.insert(stale_task_actions, {task_id, "failed"})
             failed_count = failed_count + 1
         end
     end
+
+    ::continue::
 end
 
 return {recovered_count, failed_count, stale_task_actions}

@@ -39,7 +39,7 @@ class TaskStatus(str, Enum):
     PAUSED = "paused"
     CANCELLED = "cancelled"
     PENDING_TOOL_RESULTS = "pending_tool_results"
-    PENDING_INPUT = "pending_input"
+    PENDING_EXTERNAL_INPUT = "pending_external_input"
 
 
 @dataclass

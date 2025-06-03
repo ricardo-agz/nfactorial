@@ -19,8 +19,8 @@ if __name__ == "__main__":
         xai_api_key=os.getenv("XAI_API_KEY"),
     )
 
-    # agent = DummyAgent(client=control_plane.llm_client)
-    agent = FreeAgent(client=control_plane.llm_client)
+    agent = DummyAgent(client=control_plane.llm_client)
+    # agent = FreeAgent(client=control_plane.llm_client)
     # agent = VideoGenAgent(client=control_plane.llm_client)
 
     control_plane.register_runner(
@@ -41,7 +41,7 @@ if __name__ == "__main__":
                 failed_ttl=90,
                 completed_ttl=60,
                 cancelled_ttl=30,
-            )
+            ),
         ),
     )
 

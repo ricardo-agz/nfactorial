@@ -3,7 +3,10 @@ import asyncio
 import os
 import signal
 import redis.asyncio as redis
-from typing import Any
+from typing import Any, Optional
+import uvicorn
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 
 from agent.agent import BaseAgent
 from agent.queue import enqueue_task, worker_loop, maintenance_loop
@@ -42,6 +45,16 @@ class MaintenanceWorkerConfig:
     workers: int = 1
     task_ttl: TaskTTLConfig = field(default_factory=TaskTTLConfig)
     max_cleanup_batch: int = 100  # Maximum tasks to clean up per queue per run
+
+
+@dataclass
+class ObservabilityConfig:
+    """Configuration for the observability dashboard"""
+
+    enabled: bool = True
+    host: str = "0.0.0.0"
+    port: int = 8080
+    cors_origins: list[str] = field(default_factory=lambda: ["*"])
 
 
 class AgentRunner:
@@ -111,6 +124,7 @@ class ControlPlane:
         redis_max_connections: int = 50,
         openai_api_key: str | None = None,
         xai_api_key: str | None = None,
+        observability_config: ObservabilityConfig | None = None,
     ):
         self.shutdown_event = asyncio.Event()
 
@@ -130,6 +144,7 @@ class ControlPlane:
         )
 
         self.runners: list[AgentRunner] = []
+        self.observability_config = observability_config or ObservabilityConfig()
 
     def register_runner(
         self,
@@ -148,11 +163,86 @@ class ControlPlane:
         runner.set_shutdown_event(self.shutdown_event)
         self.runners.append(runner)
 
+    async def create_observability_app(self) -> FastAPI:
+        """Create the observability FastAPI app (minimal, clean, robust)"""
+        from agent.observability import add_observability_routes
+
+        app = FastAPI(
+            title="Observability Dashboard",
+            description="Minimal real-time dashboard for distributed AI agent system",
+            version="1.0.0",
+        )
+
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=self.observability_config.cors_origins,
+            allow_credentials=True,
+            allow_methods=["*"],
+            allow_headers=["*"],
+        )
+
+        redis_client = redis.Redis(
+            connection_pool=self.redis_pool, decode_responses=True
+        )
+        agents = [runner.agent for runner in self.runners]
+
+        # Get TTL config from the first runner (assuming all runners have the same TTL config)
+        ttl_config = None
+        if self.runners:
+            ttl_config = self.runners[0].maintenance_worker_config.task_ttl
+
+        add_observability_routes(app, redis_client, agents, ttl_config)
+
+        @app.get("/")
+        async def root():
+            return {
+                "message": "Observability dashboard",
+                "dashboard": "/observability",
+                "port": self.observability_config.port,
+            }
+
+        return app
+
+    async def start_observability_server(self, shutdown_event: asyncio.Event) -> None:
+        """Start the observability web server"""
+        if not self.observability_config.enabled:
+            return
+
+        try:
+            app = await self.create_observability_app()
+
+            config = uvicorn.Config(
+                app=app,
+                host=self.observability_config.host,
+                port=self.observability_config.port,
+                log_level="info",
+                access_log=False,  # Reduce noise
+            )
+
+            server = uvicorn.Server(config)
+
+            logger.info(
+                f"🌐 Observability dashboard available at http://{self.observability_config.host}:{self.observability_config.port}/observability"
+            )
+
+            # Run server until shutdown
+            await server.serve()
+
+        except Exception as e:
+            logger.error(f"Error starting observability server: {e}")
+
     async def start_workers(self, shutdown_event: asyncio.Event) -> None:
         try:
             workers: list[asyncio.Task[Any]] = []
             for runner in self.runners:
                 workers += runner.create_worker_tasks(shutdown_event)
+
+            # Add observability server if enabled
+            if self.observability_config.enabled:
+                observability_task = asyncio.create_task(
+                    self.start_observability_server(shutdown_event)
+                )
+                workers.append(observability_task)
 
             logger.info(
                 f"Started {len(workers)} total workers for {len(self.runners)} agents"

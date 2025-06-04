@@ -28,28 +28,25 @@ for i = 1, #stale_task_ids do
     if task_status ~= "processing" then
         -- orphaned heartbeat left task in processing set but has been continued/completed/failed/cancelled
         table.insert(stale_task_actions, {task_id, "ignored"})
-        goto continue
-    end
-
-    -- Check if task exists and route based on retry count
-    if task_retries >= 0 then
-        if task_retries < max_retries then
-            -- Increment retry count and put back in queue and set status to active
-            redis.call('HSET', task_data_key, "retries", task_retries + 1)
-            redis.call('HSET', task_data_key, "status", "active")
-            redis.call('LPUSH', queue_main_key, task_id)
-            table.insert(stale_task_actions, {task_id, "recovered"})
-            recovered_count = recovered_count + 1
-        else
-            -- Max retries exceeded, send to failed queue and set status to failed
-            redis.call('ZADD', queue_failed_key, curr_timestamp, task_id)
-            redis.call('HSET', task_data_key, "status", "failed")
-            table.insert(stale_task_actions, {task_id, "failed"})
-            failed_count = failed_count + 1
+    else
+        -- Check if task exists and route based on retry count
+        if task_retries >= 0 then
+            if task_retries < max_retries then
+                -- Increment retry count and put back in queue and set status to active
+                redis.call('HSET', task_data_key, "retries", task_retries + 1)
+                redis.call('HSET', task_data_key, "status", "active")
+                redis.call('LPUSH', queue_main_key, task_id)
+                table.insert(stale_task_actions, {task_id, "recovered"})
+                recovered_count = recovered_count + 1
+            else
+                -- Max retries exceeded, send to failed queue and set status to failed
+                redis.call('ZADD', queue_failed_key, curr_timestamp, task_id)
+                redis.call('HSET', task_data_key, "status", "failed")
+                table.insert(stale_task_actions, {task_id, "failed"})
+                failed_count = failed_count + 1
+            end
         end
     end
-
-    ::continue::
 end
 
 return {recovered_count, failed_count, stale_task_actions}

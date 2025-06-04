@@ -24,8 +24,11 @@ services:
     depends_on:
       - redis
 
+  # Multiple worker instances - each will auto-discover available ports
   worker:
     build: .
+    ports:
+      - "8080:8080"
     command: python worker.py
     volumes:
       - .:/app
@@ -34,10 +37,13 @@ services:
       - OPENAI_API_KEY=${OPENAI_API_KEY}
       - XAI_API_KEY=${XAI_API_KEY}
       - EXA_API_KEY=${EXA_API_KEY}
+      # All workers have observability enabled, they'll auto-discover ports
+      - ENABLE_OBSERVABILITY=true
+      - OBSERVABILITY_PORT=8080  # Starting port, will auto-increment if taken
     depends_on:
       - redis
     deploy:
-      replicas: 3
+      replicas: 1
 
 volumes:
   redis_data:

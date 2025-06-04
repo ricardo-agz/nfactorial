@@ -612,7 +612,7 @@ async def process_task(
         )
 
         if turn_completion.pending_tool_call_ids:
-            await completion_script.execute(
+            res = await completion_script.execute(
                 tasks_data_key=tasks_data_key,
                 processing_heartbeats_key=processing_heartbeats_key,
                 queue_main_key=queue_main_key,
@@ -627,6 +627,7 @@ async def process_task(
                     turn_completion.pending_tool_call_ids
                 ),
             )
+            logger.info(f"PENDING TOOL CALL IDS Completion script result: {res}")
 
             logger.info(
                 f"⏳ Task awaiting tool results {colored(f'[{task.id}]', 'dim')}"
@@ -641,7 +642,7 @@ async def process_task(
             )
 
         elif turn_completion.is_done:
-            await completion_script.execute(
+            res = await completion_script.execute(
                 tasks_data_key=tasks_data_key,
                 processing_heartbeats_key=processing_heartbeats_key,
                 queue_main_key=queue_main_key,
@@ -652,7 +653,7 @@ async def process_task(
                 action="complete",
                 updated_task_payload_json=task.payload.to_json(),
             )
-
+            logger.info(f"✅ Task completed Completion script result: {res}")
             logger.info(f"✅ Task completed {colored(f'[{task.id}]', 'dim')}")
             await event_publisher.publish_event(
                 AgentEvent(
@@ -697,7 +698,7 @@ async def process_task(
         )
 
         action = "fail" if task.retries >= max_retries else "retry"
-        await completion_script.execute(
+        res = await completion_script.execute(
             tasks_data_key=tasks_data_key,
             processing_heartbeats_key=processing_heartbeats_key,
             queue_main_key=queue_main_key,
@@ -708,23 +709,27 @@ async def process_task(
             action=action,
             updated_task_payload_json=task.payload.to_json(),
         )
+        logger.info(f"❌ Task failed due to timeout Completion script result: {res}")
 
     except Exception as e:
         task_failed = True
         logger.error(f"❌ Task failed {colored(f'[{task.id}]', 'dim')}", exc_info=e)
 
-        await event_publisher.publish_event(
-            QueueEvent(
-                event_type="task_failed",
-                task_id=task.id,
-                owner_id=task.owner_id,
-                agent_name=agent.name,
-                error=str(e),
+        try:
+            await event_publisher.publish_event(
+                QueueEvent(
+                    event_type="task_failed",
+                    task_id=task.id,
+                    owner_id=task.owner_id,
+                    agent_name=agent.name,
+                    error=str(e),
+                )
             )
-        )
+        except Exception as e:
+            logger.error(f"Failed to send task failed event: {e}")
 
         action = "fail" if task.retries >= max_retries else "retry"
-        await completion_script.execute(
+        res = await completion_script.execute(
             tasks_data_key=tasks_data_key,
             processing_heartbeats_key=processing_heartbeats_key,
             queue_main_key=queue_main_key,
@@ -735,7 +740,8 @@ async def process_task(
             action=action,
             updated_task_payload_json=task.payload.to_json(),
         )
-
+        if not res:
+            logger.error(f"Failed to update task status: {res}")
     finally:
         # Stop heartbeat
         stop_heartbeat.set()
@@ -744,6 +750,9 @@ async def process_task(
         # Only emit retry/failure events if the task actually failed
         if task_failed:
             if task.retries >= max_retries:
+                logger.info(
+                    f"❌ Task failed permanently {colored(f'[{task.id}]', 'dim')}"
+                )
                 await event_publisher.publish_event(
                     AgentEvent(
                         event_type="run_failed",

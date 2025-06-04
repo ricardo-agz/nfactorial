@@ -87,6 +87,7 @@ class Task(Generic[ContextType]):
     ):
         data["created_at"] = datetime.fromisoformat(data["created_at"])
         data["status"] = TaskStatus(data["status"])
+        data["retries"] = int(data["retries"])
 
         # Handle payload which might be a JSON string
         if data["payload"]:

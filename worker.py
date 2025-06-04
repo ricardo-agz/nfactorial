@@ -5,6 +5,7 @@ from agent.manager import (
     AgentWorkerConfig,
     MaintenanceWorkerConfig,
     TaskTTLConfig,
+    ObservabilityConfig,
 )
 from agent.agent import DummyAgent, FreeAgent
 from example_agents.video_gen_agent import VideoGenAgent
@@ -17,6 +18,12 @@ if __name__ == "__main__":
         redis_max_connections=50,
         openai_api_key=os.getenv("OPENAI_API_KEY"),
         xai_api_key=os.getenv("XAI_API_KEY"),
+        observability_config=ObservabilityConfig(
+            enabled=True,
+            host="0.0.0.0",
+            port=8080,
+            cors_origins=["*"],
+        ),
     )
 
     agent = DummyAgent(client=control_plane.llm_client)
@@ -26,7 +33,7 @@ if __name__ == "__main__":
     control_plane.register_runner(
         agent=agent,
         agent_worker_config=AgentWorkerConfig(
-            workers=100,
+            workers=30,
             batch_size=25,
             max_retries=3,
             heartbeat_interval=2,

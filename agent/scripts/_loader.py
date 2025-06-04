@@ -3,19 +3,13 @@ from pathlib import Path
 import json
 import redis.asyncio as redis
 from redis.commands.core import AsyncScript
-from typing import Type, TypeVar
+from typing import Type, TypeVar, Any, cast
 
 T = TypeVar("T", bound=AsyncScript)
 
 # Cache for loaded scripts
-_script_cache: dict[tuple[int, str], AsyncScript] = {}
-
-
-def get_cached_script(redis_client, script_name, script_class):
-    key = (id(redis_client), script_name)
-    if key not in _script_cache:
-        _script_cache[key] = create_script(redis_client, script_name, script_class)
-    return _script_cache[key]
+_SCRIPT_CONTENT: dict[str, str] = {}
+_SCRIPT_INSTANCES: dict[tuple[int, str], Any] = {}
 
 
 def get_script_path(script_name: str) -> Path:
@@ -24,20 +18,21 @@ def get_script_path(script_name: str) -> Path:
     return script_dir / f"{script_name}.lua"
 
 
-def load_script(script_name: str) -> str:
-    """Load a Lua script from file with caching"""
-    if script_name in _script_cache:
-        return _script_cache[script_name]
+def load_script(name: str) -> str:
+    if name not in _SCRIPT_CONTENT:
+        with open(get_script_path(name)) as f:
+            _SCRIPT_CONTENT[name] = f.read()
+    return _SCRIPT_CONTENT[name]
 
-    script_path = get_script_path(script_name)
-    if not script_path.exists():
-        raise FileNotFoundError(f"Lua script not found: {script_path}")
 
-    with open(script_path, "r") as f:
-        script_content = f.read()
-
-    _script_cache[script_name] = script_content
-    return script_content
+def get_cached_script(client: redis.Redis, name: str, cls: type[T]) -> T:
+    key = (id(client), name)
+    if key not in _SCRIPT_INSTANCES:
+        base = client.register_script(load_script(name))
+        inst = cls.__new__(cls)  # type: ignore
+        inst.__dict__.update(base.__dict__)
+        _SCRIPT_INSTANCES[key] = inst
+    return cast(T, _SCRIPT_INSTANCES[key])
 
 
 def create_script(

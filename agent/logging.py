@@ -1,5 +1,8 @@
 import logging
 import sys
+import time
+import hashlib
+from threading import Lock
 
 
 class ColoredFormatter(logging.Formatter):
@@ -31,6 +34,71 @@ class ColoredFormatter(logging.Formatter):
         return log_line
 
 
+class Logger(logging.Logger):
+    """Custom logger with optional exception deduplication"""
+
+    def __init__(
+        self, name: str, dedupe_exceptions: bool = True, dedupe_window: int = 300
+    ):
+        super().__init__(name)
+        self.dedupe_exceptions = dedupe_exceptions
+        self.dedupe_window = dedupe_window
+        self._exception_cache: dict[str, tuple[float, int]] = {}
+        self._lock = Lock()
+
+    def _get_exception_signature(self, exception: Exception) -> str:
+        """Create a unique signature for an exception type and message"""
+        exc_type = type(exception).__name__
+        exc_message = str(exception)
+        signature = f"{exc_type}:{exc_message}"
+        return hashlib.md5(signature.encode()).hexdigest()
+
+    def _cleanup_old_entries(self, current_time: float) -> None:
+        """Remove entries older than the dedupe window"""
+        cutoff_time = current_time - self.dedupe_window
+        expired_keys = [
+            key
+            for key, (first_seen, _) in self._exception_cache.items()
+            if first_seen < cutoff_time
+        ]
+        for key in expired_keys:
+            del self._exception_cache[key]
+
+    def error(self, msg, *args, exc_info=None, **kwargs):
+        """Override error to handle exception deduplication"""
+        if not self.dedupe_exceptions or exc_info is None:
+            return super().error(msg, *args, exc_info=exc_info, **kwargs)
+
+        # Handle exception deduplication
+        if isinstance(exc_info, Exception):
+            exception = exc_info
+        elif exc_info is True:
+            # Can't dedupe when exc_info=True since we don't have the exception object
+            return super().error(msg, *args, exc_info=exc_info, **kwargs)
+        else:
+            return super().error(msg, *args, exc_info=exc_info, **kwargs)
+
+        current_time = time.time()
+        exc_signature = self._get_exception_signature(exception)
+
+        with self._lock:
+            self._cleanup_old_entries(current_time)
+
+            if exc_signature in self._exception_cache:
+                first_seen, count = self._exception_cache[exc_signature]
+                self._exception_cache[exc_signature] = (first_seen, count + 1)
+
+                # Log brief message for repeated exceptions
+                exc_type = type(exception).__name__
+                exc_message = str(exception)
+                brief_msg = f"{msg} - {exc_type}: {exc_message}"
+                return super().error(brief_msg, *args, **kwargs)
+            else:
+                # First time seeing this exception, log with full stack trace
+                self._exception_cache[exc_signature] = (current_time, 1)
+                return super().error(msg, *args, exc_info=exception, **kwargs)
+
+
 def colored(text: str, color: str) -> str:
     color = color.upper()
     if color not in ColoredFormatter.COLORS:
@@ -38,12 +106,22 @@ def colored(text: str, color: str) -> str:
     return f"{ColoredFormatter.COLORS[color]}{text}{ColoredFormatter.COLORS['RESET']}"
 
 
-def get_logger(name: str) -> logging.Logger:
-    """Get a logger with colored output"""
+def get_logger(name: str, dedupe_exceptions: bool = True) -> Logger:
+    """Get a logger with colored output and optional exception deduplication"""
+    # Set our custom logger class
+    logging.setLoggerClass(Logger)
     logger = logging.getLogger(name)
 
-    if logger.handlers:
-        return logger
+    if not isinstance(logger, Logger):
+        # If it's not our custom logger, create a new one
+        logger = Logger(name, dedupe_exceptions=dedupe_exceptions)
+        # Clear any existing handlers and set up fresh
+        logger.handlers.clear()
+    else:
+        # Update the dedupe setting if it's different
+        logger.dedupe_exceptions = dedupe_exceptions
+        if logger.handlers:
+            return logger
 
     logger.setLevel(logging.INFO)
 

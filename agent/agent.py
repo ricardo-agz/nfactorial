@@ -16,10 +16,10 @@ import asyncio
 import inspect
 from contextvars import ContextVar
 from openai import (
-    RateLimitError,
-    InternalServerError,
-    APITimeoutError,
-    APIConnectionError,
+    RateLimitError as OpenAIRateLimitError,
+    InternalServerError as OpenAIInternalServerError,
+    APITimeoutError as OpenAITimeoutError,
+    APIConnectionError as OpenAIConnectionError,
 )
 from openai.types.chat import (
     ChatCompletion,
@@ -54,15 +54,22 @@ class NonRetryableError(Exception):
     pass
 
 
+class RateLimitError(Exception):
+    """Rate limit error"""
+
+    pass
+
+
 execution_context: ContextVar["ExecutionContext"] = ContextVar("execution_context")
 
 
 RETRYABLE_EXCEPTIONS = (
-    RateLimitError,
-    InternalServerError,
-    APIConnectionError,
-    APITimeoutError,
+    OpenAIRateLimitError,
+    OpenAIInternalServerError,
+    OpenAIConnectionError,
+    OpenAITimeoutError,
     RetryableError,
+    RateLimitError,
 )
 
 
@@ -115,6 +122,9 @@ class ExecutionContext:
 def retry(
     max_attempts: int = 3,
     delay: float = 1.0,
+    max_delay: float = 60.0,
+    exponential_base: float = 2.0,
+    jitter: bool = True,
 ):
     def decorator(func: Callable[..., Awaitable[T]]) -> Callable[..., Awaitable[T]]:
         @wraps(func)
@@ -131,9 +141,26 @@ def retry(
                     if isinstance(e, RETRYABLE_EXCEPTIONS):
                         last_exception = e
                         if attempt < max_attempts - 1:
-                            await asyncio.sleep(
-                                delay * (2**attempt) * random.uniform(0.8, 1.2)
+                            # Calculate exponential backoff with jitter
+                            backoff_delay = min(
+                                delay * (exponential_base**attempt), max_delay
                             )
+
+                            if jitter:
+                                # Add jitter to prevent thundering herd
+                                jitter_factor = random.uniform(0.5, 1.5)
+                                backoff_delay *= jitter_factor
+
+                            # Extra delay for rate limit errors
+                            if isinstance(e, (OpenAIRateLimitError, RateLimitError)):
+                                backoff_delay *= 2  # Double the delay for rate limits
+
+                            logger.warning(
+                                f"Attempt {attempt + 1}/{max_attempts} failed: {e}. "
+                                f"Retrying in {backoff_delay:.2f}s"
+                            )
+
+                            await asyncio.sleep(backoff_delay)
                     else:
                         raise e
 
@@ -479,6 +506,11 @@ class BaseAgent(Generic[ContextType]):
             if isinstance(result, Exception):
                 logger.error(
                     f"Tool {tc.function.name} failed: {result}", exc_info=result
+                )
+                # Still need to add a tool response message to maintain conversation format
+                content = self.format_tool_result(tc.id, result)
+                new_messages.append(
+                    {"role": "tool", "tool_call_id": tc.id, "content": content}
                 )
             elif isinstance(result, ToolActionResult) and result.pending_result:
                 pending_tool_call_ids.append(tc.id)
@@ -876,10 +908,10 @@ class DummyAgent(Agent):
                 ),
             ),
             output_type=FinalOutput,
-            max_llm_retries=2,  # Fewer retries for demo agent
-            llm_retry_delay=0.5,  # Shorter delay for demo
-            max_tool_retries=1,  # Single retry for tools
-            tool_retry_delay=0.25,  # Quick retry for tools
+            max_llm_retries=3,  # Increased from 2 to 3
+            llm_retry_delay=1.0,  # Increased from 0.5 to 1.0
+            max_tool_retries=2,  # Increased from 1 to 2
+            tool_retry_delay=0.5,  # Increased from 0.25 to 0.5
         )
 
 

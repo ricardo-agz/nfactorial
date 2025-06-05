@@ -39,18 +39,19 @@ class TaskStatus(str, Enum):
     PAUSED = "paused"
     CANCELLED = "cancelled"
     PENDING_TOOL_RESULTS = "pending_tool_results"
-    PENDING_EXTERNAL_INPUT = "pending_external_input"
+    BACKOFF = "backoff"
 
 
 @dataclass
 class Task(Generic[ContextType]):
-    id: str
     owner_id: str
     payload: ContextType
     agent: str
-    retries: int
-    status: TaskStatus
-    created_at: datetime = datetime.now(timezone.utc)
+    pickups: int = 0
+    retries: int = 0
+    status: TaskStatus = TaskStatus.QUEUED
+    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    id: str = field(default_factory=lambda: str(uuid.uuid4()))
 
     @classmethod
     def create(
@@ -61,6 +62,7 @@ class Task(Generic[ContextType]):
             owner_id=owner_id,
             agent=agent,
             payload=payload,
+            pickups=0,
             retries=0,
             status=TaskStatus.QUEUED,
         )
@@ -72,8 +74,9 @@ class Task(Generic[ContextType]):
             "agent": self.agent,
             "payload": self.payload.to_dict() if self.payload else None,
             "retries": self.retries,
+            "pickups": self.pickups,
             "status": self.status.value,
-            "created_at": self.created_at.isoformat(),
+            "created_at": self.created_at.timestamp(),
         }
 
     def to_json(self) -> str:
@@ -85,9 +88,12 @@ class Task(Generic[ContextType]):
         data: dict[str, typing.Any],
         context_class: Type[ContextType],
     ):
-        data["created_at"] = datetime.fromisoformat(data["created_at"])
+        data["created_at"] = datetime.fromtimestamp(
+            float(data["created_at"]), tz=timezone.utc
+        )
         data["status"] = TaskStatus(data["status"])
         data["retries"] = int(data["retries"])
+        data["pickups"] = int(data["pickups"])
 
         # Handle payload which might be a JSON string
         if data["payload"]:

@@ -24,4 +24,4 @@ if #hash_args > 0 then
     return true
 else
     error("Task data cannot be empty")
-end 
+end

@@ -60,3 +60,4 @@ fastapi.log
 uvicorn.log
 
 example_agents/
+scratchpad/

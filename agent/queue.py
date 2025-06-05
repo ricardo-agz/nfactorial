@@ -14,25 +14,30 @@ from agent.agent import (
     EventPublisher,
     AgentEvent,
     ExecutionContext,
+    RateLimitError,
+    OpenAIRateLimitError,
 )
 from agent.events import QueueEvent
 from agent.logging import get_logger, colored
 from agent.scripts import (
-    BatchMoveScript,
+    BatchPickupScript,
     TaskSteeringScript,
     TaskCompletionScript,
     StaleRecoveryScript,
-    GarbageCollectionScript,
-    create_batch_move_script,
+    TaskExpirationScript,
+    BackoffRecoveryScript,
+    create_batch_pickup_script,
     create_task_steering_script,
     create_task_completion_script,
     create_stale_recovery_script,
-    create_garbage_collection_script,
+    create_task_expiration_script,
     create_tool_completion_script,
     create_enqueue_task_script,
-    BatchMoveScriptResult,
+    create_heartbeat_script,
+    create_backoff_recovery_script,
+    BatchPickupScriptResult,
     StaleRecoveryScriptResult,
-    GarbageCollectionScriptResult,
+    TaskExpirationScriptResult,
 )
 from agent.utils import decode
 
@@ -53,6 +58,10 @@ QUEUE_FAILED = "queue:{agent}:failed"
 QUEUE_COMPLETIONS = "queue:{agent}:completed"
 # ZSET: task_id -> timestamp of cancellation
 QUEUE_CANCELLED = "queue:{agent}:cancelled"
+# ZSET: task_id -> timestamp of when task is ready to be picked up again
+QUEUE_BACKOFF = "queue:{agent}:backoff"
+# ZSET: task_id -> timestamp of orphaned task
+QUEUE_ORPHANED = "queue:{agent}:orphaned"
 
 # ===== ACTIVE TASK PROCESSING =====
 # ZSET: task_id -> timestamp of last heartbeat
@@ -71,6 +80,27 @@ PENDING_TOOL_RESULTS = "tool:{agent}:{task_id}:results"
 # ===== COMMUNICATION =====
 # PUBSUB: real-time updates to task owners
 UPDATES_CHANNEL = "updates:{owner_id}"
+
+# ===== METRICS =====
+# HASH: {count, total_duration, total_turns, total_retries} (bucket is a timestamp of a time bucket)
+TIMELINE_METRICS_KEY_TEMPLATE = "metrics:timeline:{agent}:{metric_type}:{bucket}"
+# HASH: {count, total_duration, total_turns, total_retries} (bucket is a timestamp of a time bucket)
+TIMELINE_METRICS_COMPLETED = "metrics:timeline:{agent}:completed:{bucket}"
+TIMELINE_METRICS_COMPLETED_ALL = "metrics:timeline:__all__:completed:{bucket}"
+# HASH: {count, total_duration, total_turns, total_retries} (bucket is a timestamp of a time bucket)
+TIMELINE_METRICS_FAILED = "metrics:timeline:{agent}:failed:{bucket}"
+TIMELINE_METRICS_FAILED_ALL = "metrics:timeline:__all__:failed:{bucket}"
+# HASH: {count, total_duration, total_turns, total_retries} (bucket is a timestamp of a time bucket)
+TIMELINE_METRICS_CANCELLED = "metrics:timeline:{agent}:cancelled:{bucket}"
+TIMELINE_METRICS_CANCELLED_ALL = "metrics:timeline:__all__:cancelled:{bucket}"
+# HASH: {count, total_duration, total_turns, total_retries} (bucket is a timestamp of a time bucket)
+TIMELINE_METRICS_RETRIED = "metrics:timeline:{agent}:retried:{bucket}"
+TIMELINE_METRICS_RETRIED_ALL = "metrics:timeline:__all__:retried:{bucket}"
+
+# COUNTER: number of idle workers for this agent
+GAUGE_IDLE = "metrics:gauge:{agent}:idle"
+GAUGE_IDLE_ALL = "metrics:gauge:__all__:idle"
+
 
 # ===== SENTINEL VALUES =====
 PENDING_SENTINEL = "<|PENDING|>"
@@ -181,6 +211,13 @@ async def get_task_data(redis_client: redis.Redis, task_id: str) -> dict[str, An
     task_data: dict[str, Any] = {
         decode(key): decode(value) for key, value in raw_task_data.items()
     }
+
+    # Debug logging for missing created_at field
+    if task_data and "created_at" not in task_data:
+        logger.error(
+            f"!!!!!!! DEBUG: Task {task_id} missing created_at field. Available fields: {list(task_data.keys())}"
+        )
+        logger.error(f"!!!!!!! DEBUG: Task data: {task_data}")
 
     return task_data
 
@@ -356,9 +393,11 @@ async def publish_update(
 
 
 async def get_task_batch(
-    batch_script: BatchMoveScript,
+    batch_script: BatchPickupScript,
     agent: BaseAgent[Any],
     batch_size: int,
+    metrics_bucket_duration: int,
+    metrics_retention_duration: int,
 ) -> tuple[list[str], list[str]]:
     """
     Get batch of tasks atomically
@@ -372,16 +411,28 @@ async def get_task_batch(
     processing_heartbeats_key = PROCESSING_HEARTBEATS.format(agent=agent.name)
     task_cancellations_key = TASK_CANCELLATIONS
     queue_cancelled_key = QUEUE_CANCELLED.format(agent=agent.name)
+    queue_orphaned_key = QUEUE_ORPHANED.format(agent=agent.name)
+    task_metrics_key_template = TIMELINE_METRICS_KEY_TEMPLATE
 
     try:
-        result: BatchMoveScriptResult = await batch_script.execute(
+        result: BatchPickupScriptResult = await batch_script.execute(
             task_data_key_template=task_data_key_template,
             queue_main_key=queue_main_key,
             queue_cancelled_key=queue_cancelled_key,
             processing_heartbeats_key=processing_heartbeats_key,
             task_cancellations_key=task_cancellations_key,
+            queue_orphaned_key=queue_orphaned_key,
+            task_metrics_key_template=task_metrics_key_template,
             batch_size=batch_size,
+            agent_name=agent.name,
+            metrics_bucket_duration=metrics_bucket_duration,
+            metrics_retention_duration=metrics_retention_duration,
         )
+
+        if result.orphaned_task_ids:
+            logger.warning(
+                f"⚠️ Found {len(result.orphaned_task_ids)} orphaned tasks: {result.orphaned_task_ids}"
+            )
 
         return result.tasks_to_process_ids, result.tasks_to_cancel_ids
 
@@ -404,9 +455,10 @@ async def heartbeat_loop(
     try:
         while not stop_event.is_set():
             try:
-                await redis_client.zadd(
-                    agent_heartbeats,
-                    {task_id: time.time()},
+                heartbeat_script = create_heartbeat_script(redis_client)
+                timestamp = await heartbeat_script.execute(
+                    agent_heartbeats_key=agent_heartbeats,
+                    task_id=task_id,
                 )
 
                 # Wait for next interval
@@ -489,10 +541,12 @@ async def process_task(
     agent: BaseAgent[ContextType],
     max_retries: int,
     heartbeat_interval: int,
-    task_timeout: int = 90,
+    task_timeout: int,
+    metrics_bucket_duration: int,
+    metrics_retention_duration: int,
 ) -> None:
     """Process a single task"""
-    logger.info(f"▶️  Task started   {colored(f'[{task_id}]', 'dim')}")
+    # logger.info(f"▶️  Task started   {colored(f'[{task_id}]', 'dim')}")
 
     tasks_data_key = TASKS_DATA.format(task_id=task_id)
     queue_main_key = QUEUE_MAIN.format(agent=agent.name)
@@ -503,6 +557,9 @@ async def process_task(
     pending_tool_results_key = PENDING_TOOL_RESULTS.format(
         agent=agent.name, task_id=task_id
     )
+    task_metrics_key_template = TIMELINE_METRICS_KEY_TEMPLATE
+    gauge_idle_key_template = GAUGE_IDLE
+    queue_backoff_key = QUEUE_BACKOFF.format(agent=agent.name)
 
     task_data = await get_task_data(redis_client, task_id)
     if not task_data:
@@ -582,7 +639,7 @@ async def process_task(
                     task_data_key=tasks_data_key,
                     steering_messages_key=task_steering_key,
                     steering_message_ids=steering_message_ids,
-                    updated_task_payload_json=steered_task.to_json(),
+                    updated_task_payload_json=steered_task.payload.to_json(),
                 )
 
                 task = steered_task
@@ -619,6 +676,9 @@ async def process_task(
                 queue_completions_key=queue_completions_key,
                 queue_failed_key=queue_failed_key,
                 pending_tool_results_key=pending_tool_results_key,
+                task_metrics_key_template=task_metrics_key_template,
+                gauge_idle_key_template=gauge_idle_key_template,
+                queue_backoff_key=queue_backoff_key,
                 task_id=task.id,
                 action="pending_tool_call_results",
                 updated_task_payload_json=task.payload.to_json(),
@@ -626,8 +686,10 @@ async def process_task(
                 pending_tool_call_ids_json=json.dumps(
                     turn_completion.pending_tool_call_ids
                 ),
+                agent_name=agent.name,
+                metrics_bucket_duration=metrics_bucket_duration,
+                metrics_retention_duration=metrics_retention_duration,
             )
-            logger.info(f"PENDING TOOL CALL IDS Completion script result: {res}")
 
             logger.info(
                 f"⏳ Task awaiting tool results {colored(f'[{task.id}]', 'dim')}"
@@ -648,13 +710,18 @@ async def process_task(
                 queue_main_key=queue_main_key,
                 queue_completions_key=queue_completions_key,
                 queue_failed_key=queue_failed_key,
+                task_metrics_key_template=task_metrics_key_template,
+                gauge_idle_key_template=gauge_idle_key_template,
                 pending_tool_results_key=pending_tool_results_key,
+                queue_backoff_key=queue_backoff_key,
                 task_id=task.id,
                 action="complete",
                 updated_task_payload_json=task.payload.to_json(),
+                agent_name=agent.name,
+                metrics_bucket_duration=metrics_bucket_duration,
+                metrics_retention_duration=metrics_retention_duration,
             )
-            logger.info(f"✅ Task completed Completion script result: {res}")
-            logger.info(f"✅ Task completed {colored(f'[{task.id}]', 'dim')}")
+            # logger.info(f"✅ Task completed {colored(f'[{task.id}]', 'dim')}")
             await event_publisher.publish_event(
                 AgentEvent(
                     event_type="run_completed",
@@ -667,7 +734,7 @@ async def process_task(
         else:
             # Task needs to continue processing
             task.payload = turn_completion.context
-            logger.info(f"⏩ Task continued {colored(f'[{task.id}]', 'dim')}")
+            # logger.info(f"⏩ Task continued {colored(f'[{task.id}]', 'dim')}")
 
             await completion_script.execute(
                 tasks_data_key=tasks_data_key,
@@ -675,10 +742,16 @@ async def process_task(
                 queue_main_key=queue_main_key,
                 queue_completions_key=queue_completions_key,
                 queue_failed_key=queue_failed_key,
+                queue_backoff_key=queue_backoff_key,
                 pending_tool_results_key=pending_tool_results_key,
+                task_metrics_key_template=task_metrics_key_template,
+                gauge_idle_key_template=gauge_idle_key_template,
                 task_id=task.id,
                 action="continue",
                 updated_task_payload_json=task.payload.to_json(),
+                agent_name=agent.name,
+                metrics_bucket_duration=metrics_bucket_duration,
+                metrics_retention_duration=metrics_retention_duration,
             )
 
     except asyncio.TimeoutError:
@@ -705,11 +778,16 @@ async def process_task(
             queue_completions_key=queue_completions_key,
             queue_failed_key=queue_failed_key,
             pending_tool_results_key=pending_tool_results_key,
+            task_metrics_key_template=task_metrics_key_template,
+            gauge_idle_key_template=gauge_idle_key_template,
+            queue_backoff_key=queue_backoff_key,
             task_id=task.id,
             action=action,
             updated_task_payload_json=task.payload.to_json(),
+            agent_name=agent.name,
+            metrics_bucket_duration=metrics_bucket_duration,
+            metrics_retention_duration=metrics_retention_duration,
         )
-        logger.info(f"❌ Task failed due to timeout Completion script result: {res}")
 
     except Exception as e:
         task_failed = True
@@ -725,10 +803,14 @@ async def process_task(
                     error=str(e),
                 )
             )
-        except Exception as e:
-            logger.error(f"Failed to send task failed event: {e}")
+        except Exception as err:
+            logger.error(f"Failed to send task failed event: {err}")
 
-        action = "fail" if task.retries >= max_retries else "retry"
+        if isinstance(e, RateLimitError) or isinstance(e, OpenAIRateLimitError):
+            action = "fail" if task.retries >= max_retries else "backoff"
+        else:
+            action = "fail" if task.retries >= max_retries else "retry"
+
         res = await completion_script.execute(
             tasks_data_key=tasks_data_key,
             processing_heartbeats_key=processing_heartbeats_key,
@@ -736,9 +818,15 @@ async def process_task(
             queue_completions_key=queue_completions_key,
             queue_failed_key=queue_failed_key,
             pending_tool_results_key=pending_tool_results_key,
+            task_metrics_key_template=task_metrics_key_template,
+            gauge_idle_key_template=gauge_idle_key_template,
+            queue_backoff_key=queue_backoff_key,
             task_id=task.id,
             action=action,
             updated_task_payload_json=task.payload.to_json(),
+            agent_name=agent.name,
+            metrics_bucket_duration=metrics_bucket_duration,
+            metrics_retention_duration=metrics_retention_duration,
         )
         if not res:
             logger.error(f"Failed to update task status: {res}")
@@ -750,7 +838,7 @@ async def process_task(
         # Only emit retry/failure events if the task actually failed
         if task_failed:
             if task.retries >= max_retries:
-                logger.info(
+                logger.error(
                     f"❌ Task failed permanently {colored(f'[{task.id}]', 'dim')}"
                 )
                 await event_publisher.publish_event(
@@ -787,6 +875,8 @@ async def recover_stale_tasks(
     heartbeat_timeout: int,
     max_retries: int,
     batch_size: int,
+    metrics_bucket_duration: int,
+    metrics_retention_duration: int,
 ) -> int:
     """Atomically move stale tasks back to main queue"""
     cutoff_timestamp = time.time() - heartbeat_timeout
@@ -795,6 +885,7 @@ async def recover_stale_tasks(
     queue_main_key = QUEUE_MAIN.format(agent=agent.name)
     processing_heartbeats_key = PROCESSING_HEARTBEATS.format(agent=agent.name)
     queue_failed_key = QUEUE_FAILED.format(agent=agent.name)
+    task_metrics_key_template = TIMELINE_METRICS_KEY_TEMPLATE
 
     try:
         result: StaleRecoveryScriptResult = await recovery_script.execute(
@@ -802,9 +893,13 @@ async def recover_stale_tasks(
             queue_main_key=queue_main_key,
             processing_heartbeats_key=processing_heartbeats_key,
             queue_failed_key=queue_failed_key,
+            task_metrics_key_template=task_metrics_key_template,
             cutoff_timestamp=cutoff_timestamp,
             max_recovery_batch=batch_size,
             max_retries=max_retries,
+            agent_name=agent.name,
+            metrics_bucket_duration=metrics_bucket_duration,
+            metrics_retention_duration=metrics_retention_duration,
         )
         recovered_count = result.recovered_count
         failed_count = result.failed_count
@@ -835,8 +930,39 @@ async def recover_stale_tasks(
         return 0
 
 
-async def garbage_collect_expired_tasks(
-    garbage_collection_script: GarbageCollectionScript,
+async def recover_backoff_tasks(
+    redis_client: redis.Redis,
+    agent: BaseAgent[Any],
+    batch_size: int,
+) -> int:
+    """Move tasks from backoff queue back to main queue when their backoff time has expired"""
+    queue_backoff_key = QUEUE_BACKOFF.format(agent=agent.name)
+    queue_main_key = QUEUE_MAIN.format(agent=agent.name)
+    task_data_key_template = TASKS_DATA
+
+    try:
+        backoff_recovery_script = create_backoff_recovery_script(redis_client)
+        recovered_task_ids = await backoff_recovery_script.execute(
+            queue_backoff_key=queue_backoff_key,
+            queue_main_key=queue_main_key,
+            task_data_key_template=task_data_key_template,
+            max_batch_size=batch_size,
+        )
+
+        recovered_count = len(recovered_task_ids)
+
+        if recovered_count > 0:
+            logger.info(f"⏰ Recovered {recovered_count} tasks from backoff queue")
+
+        return recovered_count
+
+    except Exception as e:
+        logger.error(f"Error during backoff task recovery: {e}")
+        return 0
+
+
+async def remove_expired_tasks(
+    task_expiration_script: TaskExpirationScript,
     agent: BaseAgent[Any],
     task_ttl_config: Any,  # Will be TaskTTLConfig from manager.py
     max_cleanup_batch: int,
@@ -855,7 +981,7 @@ async def garbage_collect_expired_tasks(
     queue_cancelled_key = QUEUE_CANCELLED.format(agent=agent.name)
 
     try:
-        result: GarbageCollectionScriptResult = await garbage_collection_script.execute(
+        result: TaskExpirationScriptResult = await task_expiration_script.execute(
             task_data_key_template=task_data_key_template,
             queue_completions_key=queue_completions_key,
             queue_failed_key=queue_failed_key,
@@ -872,7 +998,7 @@ async def garbage_collect_expired_tasks(
 
         if total_cleaned > 0:
             logger.info(
-                f"🗑️  Garbage collected {total_cleaned} expired tasks "
+                f"🗑️  Removed {total_cleaned} expired tasks "
                 f"(completed: {result.completed_cleaned}, "
                 f"failed: {result.failed_cleaned}, "
                 f"cancelled: {result.cancelled_cleaned})"
@@ -887,7 +1013,7 @@ async def garbage_collect_expired_tasks(
         return total_cleaned
 
     except Exception as e:
-        logger.error(f"Error during garbage collection: {e}")
+        logger.error(f"Error during expired task removal: {e}")
         return 0
 
 
@@ -901,11 +1027,13 @@ async def maintenance_loop(
     interval: int,
     task_ttl_config: Any,  # Will be TaskTTLConfig from manager.py
     max_cleanup_batch: int,
+    metrics_bucket_duration: int,
+    metrics_retention_duration: int,
 ) -> None:
     """Background maintenance worker to periodically recover stale tasks and clean up expired tasks"""
     redis_client = redis.Redis(connection_pool=redis_pool, decode_responses=True)
     recovery_script = create_stale_recovery_script(redis_client)
-    garbage_collection_script = create_garbage_collection_script(redis_client)
+    task_expiration_script = create_task_expiration_script(redis_client)
 
     logger.info(
         f"Maintenance worker started (checking every {interval}s for stale tasks >{heartbeat_timeout}s old and cleaning expired tasks)"
@@ -920,11 +1048,20 @@ async def maintenance_loop(
                     heartbeat_timeout=heartbeat_timeout,
                     max_retries=max_retries,
                     batch_size=batch_size,
+                    metrics_bucket_duration=metrics_bucket_duration,
+                    metrics_retention_duration=metrics_retention_duration,
                 )
 
-                # Then, garbage collect expired finished tasks
-                await garbage_collect_expired_tasks(
-                    garbage_collection_script=garbage_collection_script,
+                # Recover tasks from backoff queue
+                await recover_backoff_tasks(
+                    redis_client=redis_client,
+                    agent=agent,
+                    batch_size=batch_size,
+                )
+
+                # Then, remove expired tasks
+                await remove_expired_tasks(
+                    task_expiration_script=task_expiration_script,
                     agent=agent,
                     task_ttl_config=task_ttl_config,
                     max_cleanup_batch=max_cleanup_batch,
@@ -968,11 +1105,13 @@ async def worker_loop(
     batch_size: int,
     max_retries: int,
     heartbeat_interval: int,
-    task_timeout: int = 90,
+    task_timeout: int,
+    metrics_bucket_duration: int,
+    metrics_retention_duration: int,
 ) -> None:
     """Main worker loop"""
     redis_client = redis.Redis(connection_pool=redis_pool, decode_responses=True)
-    batch_script = create_batch_move_script(redis_client)
+    batch_script = create_batch_pickup_script(redis_client)
     completion_script = create_task_completion_script(redis_client)
     steering_script = create_task_steering_script(redis_client)
 
@@ -985,6 +1124,8 @@ async def worker_loop(
                 batch_script=batch_script,
                 agent=agent,
                 batch_size=batch_size,
+                metrics_bucket_duration=metrics_bucket_duration,
+                metrics_retention_duration=metrics_retention_duration,
             )
             tasks_to_process_ids: list[str] = task_batch[0]
             tasks_to_cancel_ids: list[str] = task_batch[1]
@@ -1017,6 +1158,8 @@ async def worker_loop(
                             max_retries=max_retries,
                             heartbeat_interval=heartbeat_interval,
                             task_timeout=task_timeout,
+                            metrics_bucket_duration=metrics_bucket_duration,
+                            metrics_retention_duration=metrics_retention_duration,
                         )
                     )
                     for task_id in tasks_to_process_ids

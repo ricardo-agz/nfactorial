@@ -15,7 +15,7 @@ if __name__ == "__main__":
         redis_host=os.getenv("REDIS_HOST", "localhost"),
         redis_port=6379,
         redis_db=0,
-        redis_max_connections=50,
+        redis_max_connections=1000,
         openai_api_key=os.getenv("OPENAI_API_KEY"),
         xai_api_key=os.getenv("XAI_API_KEY"),
         observability_config=ObservabilityConfig(
@@ -33,19 +33,19 @@ if __name__ == "__main__":
     control_plane.register_runner(
         agent=agent,
         agent_worker_config=AgentWorkerConfig(
-            workers=30,
-            batch_size=25,
-            max_retries=3,
+            workers=50,
+            batch_size=15,
+            max_retries=5,
             heartbeat_interval=2,
             missed_heartbeats_threshold=3,
             missed_heartbeats_grace_period=1,
-            turn_timeout=90,
+            turn_timeout=120,
         ),
         maintenance_worker_config=MaintenanceWorkerConfig(
-            workers=1,
+            workers=5,
             interval=5,
             task_ttl=TaskTTLConfig(
-                failed_ttl=90,
+                failed_ttl=1800,
                 completed_ttl=60,
                 cancelled_ttl=30,
             ),

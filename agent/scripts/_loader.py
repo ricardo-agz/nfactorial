@@ -5,6 +5,8 @@ import redis.asyncio as redis
 from redis.commands.core import AsyncScript
 from typing import Type, TypeVar, Any, cast
 
+from agent.utils import decode
+
 T = TypeVar("T", bound=AsyncScript)
 
 # Cache for loaded scripts
@@ -49,16 +51,17 @@ def create_script(
 
 
 @dataclass
-class BatchMoveScriptResult:
-    """Result of the batch move script"""
+class BatchPickupScriptResult:
+    """Result of the batch pickup script"""
 
     tasks_to_process_ids: list[str]
     tasks_to_cancel_ids: list[str]
+    orphaned_task_ids: list[str]
 
 
-class BatchMoveScript(AsyncScript):
+class BatchPickupScript(AsyncScript):
     """
-    Handles moving tasks from main queue to processing
+    Handles picking up tasks from main queue
 
     Keys:
     * KEYS[1] = task_data_key_template (str)
@@ -66,9 +69,14 @@ class BatchMoveScript(AsyncScript):
     * KEYS[3] = queue_cancelled_key (str)
     * KEYS[4] = processing_heartbeats_key (str)
     * KEYS[5] = task_cancellations_key (str)
+    * KEYS[6] = queue_orphaned_key (str)
+    * KEYS[7] = task_metrics_key_template (str)
 
     Args:
     * ARGV[1] = batch_size (int)
+    * ARGV[2] = agent_name (str)
+    * ARGV[3] = metrics_bucket_duration (int)
+    * ARGV[4] = metrics_retention_duration (int)
     """
 
     async def execute(
@@ -79,8 +87,13 @@ class BatchMoveScript(AsyncScript):
         queue_cancelled_key: str,
         processing_heartbeats_key: str,
         task_cancellations_key: str,
+        queue_orphaned_key: str,
+        task_metrics_key_template: str,
         batch_size: int,
-    ) -> BatchMoveScriptResult:
+        agent_name: str,
+        metrics_bucket_duration: int,
+        metrics_retention_duration: int,
+    ) -> BatchPickupScriptResult:
         result: tuple[list[str], list[str]] = await super().__call__(  # type: ignore
             keys=[
                 task_data_key_template,
@@ -88,8 +101,15 @@ class BatchMoveScript(AsyncScript):
                 queue_cancelled_key,
                 processing_heartbeats_key,
                 task_cancellations_key,
+                queue_orphaned_key,
+                task_metrics_key_template,
             ],
-            args=[batch_size],
+            args=[
+                batch_size,
+                agent_name,
+                metrics_bucket_duration,
+                metrics_retention_duration,
+            ],
         )
 
         # Ensure task IDs are strings, handling potential bytes objects
@@ -99,19 +119,23 @@ class BatchMoveScript(AsyncScript):
         tasks_to_cancel_ids = [
             id.decode("utf-8") if isinstance(id, bytes) else str(id) for id in result[1]
         ]
+        orphaned_task_ids = [
+            id.decode("utf-8") if isinstance(id, bytes) else str(id) for id in result[2]
+        ]
 
-        return BatchMoveScriptResult(
+        return BatchPickupScriptResult(
             tasks_to_process_ids=tasks_to_process_ids,
             tasks_to_cancel_ids=tasks_to_cancel_ids,
+            orphaned_task_ids=orphaned_task_ids,
         )
 
 
 # Convenience functions for each script
-def create_batch_move_script(redis_client: redis.Redis) -> BatchMoveScript:
+def create_batch_pickup_script(redis_client: redis.Redis) -> BatchPickupScript:
     """
-    Create atomic script for moving tasks from main queue to processing
+    Create atomic script for picking up tasks from main queue
     """
-    return get_cached_script(redis_client, "batch_move", BatchMoveScript)
+    return get_cached_script(redis_client, "pickup", BatchPickupScript)
 
 
 class TaskSteeringScript(AsyncScript):
@@ -169,13 +193,19 @@ class TaskCompletionScript(AsyncScript):
     * KEYS[4] = queue_completions_key (str)
     * KEYS[5] = queue_failed_key (str)
     * KEYS[6] = pending_tool_results_key (str)
+    * KEYS[7] = queue_backoff_key (str)
+    * KEYS[8] = task_metrics_key_template (str)
+    * KEYS[9] = gauge_idle_key_template (str)
 
     Args:
     * ARGV[1] = task_id (str)
-    * ARGV[2] = action (str)
-    * ARGV[3] = updated_task_payload_json (str)
-    * ARGV[4] = pending_tool_call_result_sentinel (str)
-    * ARGV[5] = pending_tool_call_ids_json (str)
+    * ARGV[2] = agent_name (str)
+    * ARGV[3] = action (str)
+    * ARGV[4] = updated_task_payload_json (str)
+    * ARGV[5] = metrics_bucket_duration (int)
+    * ARGV[6] = metrics_retention_duration (int)
+    * ARGV[7] = pending_tool_call_result_sentinel (str)
+    * ARGV[8] = pending_tool_call_ids_json (str)
     """
 
     async def execute(
@@ -187,16 +217,25 @@ class TaskCompletionScript(AsyncScript):
         queue_completions_key: str,
         queue_failed_key: str,
         pending_tool_results_key: str,
+        queue_backoff_key: str,
+        task_metrics_key_template: str,
+        gauge_idle_key_template: str,
         task_id: str,
+        agent_name: str,
         action: str,
         updated_task_payload_json: str,
+        metrics_bucket_duration: int,
+        metrics_retention_duration: int,
         pending_tool_call_result_sentinel: str | None = None,
         pending_tool_call_ids_json: str | None = None,
     ) -> bool:
         args = [
             task_id,
+            agent_name,
             action,
             updated_task_payload_json,
+            metrics_bucket_duration,
+            metrics_retention_duration,
         ]
 
         if (
@@ -218,6 +257,9 @@ class TaskCompletionScript(AsyncScript):
                 queue_completions_key,
                 queue_failed_key,
                 pending_tool_results_key,
+                queue_backoff_key,
+                task_metrics_key_template,
+                gauge_idle_key_template,
             ],
             args=args,
         )
@@ -248,11 +290,15 @@ class StaleRecoveryScript(AsyncScript):
     * KEYS[2] = queue_main_key (str)
     * KEYS[3] = processing_heartbeats_key (str)
     * KEYS[4] = queue_failed_key (str)
+    * KEYS[5] = task_metrics_key_template (str)
 
     Args:
     * ARGV[1] = cutoff_timestamp (int)
     * ARGV[2] = max_recovery_batch (int)
     * ARGV[3] = max_retries (int)
+    * ARGV[4] = agent_name (str)
+    * ARGV[5] = metrics_bucket_duration (int)
+    * ARGV[6] = metrics_retention_duration (int)
     """
 
     async def execute(
@@ -262,9 +308,13 @@ class StaleRecoveryScript(AsyncScript):
         queue_main_key: str,
         processing_heartbeats_key: str,
         queue_failed_key: str,
+        task_metrics_key_template: str,
         cutoff_timestamp: float,
         max_recovery_batch: int,
         max_retries: int,
+        agent_name: str,
+        metrics_bucket_duration: int,
+        metrics_retention_duration: int,
     ) -> StaleRecoveryScriptResult:
         result: tuple[int, int, list[tuple[str, str]]] = await super().__call__(  # type: ignore
             keys=[
@@ -272,8 +322,16 @@ class StaleRecoveryScript(AsyncScript):
                 queue_main_key,
                 processing_heartbeats_key,
                 queue_failed_key,
+                task_metrics_key_template,
             ],
-            args=[cutoff_timestamp, max_recovery_batch, max_retries],
+            args=[
+                cutoff_timestamp,
+                max_recovery_batch,
+                max_retries,
+                agent_name,
+                metrics_bucket_duration,
+                metrics_retention_duration,
+            ],
         )
 
         # Ensure task IDs and actions are strings, handling potential bytes objects
@@ -296,12 +354,12 @@ def create_stale_recovery_script(redis_client: redis.Redis) -> StaleRecoveryScri
     """
     Creates an atomic script for recovering stale tasks with retry increment
     """
-    return get_cached_script(redis_client, "stale_recovery", StaleRecoveryScript)
+    return get_cached_script(redis_client, "recovery", StaleRecoveryScript)
 
 
 @dataclass
-class GarbageCollectionScriptResult:
-    """Result of the garbage collection script"""
+class TaskExpirationScriptResult:
+    """Result of the task expiration script"""
 
     completed_cleaned: int
     failed_cleaned: int
@@ -309,9 +367,9 @@ class GarbageCollectionScriptResult:
     cleaned_task_details: list[tuple[str, str]]  # [(queue_type, task_id), ...]
 
 
-class GarbageCollectionScript(AsyncScript):
+class TaskExpirationScript(AsyncScript):
     """
-    Handles garbage collection of expired tasks from completion, failed, and cancelled queues
+    Handles task expiration from completion, failed, and cancelled queues
 
     Keys:
     * KEYS[1] = task_data_key_template (str)
@@ -337,7 +395,7 @@ class GarbageCollectionScript(AsyncScript):
         failed_cutoff_timestamp: float,
         cancelled_cutoff_timestamp: float,
         max_cleanup_batch: int,
-    ) -> GarbageCollectionScriptResult:
+    ) -> TaskExpirationScriptResult:
         result: tuple[int, int, int, list[tuple[str, str]]] = await super().__call__(  # type: ignore
             keys=[
                 task_data_key_template,
@@ -366,7 +424,7 @@ class GarbageCollectionScript(AsyncScript):
             for queue_type, task_id in result[3]
         ]
 
-        return GarbageCollectionScriptResult(
+        return TaskExpirationScriptResult(
             completed_cleaned=result[0],
             failed_cleaned=result[1],
             cancelled_cleaned=result[2],
@@ -374,15 +432,13 @@ class GarbageCollectionScript(AsyncScript):
         )
 
 
-def create_garbage_collection_script(
+def create_task_expiration_script(
     redis_client: redis.Redis,
-) -> GarbageCollectionScript:
+) -> TaskExpirationScript:
     """
-    Creates an atomic script for garbage collection of expired tasks
+    Creates an atomic script for task expiration
     """
-    return get_cached_script(
-        redis_client, "garbage_collection", GarbageCollectionScript
-    )
+    return get_cached_script(redis_client, "expiration", TaskExpirationScript)
 
 
 class ToolCompletionScript(AsyncScript):
@@ -453,3 +509,111 @@ def create_enqueue_task_script(redis_client: redis.Redis) -> EnqueueTaskScript:
     Creates a script for enqueuing a task
     """
     return get_cached_script(redis_client, "enqueue", EnqueueTaskScript)
+
+
+class HeartbeatScript(AsyncScript):
+    """
+    Simple atomic script to update a task's heartbeat
+    """
+
+    async def execute(
+        self,
+        *,
+        agent_heartbeats_key: str,
+        task_id: str,
+    ) -> float:
+        return await super().__call__(  # type: ignore
+            keys=[agent_heartbeats_key],
+            args=[task_id],
+        )
+
+
+def create_heartbeat_script(redis_client: redis.Redis) -> HeartbeatScript:
+    """
+    Creates a script for updating a task's heartbeat
+    """
+    return get_cached_script(redis_client, "heartbeat", HeartbeatScript)
+
+
+@dataclass
+class MetricsAggregationResult:
+    """Result of the metrics aggregation script"""
+
+    system_totals: dict[str, int]
+    activity_timeline: dict[str, dict[str, Any]]
+    agent_metrics: dict[str, dict[str, Any]]
+    agent_activity_timelines: dict[str, dict[str, dict[str, Any]]]
+
+
+class MetricsAggregationScript(AsyncScript):
+    """
+    Efficiently collect all timeline metrics in a single atomic operation
+
+    Keys:
+    * KEYS[1] = timeline_duration (seconds)
+    * KEYS[2] = bucket_duration (seconds)
+    * KEYS[3] = agent_names_json (JSON array of agent names)
+    """
+
+    async def execute(
+        self, *, timeline_duration: int, bucket_duration: int, agent_names: list[str]
+    ) -> MetricsAggregationResult:
+        agent_names_json = json.dumps(agent_names)
+
+        result_json: str = await super().__call__(  # type: ignore
+            keys=[str(timeline_duration), str(bucket_duration), agent_names_json],
+            args=[],
+        )
+
+        result_data = json.loads(result_json)
+
+        return MetricsAggregationResult(
+            system_totals=result_data["system_totals"],
+            activity_timeline=result_data["activity_timeline"],
+            agent_metrics=result_data["agent_metrics"],
+            agent_activity_timelines=result_data["agent_activity_timelines"],
+        )
+
+
+def create_metrics_aggregation_script(
+    redis_client: redis.Redis,
+) -> MetricsAggregationScript:
+    """
+    Creates an atomic script for efficient metrics collection
+    """
+    return get_cached_script(redis_client, "metrics", MetricsAggregationScript)
+
+
+class BackoffRecoveryScript(AsyncScript):
+    """
+    Handles recovering tasks from backoff queue
+
+    Keys:
+    * KEYS[1] = queue_backoff_key (str)
+    * KEYS[2] = queue_main_key (str)
+    * KEYS[3] = task_data_key_template (str)
+
+    Args:
+    * ARGV[1] = max_batch_size (int)
+    """
+
+    async def execute(
+        self,
+        *,
+        queue_backoff_key: str,
+        queue_main_key: str,
+        task_data_key_template: str,
+        max_batch_size: int,
+    ) -> list[str]:
+        res: list[str | bytes] = await super().__call__(  # type: ignore
+            keys=[queue_backoff_key, queue_main_key, task_data_key_template],
+            args=[max_batch_size],
+        )
+        return [decode(id) for id in res]
+
+
+def create_backoff_recovery_script(redis_client: redis.Redis) -> BackoffRecoveryScript:
+    """
+    Creates an atomic script for recovering tasks from backoff queue
+    """
+    return get_cached_script(redis_client, "backoff", BackoffRecoveryScript)

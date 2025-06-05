@@ -3,7 +3,7 @@ import asyncio
 import os
 import signal
 import redis.asyncio as redis
-from typing import Any, Optional
+from typing import Any, Literal
 import uvicorn
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -21,11 +21,11 @@ logger = get_logger(__name__)
 class AgentWorkerConfig:
     workers: int = 1
     batch_size: int = 25
-    max_retries: int = 3
+    max_retries: int = 5
     heartbeat_interval: int = 5
-    missed_heartbeats_threshold: int = 3
+    missed_heartbeats_threshold: int = 5
     missed_heartbeats_grace_period: int = 5
-    turn_timeout: int = 90
+    turn_timeout: int = 120
 
 
 @dataclass
@@ -38,6 +38,72 @@ class TaskTTLConfig:
 
 
 @dataclass
+class MetricsTimelineConfig:
+    """Configuration for metrics timeline and bucketing"""
+
+    # Timeline duration in seconds
+    timeline_duration: int = 3600  # 1 hour default
+
+    # Bucket size in seconds (auto-calculated if None)
+    bucket_size: Literal["seconds", "minutes", "hours", "days"] = "minutes"
+
+    # Retention multiplier - how long to keep metrics data relative to timeline
+    retention_multiplier: float = 2.0  # Keep data for 2x the timeline duration
+
+    def __post_init__(self):
+        """Calculate bucket size if not provided"""
+        # Validate that timeline duration provides enough buckets
+        min_buckets = 50
+        if self.bucket_size == "seconds":
+            min_duration = min_buckets
+        elif self.bucket_size == "minutes":
+            min_duration = min_buckets * 60  # 50 minutes minimum
+        elif self.bucket_size == "hours":
+            min_duration = min_buckets * 60 * 60  # 50 hours minimum
+        elif self.bucket_size == "days":
+            min_duration = min_buckets * 60 * 60 * 24  # 50 days minimum
+        else:
+            raise ValueError(f"Invalid bucket_size: {self.bucket_size}")
+
+        if self.timeline_duration < min_duration:
+            raise ValueError(
+                f"Timeline duration ({self.timeline_duration}s) is too short for bucket size '{self.bucket_size}'. "
+                f"Minimum duration required: {min_duration}s to ensure at least {min_buckets} buckets."
+            )
+
+    @property
+    def retention_duration(self) -> int:
+        """Get the retention duration for metrics data"""
+        return int(self.timeline_duration * self.retention_multiplier)
+
+    @property
+    def bucket_duration(self) -> int:
+        if self.bucket_size == "seconds":
+            return 1
+        elif self.bucket_size == "minutes":
+            return 60
+        elif self.bucket_size == "hours":
+            return 3600
+        elif self.bucket_size == "days":
+            return 86400
+        else:
+            raise ValueError(f"Invalid bucket_size: {self.bucket_size}")
+
+    @property
+    def display_name(self) -> str:
+        """Get a human-readable display name for the timeline"""
+        if self.timeline_duration < 3600:
+            minutes = self.timeline_duration // 60
+            return f"{minutes}m"
+        elif self.timeline_duration < 86400:
+            hours = self.timeline_duration // 3600
+            return f"{hours}h"
+        else:
+            days = self.timeline_duration // 86400
+            return f"{days}d"
+
+
+@dataclass
 class MaintenanceWorkerConfig:
     """Configuration for the maintenance worker that handles both stale recovery and garbage collection"""
 
@@ -45,6 +111,9 @@ class MaintenanceWorkerConfig:
     workers: int = 1
     task_ttl: TaskTTLConfig = field(default_factory=TaskTTLConfig)
     max_cleanup_batch: int = 100  # Maximum tasks to clean up per queue per run
+    metrics_timeline: MetricsTimelineConfig = field(
+        default_factory=MetricsTimelineConfig
+    )
 
 
 @dataclass
@@ -65,6 +134,7 @@ class AgentRunner:
         agent: BaseAgent[Any],
         agent_worker_config: AgentWorkerConfig,
         maintenance_worker_config: MaintenanceWorkerConfig,
+        metrics_config: MetricsTimelineConfig = MetricsTimelineConfig(),
     ):
         self.shutdown_event = asyncio.Event()
         self.redis_pool = redis_pool
@@ -73,6 +143,7 @@ class AgentRunner:
         self.queue = to_snake_case(agent.__class__.__name__)
         self.agent_worker_config = agent_worker_config
         self.maintenance_worker_config = maintenance_worker_config
+        self.metrics_config = metrics_config
 
     def set_shutdown_event(self, shutdown_event: asyncio.Event):
         self.shutdown_event = shutdown_event
@@ -80,6 +151,12 @@ class AgentRunner:
     def create_worker_tasks(
         self, shutdown_event: asyncio.Event
     ) -> list[asyncio.Task[Any]]:
+        heartbeat_timeout = (
+            self.agent_worker_config.heartbeat_interval
+            * self.agent_worker_config.missed_heartbeats_threshold
+            + self.agent_worker_config.missed_heartbeats_grace_period
+        )
+
         return [
             asyncio.create_task(
                 worker_loop(
@@ -91,6 +168,8 @@ class AgentRunner:
                     max_retries=self.agent_worker_config.max_retries,
                     heartbeat_interval=self.agent_worker_config.heartbeat_interval,
                     task_timeout=self.agent_worker_config.turn_timeout,
+                    metrics_bucket_duration=self.metrics_config.bucket_duration,
+                    metrics_retention_duration=self.metrics_config.retention_duration,
                 )
             )
             for i in range(self.agent_worker_config.workers)
@@ -100,14 +179,14 @@ class AgentRunner:
                     shutdown_event=shutdown_event,
                     redis_pool=self.redis_pool,
                     agent=self.agent,
-                    heartbeat_timeout=self.agent_worker_config.heartbeat_interval
-                    * self.agent_worker_config.missed_heartbeats_threshold
-                    + self.agent_worker_config.missed_heartbeats_grace_period,
+                    heartbeat_timeout=heartbeat_timeout,
                     max_retries=self.agent_worker_config.max_retries,
                     batch_size=self.agent_worker_config.batch_size,
                     interval=self.maintenance_worker_config.interval,
                     task_ttl_config=self.maintenance_worker_config.task_ttl,
                     max_cleanup_batch=self.maintenance_worker_config.max_cleanup_batch,
+                    metrics_bucket_duration=self.maintenance_worker_config.metrics_timeline.bucket_duration,
+                    metrics_retention_duration=self.maintenance_worker_config.metrics_timeline.retention_duration,
                 )
             )
             for _ in range(self.maintenance_worker_config.workers)
@@ -165,7 +244,7 @@ class ControlPlane:
 
     async def create_observability_app(self) -> FastAPI:
         """Create the observability FastAPI app (minimal, clean, robust)"""
-        from agent.observability import add_observability_routes
+        from agent.dashboard.routes import add_observability_routes
 
         app = FastAPI(
             title="Observability Dashboard",
@@ -186,12 +265,12 @@ class ControlPlane:
         )
         agents = [runner.agent for runner in self.runners]
 
-        # Get TTL config from the first runner (assuming all runners have the same TTL config)
-        ttl_config = None
+        # Get metrics config from the first runner (assuming all runners have the same metrics config)
+        metrics_config = None
         if self.runners:
-            ttl_config = self.runners[0].maintenance_worker_config.task_ttl
+            metrics_config = self.runners[0].maintenance_worker_config.metrics_timeline
 
-        add_observability_routes(app, redis_client, agents, ttl_config)
+        add_observability_routes(app, redis_client, agents, metrics_config)
 
         @app.get("/")
         async def root():
@@ -255,7 +334,16 @@ class ControlPlane:
 
             # If any worker exits, something went wrong or we're shutting down
             if done and not shutdown_event.is_set():
-                logger.error("Worker exited unexpectedly")
+                for task in done:
+                    try:
+                        # This will raise the exception if the task failed
+                        task.result()
+                    except asyncio.CancelledError:
+                        logger.info(f"Worker {task.get_name()} cancelled")
+                    except Exception as e:
+                        logger.error(
+                            f"Worker exited unexpectedly with error: {e}", exc_info=True
+                        )
                 shutdown_event.set()
 
             # If shutdown was requested, wait for workers to finish gracefully
@@ -281,6 +369,10 @@ class ControlPlane:
             logger.info("All workers shut down")
 
         finally:
+            # Close LLM client connections
+            if hasattr(self.llm_client, "close"):
+                await self.llm_client.close()
+
             await self.redis_pool.disconnect()
             logger.info("Redis connection pool closed")
 

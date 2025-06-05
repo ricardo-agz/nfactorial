@@ -68,6 +68,27 @@
       position: relative;
       z-index: 1;
     }
+    
+    /* Smooth transitions for dropdown */
+    #individual-agent-charts {
+      transition: all 0.3s ease-in-out;
+      overflow: hidden;
+    }
+    
+    /* Button hover effects */
+    #toggle-individual-agents:hover {
+      background-color: #f9fafb;
+    }
+    
+    /* Individual agent chart styling */
+    .agent-chart-section {
+      border-left: 3px solid #e5e7eb;
+      transition: border-color 0.2s ease;
+    }
+    
+    .agent-chart-section:hover {
+      border-left-color: #3b82f6;
+    }
   </style>
 </head>
 <body class="bg-gray-50 text-gray-900 font-sans antialiased">
@@ -135,10 +156,10 @@
     </main>
 
     <!-- Footer -->
-    <footer id="footer" class="border-t border-gray-200 bg-white py-4">
-      <div class="max-w-7xl mx-auto px-6 text-center text-sm text-gray-500">
+    <footer class="max-w-6xl mx-auto px-6">
+        <div class="flex justify-between items-center border-t border-gray-200 py-4 text-xs text-gray-500">
         &nbsp;
-      </div>
+        </div>
     </footer>
   </div>
 

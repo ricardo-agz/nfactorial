@@ -8,6 +8,20 @@ services:
     command: redis-server --appendonly yes
     volumes:
       - redis_data:/data
+      - ./redis.conf:/usr/local/etc/redis/redis.conf:ro
+    # Resource limits for beefy laptop
+    deploy:
+      resources:
+        limits:
+          memory: 6G
+          cpus: "2.0"
+        reservations:
+          memory: 2G
+          cpus: "1.0"
+    # Kernel parameters for better network performance
+    sysctls:
+      - net.core.somaxconn=2048
+      - net.ipv4.tcp_max_syn_backlog=2048
 
   api:
     build: .
@@ -39,11 +53,15 @@ services:
       - EXA_API_KEY=${EXA_API_KEY}
       # All workers have observability enabled, they'll auto-discover ports
       - ENABLE_OBSERVABILITY=true
-      - OBSERVABILITY_PORT=8080  # Starting port, will auto-increment if taken
+      - OBSERVABILITY_PORT=8080 # Starting port, will auto-increment if taken
     depends_on:
       - redis
     deploy:
       replicas: 1
+      resources:
+        limits:
+          memory: 2G
+          cpus: "1.0"
 
 volumes:
   redis_data:

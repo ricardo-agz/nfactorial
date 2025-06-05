@@ -8,6 +8,7 @@ from openai.types.chat import ChatCompletion, ChatCompletionChunk
 from openai.types.chat.completion_create_params import ResponseFormat
 from openai._streaming import AsyncStream
 from pydantic import BaseModel
+import httpx
 
 load_dotenv()
 
@@ -27,16 +28,40 @@ class Model:
 
 class MultiClient:
     def __init__(
-        self, openai_api_key: str | None = None, xai_api_key: str | None = None
+        self,
+        openai_api_key: str | None = None,
+        xai_api_key: str | None = None,
+        max_connections: int = 1000,
+        max_keepalive_connections: int = 100,
+        timeout: float = 120.0,
     ):
+        # Configure HTTP client with proper connection pooling
+        http_client = httpx.AsyncClient(
+            limits=httpx.Limits(
+                max_connections=max_connections,
+                max_keepalive_connections=max_keepalive_connections,
+            ),
+            timeout=httpx.Timeout(timeout),
+        )
+
         if openai_api_key or os.environ.get("OPENAI_API_KEY"):
             self.openai = AsyncOpenAI(
-                api_key=openai_api_key or os.environ.get("OPENAI_API_KEY")
+                api_key=openai_api_key or os.environ.get("OPENAI_API_KEY"),
+                http_client=http_client,
             )
         if xai_api_key or os.environ.get("XAI_API_KEY"):
+            # Create separate HTTP client for XAI to avoid conflicts
+            xai_http_client = httpx.AsyncClient(
+                limits=httpx.Limits(
+                    max_connections=max_connections,
+                    max_keepalive_connections=max_keepalive_connections,
+                ),
+                timeout=httpx.Timeout(timeout),
+            )
             self.xai = AsyncOpenAI(
                 base_url="https://api.x.ai/v1",
                 api_key=xai_api_key or os.environ.get("XAI_API_KEY"),
+                http_client=xai_http_client,
             )
 
     async def completion(
@@ -75,6 +100,13 @@ class MultiClient:
             return await self.xai.chat.completions.create(**kwargs)
 
         raise ValueError(f"Unsupported provider: {model.provider}")
+
+    async def close(self):
+        """Close HTTP clients to clean up connections"""
+        if hasattr(self, "openai") and self.openai._client:
+            await self.openai._client.aclose()
+        if hasattr(self, "xai") and self.xai._client:
+            await self.xai._client.aclose()
 
 
 gpt_41 = Model(

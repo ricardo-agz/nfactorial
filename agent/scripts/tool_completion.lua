@@ -15,4 +15,4 @@ redis.call('HSET', tasks_key, 'payload', updated_task_context_json)
 redis.call('HSET', tasks_key, 'status', 'active')
 redis.call('LPUSH', main_queue, task_id)
 
-return true 
+return true

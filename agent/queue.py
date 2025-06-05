@@ -25,7 +25,6 @@ from agent.scripts import (
     TaskCompletionScript,
     StaleRecoveryScript,
     TaskExpirationScript,
-    BackoffRecoveryScript,
     create_batch_pickup_script,
     create_task_steering_script,
     create_task_completion_script,
@@ -33,7 +32,6 @@ from agent.scripts import (
     create_task_expiration_script,
     create_tool_completion_script,
     create_enqueue_task_script,
-    create_heartbeat_script,
     create_backoff_recovery_script,
     BatchPickupScriptResult,
     StaleRecoveryScriptResult,
@@ -455,11 +453,7 @@ async def heartbeat_loop(
     try:
         while not stop_event.is_set():
             try:
-                heartbeat_script = create_heartbeat_script(redis_client)
-                timestamp = await heartbeat_script.execute(
-                    agent_heartbeats_key=agent_heartbeats,
-                    task_id=task_id,
-                )
+                await redis_client.zadd(agent_heartbeats, {task_id: time.time()})  # type: ignore
 
                 # Wait for next interval
                 try:

@@ -511,30 +511,6 @@ def create_enqueue_task_script(redis_client: redis.Redis) -> EnqueueTaskScript:
     return get_cached_script(redis_client, "enqueue", EnqueueTaskScript)
 
 
-class HeartbeatScript(AsyncScript):
-    """
-    Simple atomic script to update a task's heartbeat
-    """
-
-    async def execute(
-        self,
-        *,
-        agent_heartbeats_key: str,
-        task_id: str,
-    ) -> float:
-        return await super().__call__(  # type: ignore
-            keys=[agent_heartbeats_key],
-            args=[task_id],
-        )
-
-
-def create_heartbeat_script(redis_client: redis.Redis) -> HeartbeatScript:
-    """
-    Creates a script for updating a task's heartbeat
-    """
-    return get_cached_script(redis_client, "heartbeat", HeartbeatScript)
-
-
 @dataclass
 class MetricsAggregationResult:
     """Result of the metrics aggregation script"""

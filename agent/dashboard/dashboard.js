@@ -722,11 +722,6 @@ function createDashboardLayout() {
       <!-- Activity Charts -->
       <div class="bg-white border border-gray-200 rounded-lg overflow-hidden">
         <div class="p-6 space-y-6">
-          <!-- Header -->
-          <div class="flex items-center justify-between">
-            <h3 class="text-lg font-medium text-gray-900">System Activity</h3>
-          </div>
-
           ${createActivityChartSection('completed', 'check-circle', 'text-green-500', 'Completed Tasks')}
           ${createActivityChartSection('failed', 'x-circle', 'text-red-500', 'Failed Tasks')}
           ${createActivityChartSection('cancelled', 'ban', 'text-purple-500', 'Cancelled Tasks')}

@@ -7,7 +7,6 @@ from ._loader import (
     create_tool_completion_script,
     create_enqueue_task_script,
     create_metrics_aggregation_script,
-    create_heartbeat_script,
     create_backoff_recovery_script,
     BatchPickupScript,
     TaskSteeringScript,
@@ -22,7 +21,6 @@ from ._loader import (
     StaleRecoveryScriptResult,
     TaskExpirationScriptResult,
     MetricsAggregationResult,
-    HeartbeatScript,
 )
 
 __all__ = [
@@ -34,7 +32,6 @@ __all__ = [
     "create_tool_completion_script",
     "create_enqueue_task_script",
     "create_metrics_aggregation_script",
-    "create_heartbeat_script",
     "create_backoff_recovery_script",
     "BatchPickupScript",
     "TaskSteeringScript",
@@ -49,5 +46,4 @@ __all__ = [
     "StaleRecoveryScriptResult",
     "TaskExpirationScriptResult",
     "MetricsAggregationResult",
-    "HeartbeatScript",
 ]

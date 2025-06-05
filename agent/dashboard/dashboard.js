@@ -860,96 +860,36 @@ function getErrorInfo(error) {
 
 function createErrorDisplay(errorInfo) {
   return `
-    <div class="max-w-2xl mx-auto">
+    <div class="max-w-lg mx-auto">
       <!-- Error Card -->
-      <div class="bg-white border border-red-200 rounded-lg shadow-sm overflow-hidden">
+      <div class="bg-white border border-gray-200 rounded-lg shadow-sm overflow-hidden">
         <!-- Header -->
-        <div class="bg-red-50 px-6 py-4 border-b border-red-200">
-          <div class="flex items-center gap-3">
+        <div class="px-6 py-6">
+          <div class="flex items-center gap-3 mb-4">
             <div class="flex-shrink-0">
-              <i data-lucide="wifi-off" class="w-8 h-8 text-red-500"></i>
+              <i data-lucide="wifi-off" class="w-6 h-6 text-red-500"></i>
             </div>
             <div>
-              <h3 class="text-lg font-semibold text-red-900">${errorInfo.title}</h3>
-              <p class="text-sm text-red-700">${errorInfo.message}</p>
+              <h3 class="text-lg font-medium text-gray-900">${errorInfo.title}</h3>
+              <p class="text-sm text-gray-600">${errorInfo.message}</p>
             </div>
           </div>
-        </div>
-        
-        <!-- Body -->
-        <div class="px-6 py-6">
-          <div class="space-y-4">
-            ${errorInfo.details ? `
-              <div class="text-sm text-gray-600">
-                <p>${errorInfo.details}</p>
-              </div>
-            ` : ''}
-            
-            <!-- Status Information -->
-            <div class="bg-gray-50 rounded-lg p-4">
-              <h4 class="text-sm font-medium text-gray-900 mb-3">Connection Status</h4>
-              <div class="space-y-2">
-                <div class="flex items-center justify-between text-sm">
-                  <span class="text-gray-600">Dashboard Service</span>
-                  <span class="flex items-center gap-2 text-red-600">
-                    <div class="w-2 h-2 rounded-full bg-red-500"></div>
-                    Disconnected
-                  </span>
-                </div>
-                <div class="flex items-center justify-between text-sm">
-                  <span class="text-gray-600">Last Successful Refresh</span>
-                  <span class="text-gray-900">${state.lastRefreshTime ? formatLastRefresh().replace('Last refresh: ', '') : 'Never'}</span>
-                </div>
-                <div class="flex items-center justify-between text-sm">
-                  <span class="text-gray-600">Auto Refresh</span>
-                  <span class="text-gray-900">${state.autoRefresh ? 'Enabled' : 'Disabled'}</span>
-                </div>
-              </div>
-            </div>
-            
-            <!-- Troubleshooting -->
-            <div class="bg-blue-50 rounded-lg p-4">
-              <h4 class="text-sm font-medium text-blue-900 mb-3">Troubleshooting</h4>
-              <ul class="text-sm text-blue-800 space-y-1">
-                <li class="flex items-start gap-2">
-                  <span class="text-blue-500 mt-0.5">•</span>
-                  <span>Check if the Robonet service is running</span>
-                </li>
-                <li class="flex items-start gap-2">
-                  <span class="text-blue-500 mt-0.5">•</span>
-                  <span>Verify Redis connectivity</span>
-                </li>
-                <li class="flex items-start gap-2">
-                  <span class="text-blue-500 mt-0.5">•</span>
-                  <span>Ensure network connectivity to the service</span>
-                </li>
-                <li class="flex items-start gap-2">
-                  <span class="text-blue-500 mt-0.5">•</span>
-                  <span>Try refreshing the page</span>
-                </li>
-              </ul>
-            </div>
-            
-            <!-- Action Buttons -->
-            <div class="flex items-center gap-3 pt-2">
-              <button id="retry-connection" class="flex items-center gap-2 px-4 py-2 bg-red-600 text-white text-sm font-medium rounded-lg hover:bg-red-700 transition-colors">
-                <i data-lucide="refresh-cw" class="w-4 h-4"></i>
-                Retry Connection
-              </button>
-              <button id="reload-page" class="flex items-center gap-2 px-4 py-2 bg-gray-600 text-white text-sm font-medium rounded-lg hover:bg-gray-700 transition-colors">
-                <i data-lucide="rotate-ccw" class="w-4 h-4"></i>
-                Reload Page
-              </button>
-            </div>
-          </div>
+          
+          ${errorInfo.details ? `
+            <p class="text-sm text-gray-500 mb-4">${errorInfo.details}</p>
+          ` : ''}
+          
+          <!-- Action Button -->
+          <button id="retry-connection" class="flex items-center gap-2 px-4 py-2 bg-red-600 text-white text-sm font-medium rounded-lg hover:bg-red-700 transition-colors">
+            <i data-lucide="refresh-cw" class="w-4 h-4"></i>
+            Retry
+          </button>
         </div>
       </div>
       
-      <!-- Additional Info -->
-      <div class="mt-6 text-center">
-        <p class="text-sm text-gray-500">
-          The dashboard will automatically retry when auto-refresh is enabled.
-        </p>
+      <!-- Status Info -->
+      <div class="mt-4 text-center text-xs text-gray-500">
+        ${state.autoRefresh ? 'Auto-refresh will retry automatically' : 'Manual refresh required'}
       </div>
     </div>
   `;
@@ -957,14 +897,9 @@ function createErrorDisplay(errorInfo) {
 
 function setupErrorHandlers() {
   const retryBtn = document.getElementById('retry-connection');
-  const reloadBtn = document.getElementById('reload-page');
   
   if (retryBtn) {
     retryBtn.addEventListener('click', fetchMetrics);
-  }
-  
-  if (reloadBtn) {
-    reloadBtn.addEventListener('click', () => window.location.reload());
   }
 }
 

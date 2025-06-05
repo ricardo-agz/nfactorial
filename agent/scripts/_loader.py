@@ -593,3 +593,72 @@ def create_backoff_recovery_script(redis_client: redis.Redis) -> BackoffRecovery
     Creates an atomic script for recovering tasks from backoff queue
     """
     return get_cached_script(redis_client, "backoff", BackoffRecoveryScript)
+
+
+@dataclass
+class CancelTaskScriptResult:
+    """Result of the cancel task script"""
+
+    success: bool
+    current_status: str | None
+    message: str
+
+
+class CancelTaskScript(AsyncScript):
+    """
+    Handles unified task cancellation for all task states
+
+    Keys:
+    * KEYS[1] = task_data_key (str)
+    * KEYS[2] = task_cancellations_key (str)
+    * KEYS[3] = queue_key_base (str)
+    * KEYS[4] = pending_tool_results_key_base (str)
+    * KEYS[5] = task_metrics_key_base (str)
+
+    Args:
+    * ARGV[1] = task_id (str)
+    * ARGV[2] = metrics_bucket_duration (int)
+    * ARGV[3] = metrics_retention_duration (int)
+    """
+
+    async def execute(
+        self,
+        *,
+        task_data_key: str,
+        task_cancellations_key: str,
+        queue_key_base: str,
+        pending_tool_results_key_base: str,
+        task_metrics_key_base: str,
+        task_id: str,
+        metrics_bucket_duration: int,
+        metrics_retention_duration: int,
+    ) -> CancelTaskScriptResult:
+        result: tuple[bool, str | None, str] = await super().__call__(  # type: ignore
+            keys=[
+                task_data_key,
+                task_cancellations_key,
+                queue_key_base,
+                pending_tool_results_key_base,
+                task_metrics_key_base,
+            ],
+            args=[
+                task_id,
+                metrics_bucket_duration,
+                metrics_retention_duration,
+            ],
+        )
+
+        return CancelTaskScriptResult(
+            success=bool(decode(result[0])),
+            current_status=decode(result[1]) if result[1] is not None else None,
+            message=decode(result[2]),
+        )
+
+
+def create_cancel_task_script(
+    redis_client: redis.Redis,
+) -> CancelTaskScript:
+    """
+    Creates a unified script for cancelling tasks in any state
+    """
+    return get_cached_script(redis_client, "cancellation", CancelTaskScript)

@@ -11,10 +11,8 @@ import uuid
 from contextlib import asynccontextmanager
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
-from agent.context import Task, AgentContext
-from agent.queue import enqueue_task, cancel_task, steer_task
-from agent.agent import DummyAgent, MultiAgent, FreeAgent
-from example_agents.video_gen_agent import VideoGenAgent
+from agent.context import AgentContext
+from orchestrator import control_plane, agent as default_agent
 from agent.logging import get_logger
 
 logger = get_logger("server")
@@ -27,12 +25,8 @@ redis_client: RedisType
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global redis_client
-    redis_client = redis.StrictRedis(
-        host=os.getenv("REDIS_HOST", "localhost"),
-        port=6379,
-        db=0,
-        decode_responses=True,
-    )
+    # Use the shared control plane's Redis connection
+    redis_client = await control_plane.get_redis_client()
 
     try:
         await redis_client.ping()  # type: ignore
@@ -81,7 +75,10 @@ async def websocket_updates(websocket: WebSocket, user_id: str):
                 timeout=WS_REDIS_SUB_TIMEOUT,
             )
             if msg and msg["type"] == "message":
-                await websocket.send_text(msg["data"])
+                data = msg["data"]
+                if isinstance(data, bytes):
+                    data = data.decode("utf-8")
+                await websocket.send_text(data)
     except WebSocketDisconnect:
         logger.info(f"WebSocket disconnected for user_id={user_id}")
     finally:
@@ -116,10 +113,9 @@ class SteerRequest(BaseModel):
 
 @app.post("/api/enqueue")
 async def enqueue(request: EnqueueRequest):
-    agent = DummyAgent()
-    # agent = MultiAgent()
-    # agent = FreeAgent()
-    # agent = VideoGenAgent()
+    # Use the default agent from shared manager
+    # You could also look up agents by name: control_plane.get_agent("agent_name")
+    agent = default_agent
 
     task = agent.create_task(
         owner_id=request.user_id,
@@ -130,15 +126,16 @@ async def enqueue(request: EnqueueRequest):
         ),
     )
 
-    await enqueue_task(redis_client=redis_client, task=task, agent=agent)
+    # Use the control plane's enqueue method with proper configuration
+    await control_plane.enqueue_task(agent=agent, task=task)
     return {"task_id": task.id}
 
 
 @app.post("/api/steer")
 async def steer_task_endpoint(request: SteerRequest):
     try:
-        await steer_task(
-            redis_client=redis_client,
+        # Use the control plane's steer method
+        await control_plane.steer_task(
             task_id=request.task_id,
             messages=request.messages,
         )
@@ -158,10 +155,8 @@ async def steer_task_endpoint(request: SteerRequest):
 @app.post("/api/cancel")
 async def cancel_task_endpoint(request: CancelRequest):
     try:
-        await cancel_task(
-            redis_client=redis_client,
-            task_id=request.task_id,
-        )
+        # Use the control plane's cancel method that automatically determines the agent
+        await control_plane.cancel_task(task_id=request.task_id)
 
         logger.info(
             f"Task {request.task_id} marked for cancellation by user {request.user_id}"
@@ -172,6 +167,62 @@ async def cancel_task_endpoint(request: CancelRequest):
         }
     except Exception as e:
         logger.error(f"Failed to cancel task {request.task_id}: {e}")
+        return {"success": False, "error": str(e)}
+
+
+@app.get("/api/task/{task_id}/status")
+async def get_task_status_endpoint(task_id: str):
+    """Get the status of a specific task"""
+    try:
+        status = await control_plane.get_task_status(task_id)
+        return {"task_id": task_id, "status": status}
+    except Exception as e:
+        logger.error(f"Failed to get status for task {task_id}: {e}")
+        return {"success": False, "error": str(e)}
+
+
+@app.get("/api/task/{task_id}")
+async def get_task_data_endpoint(task_id: str):
+    """Get the full data of a specific task"""
+    try:
+        task_data = await control_plane.get_task_data(task_id)
+        if not task_data:
+            return {"success": False, "error": "Task not found"}
+        return {"task_id": task_id, "data": task_data}
+    except Exception as e:
+        logger.error(f"Failed to get data for task {task_id}: {e}")
+        return {"success": False, "error": str(e)}
+
+
+@app.get("/api/agents")
+async def get_agents_endpoint():
+    """Get information about registered agents"""
+    try:
+        agents_info = []
+        for agent_name, agent in control_plane._agents_by_name.items():
+            metrics_config = control_plane.get_metrics_config(agent_name)
+            agents_info.append(
+                {
+                    "name": agent_name,
+                    "class": agent.__class__.__name__,
+                    "metrics_config": {
+                        "bucket_duration": metrics_config.bucket_duration
+                        if metrics_config
+                        else None,
+                        "retention_duration": metrics_config.retention_duration
+                        if metrics_config
+                        else None,
+                        "timeline_duration": metrics_config.timeline_duration
+                        if metrics_config
+                        else None,
+                    }
+                    if metrics_config
+                    else None,
+                }
+            )
+        return {"agents": agents_info}
+    except Exception as e:
+        logger.error(f"Failed to get agents info: {e}")
         return {"success": False, "error": str(e)}
 
 

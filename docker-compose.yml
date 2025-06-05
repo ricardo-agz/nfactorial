@@ -39,11 +39,11 @@ services:
       - redis
 
   # Multiple worker instances - each will auto-discover available ports
-  worker:
+  orchestrator:
     build: .
     ports:
       - "8080:8080"
-    command: python worker.py
+    command: python orchestrator.py
     volumes:
       - .:/app
     environment:

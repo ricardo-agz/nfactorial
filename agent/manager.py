@@ -13,6 +13,7 @@ from agent.queue import enqueue_task, worker_loop, maintenance_loop
 from agent.llms import MultiClient
 from agent.utils import to_snake_case
 from agent.logging import get_logger
+from agent.context import Task, ContextType
 
 logger = get_logger(__name__)
 
@@ -132,18 +133,18 @@ class AgentRunner:
         redis_pool: redis.ConnectionPool,
         llm_client: MultiClient,
         agent: BaseAgent[Any],
+        metrics_config: MetricsTimelineConfig,
         agent_worker_config: AgentWorkerConfig,
         maintenance_worker_config: MaintenanceWorkerConfig,
-        metrics_config: MetricsTimelineConfig = MetricsTimelineConfig(),
     ):
         self.shutdown_event = asyncio.Event()
         self.redis_pool = redis_pool
         self.llm_client = llm_client
         self.agent = agent
         self.queue = to_snake_case(agent.__class__.__name__)
+        self.metrics_config = metrics_config
         self.agent_worker_config = agent_worker_config
         self.maintenance_worker_config = maintenance_worker_config
-        self.metrics_config = metrics_config
 
     def set_shutdown_event(self, shutdown_event: asyncio.Event):
         self.shutdown_event = shutdown_event
@@ -203,7 +204,8 @@ class ControlPlane:
         redis_max_connections: int = 50,
         openai_api_key: str | None = None,
         xai_api_key: str | None = None,
-        observability_config: ObservabilityConfig | None = None,
+        observability_config: ObservabilityConfig = ObservabilityConfig(),
+        metrics_config: MetricsTimelineConfig = MetricsTimelineConfig(),
     ):
         self.shutdown_event = asyncio.Event()
 
@@ -223,7 +225,9 @@ class ControlPlane:
         )
 
         self.runners: list[AgentRunner] = []
-        self.observability_config = observability_config or ObservabilityConfig()
+        self.observability_config = observability_config
+        self.metrics_config = metrics_config
+        self._agents_by_name: dict[str, BaseAgent[Any]] = {}
 
     def register_runner(
         self,
@@ -237,10 +241,102 @@ class ControlPlane:
             agent=agent,
             agent_worker_config=agent_worker_config,
             maintenance_worker_config=maintenance_worker_config,
+            metrics_config=self.metrics_config,
         )
 
         runner.set_shutdown_event(self.shutdown_event)
         self.runners.append(runner)
+        self._agents_by_name[agent.name] = agent
+
+    def get_agent(self, agent_name: str) -> BaseAgent[Any] | None:
+        """Get an agent by name"""
+        return self._agents_by_name.get(agent_name)
+
+    async def get_redis_client(self) -> redis.Redis:
+        """Get a Redis client from the pool"""
+        return redis.Redis(connection_pool=self.redis_pool, decode_responses=True)
+
+    async def enqueue_task(
+        self,
+        agent: BaseAgent[Any],
+        task: Task[ContextType],
+    ) -> None:
+        """Enqueue a task using the control plane's configuration"""
+        from agent.queue import enqueue_task
+
+        redis_client = await self.get_redis_client()
+        try:
+            await enqueue_task(redis_client=redis_client, agent=agent, task=task)
+        finally:
+            await redis_client.close()
+
+    async def cancel_task(
+        self,
+        task_id: str,
+    ) -> None:
+        """Cancel a task using the control plane's configuration"""
+        from agent.queue import cancel_task as cancel_queued_task
+
+        redis_client = await self.get_redis_client()
+        try:
+            await cancel_queued_task(
+                redis_client=redis_client,
+                task_id=task_id,
+                metrics_bucket_duration=self.metrics_config.bucket_duration,
+                metrics_retention_duration=self.metrics_config.retention_duration,
+            )
+        finally:
+            await redis_client.close()
+
+    async def steer_task(
+        self,
+        task_id: str,
+        messages: list[dict[str, Any]],
+    ) -> None:
+        """Steer a task using the control plane's configuration"""
+        from agent.queue import steer_task
+
+        redis_client = await self.get_redis_client()
+        try:
+            await steer_task(
+                redis_client=redis_client,
+                task_id=task_id,
+                messages=messages,
+            )
+        finally:
+            await redis_client.close()
+
+    async def get_task_status(self, task_id: str) -> Any:
+        """Get task status using the control plane's configuration"""
+        from agent.queue import get_task_status
+
+        redis_client = await self.get_redis_client()
+        try:
+            return await get_task_status(redis_client=redis_client, task_id=task_id)
+        finally:
+            await redis_client.close()
+
+    async def get_task_data(self, task_id: str) -> dict[str, Any] | None:
+        """Get task data using the control plane's configuration"""
+        from agent.queue import get_task_data
+
+        redis_client = await self.get_redis_client()
+        try:
+            return await get_task_data(redis_client=redis_client, task_id=task_id)
+        finally:
+            await redis_client.close()
+
+    async def get_agent_for_task(self, task_id: str) -> BaseAgent[Any] | None:
+        """Get the agent that owns a specific task"""
+        task_data = await self.get_task_data(task_id)
+        if not task_data:
+            return None
+
+        agent_name = task_data.get("agent")
+        if not agent_name:
+            return None
+
+        return self.get_agent(agent_name)
 
     async def create_observability_app(self) -> FastAPI:
         """Create the observability FastAPI app (minimal, clean, robust)"""

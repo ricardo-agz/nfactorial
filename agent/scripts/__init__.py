@@ -8,12 +8,14 @@ from ._loader import (
     create_enqueue_task_script,
     create_metrics_aggregation_script,
     create_backoff_recovery_script,
+    create_cancel_task_script,
     BatchPickupScript,
     TaskSteeringScript,
     TaskCompletionScript,
     StaleRecoveryScript,
     TaskExpirationScript,
     ToolCompletionScript,
+    CancelTaskScript,
     EnqueueTaskScript,
     MetricsAggregationScript,
     BackoffRecoveryScript,
@@ -21,6 +23,7 @@ from ._loader import (
     StaleRecoveryScriptResult,
     TaskExpirationScriptResult,
     MetricsAggregationResult,
+    CancelTaskScriptResult,
 )
 
 __all__ = [
@@ -33,12 +36,14 @@ __all__ = [
     "create_enqueue_task_script",
     "create_metrics_aggregation_script",
     "create_backoff_recovery_script",
+    "create_cancel_task_script",
     "BatchPickupScript",
     "TaskSteeringScript",
     "TaskCompletionScript",
     "StaleRecoveryScript",
     "TaskExpirationScript",
     "ToolCompletionScript",
+    "CancelTaskScript",
     "EnqueueTaskScript",
     "MetricsAggregationScript",
     "BackoffRecoveryScript",
@@ -46,4 +51,5 @@ __all__ = [
     "StaleRecoveryScriptResult",
     "TaskExpirationScriptResult",
     "MetricsAggregationResult",
+    "CancelTaskScriptResult",
 ]

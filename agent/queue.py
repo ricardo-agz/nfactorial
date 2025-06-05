@@ -33,9 +33,11 @@ from agent.scripts import (
     create_tool_completion_script,
     create_enqueue_task_script,
     create_backoff_recovery_script,
+    create_cancel_task_script,
     BatchPickupScriptResult,
     StaleRecoveryScriptResult,
     TaskExpirationScriptResult,
+    CancelTaskScriptResult,
 )
 from agent.utils import decode
 
@@ -44,22 +46,24 @@ logger = get_logger("agent.queue")
 
 # ***** REDIS KEY SPACE *****
 
+TASKS_DATA_BASE = "tasks"
 # HASH: task data {id, status, retries, owner_id, payload}
 TASKS_DATA = "tasks:{task_id}"
 
 # ===== QUEUE MANAGEMENT =====
+QUEUE_BASE = "queue"
 # LIST: task_ids waiting to be processed
 QUEUE_MAIN = "queue:{agent}:main"
 # ZSET: task_id -> timestamp of failure
 QUEUE_FAILED = "queue:{agent}:failed"
 # ZSET: task_id -> timestamp of completion
-QUEUE_COMPLETIONS = "queue:{agent}:completed"
+QUEUE_COMPLETIONS = "queue::{agent}:completed"
 # ZSET: task_id -> timestamp of cancellation
-QUEUE_CANCELLED = "queue:{agent}:cancelled"
+QUEUE_CANCELLED = "queue::{agent}:cancelled"
 # ZSET: task_id -> timestamp of when task is ready to be picked up again
-QUEUE_BACKOFF = "queue:{agent}:backoff"
+QUEUE_BACKOFF = "queue::{agent}:backoff"
 # ZSET: task_id -> timestamp of orphaned task
-QUEUE_ORPHANED = "queue:{agent}:orphaned"
+QUEUE_ORPHANED = "queue::{agent}:orphaned"
 
 # ===== ACTIVE TASK PROCESSING =====
 # ZSET: task_id -> timestamp of last heartbeat
@@ -73,6 +77,7 @@ TASK_STEERING = "steer:{task_id}:messages"
 
 # ===== PENDING TOOL EXECUTION =====
 # HASH: tool_call_id -> result_json or <|PENDING|>
+PENDING_TOOL_RESULTS_BASE = "tool"
 PENDING_TOOL_RESULTS = "tool:{agent}:{task_id}:results"
 
 # ===== COMMUNICATION =====
@@ -80,7 +85,8 @@ PENDING_TOOL_RESULTS = "tool:{agent}:{task_id}:results"
 UPDATES_CHANNEL = "updates:{owner_id}"
 
 # ===== METRICS =====
-# HASH: {count, total_duration, total_turns, total_retries} (bucket is a timestamp of a time bucket)
+TIMELINE_METRICS_BASE = "metrics:timeline"
+# HASH: {count, total_duration, total_turns, total_retries} (bucket is a timestamp of a time bucke"metrics:timeline:{agent}:{metric_type}:{bucket}"
 TIMELINE_METRICS_KEY_TEMPLATE = "metrics:timeline:{agent}:{metric_type}:{bucket}"
 # HASH: {count, total_duration, total_turns, total_retries} (bucket is a timestamp of a time bucket)
 TIMELINE_METRICS_COMPLETED = "metrics:timeline:{agent}:completed:{bucket}"
@@ -258,13 +264,39 @@ async def enqueue_task(
 async def cancel_task(
     redis_client: redis.Redis,
     task_id: str,
+    metrics_bucket_duration: int = 300,
+    metrics_retention_duration: int = 86400,
 ) -> None:
-    """Add a task to the cancellation set"""
-    task_status = await get_task_status(redis_client, task_id)
-    if task_status in [TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED]:
-        raise InactiveTaskError(task_id)
+    """Cancel a task using unified cancellation script"""
+    tasks_data_key = TASKS_DATA.format(task_id=task_id)
+    pending_tool_results_key_base = PENDING_TOOL_RESULTS_BASE
+    queue_key_base = QUEUE_BASE
+    task_cancellations_key = TASK_CANCELLATIONS
+    timeline_metrics_key_base = TIMELINE_METRICS_BASE
 
-    await redis_client.sadd(TASK_CANCELLATIONS, task_id)  # type: ignore
+    cancel_script = create_cancel_task_script(redis_client)
+    result: CancelTaskScriptResult = await cancel_script.execute(
+        task_data_key=tasks_data_key,
+        task_cancellations_key=task_cancellations_key,
+        queue_key_base=queue_key_base,
+        pending_tool_results_key_base=pending_tool_results_key_base,
+        task_metrics_key_base=timeline_metrics_key_base,
+        task_id=task_id,
+        metrics_bucket_duration=metrics_bucket_duration,
+        metrics_retention_duration=metrics_retention_duration,
+    )
+
+    if not result.success:
+        if not result.current_status:
+            raise TaskNotFoundError(task_id)
+        elif result.current_status in [
+            TaskStatus.COMPLETED,
+            TaskStatus.FAILED,
+            TaskStatus.CANCELLED,
+        ]:
+            raise InactiveTaskError(task_id)
+        else:
+            raise Exception(result.message)
 
 
 async def steer_task(
@@ -321,6 +353,13 @@ async def complete_async_tool(
     task_status = await get_task_status(redis_client, task_id)
     if task_status in [TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED]:
         raise InactiveTaskError(task_id)
+
+    # Check if task is marked for cancellation
+    is_cancelled = await redis_client.sismember(TASK_CANCELLATIONS, task_id)  # type: ignore
+    if is_cancelled:
+        # Cancel the task instead of completing the tool call
+        await cancel_task(redis_client, task_id)
+        return False
 
     tasks_key = TASKS_DATA.format(task_id=task_id)
     tool_results_key = PENDING_TOOL_RESULTS.format(agent=agent.name, task_id=task_id)

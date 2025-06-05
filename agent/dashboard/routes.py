@@ -365,6 +365,7 @@ def add_observability_routes(
     redis_client: redis.Redis,
     agents: list[BaseAgent[Any]],
     metrics_config: Any,
+    dashboard_name: str = "Robonet Dashboard",
 ) -> None:
     """Add observability routes with Lua scripts and caching"""
 
@@ -397,7 +398,9 @@ def add_observability_routes(
         dashboard_path = os.path.join(os.path.dirname(__file__), "dashboard.html")
         try:
             with open(dashboard_path, "r", encoding="utf-8") as f:
-                return f.read()
+                html_content = f.read()
+                html_content = html_content.replace("{{APP_NAME}}", dashboard_name)
+                return html_content
         except FileNotFoundError:
             return "<html><body><h1>Dashboard not found</h1></body></html>"
 
@@ -405,19 +408,6 @@ def add_observability_routes(
     async def metrics():
         """Get all metrics efficiently using single Lua script call + caching"""
         return await collector.get_all_metrics(agents)
-
-    @app.get("/observability/api/metrics/fast", response_class=JSONResponse)
-    async def metrics_fast():
-        """Get metrics with reduced timeline for faster loading"""
-        # Create a fast collector with shorter timeline
-        fast_collector = MetricsCollector(
-            redis_client,
-            timeline_duration=900,  # 15 minutes instead of 1 hour
-            bucket_duration=bucket_duration,
-            retention_duration=retention_duration,
-            cache_ttl=15.0,  # Longer cache for fast endpoint
-        )
-        return await fast_collector.get_all_metrics(agents)
 
     @app.get("/observability/api/health", response_class=JSONResponse)
     async def health():

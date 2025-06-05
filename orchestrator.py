@@ -22,6 +22,7 @@ control_plane = ControlPlane(
         port=8080,
         cors_origins=["*"],
     ),
+    name="orchestrator",
 )
 
 # Default agent configuration

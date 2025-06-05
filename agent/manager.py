@@ -125,6 +125,7 @@ class ObservabilityConfig:
     host: str = "0.0.0.0"
     port: int = 8080
     cors_origins: list[str] = field(default_factory=lambda: ["*"])
+    dashboard_name: str | None = None
 
 
 class AgentRunner:
@@ -206,6 +207,8 @@ class ControlPlane:
         xai_api_key: str | None = None,
         observability_config: ObservabilityConfig = ObservabilityConfig(),
         metrics_config: MetricsTimelineConfig = MetricsTimelineConfig(),
+        name: str | None = None,
+        namespace: str | None = None,
     ):
         self.shutdown_event = asyncio.Event()
 
@@ -228,6 +231,11 @@ class ControlPlane:
         self.observability_config = observability_config
         self.metrics_config = metrics_config
         self._agents_by_name: dict[str, BaseAgent[Any]] = {}
+        self.name = name or namespace or "robonet"
+        self.namespace = namespace or name or "robonet"
+
+        if self.observability_config.dashboard_name is None:
+            self.observability_config.dashboard_name = f"{self.name.title()} Dashboard"
 
     def register_runner(
         self,
@@ -342,10 +350,16 @@ class ControlPlane:
         """Create the observability FastAPI app (minimal, clean, robust)"""
         from agent.dashboard.routes import add_observability_routes
 
+        dashboard_name = (
+            self.observability_config.dashboard_name or f"{self.name.title()} Dashboard"
+        )
+
         app = FastAPI(
-            title="Observability Dashboard",
+            title=dashboard_name,
             description="Minimal real-time dashboard for distributed AI agent system",
             version="1.0.0",
+            redoc_url=None,
+            docs_url=None,
         )
 
         app.add_middleware(
@@ -366,7 +380,13 @@ class ControlPlane:
         if self.runners:
             metrics_config = self.runners[0].maintenance_worker_config.metrics_timeline
 
-        add_observability_routes(app, redis_client, agents, metrics_config)
+        add_observability_routes(
+            app,
+            redis_client,
+            agents,
+            metrics_config,
+            dashboard_name,
+        )
 
         @app.get("/")
         async def root():

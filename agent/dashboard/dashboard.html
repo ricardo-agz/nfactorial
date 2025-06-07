@@ -89,6 +89,41 @@
     .agent-chart-section:hover {
       border-left-color: #3b82f6;
     }
+
+    /* Performance optimizations */
+    * {
+      /* Reduce layout thrashing */
+      box-sizing: border-box;
+    }
+    
+    /* Optimize table rendering */
+    table {
+      table-layout: fixed;
+      width: 100%;
+    }
+    
+    /* Optimize animations */
+    .animate-pulse {
+      animation: pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+    }
+    
+    /* Prevent unnecessary repaints */
+    .chart-container canvas {
+      will-change: auto;
+    }
+    
+    /* Optimize text rendering */
+    body {
+      text-rendering: optimizeSpeed;
+      -webkit-font-smoothing: antialiased;
+      -moz-osx-font-smoothing: grayscale;
+    }
+    
+    /* Reduce reflow during updates */
+    .overview-cards > div,
+    .agent-table tr {
+      contain: layout style;
+    }
   </style>
 </head>
 <body class="bg-gray-50 text-gray-900 font-sans antialiased">

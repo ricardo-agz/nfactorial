@@ -5,10 +5,8 @@ import signal
 import httpx
 import redis.asyncio as redis
 from typing import Any, Literal
-import uvicorn
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-import threading
 
 from agent.agent import BaseAgent
 from agent.queue import enqueue_task, worker_loop, maintenance_loop

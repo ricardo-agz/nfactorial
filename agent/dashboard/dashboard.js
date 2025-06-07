@@ -9,20 +9,21 @@ const CONFIG = {
   LAST_REFRESH_UPDATE_INTERVAL: 30000 // 30 seconds
 };
 
-const TASK_COLORS = {
-  queued: '#3B82F6',
-  processing: '#10B981', 
-  backoff: '#F97316',
-  completed: '#059669',
-  failed: '#EF4444',
-  cancelled: '#6B7280',
-  pending_tool_results: '#F59E0B'
-};
-
-const ACTIVITY_COLORS = {
-  completed: '#10B981',
-  failed: '#EF4444', 
-  cancelled: '#8B5CF6'
+const COLORS = {
+  task: {
+    queued: '#3B82F6',
+    processing: '#10B981', 
+    backoff: '#F97316',
+    completed: '#059669',
+    failed: '#EF4444',
+    cancelled: '#6B7280',
+    pending_tool_results: '#F59E0B'
+  },
+  activity: {
+    completed: '#10B981',
+    failed: '#EF4444', 
+    cancelled: '#8B5CF6'
+  }
 };
 
 const STATUS_CONFIG = {
@@ -73,6 +74,11 @@ const elements = {
 // UTILITY FUNCTIONS
 // ============================================================================
 
+/**
+ * Safely creates Lucide icons without throwing errors
+ * Handles cases where Lucide library might not be loaded
+ * @returns {void}
+ */
 function safeCreateIcons() {
   try {
     if (typeof lucide !== 'undefined' && lucide.createIcons) {
@@ -83,17 +89,12 @@ function safeCreateIcons() {
   }
 }
 
-function formatUptime(seconds) {
-  const days = Math.floor(seconds / 86400);
-  const hours = Math.floor((seconds % 86400) / 3600);
-  const minutes = Math.floor((seconds % 3600) / 60);
-  
-  if (days > 0) return `${days}d ${hours}h`;
-  if (hours > 0) return `${hours}h ${minutes}m`;
-  return `${minutes}m`;
-}
-
-function formatLastActive(timestamp) {
+/**
+ * Formats a timestamp into a human-readable relative time string
+ * @param {string|number|Date} timestamp - The timestamp to format
+ * @returns {string} Formatted time string (e.g., "2m ago", "1h ago", "3d ago")
+ */
+function formatTime(timestamp) {
   if (!timestamp) return 'Never';
   const now = new Date();
   const time = new Date(timestamp);
@@ -110,25 +111,37 @@ function formatLastActive(timestamp) {
   return `${diffDays}d ago`;
 }
 
-function formatRefreshInterval(ms) {
+/**
+ * Formats a time interval in milliseconds to a readable string
+ * @param {number} ms - Time interval in milliseconds
+ * @returns {string} Formatted interval string (e.g., "30 s", "2 min")
+ */
+function formatInterval(ms) {
   return ms < 60000 ? `${ms / 1000} s` : `${ms / 60000} min`;
 }
 
+/**
+ * Formats the last refresh time for display
+ * @returns {string} Formatted last refresh string
+ */
 function formatLastRefresh() {
   if (!state.lastRefreshTime) return 'Last refresh: --';
   
-  const now = new Date();
-  const diffMs = now - state.lastRefreshTime;
-  const diffSecs = Math.floor(diffMs / 1000);
+  const diffMs = Date.now() - state.lastRefreshTime;
   const diffMins = Math.floor(diffMs / 60000);
   
-  if (diffSecs < 60) return 'Last refresh: < 1 min';
+  if (diffMs < 60000) return 'Last refresh: < 1 min';
   if (diffMins < 60) return `Last refresh: ${diffMins} min ago`;
   
   const diffHours = Math.floor(diffMins / 60);
   return `Last refresh: ${diffHours}h ago`;
 }
 
+/**
+ * Formats a duration in seconds to a human-readable string
+ * @param {number} seconds - Duration in seconds
+ * @returns {string} Formatted duration string (e.g., "30s", "2.5m", "1.2h")
+ */
 function formatDuration(seconds) {
   if (seconds < 60) return `${seconds}s`;
   
@@ -146,13 +159,15 @@ function formatDuration(seconds) {
 // ============================================================================
 
 /**
- * Determines the status of an agent based on its current activity:
- * - 'warning': Has stale tasks that may need attention
- * - 'active': Currently processing tasks
- * - 'busy': Has tasks queued but not processing (waiting for workers)
- * - 'idle': Has processed tasks before but currently inactive
- * - 'ready': Healthy agent with no activity history (ready to work)
- * - 'offline': Reserved for truly offline/unresponsive agents
+ * Determines the status of an agent based on its current activity
+ * Status priority: warning > active > busy > idle > ready > offline
+ * @param {Object} agent - Agent data object
+ * @param {number} agent.stale_tasks_count - Number of stale tasks
+ * @param {number} agent.processing_count - Number of tasks currently processing
+ * @param {number} agent.main_queue_size - Number of tasks in main queue
+ * @param {number} agent.completed_count - Number of completed tasks
+ * @param {number} agent.failed_count - Number of failed tasks
+ * @returns {string} Agent status ('warning'|'active'|'busy'|'idle'|'ready'|'offline')
  */
 function getAgentStatus(agent) {
   if (agent.stale_tasks_count > 0) return 'warning';
@@ -162,6 +177,14 @@ function getAgentStatus(agent) {
   return 'ready';
 }
 
+/**
+ * Gets display information for a given agent status
+ * @param {string} status - Agent status string 
+ * @returns {Object} Status display configuration
+ * @returns {string} returns.label - Human-readable status label
+ * @returns {string} returns.color - CSS class for text color
+ * @returns {string} returns.dot - CSS class for status indicator dot
+ */
 function getStatusInfo(status) {
   return STATUS_CONFIG[status] || STATUS_CONFIG.default;
 }
@@ -170,6 +193,11 @@ function getStatusInfo(status) {
 // CHART MANAGEMENT
 // ============================================================================
 
+/**
+ * Safely destroys a Chart.js instance and removes it from state
+ * @param {string} chartId - Unique identifier for the chart
+ * @returns {void}
+ */
 function destroyChart(chartId) {
   if (state.charts[chartId]) {
     state.charts[chartId].destroy();
@@ -177,6 +205,18 @@ function destroyChart(chartId) {
   }
 }
 
+/**
+ * Creates or updates the task distribution doughnut chart
+ * @param {Object} distribution - Task distribution data
+ * @param {number} distribution.queued - Number of queued tasks
+ * @param {number} distribution.processing - Number of processing tasks
+ * @param {number} distribution.backoff - Number of tasks in backoff
+ * @param {number} distribution.completed - Number of completed tasks
+ * @param {number} distribution.failed - Number of failed tasks
+ * @param {number} distribution.cancelled - Number of cancelled tasks
+ * @param {number} distribution.pending_tool_results - Number of tasks pending tool results
+ * @returns {void}
+ */
 function createTaskDistributionChart(distribution) {
   const ctx = document.getElementById('taskDistributionChart');
   if (!ctx) return;
@@ -196,17 +236,23 @@ function createTaskDistributionChart(distribution) {
   }
 }
 
+/**
+ * Updates the task distribution chart legend
+ * @param {Object} distribution - Task distribution data
+ * @param {HTMLElement} legendContainer - Legend container element
+ * @returns {void}
+ */
 function updateTaskDistributionLegend(distribution, legendContainer) {
   if (!legendContainer) return;
 
   const legendData = [
-    { label: 'Queued', color: TASK_COLORS.queued, value: distribution.queued },
-    { label: 'Processing', color: TASK_COLORS.processing, value: distribution.processing },
-    { label: 'Backoff', color: TASK_COLORS.backoff, value: distribution.backoff },
-    { label: 'Completed', color: TASK_COLORS.completed, value: distribution.completed },
-    { label: 'Failed', color: TASK_COLORS.failed, value: distribution.failed },
-    { label: 'Cancelled', color: TASK_COLORS.cancelled, value: distribution.cancelled },
-    { label: 'Idle', color: TASK_COLORS.pending_tool_results, value: distribution.idle }
+    { label: 'Queued', color: COLORS.task.queued, value: distribution.queued },
+    { label: 'Processing', color: COLORS.task.processing, value: distribution.processing },
+    { label: 'Backoff', color: COLORS.task.backoff, value: distribution.backoff },
+    { label: 'Completed', color: COLORS.task.completed, value: distribution.completed },
+    { label: 'Failed', color: COLORS.task.failed, value: distribution.failed },
+    { label: 'Cancelled', color: COLORS.task.cancelled, value: distribution.cancelled },
+    { label: 'Idle', color: COLORS.task.pending_tool_results, value: distribution.idle }
   ];
 
   legendContainer.innerHTML = `
@@ -222,18 +268,25 @@ function updateTaskDistributionLegend(distribution, legendContainer) {
   `;
 }
 
+/**
+ * Updates an existing task distribution chart with new data
+ * @param {Object} distribution - Task distribution data
+ * @param {number} totalTasks - Total number of tasks
+ * @param {HTMLElement} chartContainer - Chart container element
+ * @returns {void}
+ */
 function updateExistingTaskChart(distribution, totalTasks, chartContainer) {
   const chart = state.charts.taskDistribution;
   
   if (totalTasks === 0) {
     // Show placeholder
     chart.data.datasets[0].data = [1, 0, 0, 0, 0, 0, 0];
-    chart.data.datasets[0].backgroundColor = ['#E5E7EB', ...Object.values(TASK_COLORS).slice(1)];
+    chart.data.datasets[0].backgroundColor = ['#E5E7EB', ...Object.values(COLORS.task).slice(1)];
     chart.options.plugins.legend.display = false;
     chart.options.plugins.tooltip.enabled = false;
     chart.update('none');
     
-    showChartOverlay(chartContainer, 'No Tasks', 'System is idle');
+    toggleChartOverlay(chartContainer, true, 'No Tasks', 'System is idle');
   } else {
     // Show real data
     chart.data.datasets[0].data = [
@@ -241,15 +294,23 @@ function updateExistingTaskChart(distribution, totalTasks, chartContainer) {
       distribution.completed, distribution.failed, distribution.cancelled,
       distribution.pending_tool_results
     ];
-    chart.data.datasets[0].backgroundColor = Object.values(TASK_COLORS);
+    chart.data.datasets[0].backgroundColor = Object.values(COLORS.task);
     chart.options.plugins.legend.display = false;
     chart.options.plugins.tooltip.enabled = true;
     chart.update('none');
     
-    hideChartOverlay(chartContainer);
+    toggleChartOverlay(chartContainer, false);
   }
 }
 
+/**
+ * Creates a new task distribution chart
+ * @param {HTMLCanvasElement} ctx - Canvas context for the chart
+ * @param {Object} distribution - Task distribution data
+ * @param {number} totalTasks - Total number of tasks
+ * @param {HTMLElement} chartContainer - Chart container element
+ * @returns {void}
+ */
 function createNewTaskChart(ctx, distribution, totalTasks, chartContainer) {
   destroyChart('taskDistribution');
 
@@ -260,8 +321,8 @@ function createNewTaskChart(ctx, distribution, totalTasks, chartContainer) {
        distribution.pending_tool_results];
 
   const backgroundColor = totalTasks === 0
-    ? ['#E5E7EB', ...Object.values(TASK_COLORS).slice(1)]
-    : Object.values(TASK_COLORS);
+    ? ['#E5E7EB', ...Object.values(COLORS.task).slice(1)]
+    : Object.values(COLORS.task);
 
   state.charts.taskDistribution = new Chart(ctx, {
     type: 'doughnut',
@@ -288,37 +349,57 @@ function createNewTaskChart(ctx, distribution, totalTasks, chartContainer) {
   });
 
   if (totalTasks === 0) {
-    showChartOverlay(chartContainer, 'No Tasks', 'System is idle');
+    toggleChartOverlay(chartContainer, true, 'No Tasks', 'System is idle');
   }
 }
 
-function showChartOverlay(container, title, subtitle) {
+/**
+ * Toggles chart overlay visibility for empty state display
+ * @param {HTMLElement} container - Chart container element
+ * @param {boolean} show - Whether to show the overlay
+ * @param {string} [title=''] - Overlay title text
+ * @param {string} [subtitle=''] - Overlay subtitle text
+ * @returns {void}
+ */
+function toggleChartOverlay(container, show, title = '', subtitle = '') {
   let overlay = container.querySelector('.chart-overlay');
-  if (!overlay) {
-    overlay = document.createElement('div');
-    overlay.className = 'chart-overlay absolute top-1/2 left-1/2 transform -translate-x-1/2 -translate-y-1/2 pointer-events-none';
-    container.appendChild(overlay);
-  }
   
-  overlay.innerHTML = `
-    <div class="text-center">
-      <div class="text-sm font-normal text-gray-500">${title}</div>
-      <div class="text-xs text-gray-400">${subtitle}</div>
-    </div>
-  `;
+  if (show) {
+    if (!overlay) {
+      overlay = document.createElement('div');
+      overlay.className = 'chart-overlay absolute top-1/2 left-1/2 transform -translate-x-1/2 -translate-y-1/2 pointer-events-none';
+      container.appendChild(overlay);
+    }
+    
+    overlay.innerHTML = `
+      <div class="text-center">
+        <div class="text-sm font-normal text-gray-500">${title}</div>
+        <div class="text-xs text-gray-400">${subtitle}</div>
+      </div>
+    `;
+  } else if (overlay) {
+    overlay.remove();
+  }
 }
 
-function hideChartOverlay(container) {
-  const overlay = container.querySelector('.chart-overlay');
-  if (overlay) overlay.remove();
-}
-
+/**
+ * Creates or updates an activity chart (bar chart) for completed, failed, or cancelled tasks
+ * @param {string} canvasId - ID of the canvas element
+ * @param {Object} data - Activity chart data
+ * @param {Array} data.buckets - Array of time buckets with task counts
+ * @param {number} data.buckets[].timestamp - Bucket timestamp
+ * @param {number} data.buckets[].count - Task count for this bucket
+ * @param {string} color - Chart color (hex code)
+ * @param {string} emptyMessage - Message to display when no data
+ * @returns {Chart|undefined} Chart.js instance or undefined if creation failed
+ */
 function createActivityChart(canvasId, data, color, emptyMessage) {
   const ctx = document.getElementById(canvasId);
   if (!ctx || typeof Chart === 'undefined') return;
 
-  destroyChart(canvasId);
-
+  // Only destroy and recreate if necessary
+  const existingChart = state.charts[canvasId];
+  
   // Get the bucket data and ensure we show the most recent activity
   let taskCounts = [];
   
@@ -339,6 +420,29 @@ function createActivityChart(canvasId, data, color, emptyMessage) {
   }
 
   const paddedTaskCounts = taskCounts.slice(-CONFIG.CHART_BARS); // Ensure exactly CHART_BARS elements
+
+  // If chart exists and data structure is the same, just update data
+  if (existingChart && !existingChart.destroyed && existingChart.data.datasets[0].data.length === paddedTaskCounts.length) {
+    const maxTaskCount = Math.max(...paddedTaskCounts);
+    const effectiveMaxTaskCount = Math.max(maxTaskCount, 10);
+    const minHeight = effectiveMaxTaskCount * CONFIG.MIN_BAR_HEIGHT_RATIO;
+    const maxHeight = effectiveMaxTaskCount;
+    
+    const barData = paddedTaskCounts.map(count => 
+      count === 0 ? minHeight : minHeight + (count / maxHeight) * maxHeight
+    );
+    const barColors = paddedTaskCounts.map(count => count > 0 ? color : '#F3F4F6');
+    
+    // Update existing chart data
+    existingChart.data.datasets[0].data = barData;
+    existingChart.data.datasets[0].backgroundColor = barColors;
+    existingChart.options.scales.y.max = maxHeight + minHeight;
+    existingChart.update('none'); // Use 'none' mode for fastest update
+    return existingChart;
+  }
+
+  // Create new chart only if necessary
+  destroyChart(canvasId);
 
   const maxTaskCount = Math.max(...paddedTaskCounts);
   const effectiveMaxTaskCount = Math.max(maxTaskCount, 10);
@@ -366,7 +470,7 @@ function createActivityChart(canvasId, data, color, emptyMessage) {
       options: {
         responsive: true,
         maintainAspectRatio: false,
-        animation: false,
+        animation: false, // Disable animations for better performance
         plugins: {
           legend: { display: false },
           tooltip: { 
@@ -409,13 +513,21 @@ function createActivityChart(canvasId, data, color, emptyMessage) {
   return state.charts[canvasId];
 }
 
+/**
+ * Updates all activity charts (completed, failed, cancelled)
+ * @param {Object} activityCharts - Activity charts data
+ * @param {Object} activityCharts.completed - Completed tasks chart data
+ * @param {Object} activityCharts.failed - Failed tasks chart data
+ * @param {Object} activityCharts.cancelled - Cancelled tasks chart data
+ * @returns {void}
+ */
 function updateActivityCharts(activityCharts) {
   if (!activityCharts) return;
 
   // Create/update charts
-  createActivityChart('completedChart', activityCharts.completed, ACTIVITY_COLORS.completed, 'No completed tasks');
-  createActivityChart('failedChart', activityCharts.failed, ACTIVITY_COLORS.failed, 'No failed tasks');
-  createActivityChart('cancelledChart', activityCharts.cancelled, ACTIVITY_COLORS.cancelled, 'No cancelled tasks');
+  createActivityChart('completedChart', activityCharts.completed, COLORS.activity.completed, 'No completed tasks');
+  createActivityChart('failedChart', activityCharts.failed, COLORS.activity.failed, 'No failed tasks');
+  createActivityChart('cancelledChart', activityCharts.cancelled, COLORS.activity.cancelled, 'No cancelled tasks');
 
   // Update summaries
   updateActivitySummary('completed', activityCharts.completed);
@@ -423,6 +535,14 @@ function updateActivityCharts(activityCharts) {
   updateActivitySummary('cancelled', activityCharts.cancelled);
 }
 
+/**
+ * Updates the activity summary text for a specific activity type
+ * @param {string} type - Activity type ('completed'|'failed'|'cancelled')
+ * @param {Object} data - Activity data
+ * @param {number} data.total_tasks - Total number of tasks
+ * @param {number} data.ttl_seconds - Time-to-live in seconds
+ * @returns {void}
+ */
 function updateActivitySummary(type, data) {
   const summaryElement = document.getElementById(`${type}-summary`);
   if (summaryElement) {
@@ -430,6 +550,12 @@ function updateActivitySummary(type, data) {
   }
 }
 
+/**
+ * Creates individual agent activity charts for a specific activity type
+ * @param {Object} agentActivityCharts - Agent-specific activity chart data
+ * @param {string} activityType - Type of activity ('completed'|'failed'|'cancelled')
+ * @returns {void}
+ */
 function createIndividualAgentCharts(agentActivityCharts, activityType) {
   if (!agentActivityCharts || !state.showIndividualAgents[activityType]) return;
 
@@ -447,8 +573,16 @@ function createIndividualAgentCharts(agentActivityCharts, activityType) {
   Object.entries(agentActivityCharts).forEach(([agentName, agentCharts]) => {
     addIndividualAgentChart(agentChartsContainer, agentName, agentCharts[activityType], activityType);
   });
+  
+  // Refresh icons for the new content
+  safeCreateIcons();
 }
 
+/**
+ * Cleans up existing agent charts and their DOM elements
+ * @param {HTMLElement} container - Container element holding the charts
+ * @returns {void}
+ */
 function cleanupExistingAgentCharts(container) {
   const existingCanvases = container.querySelectorAll('canvas');
   existingCanvases.forEach(canvas => {
@@ -457,6 +591,12 @@ function cleanupExistingAgentCharts(container) {
   container.innerHTML = '';
 }
 
+/**
+ * Adds an aggregate "All" chart to the individual charts container
+ * @param {HTMLElement} container - Container element
+ * @param {string} activityType - Type of activity
+ * @returns {void}
+ */
 function addAggregateChart(container, activityType) {
   const aggregateData = state.lastData?.activity_charts?.[activityType];
   const totalTasks = aggregateData?.total_tasks || 0;
@@ -466,18 +606,33 @@ function addAggregateChart(container, activityType) {
   allSection.innerHTML = createAgentChartHTML('All', totalTasks, `all-${activityType}`);
   container.appendChild(allSection);
   
-  createActivityChart(`all-${activityType}`, aggregateData, ACTIVITY_COLORS[activityType], `No ${activityType} tasks`);
+  createActivityChart(`all-${activityType}`, aggregateData, COLORS.activity[activityType], `No ${activityType} tasks`);
 }
 
+/**
+ * Adds an individual agent chart to the container
+ * @param {HTMLElement} container - Container element
+ * @param {string} agentName - Name of the agent
+ * @param {Object} activityData - Activity data for this agent
+ * @param {string} activityType - Type of activity
+ * @returns {void}
+ */
 function addIndividualAgentChart(container, agentName, activityData, activityType) {
   const agentSection = document.createElement('div');
   agentSection.className = 'space-y-3';
   agentSection.innerHTML = createAgentChartHTML(agentName, activityData.total_tasks, `agent-${agentName}-${activityType}`);
   container.appendChild(agentSection);
   
-  createActivityChart(`agent-${agentName}-${activityType}`, activityData, ACTIVITY_COLORS[activityType], `No ${activityType} tasks`);
+  createActivityChart(`agent-${agentName}-${activityType}`, activityData, COLORS.activity[activityType], `No ${activityType} tasks`);
 }
 
+/**
+ * Creates HTML for an individual agent chart section
+ * @param {string} name - Agent name or "All"
+ * @param {number} totalTasks - Total number of tasks
+ * @param {string} canvasId - Canvas element ID
+ * @returns {string} HTML string for the chart section
+ */
 function createAgentChartHTML(name, totalTasks, canvasId) {
   return `
     <div class="flex items-center justify-between">
@@ -492,6 +647,11 @@ function createAgentChartHTML(name, totalTasks, canvasId) {
   `;
 }
 
+/**
+ * Toggles the visibility of individual agent charts for a specific activity type
+ * @param {string} activityType - Type of activity ('completed'|'failed'|'cancelled')
+ * @returns {void}
+ */
 function toggleIndividualAgents(activityType) {
   state.showIndividualAgents[activityType] = !state.showIndividualAgents[activityType];
   
@@ -538,18 +698,34 @@ function toggleIndividualAgents(activityType) {
 // UI UPDATE FUNCTIONS
 // ============================================================================
 
+/**
+ * Updates the last refresh time display in the UI
+ * @returns {void}
+ */
 function updateLastRefreshDisplay() {
   if (elements.lastRefreshText) {
     elements.lastRefreshText.textContent = formatLastRefresh();
   }
 }
 
+/**
+ * Updates the refresh rate display in the UI
+ * @returns {void}
+ */
 function updateRefreshRateDisplay() {
   if (elements.refreshRateDisplay) {
-    elements.refreshRateDisplay.textContent = formatRefreshInterval(state.refreshInterval);
+    elements.refreshRateDisplay.textContent = formatInterval(state.refreshInterval);
   }
 }
 
+/**
+ * Updates the system status badge based on current system health
+ * @param {Object} data - Dashboard data
+ * @param {Object} data.system - System information
+ * @param {boolean} data.system.redis_connected - Redis connection status
+ * @param {Array} data.queues - Array of agent queue information
+ * @returns {void}
+ */
 function updateStatusBadge(data) {
   const { system, queues } = data;
   const hasIssues = queues.some(q => getAgentStatus(q) === 'warning' || getAgentStatus(q) === 'offline');
@@ -564,6 +740,18 @@ function updateStatusBadge(data) {
   elements.statusBadge.querySelector('span').textContent = statusText;
 }
 
+/**
+ * Updates the overview cards with system metrics
+ * @param {Object} system - System metrics data
+ * @param {number} system.total_agents - Total number of agents
+ * @param {number} system.total_workers - Total number of workers
+ * @param {number} system.total_tasks_queued - Total queued tasks
+ * @param {number} system.total_tasks_processing - Total processing tasks
+ * @param {number} system.system_throughput_per_minute - System throughput per minute
+ * @param {number} system.overall_success_rate_percent - Overall success rate percentage
+ * @param {string} system.activity_window_display - Activity window display string
+ * @returns {void}
+ */
 function updateOverviewCards(system) {
   const overviewCards = document.getElementById('overview-cards');
   if (!overviewCards) return;
@@ -605,67 +793,136 @@ function updateOverviewCards(system) {
       <div class="mt-2 text-xs text-gray-500">${system.activity_window_display}</div>
     </div>
   `;
+  
+  // Refresh icons for the new content
+  safeCreateIcons();
 }
 
+/**
+ * Updates the agent performance table with current data
+ * @param {Array} queues - Array of agent queue data
+ * @param {Array} performance - Array of agent performance data
+ * @returns {void}
+ */
 function updateAgentTable(queues, performance) {
   const agentTable = document.getElementById('agent-table');
   if (!agentTable) return;
 
-  const tableRows = queues.map((agent, index) => {
-    const status = getAgentStatus(agent);
-    const statusInfo = getStatusInfo(status);
-    const perf = performance[index] || {};
-    
-    return `
-      <tr class="hover:bg-gray-50">
-        <td class="px-6 py-4 whitespace-nowrap">
-          <div class="text-sm font-medium text-gray-900">${agent.agent_name}</div>
-        </td>
-        <td class="px-6 py-4 whitespace-nowrap">
+  // Check if we can update existing rows instead of full re-render
+  const existingRows = agentTable.querySelectorAll('tbody tr:not(.animate-pulse)');
+  const canUpdate = existingRows.length === queues.length && existingRows.length > 0;
+
+  if (canUpdate) {
+    // Update existing rows in place for better performance
+    existingRows.forEach((row, index) => {
+      const agent = queues[index];
+      const perf = performance[index] || {};
+      const status = getAgentStatus(agent);
+      const statusInfo = getStatusInfo(status);
+      
+      const cells = row.querySelectorAll('td');
+      if (cells.length >= 9) {
+        // Update only the dynamic content
+        cells[0].innerHTML = `<div class="text-sm font-medium text-gray-900">${agent.agent_name}</div>`;
+        cells[1].innerHTML = `
           <div class="flex items-center gap-2">
             <div class="w-2 h-2 rounded-full ${statusInfo.dot}"></div>
             <span class="text-sm ${statusInfo.color}">${statusInfo.label}</span>
             ${agent.stale_tasks_count > 0 ? `<span class="text-xs text-yellow-600">(${agent.stale_tasks_count} stale)</span>` : ''}
           </div>
-        </td>
-        <td class="px-6 py-4 whitespace-nowrap text-center text-sm text-gray-900">${agent.main_queue_size}</td>
-        <td class="px-6 py-4 whitespace-nowrap text-center text-sm text-gray-900">${agent.processing_count}</td>
-        <td class="px-6 py-4 whitespace-nowrap text-center text-sm text-gray-900">${agent.backoff_count || 0}</td>
-        <td class="px-6 py-4 whitespace-nowrap text-center text-sm text-gray-900">${(perf.current_throughput || 0).toFixed(1)}/min</td>
-        <td class="px-6 py-4 whitespace-nowrap text-center text-sm text-gray-900">${(perf.success_rate_percent || 0).toFixed(1)}%</td>
-        <td class="px-6 py-4 whitespace-nowrap text-center text-sm text-gray-900">${(perf.avg_processing_time_seconds || 0).toFixed(1)}s</td>
-        <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500">${formatLastActive(perf.last_activity)}</td>
-      </tr>
-    `;
-  }).join('');
+        `;
+        cells[2].textContent = agent.main_queue_size;
+        cells[3].textContent = agent.processing_count;
+        cells[4].textContent = agent.backoff_count || 0;
+        cells[5].textContent = `${(perf.current_throughput || 0).toFixed(1)}/min`;
+        cells[6].textContent = `${(perf.success_rate_percent || 0).toFixed(1)}%`;
+        cells[7].textContent = `${(perf.avg_processing_time_seconds || 0).toFixed(1)}s`;
+        cells[8].textContent = formatTime(perf.last_activity);
+      }
+    });
+    return;
+  }
 
-  agentTable.innerHTML = `
-    <div class="px-6 py-4 border-b border-gray-200">
-      <h3 class="text-lg font-medium text-gray-900">Agents</h3>
-    </div>
-    <div class="overflow-x-auto">
-      <table class="w-full">
-        <thead class="bg-gray-50">
-          <tr>
-            <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Agent</th>
-            <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Status</th>
-            <th class="px-6 py-3 text-center text-xs font-medium text-gray-500 uppercase tracking-wider">Queue</th>
-            <th class="px-6 py-3 text-center text-xs font-medium text-gray-500 uppercase tracking-wider">Processing</th>
-            <th class="px-6 py-3 text-center text-xs font-medium text-gray-500 uppercase tracking-wider">Backoff</th>
-            <th class="px-6 py-3 text-center text-xs font-medium text-gray-500 uppercase tracking-wider">Throughput</th>
-            <th class="px-6 py-3 text-center text-xs font-medium text-gray-500 uppercase tracking-wider">Success Rate</th>
-            <th class="px-6 py-3 text-center text-xs font-medium text-gray-500 uppercase tracking-wider">Avg Time</th>
-            <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Last Active</th>
-          </tr>
-        </thead>
-        <tbody class="bg-white divide-y divide-gray-200">
-          ${tableRows}
-        </tbody>
-      </table>
-    </div>
+  // Full re-render only when necessary (different number of agents or transitioning from skeleton)
+  const fragment = document.createDocumentFragment();
+  
+  // Create header
+  const headerDiv = document.createElement('div');
+  headerDiv.className = 'px-6 py-4 border-b border-gray-200';
+  headerDiv.innerHTML = '<h3 class="text-lg font-medium text-gray-900">Agents</h3>';
+  fragment.appendChild(headerDiv);
+  
+  // Create table container
+  const tableContainer = document.createElement('div');
+  tableContainer.className = 'overflow-x-auto';
+  
+  const table = document.createElement('table');
+  table.className = 'w-full';
+  
+  // Create table header
+  const thead = document.createElement('thead');
+  thead.className = 'bg-gray-50';
+  thead.innerHTML = `
+    <tr>
+      <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Agent</th>
+      <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Status</th>
+      <th class="px-6 py-3 text-center text-xs font-medium text-gray-500 uppercase tracking-wider">Queue</th>
+      <th class="px-6 py-3 text-center text-xs font-medium text-gray-500 uppercase tracking-wider">Processing</th>
+      <th class="px-6 py-3 text-center text-xs font-medium text-gray-500 uppercase tracking-wider">Backoff</th>
+      <th class="px-6 py-3 text-center text-xs font-medium text-gray-500 uppercase tracking-wider">Throughput</th>
+      <th class="px-6 py-3 text-center text-xs font-medium text-gray-500 uppercase tracking-wider">Success Rate</th>
+      <th class="px-6 py-3 text-center text-xs font-medium text-gray-500 uppercase tracking-wider">Avg Time</th>
+      <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Last Active</th>
+    </tr>
   `;
+  
+  // Create table body
+  const tbody = document.createElement('tbody');
+  tbody.className = 'bg-white divide-y divide-gray-200';
+  
+  queues.forEach((agent, index) => {
+    const status = getAgentStatus(agent);
+    const statusInfo = getStatusInfo(status);
+    const perf = performance[index] || {};
+    
+    const row = document.createElement('tr');
+    row.className = 'hover:bg-gray-50';
+    row.innerHTML = `
+      <td class="px-6 py-4 whitespace-nowrap">
+        <div class="text-sm font-medium text-gray-900">${agent.agent_name}</div>
+      </td>
+      <td class="px-6 py-4 whitespace-nowrap">
+        <div class="flex items-center gap-2">
+          <div class="w-2 h-2 rounded-full ${statusInfo.dot}"></div>
+          <span class="text-sm ${statusInfo.color}">${statusInfo.label}</span>
+          ${agent.stale_tasks_count > 0 ? `<span class="text-xs text-yellow-600">(${agent.stale_tasks_count} stale)</span>` : ''}
+        </div>
+      </td>
+      <td class="px-6 py-4 whitespace-nowrap text-center text-sm text-gray-900">${agent.main_queue_size}</td>
+      <td class="px-6 py-4 whitespace-nowrap text-center text-sm text-gray-900">${agent.processing_count}</td>
+      <td class="px-6 py-4 whitespace-nowrap text-center text-sm text-gray-900">${agent.backoff_count || 0}</td>
+      <td class="px-6 py-4 whitespace-nowrap text-center text-sm text-gray-900">${(perf.current_throughput || 0).toFixed(1)}/min</td>
+      <td class="px-6 py-4 whitespace-nowrap text-center text-sm text-gray-900">${(perf.success_rate_percent || 0).toFixed(1)}%</td>
+      <td class="px-6 py-4 whitespace-nowrap text-center text-sm text-gray-900">${(perf.avg_processing_time_seconds || 0).toFixed(1)}s</td>
+      <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500">${formatTime(perf.last_activity)}</td>
+    `;
+    tbody.appendChild(row);
+  });
+  
+  table.appendChild(thead);
+  table.appendChild(tbody);
+  tableContainer.appendChild(table);
+  fragment.appendChild(tableContainer);
+  
+  // Replace content efficiently
+  agentTable.innerHTML = '';
+  agentTable.appendChild(fragment);
 }
 
+/**
+ * Updates the state of toggle buttons for individual agent charts
+ * @returns {void}
+ */
 function updateToggleButtonStates() {
   ['completed', 'failed', 'cancelled'].forEach(activityType => {
     const toggleBtn = document.getElementById(`toggle-${activityType}-agents`);
@@ -689,12 +946,19 @@ function updateToggleButtonStates() {
       }
     }
   });
+  
+  // Refresh icons after updating attributes
+  safeCreateIcons();
 }
 
 // ============================================================================
 // DASHBOARD LAYOUT TEMPLATES
 // ============================================================================
 
+/**
+ * Creates the main dashboard layout HTML structure
+ * @returns {string} HTML string for the complete dashboard layout
+ */
 function createDashboardLayout() {
   return `
     <div class="w-full space-y-8">
@@ -736,6 +1000,14 @@ function createDashboardLayout() {
   `;
 }
 
+/**
+ * Creates HTML for an activity chart section
+ * @param {string} type - Activity type ('completed'|'failed'|'cancelled')
+ * @param {string} icon - Lucide icon name
+ * @param {string} iconColor - CSS class for icon color
+ * @param {string} title - Section title
+ * @returns {string} HTML string for the activity chart section
+ */
 function createActivityChartSection(type, icon, iconColor, title) {
   return `
     <div class="space-y-3">
@@ -766,10 +1038,21 @@ function createActivityChartSection(type, icon, iconColor, title) {
 // MAIN DASHBOARD RENDERING
 // ============================================================================
 
+/**
+ * Main function to render the entire dashboard with provided data
+ * @param {Object} data - Complete dashboard data
+ * @param {Object} data.system - System metrics and information
+ * @param {Array} data.queues - Agent queue information
+ * @param {Array} data.performance - Agent performance metrics
+ * @param {Object} data.task_distribution - Task distribution data
+ * @param {Object} data.activity_charts - Activity chart data
+ * @param {Object} data.agent_activity_charts - Individual agent activity data
+ * @returns {void}
+ */
 function renderDashboard(data) {
   const { system, queues, performance, task_distribution, activity_charts, agent_activity_charts } = data;
   
-  // Update status badge
+  // Update status badge immediately (lightweight)
   updateStatusBadge(data);
 
   // Check if this is the first render
@@ -780,27 +1063,64 @@ function renderDashboard(data) {
     setupActivityToggleListeners();
   }
 
-  // Update all dashboard components
-  updateOverviewCards(system);
-  createTaskDistributionChart(task_distribution);
-  updateActivityCharts(activity_charts);
-  
-  // Update individual agent charts for any that are visible
-  if (agent_activity_charts) {
-    ['completed', 'failed', 'cancelled'].forEach(activityType => {
-      if (state.showIndividualAgents[activityType]) {
-        createIndividualAgentCharts(agent_activity_charts, activityType);
+  // Batch the heavy operations using requestAnimationFrame
+  const renderTasks = [
+    () => updateOverviewCards(system),
+    () => createTaskDistributionChart(task_distribution),
+    () => updateActivityCharts(activity_charts),
+    () => {
+      // Update individual agent charts for any that are visible
+      if (agent_activity_charts) {
+        ['completed', 'failed', 'cancelled'].forEach(activityType => {
+          if (state.showIndividualAgents[activityType]) {
+            createIndividualAgentCharts(agent_activity_charts, activityType);
+          }
+        });
       }
-    });
-  }
-  
-  updateToggleButtonStates();
-  updateAgentTable(queues, performance);
-  
-  safeCreateIcons();
-  state.lastData = data;
+    },
+    () => updateToggleButtonStates(),
+    () => updateAgentTable(queues, performance),
+    () => {
+      // Only refresh icons on first render when new DOM elements are created
+      if (isFirstRender) {
+        safeCreateIcons();
+      }
+      state.lastData = data;
+    }
+  ];
+
+  // Execute render tasks in batches to prevent blocking
+  executeBatchedRender(renderTasks);
 }
 
+/**
+ * Executes render tasks in batches to prevent UI blocking
+ * @param {Array<Function>} tasks - Array of render task functions
+ * @returns {void}
+ */
+function executeBatchedRender(tasks) {
+  if (tasks.length === 0) return;
+  
+  const batchSize = 2;
+  const currentBatch = tasks.splice(0, batchSize);
+  
+  currentBatch.forEach(task => {
+    try {
+      task();
+    } catch (error) {
+      console.warn('Render task failed:', error);
+    }
+  });
+  
+  if (tasks.length > 0) {
+    requestAnimationFrame(() => executeBatchedRender(tasks));
+  }
+}
+
+/**
+ * Sets up event listeners for activity chart toggle buttons
+ * @returns {void}
+ */
 function setupActivityToggleListeners() {
   ['completed', 'failed', 'cancelled'].forEach(activityType => {
     const toggleBtn = document.getElementById(`toggle-${activityType}-agents`);
@@ -818,31 +1138,41 @@ function setupActivityToggleListeners() {
 // ERROR HANDLING
 // ============================================================================
 
+/**
+ * Analyzes an error and returns appropriate error information for display
+ * @param {Error} error - The error object to analyze
+ * @returns {Object} Error information object
+ * @returns {string} returns.title - Error title for display
+ * @returns {string} returns.message - Error message for display
+ * @returns {string} returns.details - Additional error details
+ */
 function getErrorInfo(error) {
-  if (error.message.includes('HTTP 500')) {
-    return {
+  const errorTypes = {
+    'HTTP 500': {
       title: 'Server Error',
       message: 'The dashboard service encountered an internal error',
       details: 'This might be due to Redis connectivity issues or service problems.'
-    };
-  }
-  
-  if (error.message.includes('HTTP 404')) {
-    return {
+    },
+    'HTTP 404': {
       title: 'Service Not Found',
       message: 'The dashboard API endpoint is not available',
       details: 'Please check if the observability service is properly configured.'
-    };
-  }
-  
-  if (error.message.includes('HTTP 503')) {
-    return {
+    },
+    'HTTP 503': {
       title: 'Service Unavailable',
       message: 'The dashboard service is temporarily unavailable',
       details: 'The service may be starting up or experiencing high load.'
-    };
+    }
+  };
+
+  // Check for specific HTTP errors
+  for (const [errorCode, info] of Object.entries(errorTypes)) {
+    if (error.message.includes(errorCode)) {
+      return info;
+    }
   }
-  
+
+  // Check for network errors
   if (error.message.includes('Failed to fetch') || error.message.includes('NetworkError')) {
     return {
       title: 'Network Error',
@@ -851,6 +1181,7 @@ function getErrorInfo(error) {
     };
   }
   
+  // Default error
   return {
     title: 'Connection Error',
     message: 'Unable to connect to the dashboard service',
@@ -858,6 +1189,14 @@ function getErrorInfo(error) {
   };
 }
 
+/**
+ * Creates HTML for error display UI
+ * @param {Object} errorInfo - Error information object from getErrorInfo
+ * @param {string} errorInfo.title - Error title
+ * @param {string} errorInfo.message - Error message
+ * @param {string} errorInfo.details - Error details
+ * @returns {string} HTML string for error display
+ */
 function createErrorDisplay(errorInfo) {
   return `
     <div class="max-w-lg mx-auto">
@@ -895,6 +1234,10 @@ function createErrorDisplay(errorInfo) {
   `;
 }
 
+/**
+ * Sets up event handlers for error display elements
+ * @returns {void}
+ */
 function setupErrorHandlers() {
   const retryBtn = document.getElementById('retry-connection');
   
@@ -907,6 +1250,13 @@ function setupErrorHandlers() {
 // DATA FETCHING
 // ============================================================================
 
+/**
+ * Fetches metrics data from the API and updates the dashboard
+ * Handles loading states, error states, and successful data rendering
+ * @async
+ * @returns {Promise<void>}
+ * @throws {Error} When API request fails or returns invalid data
+ */
 async function fetchMetrics() {
   // Show loading state
   elements.manualRefreshBtn.classList.add('opacity-70', 'pointer-events-none');
@@ -936,6 +1286,11 @@ async function fetchMetrics() {
   }
 }
 
+/**
+ * Handles fetch errors by updating UI to show error state
+ * @param {Error} error - The error that occurred during fetch
+ * @returns {void}
+ */
 function handleFetchError(error) {
   // Update status badge to show error
   elements.statusBadge.className = 'flex items-center gap-2 text-sm font-medium text-red-600';
@@ -958,6 +1313,10 @@ function handleFetchError(error) {
 // REFRESH MANAGEMENT
 // ============================================================================
 
+/**
+ * Sets up or clears the auto-refresh timer based on current state
+ * @returns {void}
+ */
 function setupAutoRefresh() {
   clearInterval(state.refreshTimer);
   if (state.autoRefresh) {
@@ -965,12 +1324,21 @@ function setupAutoRefresh() {
   }
 }
 
+/**
+ * Handles refresh rate changes from the UI dropdown
+ * @param {number} newInterval - New refresh interval in milliseconds
+ * @returns {void}
+ */
 function handleRefreshRateChange(newInterval) {
   state.refreshInterval = newInterval;
   updateRefreshRateDisplay();
   setupAutoRefresh();
 }
 
+/**
+ * Toggles auto-refresh on/off and updates the UI toggle switch
+ * @returns {void}
+ */
 function toggleAutoRefresh() {
   state.autoRefresh = !state.autoRefresh;
   
@@ -990,6 +1358,10 @@ function toggleAutoRefresh() {
 // EVENT LISTENERS
 // ============================================================================
 
+/**
+ * Sets up event listeners for the dashboard
+ * @returns {void}
+ */
 function setupEventListeners() {
   // Manual refresh button
   elements.manualRefreshBtn.addEventListener('click', fetchMetrics);
@@ -1004,8 +1376,7 @@ function setupEventListeners() {
   document.querySelectorAll('.refresh-option').forEach(option => {
     option.addEventListener('click', (e) => {
       e.stopPropagation();
-      const newInterval = parseInt(e.target.dataset.interval);
-      handleRefreshRateChange(newInterval);
+      handleRefreshRateChange(parseInt(e.target.dataset.interval));
       elements.refreshDropdown.classList.add('hidden');
     });
   });
@@ -1025,17 +1396,142 @@ function setupEventListeners() {
 // INITIALIZATION
 // ============================================================================
 
+/**
+ * Initializes the dashboard application
+ * @returns {void}
+ */
 function initialize() {
   safeCreateIcons();
   updateRefreshRateDisplay();
   setupEventListeners();
-  fetchMetrics();
-  setupAutoRefresh();
+  
+  // Show dashboard skeleton immediately for better perceived performance
+  showDashboardSkeleton();
+  
+  // Load data asynchronously without blocking
+  setTimeout(() => {
+    fetchMetrics();
+    setupAutoRefresh();
+  }, 0);
   
   // Update last refresh display every 30 seconds
   setInterval(updateLastRefreshDisplay, CONFIG.LAST_REFRESH_UPDATE_INTERVAL);
 }
 
+/**
+ * Shows the dashboard skeleton
+ * @returns {void}
+ */
+function showDashboardSkeleton() {
+  // Show the basic layout immediately
+  elements.mainContent.innerHTML = createDashboardLayout();
+  setupActivityToggleListeners();
+  
+  // Show loading states in key areas
+  const overviewCards = document.getElementById('overview-cards');
+  if (overviewCards) {
+    overviewCards.innerHTML = createSkeletonCards();
+  }
+  
+  const agentTable = document.getElementById('agent-table');
+  if (agentTable) {
+    agentTable.innerHTML = createSkeletonTable();
+  }
+  
+  safeCreateIcons();
+}
+
+/**
+ * Creates skeleton cards for the dashboard
+ * @returns {string} HTML string for skeleton cards
+ */
+function createSkeletonCards() {
+  return `
+    <div class="bg-white border border-gray-200 rounded-lg p-4 relative">
+      <div class="animate-pulse">
+        <div class="h-6 bg-gray-200 rounded w-12 mb-2"></div>
+        <div class="h-3 bg-gray-200 rounded w-20"></div>
+      </div>
+      <i data-lucide="cpu" class="w-4 h-4 text-gray-300 absolute top-4 right-4"></i>
+      <div class="mt-2 h-3 bg-gray-200 rounded w-24 animate-pulse"></div>
+    </div>
+    <div class="bg-white border border-gray-200 rounded-lg p-4 relative">
+      <div class="animate-pulse">
+        <div class="h-6 bg-gray-200 rounded w-12 mb-2"></div>
+        <div class="h-3 bg-gray-200 rounded w-20"></div>
+      </div>
+      <i data-lucide="clock" class="w-4 h-4 text-gray-300 absolute top-4 right-4"></i>
+      <div class="mt-2 h-3 bg-gray-200 rounded w-24 animate-pulse"></div>
+    </div>
+    <div class="bg-white border border-gray-200 rounded-lg p-4 relative">
+      <div class="animate-pulse">
+        <div class="h-6 bg-gray-200 rounded w-12 mb-2"></div>
+        <div class="h-3 bg-gray-200 rounded w-20"></div>
+      </div>
+      <i data-lucide="zap" class="w-4 h-4 text-gray-300 absolute top-4 right-4"></i>
+      <div class="mt-2 h-3 bg-gray-200 rounded w-24 animate-pulse"></div>
+    </div>
+    <div class="bg-white border border-gray-200 rounded-lg p-4 relative">
+      <div class="animate-pulse">
+        <div class="h-6 bg-gray-200 rounded w-12 mb-2"></div>
+        <div class="h-3 bg-gray-200 rounded w-20"></div>
+      </div>
+      <i data-lucide="check-circle" class="w-4 h-4 text-gray-300 absolute top-4 right-4"></i>
+      <div class="mt-2 h-3 bg-gray-200 rounded w-24 animate-pulse"></div>
+    </div>
+  `;
+}
+
+/**
+ * Creates skeleton table for the dashboard
+ * @returns {string} HTML string for skeleton table
+ */
+function createSkeletonTable() {
+  return `
+    <div class="px-6 py-4 border-b border-gray-200">
+      <h3 class="text-lg font-medium text-gray-900">Agents</h3>
+    </div>
+    <div class="overflow-x-auto">
+      <table class="w-full">
+        <thead class="bg-gray-50">
+          <tr>
+            <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Agent</th>
+            <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Status</th>
+            <th class="px-6 py-3 text-center text-xs font-medium text-gray-500 uppercase tracking-wider">Queue</th>
+            <th class="px-6 py-3 text-center text-xs font-medium text-gray-500 uppercase tracking-wider">Processing</th>
+            <th class="px-6 py-3 text-center text-xs font-medium text-gray-500 uppercase tracking-wider">Backoff</th>
+            <th class="px-6 py-3 text-center text-xs font-medium text-gray-500 uppercase tracking-wider">Throughput</th>
+            <th class="px-6 py-3 text-center text-xs font-medium text-gray-500 uppercase tracking-wider">Success Rate</th>
+            <th class="px-6 py-3 text-center text-xs font-medium text-gray-500 uppercase tracking-wider">Avg Time</th>
+            <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Last Active</th>
+          </tr>
+        </thead>
+        <tbody class="bg-white divide-y divide-gray-200">
+          <tr class="animate-pulse">
+            <td class="px-6 py-4"><div class="h-4 bg-gray-200 rounded w-20"></div></td>
+            <td class="px-6 py-4"><div class="h-4 bg-gray-200 rounded w-16"></div></td>
+            <td class="px-6 py-4 text-center"><div class="h-4 bg-gray-200 rounded w-8 mx-auto"></div></td>
+            <td class="px-6 py-4 text-center"><div class="h-4 bg-gray-200 rounded w-8 mx-auto"></div></td>
+            <td class="px-6 py-4 text-center"><div class="h-4 bg-gray-200 rounded w-8 mx-auto"></div></td>
+            <td class="px-6 py-4 text-center"><div class="h-4 bg-gray-200 rounded w-12 mx-auto"></div></td>
+            <td class="px-6 py-4 text-center"><div class="h-4 bg-gray-200 rounded w-10 mx-auto"></div></td>
+            <td class="px-6 py-4 text-center"><div class="h-4 bg-gray-200 rounded w-10 mx-auto"></div></td>
+            <td class="px-6 py-4"><div class="h-4 bg-gray-200 rounded w-16"></div></td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  `;
+}
+
+// ============================================================================
+// WAIT FOR LUCIDE AND INITIALIZE
+// ============================================================================
+
+/**
+ * Waits for Lucide and initializes the dashboard
+ * @returns {void}
+ */
 function waitForLucideAndInitialize() {
   if (typeof lucide !== 'undefined' && lucide.createIcons) {
     initialize();

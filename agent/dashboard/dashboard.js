@@ -130,11 +130,7 @@ function formatLastRefresh() {
 }
 
 function formatDuration(seconds) {
-  if (!seconds || seconds === 0) return '0s';
-  
-  if (seconds < 60) {
-    return seconds < 1 ? `${(seconds * 1000).toFixed(0)}ms` : `${seconds.toFixed(1)}s`;
-  }
+  if (seconds < 60) return `${seconds}s`;
   
   const minutes = seconds / 60;
   if (seconds < 3600) {
@@ -317,128 +313,100 @@ function hideChartOverlay(container) {
   if (overlay) overlay.remove();
 }
 
-// Add performance optimization utilities
-const PERFORMANCE = {
-  updatePending: false,
-  lastUpdateTime: 0,
-  minUpdateInterval: 100, // Minimum ms between updates
-};
-
-function debouncedUpdate(data) {
-  const now = performance.now();
-  if (!PERFORMANCE.updatePending && (now - PERFORMANCE.lastUpdateTime) >= PERFORMANCE.minUpdateInterval) {
-    PERFORMANCE.updatePending = true;
-    requestAnimationFrame(() => {
-      renderDashboard(data);
-      PERFORMANCE.lastUpdateTime = performance.now();
-      PERFORMANCE.updatePending = false;
-    });
-  }
-}
-
-// Optimize chart creation/updates
-function updateActivityChart(canvasId, data, color, emptyMessage) {
+function createActivityChart(canvasId, data, color, emptyMessage) {
   const ctx = document.getElementById(canvasId);
   if (!ctx || typeof Chart === 'undefined') return;
 
-  const chart = state.charts[canvasId];
-  const taskCounts = getChartData(data);
-  const chartData = prepareChartData(taskCounts, color);
+  destroyChart(canvasId);
 
-  if (chart && !chart.destroyed) {
-    // Update existing chart
-    chart.data.datasets[0].data = chartData.data;
-    chart.data.datasets[0].backgroundColor = chartData.colors;
-    chart.update('none'); // Disable animation for performance
+  // Get the bucket data and ensure we show the most recent activity
+  let taskCounts = [];
+  
+  if (data?.buckets?.length > 0) {
+    // Sort buckets by timestamp to ensure proper order
+    const sortedBuckets = [...data.buckets].sort((a, b) => a.timestamp - b.timestamp);
+    
+    // Take the most recent buckets up to CHART_BARS count
+    const recentBuckets = sortedBuckets.slice(-CONFIG.CHART_BARS);
+    taskCounts = recentBuckets.map(bucket => bucket.count);
+    
+    // Pad with zeros if we have fewer buckets than chart bars
+    while (taskCounts.length < CONFIG.CHART_BARS) {
+      taskCounts.unshift(0); // Add zeros at the beginning for older time periods
+    }
   } else {
-    // Create new chart only if needed
-    createNewActivityChart(ctx, chartData, canvasId);
-  }
-}
-
-function getChartData(data) {
-  if (!data?.buckets?.length) {
-    return Array(CONFIG.CHART_BARS).fill(0);
+    taskCounts = Array(CONFIG.CHART_BARS).fill(0);
   }
 
-  const sortedBuckets = [...data.buckets].sort((a, b) => a.timestamp - b.timestamp);
-  const recentBuckets = sortedBuckets.slice(-CONFIG.CHART_BARS);
-  const taskCounts = recentBuckets.map(bucket => bucket.count);
-  
-  while (taskCounts.length < CONFIG.CHART_BARS) {
-    taskCounts.unshift(0);
-  }
-  
-  return taskCounts.slice(-CONFIG.CHART_BARS);
-}
+  const paddedTaskCounts = taskCounts.slice(-CONFIG.CHART_BARS); // Ensure exactly CHART_BARS elements
 
-function prepareChartData(taskCounts, color) {
-  const maxCount = Math.max(...taskCounts);
-  const effectiveMax = Math.max(maxCount, 10);
-  const minHeight = effectiveMax * CONFIG.MIN_BAR_HEIGHT_RATIO;
-  const maxHeight = effectiveMax;
+  const maxTaskCount = Math.max(...paddedTaskCounts);
+  const effectiveMaxTaskCount = Math.max(maxTaskCount, 10);
+  const minHeight = effectiveMaxTaskCount * CONFIG.MIN_BAR_HEIGHT_RATIO;
+  const maxHeight = effectiveMaxTaskCount;
   const totalScale = maxHeight + minHeight;
 
-  return {
-    data: taskCounts.map(count => count === 0 ? minHeight : minHeight + (count / maxHeight) * maxHeight),
-    colors: taskCounts.map(count => count > 0 ? color : '#F3F4F6'),
-    originalCounts: taskCounts,
-    totalScale
-  };
-}
+  const barData = paddedTaskCounts.map(count => 
+    count === 0 ? minHeight : minHeight + (count / maxHeight) * maxHeight
+  );
+  
+  const barColors = paddedTaskCounts.map(count => count > 0 ? color : '#F3F4F6');
 
-function createNewActivityChart(ctx, chartData, chartId) {
-  const chartConfig = {
-    type: 'bar',
-    data: {
-      labels: Array(CONFIG.CHART_BARS).fill(''),
-      datasets: [{
-        data: chartData.data,
-        backgroundColor: chartData.colors,
-        borderWidth: 0
-      }]
-    },
-    options: {
-      responsive: true,
-      maintainAspectRatio: false,
-      animation: false,
-      responsiveAnimationDuration: 0,
-      plugins: {
-        legend: { display: false },
-        tooltip: { 
-          enabled: true,
-          mode: 'index',
-          intersect: false,
-          callbacks: {
-            title: () => '',
-            label: (context) => {
-              const count = chartData.originalCounts[context.dataIndex];
-              return count > 0 ? (count === 1 ? '1 task' : `${count} tasks`) : null;
-            }
-          },
-          filter: (tooltipItem) => chartData.originalCounts[tooltipItem.dataIndex] > 0
-        }
+  try {
+    state.charts[canvasId] = new Chart(ctx, {
+      type: 'bar',
+      data: {
+        labels: Array(CONFIG.CHART_BARS).fill(''),
+        datasets: [{
+          data: barData,
+          backgroundColor: barColors,
+          borderWidth: 0
+        }]
       },
-      scales: {
-        x: { display: false, grid: { display: false } },
-        y: { 
-          display: false, 
-          beginAtZero: true, 
-          min: 0, 
-          max: chartData.totalScale, 
-          grid: { display: false } 
-        }
-      },
-      elements: {
-        bar: {
-          categoryPercentage: 1.0,
-          barPercentage: 0.8
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        animation: false,
+        plugins: {
+          legend: { display: false },
+          tooltip: { 
+            enabled: true,
+            mode: 'index',
+            intersect: false,
+            callbacks: {
+              title: () => '',
+              label: (context) => {
+                const count = paddedTaskCounts[context.dataIndex];
+                return count > 0 ? (count === 1 ? '1 task' : `${count} tasks`) : null;
+              }
+            },
+            filter: (tooltipItem) => paddedTaskCounts[tooltipItem.dataIndex] > 0
+          }
+        },
+        scales: {
+          x: { display: false, grid: { display: false } },
+          y: { 
+            display: false, 
+            beginAtZero: true, 
+            min: 0, 
+            max: totalScale, 
+            grid: { display: false } 
+          }
+        },
+        layout: { padding: 0 },
+        elements: {
+          bar: {
+            categoryPercentage: 1.0,
+            barPercentage: 0.8
+          }
         }
       }
-    }
-  };
+    });
+  } catch (error) {
+    console.error(`Error creating chart for ${canvasId}:`, error);
+  }
 
-  state.charts[chartId] = new Chart(ctx, chartConfig);
+  return state.charts[canvasId];
 }
 
 function updateActivityCharts(activityCharts) {
@@ -639,49 +607,63 @@ function updateOverviewCards(system) {
   `;
 }
 
-// Optimize table updates with document fragments
 function updateAgentTable(queues, performance) {
   const agentTable = document.getElementById('agent-table');
   if (!agentTable) return;
 
-  const tbody = agentTable.querySelector('tbody');
-  if (!tbody) return;
-
-  const fragment = document.createDocumentFragment();
-  
-  queues.forEach((agent, index) => {
+  const tableRows = queues.map((agent, index) => {
     const status = getAgentStatus(agent);
     const statusInfo = getStatusInfo(status);
     const perf = performance[index] || {};
     
-    const row = document.createElement('tr');
-    row.className = 'hover:bg-gray-50';
-    row.innerHTML = `
-      <td class="px-6 py-4 whitespace-nowrap">
-        <div class="text-sm font-medium text-gray-900">${agent.agent_name}</div>
-      </td>
-      <td class="px-6 py-4 whitespace-nowrap">
-        <div class="flex items-center gap-2">
-          <div class="w-2 h-2 rounded-full ${statusInfo.dot}"></div>
-          <span class="text-sm ${statusInfo.color}">${statusInfo.label}</span>
-          ${agent.stale_tasks_count > 0 ? `<span class="text-xs text-yellow-600">(${agent.stale_tasks_count} stale)</span>` : ''}
-        </div>
-      </td>
-      <td class="px-6 py-4 whitespace-nowrap text-center text-sm text-gray-900">${agent.main_queue_size}</td>
-      <td class="px-6 py-4 whitespace-nowrap text-center text-sm text-gray-900">${agent.processing_count}</td>
-      <td class="px-6 py-4 whitespace-nowrap text-center text-sm text-gray-900">${agent.backoff_count || 0}</td>
-      <td class="px-6 py-4 whitespace-nowrap text-center text-sm text-gray-900">${(perf.current_throughput || 0).toFixed(1)}/min</td>
-      <td class="px-6 py-4 whitespace-nowrap text-center text-sm text-gray-900">${(perf.success_rate_percent || 0).toFixed(1)}%</td>
-      <td class="px-6 py-4 whitespace-nowrap text-center text-sm text-gray-900">${(perf.avg_processing_time_seconds || 0).toFixed(1)}s</td>
-      <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500">${formatLastActive(perf.last_activity)}</td>
+    return `
+      <tr class="hover:bg-gray-50">
+        <td class="px-6 py-4 whitespace-nowrap">
+          <div class="text-sm font-medium text-gray-900">${agent.agent_name}</div>
+        </td>
+        <td class="px-6 py-4 whitespace-nowrap">
+          <div class="flex items-center gap-2">
+            <div class="w-2 h-2 rounded-full ${statusInfo.dot}"></div>
+            <span class="text-sm ${statusInfo.color}">${statusInfo.label}</span>
+            ${agent.stale_tasks_count > 0 ? `<span class="text-xs text-yellow-600">(${agent.stale_tasks_count} stale)</span>` : ''}
+          </div>
+        </td>
+        <td class="px-6 py-4 whitespace-nowrap text-center text-sm text-gray-900">${agent.main_queue_size}</td>
+        <td class="px-6 py-4 whitespace-nowrap text-center text-sm text-gray-900">${agent.processing_count}</td>
+        <td class="px-6 py-4 whitespace-nowrap text-center text-sm text-gray-900">${agent.backoff_count || 0}</td>
+        <td class="px-6 py-4 whitespace-nowrap text-center text-sm text-gray-900">${(perf.current_throughput || 0).toFixed(1)}/min</td>
+        <td class="px-6 py-4 whitespace-nowrap text-center text-sm text-gray-900">${(perf.success_rate_percent || 0).toFixed(1)}%</td>
+        <td class="px-6 py-4 whitespace-nowrap text-center text-sm text-gray-900">${(perf.avg_processing_time_seconds || 0).toFixed(1)}s</td>
+        <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500">${formatLastActive(perf.last_activity)}</td>
+      </tr>
     `;
-    
-    fragment.appendChild(row);
-  });
+  }).join('');
 
-  // Single DOM update
-  tbody.innerHTML = '';
-  tbody.appendChild(fragment);
+  agentTable.innerHTML = `
+    <div class="px-6 py-4 border-b border-gray-200">
+      <h3 class="text-lg font-medium text-gray-900">Agents</h3>
+    </div>
+    <div class="overflow-x-auto">
+      <table class="w-full">
+        <thead class="bg-gray-50">
+          <tr>
+            <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Agent</th>
+            <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Status</th>
+            <th class="px-6 py-3 text-center text-xs font-medium text-gray-500 uppercase tracking-wider">Queue</th>
+            <th class="px-6 py-3 text-center text-xs font-medium text-gray-500 uppercase tracking-wider">Processing</th>
+            <th class="px-6 py-3 text-center text-xs font-medium text-gray-500 uppercase tracking-wider">Backoff</th>
+            <th class="px-6 py-3 text-center text-xs font-medium text-gray-500 uppercase tracking-wider">Throughput</th>
+            <th class="px-6 py-3 text-center text-xs font-medium text-gray-500 uppercase tracking-wider">Success Rate</th>
+            <th class="px-6 py-3 text-center text-xs font-medium text-gray-500 uppercase tracking-wider">Avg Time</th>
+            <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Last Active</th>
+          </tr>
+        </thead>
+        <tbody class="bg-white divide-y divide-gray-200">
+          ${tableRows}
+        </tbody>
+      </table>
+    </div>
+  `;
 }
 
 function updateToggleButtonStates() {
@@ -926,6 +908,7 @@ function setupErrorHandlers() {
 // ============================================================================
 
 async function fetchMetrics() {
+  // Show loading state
   elements.manualRefreshBtn.classList.add('opacity-70', 'pointer-events-none');
   elements.manualRefreshBtn.querySelector('.w-4').classList.add('spin');
   
@@ -934,8 +917,9 @@ async function fetchMetrics() {
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     
     const data = await response.json();
-    debouncedUpdate(data); // Use debounced update instead of direct render
+    renderDashboard(data);
     
+    // Update last refresh time
     state.lastRefreshTime = new Date();
     updateLastRefreshDisplay();
     
@@ -946,6 +930,7 @@ async function fetchMetrics() {
     console.error('Failed to fetch metrics:', error);
     handleFetchError(error);
   } finally {
+    // Remove loading state
     elements.manualRefreshBtn.classList.remove('opacity-70', 'pointer-events-none');
     elements.manualRefreshBtn.querySelector('.w-4').classList.remove('spin');
   }

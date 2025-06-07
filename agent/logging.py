@@ -3,6 +3,7 @@ import sys
 import time
 import hashlib
 from threading import Lock
+from typing import Any
 
 
 class ColoredFormatter(logging.Formatter):
@@ -64,7 +65,7 @@ class Logger(logging.Logger):
         for key in expired_keys:
             del self._exception_cache[key]
 
-    def error(self, msg, *args, exc_info=None, **kwargs):
+    def error(self, msg: object, *args: object, exc_info: Any = None, **kwargs: Any) -> None:
         """Override error to handle exception deduplication"""
         if not self.dedupe_exceptions or exc_info is None:
             return super().error(msg, *args, exc_info=exc_info, **kwargs)

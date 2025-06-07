@@ -19,14 +19,14 @@ control_plane = ControlPlane(
     observability_config=ObservabilityConfig(
         enabled=True,
         host="0.0.0.0",
-        port=8080,
+        port=8081,
         cors_origins=["*"],
     ),
     name="orchestrator",
 )
 
 # Default agent configuration
-agent = DummyAgent(client=control_plane.llm_client)
+agent = DummyAgent()
 # agent = FreeAgent(client=control_plane.llm_client)
 
 control_plane.register_runner(

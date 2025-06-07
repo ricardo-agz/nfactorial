@@ -4,7 +4,10 @@ import typing
 import json
 import uuid
 from enum import Enum
-from typing import TypeVar, Generic, Type
+from typing import TypeVar, Generic, Type, Any, cast
+
+from agent.utils import decode
+
 
 ContextType = TypeVar("ContextType", bound="AgentContext")
 
@@ -27,7 +30,7 @@ class AgentContext:
 
     @classmethod
     def from_json(cls, json_str: str):
-        return cls.from_dict(json.loads(json_str))
+        return cls.from_dict(json.loads(decode(json_str)))
 
 
 class TaskStatus(str, Enum):
@@ -43,14 +46,39 @@ class TaskStatus(str, Enum):
 
 
 @dataclass
-class Task(Generic[ContextType]):
+class TaskMetadata:
     owner_id: str
-    payload: ContextType
+    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+
+    def to_dict(self):
+        return {
+            "owner_id": self.owner_id,
+            "created_at": self.created_at.timestamp(),
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, typing.Any]):
+        data["created_at"] = datetime.fromtimestamp(
+            float(data["created_at"]), tz=timezone.utc
+        )
+        return cls(**data)
+
+    def to_json(self) -> str:
+        return json.dumps(self.to_dict())
+
+    @classmethod
+    def from_json(cls, json_str: str | bytes):
+        return cls.from_dict(json.loads(decode(json_str)))
+
+
+@dataclass
+class Task(Generic[ContextType]):
+    status: TaskStatus
     agent: str
+    payload: ContextType
+    metadata: TaskMetadata
     pickups: int = 0
     retries: int = 0
-    status: TaskStatus = TaskStatus.QUEUED
-    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     id: str = field(default_factory=lambda: str(uuid.uuid4()))
 
     @classmethod
@@ -58,25 +86,23 @@ class Task(Generic[ContextType]):
         cls, owner_id: str, agent: str, payload: ContextType
     ) -> "Task[ContextType]":
         return Task(
-            id=str(uuid.uuid4()),
-            owner_id=owner_id,
+            status=TaskStatus.QUEUED,
             agent=agent,
             payload=payload,
-            pickups=0,
-            retries=0,
-            status=TaskStatus.QUEUED,
+            metadata=TaskMetadata(
+                owner_id=owner_id,
+            ),
         )
 
     def to_dict(self):
         return {
             "id": self.id,
-            "owner_id": self.owner_id,
+            "status": self.status.value,
             "agent": self.agent,
             "payload": self.payload.to_dict() if self.payload else None,
-            "retries": self.retries,
             "pickups": self.pickups,
-            "status": self.status.value,
-            "created_at": self.created_at.timestamp(),
+            "retries": self.retries,
+            "metadata": self.metadata.to_dict(),
         }
 
     def to_json(self) -> str:
@@ -85,36 +111,28 @@ class Task(Generic[ContextType]):
     @classmethod
     def from_dict(
         cls,
-        data: dict[str, typing.Any],
+        data: dict[str, Any],
         context_class: Type[ContextType],
-    ):
-        data["created_at"] = datetime.fromtimestamp(
-            float(data["created_at"]), tz=timezone.utc
-        )
+    ) -> "Task[ContextType]":
         data["status"] = TaskStatus(data["status"])
-        data["retries"] = int(data["retries"])
-        data["pickups"] = int(data["pickups"])
+        data["metadata"] = TaskMetadata.from_dict(data["metadata"])
 
-        # Handle payload which might be a JSON string
         if data["payload"]:
-            if isinstance(data["payload"], str):
-                # Parse JSON string to dict first
-                payload_dict = json.loads(data["payload"])
-                data["payload"] = context_class.from_dict(payload_dict)
-            elif isinstance(data["payload"], bytes):
-                # Decode bytes to string, then parse JSON
-                payload_str = data["payload"].decode("utf-8")
-                payload_dict = json.loads(payload_str)
-                data["payload"] = context_class.from_dict(payload_dict)
+            if isinstance(data["payload"], dict):
+                data["payload"] = context_class.from_dict(
+                    cast(dict[str, Any], data["payload"])
+                )
             else:
-                # Already a dict
-                data["payload"] = context_class.from_dict(data["payload"])
+                payload_str = decode(data["payload"])
+                data["payload"] = context_class.from_dict(json.loads(payload_str))
         else:
             data["payload"] = None
 
         return cls(**data)
 
     @classmethod
-    def from_json(cls, json_str: str, context_class: Type[ContextType]):
-        data = json.loads(json_str)
+    def from_json(
+        cls, json_str: str | bytes, context_class: Type[ContextType]
+    ) -> "Task[ContextType]":
+        data = json.loads(decode(json_str))
         return cls.from_dict(data, context_class)

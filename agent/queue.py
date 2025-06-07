@@ -16,6 +16,9 @@ from agent.agent import (
     ExecutionContext,
     RateLimitError,
     OpenAIRateLimitError,
+    OpenAIInternalServerError,
+    OpenAITimeoutError,
+    OpenAIConnectionError,
 )
 from agent.events import QueueEvent
 from agent.logging import get_logger, colored
@@ -46,9 +49,20 @@ logger = get_logger("agent.queue")
 
 # ***** REDIS KEY SPACE *****
 
-TASKS_DATA_BASE = "tasks"
-# HASH: task data {id, status, retries, owner_id, payload}
-TASKS_DATA = "tasks:{task_id}"
+# HASH: task_id -> full task data (status, agent, payload, metadata)
+TASKS_DATA = "tasks:data:{task_id}"
+# HASH: task_id -> status
+TASK_STATUS = "tasks:status"  # queued | processing | completed | failed | cancelled
+# HASH: task_id -> agent
+TASK_AGENT = "tasks:agent"
+# HASH: task_id -> agent payload
+TASK_PAYLOAD = "tasks:payload"
+# HASH: task_id -> num pickups (int)
+TASK_PICKUPS = "tasks:pickups"
+# HASH: task_id -> num retries (int)
+TASK_RETRIES = "tasks:retries"
+# HASH: task_id -> {created_at, owner_id}
+TASK_META = "tasks:meta"
 
 # ===== QUEUE MANAGEMENT =====
 QUEUE_BASE = "queue"
@@ -57,13 +71,13 @@ QUEUE_MAIN = "queue:{agent}:main"
 # ZSET: task_id -> timestamp of failure
 QUEUE_FAILED = "queue:{agent}:failed"
 # ZSET: task_id -> timestamp of completion
-QUEUE_COMPLETIONS = "queue::{agent}:completed"
+QUEUE_COMPLETIONS = "queue:{agent}:completed"
 # ZSET: task_id -> timestamp of cancellation
-QUEUE_CANCELLED = "queue::{agent}:cancelled"
+QUEUE_CANCELLED = "queue:{agent}:cancelled"
 # ZSET: task_id -> timestamp of when task is ready to be picked up again
-QUEUE_BACKOFF = "queue::{agent}:backoff"
+QUEUE_BACKOFF = "queue:{agent}:backoff"
 # ZSET: task_id -> timestamp of orphaned task
-QUEUE_ORPHANED = "queue::{agent}:orphaned"
+QUEUE_ORPHANED = "queue:{agent}:orphaned"
 
 # ===== ACTIVE TASK PROCESSING =====
 # ZSET: task_id -> timestamp of last heartbeat
@@ -77,7 +91,6 @@ TASK_STEERING = "steer:{task_id}:messages"
 
 # ===== PENDING TOOL EXECUTION =====
 # HASH: tool_call_id -> result_json or <|PENDING|>
-PENDING_TOOL_RESULTS_BASE = "tool"
 PENDING_TOOL_RESULTS = "tool:{agent}:{task_id}:results"
 
 # ===== COMMUNICATION =====
@@ -85,21 +98,10 @@ PENDING_TOOL_RESULTS = "tool:{agent}:{task_id}:results"
 UPDATES_CHANNEL = "updates:{owner_id}"
 
 # ===== METRICS =====
-TIMELINE_METRICS_BASE = "metrics:timeline"
-# HASH: {count, total_duration, total_turns, total_retries} (bucket is a timestamp of a time bucke"metrics:timeline:{agent}:{metric_type}:{bucket}"
-TIMELINE_METRICS_KEY_TEMPLATE = "metrics:timeline:{agent}:{metric_type}:{bucket}"
-# HASH: {count, total_duration, total_turns, total_retries} (bucket is a timestamp of a time bucket)
-TIMELINE_METRICS_COMPLETED = "metrics:timeline:{agent}:completed:{bucket}"
-TIMELINE_METRICS_COMPLETED_ALL = "metrics:timeline:__all__:completed:{bucket}"
-# HASH: {count, total_duration, total_turns, total_retries} (bucket is a timestamp of a time bucket)
-TIMELINE_METRICS_FAILED = "metrics:timeline:{agent}:failed:{bucket}"
-TIMELINE_METRICS_FAILED_ALL = "metrics:timeline:__all__:failed:{bucket}"
-# HASH: {count, total_duration, total_turns, total_retries} (bucket is a timestamp of a time bucket)
-TIMELINE_METRICS_CANCELLED = "metrics:timeline:{agent}:cancelled:{bucket}"
-TIMELINE_METRICS_CANCELLED_ALL = "metrics:timeline:__all__:cancelled:{bucket}"
-# HASH: {count, total_duration, total_turns, total_retries} (bucket is a timestamp of a time bucket)
-TIMELINE_METRICS_RETRIED = "metrics:timeline:{agent}:retried:{bucket}"
-TIMELINE_METRICS_RETRIED_ALL = "metrics:timeline:__all__:retried:{bucket}"
+# HASH: {completed, failed, ..., completed_duration, failed_duration, ...} (bucket is a timestamp of a time bucket)
+# completed, failed, cancelled, retried
+AGENT_ACTIVITY_METRICS = "metrics:{agent}:{bucket}"
+GLOBAL_ACTIVITY_METRICS = "metrics:__all__:{bucket}"
 
 # COUNTER: number of idle workers for this agent
 GAUGE_IDLE = "metrics:gauge:{agent}:idle"
@@ -197,6 +199,16 @@ class InactiveTaskError(Exception):
         super().__init__(f"Task {task_id} is not active")
 
 
+class CorruptedTaskDataError(Exception):
+    """Exception raised when task data is corrupted"""
+
+    def __init__(self, task_id: str, missing_fields: list[str]):
+        self.task_id = task_id
+        super().__init__(
+            f"Task {task_id} data is corrupted, missing fields: {missing_fields}"
+        )
+
+
 def is_valid_task_id(task_id: str) -> bool:
     try:
         uuid.UUID(task_id)
@@ -206,22 +218,40 @@ def is_valid_task_id(task_id: str) -> bool:
 
 
 async def get_task_data(redis_client: redis.Redis, task_id: str) -> dict[str, Any]:
-    task_data_key = TASKS_DATA.format(task_id=task_id)
-    raw_task_data = cast(
-        dict[str | bytes, str | bytes],
-        await redis_client.hgetall(task_data_key),  # type: ignore
-    )
+    pipe = redis_client.pipeline(transaction=True)
+    pipe.multi()
+    pipe.hget(TASK_STATUS, task_id)
+    pipe.hget(TASK_AGENT, task_id)
+    pipe.hget(TASK_PAYLOAD, task_id)
+    pipe.hget(TASK_PICKUPS, task_id)
+    pipe.hget(TASK_RETRIES, task_id)
+    pipe.hget(TASK_META, task_id)
+
+    status, agent, payload_json, pickups, retries, meta_json = await pipe.execute()
+
+    if not status and not agent and not payload_json and not meta_json:
+        raise TaskNotFoundError(task_id)
+    elif not all([status, agent, payload_json, pickups, retries, meta_json]):
+        fields = {
+            "status": status,
+            "agent": agent,
+            "payload": payload_json,
+            "pickups": pickups,
+            "retries": retries,
+            "metadata": meta_json,
+        }
+        missing_fields = [field for field, value in fields.items() if not value]
+        raise CorruptedTaskDataError(task_id, missing_fields)
 
     task_data: dict[str, Any] = {
-        decode(key): decode(value) for key, value in raw_task_data.items()
+        "id": task_id,
+        "status": decode(status),
+        "agent": decode(agent),
+        "payload": json.loads(decode(payload_json)),
+        "pickups": int(decode(pickups)),
+        "retries": int(decode(retries)),
+        "metadata": json.loads(decode(meta_json)),
     }
-
-    # Debug logging for missing created_at field
-    if task_data and "created_at" not in task_data:
-        logger.error(
-            f"!!!!!!! DEBUG: Task {task_id} missing created_at field. Available fields: {list(task_data.keys())}"
-        )
-        logger.error(f"!!!!!!! DEBUG: Task data: {task_data}")
 
     return task_data
 
@@ -230,35 +260,52 @@ async def get_task_status(redis_client: redis.Redis, task_id: str) -> TaskStatus
     if not is_valid_task_id(task_id):
         raise InvalidTaskIdError(task_id)
 
-    task_status_raw: str | bytes = await redis_client.hget(
-        TASKS_DATA.format(task_id=task_id), "status"
-    )  # type: ignore
-    if not task_status_raw:
+    status: str | bytes = await redis_client.hget(TASK_STATUS, task_id)  # type: ignore
+    if not status:
         raise TaskNotFoundError(task_id)
 
-    task_status = decode(task_status_raw)
-    return TaskStatus(task_status)
+    return TaskStatus(decode(status))
+
+
+async def get_task_agent(redis_client: redis.Redis, task_id: str) -> str:
+    if not is_valid_task_id(task_id):
+        raise InvalidTaskIdError(task_id)
+
+    agent: str | bytes = await redis_client.hget(TASK_AGENT, task_id)  # type: ignore
+    if not agent:
+        raise TaskNotFoundError(task_id)
+
+    return decode(agent)
 
 
 async def enqueue_task(
     redis_client: redis.Redis, agent: BaseAgent[Any], task: Task[ContextType]
 ) -> None:
     queue_main_key = QUEUE_MAIN.format(agent=agent.name)
-    tasks_data_key = TASKS_DATA.format(task_id=task.id)
-
-    task.status = TaskStatus.QUEUED
-    task_data = task.to_dict()
+    task_statuses_key = TASK_STATUS
+    task_agents_key = TASK_AGENT
+    task_payloads_key = TASK_PAYLOAD
+    task_metas_key = TASK_META
 
     if not is_valid_task_id(task.id):
         raise InvalidTaskIdError(task.id)
 
-    enqueue_script = create_enqueue_task_script(redis_client)
+    enqueue_script = await create_enqueue_task_script(redis_client)
     await enqueue_script.execute(
-        queue_main_key=queue_main_key,
-        tasks_data_key=tasks_data_key,
+        agent_queue_key=queue_main_key,
+        task_statuses_key=task_statuses_key,
+        task_agents_key=task_agents_key,
+        task_payloads_key=task_payloads_key,
+        task_pickups_key=TASK_PICKUPS,
+        task_retries_key=TASK_RETRIES,
+        task_metas_key=task_metas_key,
         task_id=task.id,
-        task_data=json.dumps(task_data),
-    )  # type: ignore
+        task_agent=agent.name,
+        task_payload_json=task.payload.to_json(),
+        task_pickups=0,
+        task_retries=0,
+        task_meta_json=task.metadata.to_json(),
+    )
 
 
 async def cancel_task(
@@ -268,22 +315,33 @@ async def cancel_task(
     metrics_retention_duration: int = 86400,
 ) -> None:
     """Cancel a task using unified cancellation script"""
-    tasks_data_key = TASKS_DATA.format(task_id=task_id)
-    pending_tool_results_key_base = PENDING_TOOL_RESULTS_BASE
-    queue_key_base = QUEUE_BASE
-    task_cancellations_key = TASK_CANCELLATIONS
-    timeline_metrics_key_base = TIMELINE_METRICS_BASE
+    agent = await get_task_agent(redis_client, task_id)
 
-    cancel_script = create_cancel_task_script(redis_client)
+    bucket_id = int(time.time() / metrics_bucket_duration) * metrics_bucket_duration
+    agent_metrics_bucket_key = AGENT_ACTIVITY_METRICS.format(
+        agent=agent.name, bucket=bucket_id
+    )
+    global_metrics_bucket_key = GLOBAL_ACTIVITY_METRICS.format(bucket=bucket_id)
+
+    cancel_script = await create_cancel_task_script(redis_client)
     result: CancelTaskScriptResult = await cancel_script.execute(
-        task_data_key=tasks_data_key,
-        task_cancellations_key=task_cancellations_key,
-        queue_key_base=queue_key_base,
-        pending_tool_results_key_base=pending_tool_results_key_base,
-        task_metrics_key_base=timeline_metrics_key_base,
+        queue_cancelled_key=QUEUE_CANCELLED.format(agent=agent),
+        queue_backoff_key=QUEUE_BACKOFF.format(agent=agent),
+        queue_orphaned_key=QUEUE_ORPHANED.format(agent=agent),
+        pending_cancellations_key=TASK_CANCELLATIONS,
+        task_statuses_key=TASK_STATUS,
+        task_agents_key=TASK_AGENT,
+        task_payloads_key=TASK_PAYLOAD,
+        task_pickups_key=TASK_PICKUPS,
+        task_retries_key=TASK_RETRIES,
+        task_metas_key=TASK_META,
+        pending_tool_results_key=PENDING_TOOL_RESULTS.format(
+            agent=agent, task_id=task_id
+        ),
+        agent_metrics_bucket_key=agent_metrics_bucket_key,
+        global_metrics_bucket_key=global_metrics_bucket_key,
         task_id=task_id,
-        metrics_bucket_duration=metrics_bucket_duration,
-        metrics_retention_duration=metrics_retention_duration,
+        metrics_ttl=metrics_retention_duration,
     )
 
     if not result.success:
@@ -350,7 +408,8 @@ async def complete_async_tool(
     result: Any,
 ) -> bool:
     """Complete a tool call"""
-    task_status = await get_task_status(redis_client, task_id)
+    task_data = await get_task_data(redis_client, task_id)
+    task_status = TaskStatus(task_data["status"])
     if task_status in [TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED]:
         raise InactiveTaskError(task_id)
 
@@ -361,7 +420,6 @@ async def complete_async_tool(
         await cancel_task(redis_client, task_id)
         return False
 
-    tasks_key = TASKS_DATA.format(task_id=task_id)
     tool_results_key = PENDING_TOOL_RESULTS.format(agent=agent.name, task_id=task_id)
     agent_queue_key = QUEUE_MAIN.format(agent=agent.name)
 
@@ -407,11 +465,17 @@ async def complete_async_tool(
     ).context
 
     # Move task back to queue
-    tool_completion_script = create_tool_completion_script(redis_client)
+    tool_completion_script = await create_tool_completion_script(redis_client)
     success = await tool_completion_script.execute(
-        pending_tool_results_key=tool_results_key,
         queue_main_key=agent_queue_key,
-        tasks_data_key=tasks_key,
+        queue_orphaned_key=QUEUE_ORPHANED.format(agent=agent.name),
+        pending_tool_results_key=tool_results_key,
+        task_statuses_key=TASK_STATUS,
+        task_agents_key=TASK_AGENT,
+        task_payloads_key=TASK_PAYLOAD,
+        task_pickups_key=TASK_PICKUPS,
+        task_retries_key=TASK_RETRIES,
+        task_metas_key=TASK_META,
         task_id=task.id,
         updated_task_context_json=updated_context.to_json(),
     )
@@ -434,7 +498,7 @@ async def get_task_batch(
     agent: BaseAgent[Any],
     batch_size: int,
     metrics_bucket_duration: int,
-    metrics_retention_duration: int,
+    metrics_ttl: int,
 ) -> tuple[list[str], list[str]]:
     """
     Get batch of tasks atomically
@@ -443,32 +507,50 @@ async def get_task_batch(
         * List of task ids to process
         * List of task ids to cancel
     """
-    task_data_key_template = TASKS_DATA
+    timestamp = time.time()
+    bucket_id = int(timestamp / metrics_bucket_duration) * metrics_bucket_duration
+
     queue_main_key = QUEUE_MAIN.format(agent=agent.name)
-    processing_heartbeats_key = PROCESSING_HEARTBEATS.format(agent=agent.name)
-    task_cancellations_key = TASK_CANCELLATIONS
     queue_cancelled_key = QUEUE_CANCELLED.format(agent=agent.name)
     queue_orphaned_key = QUEUE_ORPHANED.format(agent=agent.name)
-    task_metrics_key_template = TIMELINE_METRICS_KEY_TEMPLATE
+    processing_heartbeats_key = PROCESSING_HEARTBEATS.format(agent=agent.name)
+    task_cancellations_key = TASK_CANCELLATIONS
+    task_statuses_key = TASK_STATUS
+    task_agents_key = TASK_AGENT
+    task_payloads_key = TASK_PAYLOAD
+    task_pickups_key = TASK_PICKUPS
+    task_retries_key = TASK_RETRIES
+    task_metas_key = TASK_META
+    agent_metrics_bucket_key = AGENT_ACTIVITY_METRICS.format(
+        agent=agent.name, bucket=bucket_id
+    )
+    global_metrics_bucket_key = GLOBAL_ACTIVITY_METRICS.format(bucket=bucket_id)
 
     try:
         result: BatchPickupScriptResult = await batch_script.execute(
-            task_data_key_template=task_data_key_template,
             queue_main_key=queue_main_key,
             queue_cancelled_key=queue_cancelled_key,
-            processing_heartbeats_key=processing_heartbeats_key,
-            task_cancellations_key=task_cancellations_key,
             queue_orphaned_key=queue_orphaned_key,
-            task_metrics_key_template=task_metrics_key_template,
+            task_statuses_key=task_statuses_key,
+            task_agents_key=task_agents_key,
+            task_payloads_key=task_payloads_key,
+            task_pickups_key=task_pickups_key,
+            task_retries_key=task_retries_key,
+            task_metas_key=task_metas_key,
+            task_cancellations_key=task_cancellations_key,
+            processing_heartbeats_key=processing_heartbeats_key,
+            agent_metrics_bucket_key=agent_metrics_bucket_key,
+            global_metrics_bucket_key=global_metrics_bucket_key,
             batch_size=batch_size,
-            agent_name=agent.name,
-            metrics_bucket_duration=metrics_bucket_duration,
-            metrics_retention_duration=metrics_retention_duration,
+            metrics_ttl=metrics_ttl,
         )
-
         if result.orphaned_task_ids:
             logger.warning(
                 f"⚠️ Found {len(result.orphaned_task_ids)} orphaned tasks: {result.orphaned_task_ids}"
+            )
+        if result.corrupted_task_ids:
+            logger.warning(
+                f"⚠️ Found {len(result.corrupted_task_ids)} corrupted tasks: {result.corrupted_task_ids}"
             )
 
         return result.tasks_to_process_ids, result.tasks_to_cancel_ids
@@ -537,13 +619,13 @@ async def handle_cancelled_tasks(
 
         event_publisher = EventPublisher(
             redis_client=redis_client,
-            channel=UPDATES_CHANNEL.format(owner_id=task.owner_id),
+            channel=UPDATES_CHANNEL.format(owner_id=task.metadata.owner_id),
         )
 
         try:
             execution_ctx = ExecutionContext(
                 task_id=task.id,
-                owner_id=task.owner_id,
+                owner_id=task.metadata.owner_id,
                 retries=task.retries,
                 iterations=task.payload.turn,
                 events=event_publisher,
@@ -555,7 +637,7 @@ async def handle_cancelled_tasks(
                 AgentEvent(
                     event_type="run_cancelled",
                     task_id=task.id,
-                    owner_id=task.owner_id,
+                    owner_id=task.metadata.owner_id,
                     agent_name=agent.name,
                 )
             )
@@ -580,19 +662,24 @@ async def process_task(
 ) -> None:
     """Process a single task"""
     # logger.info(f"▶️  Task started   {colored(f'[{task_id}]', 'dim')}")
+    bucket_id = int(time.time() / metrics_bucket_duration) * metrics_bucket_duration
 
-    tasks_data_key = TASKS_DATA.format(task_id=task_id)
     queue_main_key = QUEUE_MAIN.format(agent=agent.name)
-    processing_heartbeats_key = PROCESSING_HEARTBEATS.format(agent=agent.name)
-    queue_failed_key = QUEUE_FAILED.format(agent=agent.name)
     queue_completions_key = QUEUE_COMPLETIONS.format(agent=agent.name)
+    queue_backoff_key = QUEUE_BACKOFF.format(agent=agent.name)
+    queue_failed_key = QUEUE_FAILED.format(agent=agent.name)
+    queue_orphaned_key = QUEUE_ORPHANED.format(agent=agent.name)
+    processing_heartbeats_key = PROCESSING_HEARTBEATS.format(agent=agent.name)
     task_steering_key = TASK_STEERING.format(task_id=task_id)
     pending_tool_results_key = PENDING_TOOL_RESULTS.format(
         agent=agent.name, task_id=task_id
     )
-    task_metrics_key_template = TIMELINE_METRICS_KEY_TEMPLATE
-    gauge_idle_key_template = GAUGE_IDLE
-    queue_backoff_key = QUEUE_BACKOFF.format(agent=agent.name)
+    agent_metrics_bucket_key = AGENT_ACTIVITY_METRICS.format(
+        agent=agent.name, bucket=bucket_id
+    )
+    global_metrics_bucket_key = GLOBAL_ACTIVITY_METRICS.format(bucket=bucket_id)
+    agent_idle_gauge_key = GAUGE_IDLE.format(agent=agent.name)
+    global_idle_gauge_key = GAUGE_IDLE_ALL
 
     task_data = await get_task_data(redis_client, task_id)
     if not task_data:
@@ -620,7 +707,7 @@ async def process_task(
 
     event_publisher = EventPublisher(
         redis_client=redis_client,
-        channel=UPDATES_CHANNEL.format(owner_id=task.owner_id),
+        channel=UPDATES_CHANNEL.format(owner_id=task.metadata.owner_id),
     )
 
     task_failed = False
@@ -630,14 +717,14 @@ async def process_task(
                 AgentEvent(
                     event_type="run_started",
                     task_id=task.id,
-                    owner_id=task.owner_id,
+                    owner_id=task.metadata.owner_id,
                     agent_name=agent.name,
                 )
             )
 
         execution_ctx = ExecutionContext(
             task_id=task.id,
-            owner_id=task.owner_id,
+            owner_id=task.metadata.owner_id,
             retries=task.retries,
             iterations=task.payload.turn,
             events=event_publisher,
@@ -669,7 +756,13 @@ async def process_task(
 
             try:
                 await steering_script.execute(
-                    task_data_key=tasks_data_key,
+                    queue_orphaned_key=queue_orphaned_key,
+                    task_statuses_key=TASK_STATUS,
+                    task_agents_key=TASK_AGENT,
+                    task_payloads_key=TASK_PAYLOAD,
+                    task_pickups_key=TASK_PICKUPS,
+                    task_retries_key=TASK_RETRIES,
+                    task_metas_key=TASK_META,
                     steering_messages_key=task_steering_key,
                     steering_message_ids=steering_message_ids,
                     updated_task_payload_json=steered_task.payload.to_json(),
@@ -680,7 +773,7 @@ async def process_task(
                     AgentEvent(
                         event_type="run_steering_applied",
                         task_id=task.id,
-                        owner_id=task.owner_id,
+                        owner_id=task.metadata.owner_id,
                         agent_name=agent.name,
                     )
                 )
@@ -690,7 +783,7 @@ async def process_task(
                     AgentEvent(
                         event_type="run_steering_failed",
                         task_id=task.id,
-                        owner_id=task.owner_id,
+                        owner_id=task.metadata.owner_id,
                         agent_name=agent.name,
                         error=str(e),
                     )
@@ -702,26 +795,35 @@ async def process_task(
         )
 
         if turn_completion.pending_tool_call_ids:
+            logger.info(
+                f"This should not be happening? {turn_completion.pending_tool_call_ids}"
+            )
             res = await completion_script.execute(
-                tasks_data_key=tasks_data_key,
-                processing_heartbeats_key=processing_heartbeats_key,
                 queue_main_key=queue_main_key,
                 queue_completions_key=queue_completions_key,
                 queue_failed_key=queue_failed_key,
-                pending_tool_results_key=pending_tool_results_key,
-                task_metrics_key_template=task_metrics_key_template,
-                gauge_idle_key_template=gauge_idle_key_template,
                 queue_backoff_key=queue_backoff_key,
+                queue_orphaned_key=queue_orphaned_key,
+                task_statuses_key=TASK_STATUS,
+                task_agents_key=TASK_AGENT,
+                task_payloads_key=TASK_PAYLOAD,
+                task_pickups_key=TASK_PICKUPS,
+                task_retries_key=TASK_RETRIES,
+                task_metas_key=TASK_META,
+                processing_heartbeats_key=processing_heartbeats_key,
+                pending_tool_results_key=pending_tool_results_key,
+                agent_metrics_bucket_key=agent_metrics_bucket_key,
+                global_metrics_bucket_key=global_metrics_bucket_key,
+                agent_idle_gauge_key=agent_idle_gauge_key,
+                global_idle_gauge_key=global_idle_gauge_key,
                 task_id=task.id,
                 action="pending_tool_call_results",
                 updated_task_payload_json=task.payload.to_json(),
-                pending_tool_call_result_sentinel=PENDING_SENTINEL,
+                metrics_ttl=metrics_retention_duration,
+                pending_sentinel=PENDING_SENTINEL,
                 pending_tool_call_ids_json=json.dumps(
                     turn_completion.pending_tool_call_ids
                 ),
-                agent_name=agent.name,
-                metrics_bucket_duration=metrics_bucket_duration,
-                metrics_retention_duration=metrics_retention_duration,
             )
 
             logger.info(
@@ -731,35 +833,41 @@ async def process_task(
                 AgentEvent(
                     event_type="task_pending_tool_call_results",
                     task_id=task.id,
-                    owner_id=task.owner_id,
+                    owner_id=task.metadata.owner_id,
                     agent_name=agent.name,
                 )
             )
 
         elif turn_completion.is_done:
             res = await completion_script.execute(
-                tasks_data_key=tasks_data_key,
                 processing_heartbeats_key=processing_heartbeats_key,
                 queue_main_key=queue_main_key,
                 queue_completions_key=queue_completions_key,
                 queue_failed_key=queue_failed_key,
-                task_metrics_key_template=task_metrics_key_template,
-                gauge_idle_key_template=gauge_idle_key_template,
-                pending_tool_results_key=pending_tool_results_key,
                 queue_backoff_key=queue_backoff_key,
+                queue_orphaned_key=queue_orphaned_key,
+                task_statuses_key=TASK_STATUS,
+                task_agents_key=TASK_AGENT,
+                task_payloads_key=TASK_PAYLOAD,
+                task_pickups_key=TASK_PICKUPS,
+                task_retries_key=TASK_RETRIES,
+                task_metas_key=TASK_META,
+                pending_tool_results_key=pending_tool_results_key,
+                agent_metrics_bucket_key=agent_metrics_bucket_key,
+                global_metrics_bucket_key=global_metrics_bucket_key,
+                agent_idle_gauge_key=agent_idle_gauge_key,
+                global_idle_gauge_key=global_idle_gauge_key,
                 task_id=task.id,
                 action="complete",
                 updated_task_payload_json=task.payload.to_json(),
-                agent_name=agent.name,
-                metrics_bucket_duration=metrics_bucket_duration,
-                metrics_retention_duration=metrics_retention_duration,
+                metrics_ttl=metrics_retention_duration,
             )
             # logger.info(f"✅ Task completed {colored(f'[{task.id}]', 'dim')}")
             await event_publisher.publish_event(
                 AgentEvent(
                     event_type="run_completed",
                     task_id=task.id,
-                    owner_id=task.owner_id,
+                    owner_id=task.metadata.owner_id,
                     agent_name=agent.name,
                 )
             )
@@ -770,21 +878,27 @@ async def process_task(
             # logger.info(f"⏩ Task continued {colored(f'[{task.id}]', 'dim')}")
 
             await completion_script.execute(
-                tasks_data_key=tasks_data_key,
                 processing_heartbeats_key=processing_heartbeats_key,
                 queue_main_key=queue_main_key,
                 queue_completions_key=queue_completions_key,
                 queue_failed_key=queue_failed_key,
                 queue_backoff_key=queue_backoff_key,
+                queue_orphaned_key=queue_orphaned_key,
+                task_statuses_key=TASK_STATUS,
+                task_agents_key=TASK_AGENT,
+                task_payloads_key=TASK_PAYLOAD,
+                task_pickups_key=TASK_PICKUPS,
+                task_retries_key=TASK_RETRIES,
+                task_metas_key=TASK_META,
                 pending_tool_results_key=pending_tool_results_key,
-                task_metrics_key_template=task_metrics_key_template,
-                gauge_idle_key_template=gauge_idle_key_template,
+                agent_metrics_bucket_key=agent_metrics_bucket_key,
+                global_metrics_bucket_key=global_metrics_bucket_key,
+                agent_idle_gauge_key=agent_idle_gauge_key,
+                global_idle_gauge_key=global_idle_gauge_key,
                 task_id=task.id,
                 action="continue",
                 updated_task_payload_json=task.payload.to_json(),
-                agent_name=agent.name,
-                metrics_bucket_duration=metrics_bucket_duration,
-                metrics_retention_duration=metrics_retention_duration,
+                metrics_ttl=metrics_retention_duration,
             )
 
     except asyncio.TimeoutError:
@@ -797,7 +911,7 @@ async def process_task(
             QueueEvent(
                 event_type="task_failed",
                 task_id=task.id,
-                owner_id=task.owner_id,
+                owner_id=task.metadata.owner_id,
                 agent_name=agent.name,
                 error=f"Task {task.id} timed out after {task_timeout} seconds",
             )
@@ -805,21 +919,27 @@ async def process_task(
 
         action = "fail" if task.retries >= max_retries else "retry"
         res = await completion_script.execute(
-            tasks_data_key=tasks_data_key,
             processing_heartbeats_key=processing_heartbeats_key,
             queue_main_key=queue_main_key,
             queue_completions_key=queue_completions_key,
             queue_failed_key=queue_failed_key,
-            pending_tool_results_key=pending_tool_results_key,
-            task_metrics_key_template=task_metrics_key_template,
-            gauge_idle_key_template=gauge_idle_key_template,
             queue_backoff_key=queue_backoff_key,
+            queue_orphaned_key=queue_orphaned_key,
+            task_statuses_key=TASK_STATUS,
+            task_agents_key=TASK_AGENT,
+            task_payloads_key=TASK_PAYLOAD,
+            task_pickups_key=TASK_PICKUPS,
+            task_retries_key=TASK_RETRIES,
+            task_metas_key=TASK_META,
+            pending_tool_results_key=pending_tool_results_key,
+            agent_metrics_bucket_key=agent_metrics_bucket_key,
+            global_metrics_bucket_key=global_metrics_bucket_key,
+            agent_idle_gauge_key=agent_idle_gauge_key,
+            global_idle_gauge_key=global_idle_gauge_key,
             task_id=task.id,
             action=action,
             updated_task_payload_json=task.payload.to_json(),
-            agent_name=agent.name,
-            metrics_bucket_duration=metrics_bucket_duration,
-            metrics_retention_duration=metrics_retention_duration,
+            metrics_ttl=metrics_retention_duration,
         )
 
     except Exception as e:
@@ -831,7 +951,7 @@ async def process_task(
                 QueueEvent(
                     event_type="task_failed",
                     task_id=task.id,
-                    owner_id=task.owner_id,
+                    owner_id=task.metadata.owner_id,
                     agent_name=agent.name,
                     error=str(e),
                 )
@@ -839,27 +959,40 @@ async def process_task(
         except Exception as err:
             logger.error(f"Failed to send task failed event: {err}")
 
-        if isinstance(e, RateLimitError) or isinstance(e, OpenAIRateLimitError):
+        backoff_exceptions = (
+            RateLimitError,
+            OpenAIRateLimitError,
+            OpenAIInternalServerError,
+            OpenAITimeoutError,
+            OpenAIConnectionError,
+        )
+        if isinstance(e, backoff_exceptions):
             action = "fail" if task.retries >= max_retries else "backoff"
         else:
             action = "fail" if task.retries >= max_retries else "retry"
 
         res = await completion_script.execute(
-            tasks_data_key=tasks_data_key,
             processing_heartbeats_key=processing_heartbeats_key,
             queue_main_key=queue_main_key,
             queue_completions_key=queue_completions_key,
             queue_failed_key=queue_failed_key,
-            pending_tool_results_key=pending_tool_results_key,
-            task_metrics_key_template=task_metrics_key_template,
-            gauge_idle_key_template=gauge_idle_key_template,
             queue_backoff_key=queue_backoff_key,
+            queue_orphaned_key=queue_orphaned_key,
+            task_statuses_key=TASK_STATUS,
+            task_agents_key=TASK_AGENT,
+            task_payloads_key=TASK_PAYLOAD,
+            task_pickups_key=TASK_PICKUPS,
+            task_retries_key=TASK_RETRIES,
+            task_metas_key=TASK_META,
+            pending_tool_results_key=pending_tool_results_key,
+            agent_metrics_bucket_key=agent_metrics_bucket_key,
+            global_metrics_bucket_key=global_metrics_bucket_key,
+            agent_idle_gauge_key=agent_idle_gauge_key,
+            global_idle_gauge_key=global_idle_gauge_key,
             task_id=task.id,
             action=action,
             updated_task_payload_json=task.payload.to_json(),
-            agent_name=agent.name,
-            metrics_bucket_duration=metrics_bucket_duration,
-            metrics_retention_duration=metrics_retention_duration,
+            metrics_ttl=metrics_retention_duration,
         )
         if not res:
             logger.error(f"Failed to update task status: {res}")
@@ -878,7 +1011,7 @@ async def process_task(
                     AgentEvent(
                         event_type="run_failed",
                         task_id=task.id,
-                        owner_id=task.owner_id,
+                        owner_id=task.metadata.owner_id,
                         agent_name=agent.name,
                         error=f"Agent {agent.name} failed to complete task {task.id} due to max retries ({max_retries})",
                     )
@@ -891,7 +1024,7 @@ async def process_task(
                     QueueEvent(
                         event_type="task_retried",
                         task_id=task.id,
-                        owner_id=task.owner_id,
+                        owner_id=task.metadata.owner_id,
                         agent_name=agent.name,
                     )
                 )
@@ -913,26 +1046,35 @@ async def recover_stale_tasks(
 ) -> int:
     """Atomically move stale tasks back to main queue"""
     cutoff_timestamp = time.time() - heartbeat_timeout
+    bucket_id = int(time.time() / metrics_bucket_duration) * metrics_bucket_duration
 
-    task_data_key_template = TASKS_DATA
     queue_main_key = QUEUE_MAIN.format(agent=agent.name)
-    processing_heartbeats_key = PROCESSING_HEARTBEATS.format(agent=agent.name)
+    queue_orphaned_key = QUEUE_ORPHANED.format(agent=agent.name)
     queue_failed_key = QUEUE_FAILED.format(agent=agent.name)
-    task_metrics_key_template = TIMELINE_METRICS_KEY_TEMPLATE
+    processing_heartbeats_key = PROCESSING_HEARTBEATS.format(agent=agent.name)
+    agent_metrics_bucket_key = AGENT_ACTIVITY_METRICS.format(
+        agent=agent.name, bucket=bucket_id
+    )
+    global_metrics_bucket_key = GLOBAL_ACTIVITY_METRICS.format(bucket=bucket_id)
 
     try:
         result: StaleRecoveryScriptResult = await recovery_script.execute(
-            task_data_key_template=task_data_key_template,
             queue_main_key=queue_main_key,
-            processing_heartbeats_key=processing_heartbeats_key,
             queue_failed_key=queue_failed_key,
-            task_metrics_key_template=task_metrics_key_template,
+            queue_orphaned_key=queue_orphaned_key,
+            task_statuses_key=TASK_STATUS,
+            task_agents_key=TASK_AGENT,
+            task_payloads_key=TASK_PAYLOAD,
+            task_pickups_key=TASK_PICKUPS,
+            task_retries_key=TASK_RETRIES,
+            task_metas_key=TASK_META,
+            processing_heartbeats_key=processing_heartbeats_key,
+            agent_metrics_bucket_key=agent_metrics_bucket_key,
+            global_metrics_bucket_key=global_metrics_bucket_key,
             cutoff_timestamp=cutoff_timestamp,
             max_recovery_batch=batch_size,
             max_retries=max_retries,
-            agent_name=agent.name,
-            metrics_bucket_duration=metrics_bucket_duration,
-            metrics_retention_duration=metrics_retention_duration,
+            metrics_ttl=metrics_retention_duration,
         )
         recovered_count = result.recovered_count
         failed_count = result.failed_count
@@ -971,14 +1113,19 @@ async def recover_backoff_tasks(
     """Move tasks from backoff queue back to main queue when their backoff time has expired"""
     queue_backoff_key = QUEUE_BACKOFF.format(agent=agent.name)
     queue_main_key = QUEUE_MAIN.format(agent=agent.name)
-    task_data_key_template = TASKS_DATA
 
     try:
-        backoff_recovery_script = create_backoff_recovery_script(redis_client)
+        backoff_recovery_script = await create_backoff_recovery_script(redis_client)
         recovered_task_ids = await backoff_recovery_script.execute(
             queue_backoff_key=queue_backoff_key,
             queue_main_key=queue_main_key,
-            task_data_key_template=task_data_key_template,
+            queue_orphaned_key=QUEUE_ORPHANED.format(agent=agent.name),
+            task_statuses_key=TASK_STATUS,
+            task_agents_key=TASK_AGENT,
+            task_payloads_key=TASK_PAYLOAD,
+            task_pickups_key=TASK_PICKUPS,
+            task_retries_key=TASK_RETRIES,
+            task_metas_key=TASK_META,
             max_batch_size=batch_size,
         )
 
@@ -1008,17 +1155,23 @@ async def remove_expired_tasks(
     failed_cutoff = current_time - task_ttl_config.failed_ttl
     cancelled_cutoff = current_time - task_ttl_config.cancelled_ttl
 
-    task_data_key_template = TASKS_DATA
     queue_completions_key = QUEUE_COMPLETIONS.format(agent=agent.name)
     queue_failed_key = QUEUE_FAILED.format(agent=agent.name)
     queue_cancelled_key = QUEUE_CANCELLED.format(agent=agent.name)
+    queue_orphaned_key = QUEUE_ORPHANED.format(agent=agent.name)
 
     try:
         result: TaskExpirationScriptResult = await task_expiration_script.execute(
-            task_data_key_template=task_data_key_template,
             queue_completions_key=queue_completions_key,
             queue_failed_key=queue_failed_key,
             queue_cancelled_key=queue_cancelled_key,
+            queue_orphaned_key=queue_orphaned_key,
+            task_statuses_key=TASK_STATUS,
+            task_agents_key=TASK_AGENT,
+            task_payloads_key=TASK_PAYLOAD,
+            task_pickups_key=TASK_PICKUPS,
+            task_retries_key=TASK_RETRIES,
+            task_metas_key=TASK_META,
             completed_cutoff_timestamp=completed_cutoff,
             failed_cutoff_timestamp=failed_cutoff,
             cancelled_cutoff_timestamp=cancelled_cutoff,
@@ -1065,8 +1218,8 @@ async def maintenance_loop(
 ) -> None:
     """Background maintenance worker to periodically recover stale tasks and clean up expired tasks"""
     redis_client = redis.Redis(connection_pool=redis_pool, decode_responses=True)
-    recovery_script = create_stale_recovery_script(redis_client)
-    task_expiration_script = create_task_expiration_script(redis_client)
+    recovery_script = await create_stale_recovery_script(redis_client)
+    task_expiration_script = await create_task_expiration_script(redis_client)
 
     logger.info(
         f"Maintenance worker started (checking every {interval}s for stale tasks >{heartbeat_timeout}s old and cleaning expired tasks)"
@@ -1144,9 +1297,9 @@ async def worker_loop(
 ) -> None:
     """Main worker loop"""
     redis_client = redis.Redis(connection_pool=redis_pool, decode_responses=True)
-    batch_script = create_batch_pickup_script(redis_client)
-    completion_script = create_task_completion_script(redis_client)
-    steering_script = create_task_steering_script(redis_client)
+    batch_script = await create_batch_pickup_script(redis_client)
+    completion_script = await create_task_completion_script(redis_client)
+    steering_script = await create_task_steering_script(redis_client)
 
     logger.info(f"Worker {worker_id} started")
     current_tasks: list[asyncio.Task[Any]] = []
@@ -1158,7 +1311,7 @@ async def worker_loop(
                 agent=agent,
                 batch_size=batch_size,
                 metrics_bucket_duration=metrics_bucket_duration,
-                metrics_retention_duration=metrics_retention_duration,
+                metrics_ttl=metrics_retention_duration,
             )
             tasks_to_process_ids: list[str] = task_batch[0]
             tasks_to_cancel_ids: list[str] = task_batch[1]

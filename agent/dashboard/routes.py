@@ -12,7 +12,6 @@ from fastapi.staticfiles import StaticFiles
 
 from agent.agent import BaseAgent
 from agent.logging import get_logger
-from agent.scripts import create_metrics_aggregation_script, MetricsAggregationScript
 
 logger = get_logger(__name__)
 
@@ -30,7 +29,7 @@ class CachedMetrics:
 
 
 class MetricsCollector:
-    """Metrics collector using single Lua script and caching"""
+    """Metrics collector using Redis pipelines and caching"""
 
     def __init__(
         self,
@@ -51,15 +50,6 @@ class MetricsCollector:
         self._cache: Optional[CachedMetrics] = None
         self._cache_lock = asyncio.Lock()
 
-        # Lazy-loaded script
-        self._aggregation_script: Optional[MetricsAggregationScript] = None
-
-    async def _get_aggregation_script(self) -> MetricsAggregationScript:
-        """Lazy load the aggregation script"""
-        if self._aggregation_script is None:
-            self._aggregation_script = create_metrics_aggregation_script(self._r)
-        return self._aggregation_script
-
     async def _check_redis(self) -> bool:
         """Check Redis connectivity"""
         try:
@@ -69,7 +59,7 @@ class MetricsCollector:
             return False
 
     async def get_all_metrics(self, agents: list[BaseAgent[Any]]) -> dict[str, Any]:
-        """Get all metrics using single Lua script call with caching"""
+        """Get all metrics using Redis pipelines and transactions"""
 
         # Check cache first
         async with self._cache_lock:
@@ -81,19 +71,192 @@ class MetricsCollector:
             # Get agent names
             agent_names = [agent.name for agent in agents]
 
-            # Use the aggregation script to get all data in one call
-            script = await self._get_aggregation_script()
-            result = await script.execute(
-                timeline_duration=self._timeline_duration,
-                bucket_duration=self._bucket_duration,
-                agent_names=agent_names,
+            # Calculate bucket timestamps
+            current_time = time.time()
+            start_time = current_time - self._timeline_duration
+            start_bucket = (
+                int(start_time / self._bucket_duration) * self._bucket_duration
+            )
+            end_bucket = (
+                int(current_time / self._bucket_duration) * self._bucket_duration
+            )
+            bucket_timestamps = list(
+                range(
+                    start_bucket,
+                    end_bucket + self._bucket_duration,
+                    self._bucket_duration,
+                )
             )
 
-            # Process the aggregated data
-            system_totals = result.system_totals
-            activity_timeline = result.activity_timeline
-            agent_metrics = result.agent_metrics
-            agent_activity_timelines = getattr(result, "agent_activity_timelines", {})
+            # Initialize result structure
+            system_totals = {"queued": 0, "processing": 0, "idle": 0, "backoff": 0}
+            activity_timeline = {
+                metric_type: {"buckets": [], "total_tasks": 0, "total_duration": 0}
+                for metric_type in ["completed", "failed", "cancelled", "retried"]
+            }
+            agent_metrics = {}
+            agent_activity_timelines = {}
+
+            # Step 1: Collect current queue states using pipeline
+            pipe = self._r.pipeline(transaction=True)
+            for agent_name in agent_names:
+                # Use exact Redis key patterns from queue.py
+                queue_main_key = f"queue:{agent_name}:main"
+                processing_heartbeats_key = f"processing:{agent_name}:heartbeats"
+                queue_backoff_key = f"queue:{agent_name}:backoff"
+                agent_idle_gauge_key = f"metrics:gauge:{agent_name}:idle"
+
+                pipe.llen(queue_main_key)  # Get main queue length
+                pipe.zcard(processing_heartbeats_key)  # Get processing count
+                pipe.zcard(queue_backoff_key)  # Get backoff count
+                pipe.get(agent_idle_gauge_key)  # Get idle count
+                pipe.zrange(
+                    processing_heartbeats_key, -1, -1, withscores=True
+                )  # Get last heartbeat
+
+            queue_results = await pipe.execute()
+
+            # Process queue state results
+            for i, agent_name in enumerate(agent_names):
+                base_idx = i * 5
+                queued = int(queue_results[base_idx] or 0)
+                processing = int(queue_results[base_idx + 1] or 0)
+                backoff = int(queue_results[base_idx + 2] or 0)
+                idle = int(queue_results[base_idx + 3] or 0)
+                last_heartbeat_data = queue_results[base_idx + 4]
+                last_heartbeat = (
+                    float(last_heartbeat_data[0][1]) if last_heartbeat_data else None
+                )
+
+                agent_metrics[agent_name] = {
+                    "queued": queued,
+                    "processing": processing,
+                    "backoff": backoff,
+                    "idle": idle,
+                    "last_heartbeat": last_heartbeat,
+                    "completed": 0,
+                    "failed": 0,
+                    "total_duration": 0,
+                }
+
+                agent_activity_timelines[agent_name] = {
+                    metric_type: {"buckets": [], "total_tasks": 0, "total_duration": 0}
+                    for metric_type in ["completed", "failed", "cancelled", "retried"]
+                }
+
+                system_totals["queued"] += queued
+                system_totals["processing"] += processing
+                system_totals["backoff"] += backoff
+                system_totals["idle"] += idle
+
+            # Step 2: Collect metrics for each bucket using pipeline
+            for bucket_timestamp in bucket_timestamps:
+                pipe = self._r.pipeline(transaction=True)
+
+                # Get global metrics using exact key pattern from queue.py
+                global_metrics_key = f"metrics:__all__:{bucket_timestamp}"
+                pipe.hmget(
+                    global_metrics_key,
+                    "completed_count",
+                    "completed_total_duration",
+                    "completed_total_turns",
+                    "completed_total_retries",
+                    "failed_count",
+                    "failed_total_duration",
+                    "failed_total_turns",
+                    "failed_total_retries",
+                    "cancelled_count",
+                    "cancelled_total_duration",
+                    "cancelled_total_turns",
+                    "cancelled_total_retries",
+                    "retried_count",
+                    "retried_total_duration",
+                    "retried_total_turns",
+                    "retried_total_retries",
+                )
+
+                # Get per-agent metrics
+                for agent_name in agent_names:
+                    agent_metrics_key = f"metrics:{agent_name}:{bucket_timestamp}"
+                    pipe.hmget(
+                        agent_metrics_key,
+                        "completed_count",
+                        "completed_total_duration",
+                        "completed_total_turns",
+                        "completed_total_retries",
+                        "failed_count",
+                        "failed_total_duration",
+                        "failed_total_turns",
+                        "failed_total_retries",
+                        "cancelled_count",
+                        "cancelled_total_duration",
+                        "cancelled_total_turns",
+                        "cancelled_total_retries",
+                        "retried_count",
+                        "retried_total_duration",
+                        "retried_total_turns",
+                        "retried_total_retries",
+                    )
+
+                results = await pipe.execute()
+
+                # Process global metrics
+                global_metrics = results[0]
+                metric_types = ["completed", "failed", "cancelled", "retried"]
+                for i, metric_type in enumerate(metric_types):
+                    base_idx = i * 4
+                    count = int(global_metrics[base_idx] or 0)
+                    total_duration = float(global_metrics[base_idx + 1] or 0)
+                    total_turns = int(global_metrics[base_idx + 2] or 0)
+                    total_retries = int(global_metrics[base_idx + 3] or 0)
+
+                    activity_timeline[metric_type]["buckets"].append(
+                        {
+                            "timestamp": bucket_timestamp,
+                            "count": count,
+                            "total_duration": total_duration,
+                            "total_turns": total_turns,
+                            "total_retries": total_retries,
+                        }
+                    )
+                    activity_timeline[metric_type]["total_tasks"] += count
+                    activity_timeline[metric_type]["total_duration"] += total_duration
+
+                # Process per-agent metrics
+                for agent_idx, agent_name in enumerate(agent_names):
+                    agent_metrics_result = results[agent_idx + 1]
+                    for i, metric_type in enumerate(metric_types):
+                        base_idx = i * 4
+                        count = int(agent_metrics_result[base_idx] or 0)
+                        total_duration = float(agent_metrics_result[base_idx + 1] or 0)
+                        total_turns = int(agent_metrics_result[base_idx + 2] or 0)
+                        total_retries = int(agent_metrics_result[base_idx + 3] or 0)
+
+                        agent_activity_timelines[agent_name][metric_type][
+                            "buckets"
+                        ].append(
+                            {
+                                "timestamp": bucket_timestamp,
+                                "count": count,
+                                "total_duration": total_duration,
+                                "total_turns": total_turns,
+                                "total_retries": total_retries,
+                            }
+                        )
+                        agent_activity_timelines[agent_name][metric_type][
+                            "total_tasks"
+                        ] += count
+                        agent_activity_timelines[agent_name][metric_type][
+                            "total_duration"
+                        ] += total_duration
+
+                        if metric_type == "completed":
+                            agent_metrics[agent_name]["completed"] += count
+                            agent_metrics[agent_name]["total_duration"] += (
+                                total_duration
+                            )
+                        elif metric_type == "failed":
+                            agent_metrics[agent_name]["failed"] += count
 
             # Calculate derived metrics using full timeline for success rate
             total_completed = activity_timeline["completed"]["total_tasks"]
@@ -338,7 +501,7 @@ class MetricsCollector:
                     ttl=self._cache_ttl,
                 )
 
-            logger.debug("Collected metrics using Lua script")
+            logger.debug("Collected metrics using Redis pipelines and transactions")
             return metrics_data
 
         except Exception as e:

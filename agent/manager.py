@@ -2,11 +2,13 @@ from dataclasses import dataclass, field
 import asyncio
 import os
 import signal
+import httpx
 import redis.asyncio as redis
 from typing import Any, Literal
 import uvicorn
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+import threading
 
 from agent.agent import BaseAgent
 from agent.queue import enqueue_task, worker_loop, maintenance_loop
@@ -138,6 +140,8 @@ class AgentRunner:
         agent_worker_config: AgentWorkerConfig,
         maintenance_worker_config: MaintenanceWorkerConfig,
     ):
+        agent.client = agent.client or llm_client
+
         self.shutdown_event = asyncio.Event()
         self.redis_pool = redis_pool
         self.llm_client = llm_client
@@ -222,11 +226,10 @@ class ControlPlane:
                 max_connections=redis_max_connections,
             )
 
-        self.llm_client = MultiClient(
-            openai_api_key=openai_api_key or os.getenv("OPENAI_API_KEY"),
-            xai_api_key=xai_api_key or os.getenv("XAI_API_KEY"),
-        )
-
+        self.api_keys = {
+            "openai_api_key": openai_api_key or os.getenv("OPENAI_API_KEY"),
+            "xai_api_key": xai_api_key or os.getenv("XAI_API_KEY"),
+        }
         self.runners: list[AgentRunner] = []
         self.observability_config = observability_config
         self.metrics_config = metrics_config
@@ -243,9 +246,22 @@ class ControlPlane:
         agent_worker_config: AgentWorkerConfig,
         maintenance_worker_config: MaintenanceWorkerConfig,
     ):
+        num_connections = agent_worker_config.workers * agent_worker_config.batch_size
+        http_client = httpx.AsyncClient(
+            limits=httpx.Limits(
+                max_connections=num_connections * 1.25,
+                max_keepalive_connections=num_connections,
+            ),
+            timeout=httpx.Timeout(agent.request_timeout),
+        )
+        llm_client = MultiClient(
+            http_client=http_client,
+            **self.api_keys,
+        )
+
         runner = AgentRunner(
             redis_pool=self.redis_pool,
-            llm_client=self.llm_client,
+            llm_client=llm_client,
             agent=agent,
             agent_worker_config=agent_worker_config,
             maintenance_worker_config=maintenance_worker_config,
@@ -346,7 +362,7 @@ class ControlPlane:
 
         return self.get_agent(agent_name)
 
-    async def create_observability_app(self) -> FastAPI:
+    def create_observability_app(self) -> FastAPI:
         """Create the observability FastAPI app (minimal, clean, robust)"""
         from agent.dashboard.routes import add_observability_routes
 
@@ -398,46 +414,42 @@ class ControlPlane:
 
         return app
 
-    async def start_observability_server(self, shutdown_event: asyncio.Event) -> None:
+    def start_observability_server(self) -> None:
         """Start the observability web server"""
-        if not self.observability_config.enabled:
-            return
+        import uvicorn
 
-        try:
-            app = await self.create_observability_app()
+        app = self.create_observability_app()
+        logger.info(
+            f"🌐 Observability dashboard available at http://{self.observability_config.host}:{self.observability_config.port}/observability"
+        )
+        uvicorn.run(
+            app,
+            host=self.observability_config.host,
+            port=self.observability_config.port,
+            log_level="info",
+            access_log=False,  # Reduce noise
+        )
 
-            config = uvicorn.Config(
-                app=app,
-                host=self.observability_config.host,
-                port=self.observability_config.port,
-                log_level="info",
-                access_log=False,  # Reduce noise
-            )
+    async def start_async_observability_server(self) -> None:
+        """Start the observability web server asynchronously"""
+        import uvicorn
 
-            server = uvicorn.Server(config)
-
-            logger.info(
-                f"🌐 Observability dashboard available at http://{self.observability_config.host}:{self.observability_config.port}/observability"
-            )
-
-            # Run server until shutdown
-            await server.serve()
-
-        except Exception as e:
-            logger.error(f"Error starting observability server: {e}")
+        app = self.create_observability_app()
+        config = uvicorn.Config(
+            app,
+            host=self.observability_config.host,
+            port=self.observability_config.port,
+            log_level="info",
+            access_log=False,  # Reduce noise
+        )
+        server = uvicorn.Server(config)
+        await server.serve()
 
     async def start_workers(self, shutdown_event: asyncio.Event) -> None:
         try:
             workers: list[asyncio.Task[Any]] = []
             for runner in self.runners:
                 workers += runner.create_worker_tasks(shutdown_event)
-
-            # Add observability server if enabled
-            if self.observability_config.enabled:
-                observability_task = asyncio.create_task(
-                    self.start_observability_server(shutdown_event)
-                )
-                workers.append(observability_task)
 
             logger.info(
                 f"Started {len(workers)} total workers for {len(self.runners)} agents"
@@ -492,7 +504,7 @@ class ControlPlane:
             await self.redis_pool.disconnect()
             logger.info("Redis connection pool closed")
 
-    def run(self):
+    def run(self, run_observability_server: bool = True):
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
 
@@ -500,7 +512,19 @@ class ControlPlane:
             loop.add_signal_handler(sig, self.shutdown_event.set)
 
         try:
-            loop.run_until_complete(self.start_workers(self.shutdown_event))
+            # Run both workers and observability server concurrently
+            if run_observability_server:
+                observability_task = loop.create_task(
+                    self.start_async_observability_server()
+                )
+                loop.run_until_complete(
+                    asyncio.gather(
+                        self.start_workers(self.shutdown_event), observability_task
+                    )
+                )
+            else:
+                loop.run_until_complete(self.start_workers(self.shutdown_event))
+
         except KeyboardInterrupt:
             logger.info("Received keyboard interrupt, shutting down...")
             self.shutdown_event.set()

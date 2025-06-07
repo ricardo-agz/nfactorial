@@ -1,31 +1,30 @@
---[[
-Garbage Collection Script for TTL-based task cleanup
-
-This script removes expired tasks from completion, failed, and cancelled queues
-and deletes their associated task data.
-
-Returns:
-* [completed_cleaned, failed_cleaned, cancelled_cleaned, cleaned_task_ids]
---]]
-
-local task_data_key_template = KEYS[1]
-local queue_completions_key = KEYS[2]
-local queue_failed_key = KEYS[3]
-local queue_cancelled_key = KEYS[4]
+local queue_completions_key = KEYS[1]
+local queue_failed_key = KEYS[2]
+local queue_cancelled_key = KEYS[3]
+local queue_orphaned_key = KEYS[4]
+local task_statuses_key = KEYS[5]
+local task_agents_key = KEYS[6]
+local task_payloads_key = KEYS[7]
+local task_pickups_key = KEYS[8]
+local task_retries_key = KEYS[9]
+local task_metas_key = KEYS[10]
 
 local completed_cutoff_timestamp = tonumber(ARGV[1])
 local failed_cutoff_timestamp = tonumber(ARGV[2])
 local cancelled_cutoff_timestamp = tonumber(ARGV[3])
 local max_cleanup_batch = tonumber(ARGV[4])
 
+local time_result = redis.call('TIME')
+local timestamp = tonumber(time_result[1]) + (tonumber(time_result[2]) / 1000000)
+
 -- Input validation
 if not max_cleanup_batch or max_cleanup_batch <= 0 then
-    return { 0, 0, 0, {} }
+    error("max_cleanup_batch must be greater than 0")
 end
 
 -- Early exit if no cutoff timestamps are provided
-if not completed_cutoff_timestamp and not failed_cutoff_timestamp and not cancelled_cutoff_timestamp then
-    return { 0, 0, 0, {} }
+if not completed_cutoff_timestamp or not failed_cutoff_timestamp or not cancelled_cutoff_timestamp then
+    error("all cutoff timestamps must be provided")
 end
 
 local completed_cleaned = 0
@@ -50,19 +49,28 @@ local function clean_expired_tasks(queue_key, cutoff_timestamp, max_batch)
         redis.call('ZREM', queue_key, expired_tasks[i])
     end
 
-    -- Prepare task data keys for batch deletion
-    local task_data_keys = {}
     local task_ids = {}
     for i = 1, #expired_tasks do
         local task_id = expired_tasks[i]
-        local task_data_key = string.gsub(task_data_key_template, '{task_id}', task_id)
-        table.insert(task_data_keys, task_data_key)
-        table.insert(task_ids, task_id)
-    end
 
-    -- Batch delete all task data
-    if #task_data_keys > 0 then
-        redis.call('DEL', unpack(task_data_keys))
+        local task_result = load_task(
+            { task_statuses_key, task_agents_key, task_payloads_key, task_pickups_key, task_retries_key, task_metas_key },
+            { task_id }
+        )
+
+        if task_result.state == "missing" then
+            -- Task is missing, add to orphaned queue
+            redis.call('ZADD', queue_orphaned_key, timestamp, task_id)
+        else
+            redis.call('HDEL', task_statuses_key, task_id)
+            redis.call('HDEL', task_agents_key, task_id)
+            redis.call('HDEL', task_payloads_key, task_id)
+            redis.call('HDEL', task_pickups_key, task_id)
+            redis.call('HDEL', task_retries_key, task_id)
+            redis.call('HDEL', task_metas_key, task_id)
+        end
+
+        table.insert(task_ids, task_id)
     end
 
     return #expired_tasks, task_ids

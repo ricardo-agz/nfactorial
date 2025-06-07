@@ -31,18 +31,22 @@ class MultiClient:
         self,
         openai_api_key: str | None = None,
         xai_api_key: str | None = None,
-        max_connections: int = 1000,
-        max_keepalive_connections: int = 100,
+        http_client: httpx.AsyncClient | None = None,
+        max_connections: int = 1500,
+        max_keepalive_connections: int = 1000,
         timeout: float = 120.0,
     ):
-        # Configure HTTP client with proper connection pooling
-        http_client = httpx.AsyncClient(
-            limits=httpx.Limits(
-                max_connections=max_connections,
-                max_keepalive_connections=max_keepalive_connections,
-            ),
-            timeout=httpx.Timeout(timeout),
-        )
+        if http_client:
+            self.http_client = http_client
+        else:
+            # Configure HTTP client with proper connection pooling
+            self.http_client = httpx.AsyncClient(
+                limits=httpx.Limits(
+                    max_connections=max_connections,
+                    max_keepalive_connections=max_keepalive_connections,
+                ),
+                timeout=httpx.Timeout(timeout),
+            )
 
         if openai_api_key or os.environ.get("OPENAI_API_KEY"):
             self.openai = AsyncOpenAI(

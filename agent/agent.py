@@ -155,10 +155,10 @@ def retry(
                             if isinstance(e, (OpenAIRateLimitError, RateLimitError)):
                                 backoff_delay *= 2  # Double the delay for rate limits
 
-                            logger.warning(
-                                f"Attempt {attempt + 1}/{max_attempts} failed: {e}. "
-                                f"Retrying in {backoff_delay:.2f}s"
-                            )
+                            # logger.warning(
+                            #     f"Attempt {attempt + 1}/{max_attempts} failed: {e}. "
+                            #     f"Retrying in {backoff_delay:.2f}s"
+                            # )
 
                             await asyncio.sleep(backoff_delay)
                     else:
@@ -309,6 +309,7 @@ class BaseAgent(Generic[ContextType]):
         context_window_limit: int | None = None,
         max_turns: int | None = None,
         client: MultiClient | None = None,
+        request_timeout: float = 120.0,
         max_llm_retries: int = 1,
         llm_retry_delay: float = 0.5,
         max_tool_retries: int = 1,
@@ -322,7 +323,8 @@ class BaseAgent(Generic[ContextType]):
         self.instructions = instructions
         self.tools = tools
         self.tool_actions = tool_actions
-        self.client = client or MultiClient()
+        self.client = client or MultiClient(timeout=request_timeout)
+        self.request_timeout = request_timeout
         self.event_publisher: EventPublisher | None = None
         self.model = model
         self.model_settings = model_settings

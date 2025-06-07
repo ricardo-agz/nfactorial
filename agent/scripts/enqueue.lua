@@ -1,27 +1,27 @@
-local agent_queue = KEYS[1]
-local tasks_key = KEYS[2]
+local agent_queue_key = KEYS[1]
+local task_statuses_key = KEYS[2]
+local task_agents_key = KEYS[3]
+local task_payloads_key = KEYS[4]
+local task_pickups_key = KEYS[5]
+local task_retries_key = KEYS[6]
+local task_metas_key = KEYS[7]
+
 local task_id = ARGV[1]
-local task_data_json = ARGV[2]
+local task_agent = ARGV[2]
+local task_payload_json = ARGV[3]
+local task_pickups = tonumber(ARGV[4])
+local task_retries = tonumber(ARGV[5])
+local task_meta_json = ARGV[6]
 
--- Push task_id to agent queue
-redis.call('LPUSH', agent_queue, task_id)
+-- Push task_id to the back of the agent queue
+redis.call('RPUSH', agent_queue_key, task_id)
 
--- Decode task data and set all fields in TASKS hash
-local task_data = cjson.decode(task_data_json)
-local hash_args = {}
-for key, value in pairs(task_data) do
-    table.insert(hash_args, key)
-    -- Convert value to string if it's not already a string or number
-    if type(value) == "table" then
-        table.insert(hash_args, cjson.encode(value))
-    else
-        table.insert(hash_args, value)
-    end
-end
+-- Set task data
+redis.call('HSET', task_statuses_key, task_id, "queued")
+redis.call('HSET', task_agents_key, task_id, task_agent)
+redis.call('HSET', task_payloads_key, task_id, task_payload_json)
+redis.call('HSET', task_pickups_key, task_id, task_pickups)
+redis.call('HSET', task_retries_key, task_id, task_retries)
+redis.call('HSET', task_metas_key, task_id, task_meta_json)
 
-if #hash_args > 0 then
-    redis.call('HSET', tasks_key, unpack(hash_args))
-    return true
-else
-    error("Task data cannot be empty")
-end
+return true

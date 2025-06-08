@@ -1,0 +1,207 @@
+from typing import Any
+import os
+from dotenv import load_dotenv
+
+from factorial import (
+    Agent,
+    AgentContext,
+    Orchestrator,
+    ModelSettings,
+    gpt_41_nano,
+    AgentWorkerConfig,
+    MaintenanceWorkerConfig,
+    TaskTTLConfig,
+    ObservabilityConfig,
+    MetricsTimelineConfig,
+)
+from factorial.utils import BaseModel
+from exa_py import Exa
+
+
+current_dir = os.path.dirname(os.path.abspath(__file__))
+env_path = os.path.join(current_dir, ".env")
+
+load_dotenv(env_path, override=True)
+
+
+tools = [
+    {
+        "type": "function",
+        "function": {
+            "name": "search",
+            "description": "Search the web for information",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                },
+                "required": ["query"],
+                "additionalProperties": False,
+            },
+        },
+        "strict": True,
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "scrape",
+            "description": "Scrape a website",
+            "parameters": {
+                "type": "object",
+                "properties": {"url": {"type": "string"}},
+                "required": ["url"],
+                "additionalProperties": False,
+            },
+        },
+        "strict": True,
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "plan",
+            "description": "Plan a task",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "overview": {"type": "string"},
+                    "steps": {"type": "array", "items": {"type": "string"}},
+                },
+                "required": ["overview", "steps"],
+                "additionalProperties": False,
+            },
+        },
+        "strict": True,
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "reflect",
+            "description": "Reflect on a task",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "reflection": {"type": "string"},
+                },
+                "required": ["reflection"],
+                "additionalProperties": False,
+            },
+        },
+        "strict": True,
+    },
+]
+
+
+def plan(
+    overview: str, steps: list[str], agent_ctx: AgentContext
+) -> tuple[str, dict[str, Any]]:
+    return f"{overview}\n{' -> '.join(steps)}", {"overview": overview, "steps": steps}
+
+
+def reflect(reflection: str, agent_ctx: AgentContext) -> tuple[str, str]:
+    return reflection, reflection
+
+
+def search(query: str) -> tuple[str, list[dict[str, Any]]]:
+    exa = Exa(api_key=os.getenv("EXA_API_KEY"))
+
+    result = exa.search_and_contents(  # type: ignore
+        query=query, num_results=10, text={"max_characters": 500}
+    )
+
+    data = [
+        {
+            "title": r.title,
+            "url": r.url,
+        }
+        for r in result.results
+    ]
+
+    return str(result), data
+
+
+def scrape(url: str) -> tuple[str, str]:
+    exa = Exa(api_key=os.getenv("EXA_API_KEY"))
+
+    response = exa.get_contents(
+        [url],
+        text=True,
+    )
+
+    return str(response), response.data.results[0]
+
+
+class FinalOutput(BaseModel):
+    final_output: str
+
+
+basic_agent = Agent(
+    description="Basic Agent",
+    model=gpt_41_nano,
+    instructions="You are a helpful assistant. Always start out by making a plan.",
+    tools=tools,
+    tool_actions={
+        "search": search,
+        "plan": plan,
+        "reflect": reflect,
+        "scrape": scrape,
+    },
+    model_settings=ModelSettings[AgentContext](
+        temperature=0.0,
+        tool_choice=lambda context: (
+            {
+                "type": "function",
+                "function": {"name": "plan"},
+            }
+            if context.turn == 0
+            else "required"
+        ),
+    ),
+    output_type=FinalOutput,
+)
+
+orchestrator = Orchestrator(
+    redis_host=os.getenv("REDIS_HOST", "localhost"),
+    redis_port=int(os.getenv("REDIS_PORT", 6379)),
+    redis_db=int(os.getenv("REDIS_DB", 0)),
+    redis_max_connections=int(os.getenv("REDIS_MAX_CONNECTIONS", 1000)),
+    openai_api_key=os.getenv("OPENAI_API_KEY"),
+    xai_api_key=os.getenv("XAI_API_KEY"),
+    observability_config=ObservabilityConfig(
+        enabled=True,
+        host="0.0.0.0",
+        port=8081,
+        cors_origins=["*"],
+    ),
+    name="orchestrator",
+)
+
+orchestrator.register_runner(
+    agent=basic_agent,
+    agent_worker_config=AgentWorkerConfig(
+        workers=50,
+        batch_size=15,
+        max_retries=5,
+        heartbeat_interval=2,
+        missed_heartbeats_threshold=3,
+        missed_heartbeats_grace_period=1,
+        turn_timeout=120,
+    ),
+    maintenance_worker_config=MaintenanceWorkerConfig(
+        workers=5,
+        interval=5,
+        task_ttl=TaskTTLConfig(
+            failed_ttl=1800,
+            completed_ttl=60,
+            cancelled_ttl=30,
+        ),
+        metrics_timeline=MetricsTimelineConfig(
+            timeline_duration=3600,  # 1 hour
+            bucket_size="minutes",
+            retention_multiplier=2.0,
+        ),
+    ),
+)
+
+
+if __name__ == "__main__":
+    orchestrator.run()

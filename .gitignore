@@ -1,4 +1,5 @@
 **/*.env
+**/node_modules/
 
 # Python and FastAPI
 *.env
@@ -15,6 +16,21 @@ ui/node_modules/
 ui/vite/dist/
 ui/vite/.cache/
 ui/vite/.temp/
+
+# Examples subdirectories - ignore common development files
+examples/**/node_modules/
+examples/**/*.env
+examples/**/.env*
+examples/**/dist/
+examples/**/build/
+examples/**/__pycache__/
+examples/**/*.pyc
+examples/**/.venv/
+examples/**/.mypy_cache/
+examples/**/vite/dist/
+examples/**/vite/.cache/
+examples/**/vite/.temp/
+examples/**/*.log
 
 # IDE and editor files
 .vscode/
@@ -58,6 +74,15 @@ ui/public/media/
 # FastAPI-specific files
 fastapi.log
 uvicorn.log
+
+# Docusaurus documentation
+docs/node_modules/
+docs/build/
+docs/.docusaurus/
+docs/.cache-loader/
+docs/npm-debug.log*
+docs/yarn-debug.log*
+docs/yarn-error.log*
 
 example_agents/
 scratchpad/

@@ -10,7 +10,7 @@ pip install nfactorial
 
 ## Set up Redis
 
-Factorial uses Redis for distributed task management. You can run Redis locally:
+Factorial uses Redis for distributed task management. Run Redis locally:
 
 ```bash
 # Using Docker
@@ -21,18 +21,20 @@ brew install redis
 redis-server
 ```
 
-## Set an API Key
+## Set your LLM API Keys
 
-Set your OpenAI API key:
+Set your OpenAI/xAI/Anthropic API key(s):
 
 ```bash
-export OPENAI_API_KEY=sk-...
+export OPENAI_API_KEY=...
+export XAI_API_KEY=...
+export ANTHROPIC_API_KEY=...
 ```
 
 ## Create your first agent
 
 ```python
-from factorial import Agent, AgentContext, Orchestrator
+from factorial import Agent, Orchestrator, gpt_41
 
 # Define tools
 tools = [
@@ -58,8 +60,8 @@ def get_weather(location: str) -> str:
 
 # Create agent
 agent = Agent(
-    description="Weather Assistant",
     instructions="You help users get weather information.",
+    model=gpt_41,
     tools=tools,
     tool_actions={"get_weather": get_weather},
 )
@@ -99,9 +101,3 @@ asyncio.run(main())
 ## View the dashboard
 
 Open http://localhost:8080/observability to see the real-time dashboard with task queues, metrics, and agent performance.
-
-## Next steps
-
-- Learn about [Agents](agents) and how to customize them
-- Explore the [Orchestrator](orchestrator) for scaling and deployment
-- Check out [Examples](examples/basic-agent) for more complex use cases 

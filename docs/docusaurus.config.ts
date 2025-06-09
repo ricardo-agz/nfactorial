@@ -59,9 +59,15 @@ const config: Config = {
       title: 'Factorial',
       logo: {
         alt: 'Factorial',
-        src: 'data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMjQiIGhlaWdodD0iMjQiIHZpZXdCb3g9IjAgMCAyNCAyNCIgZmlsbD0ibm9uZSIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj4KPHBhdGggZD0iTTEyIDJDMTMuMSAyIDE0IDIuOSAxNCA0VjEzQzE0IDE0LjEgMTMuMSAxNSAxMiAxNUMxMC45IDE1IDEwIDE0LjEgMTAgMTNWNEMxMCAyLjkgMTAuOSAyIDEyIDJaIiBmaWxsPSIjNjBhNWZhIi8+CjxjaXJjbGUgY3g9IjEyIiBjeT0iMTkiIHI9IjIiIGZpbGw9IiM2MGE1ZmEiLz4KPC9zdmc+',
-        width: 24,
-        height: 24,
+        src: 'img/logo.svg',
+        srcDark: 'img/logo-white.svg',
+        width: 17,
+        height: 17,
+        style: {
+          marginRight: '18px',
+          marginLeft: '10px',
+          paddingBottom: '1px',
+        },
       },
       items: [
         {

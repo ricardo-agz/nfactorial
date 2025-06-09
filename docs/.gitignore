@@ -8,6 +8,10 @@
 .docusaurus
 .cache-loader
 
+# Lock files (not needed for docs)
+package-lock.json
+yarn.lock
+
 # Misc
 .DS_Store
 .env.local

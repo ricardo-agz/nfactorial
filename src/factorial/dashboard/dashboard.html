@@ -1,0 +1,203 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>{{APP_NAME}}</title>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://unpkg.com/lucide@latest/dist/umd/lucide.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          fontFamily: {
+            'sans': ['Inter', 'system-ui', 'sans-serif'],
+          },
+          colors: {
+            'brand': {
+              50: '#f0f9ff',
+              100: '#e0f2fe',
+              500: '#0ea5e9',
+              600: '#0284c7',
+              700: '#0369a1',
+            }
+          }
+        }
+      }
+    }
+  </script>
+  <style>
+    @keyframes spin {
+      to { transform: rotate(360deg); }
+    }
+    .spin {
+      animation: spin 1s linear infinite;
+    }
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.5; }
+    }
+    .pulse {
+      animation: pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+    }
+    
+    /* Ensure icons have proper dimensions even when not loaded */
+    i[data-lucide] {
+      display: inline-block;
+      min-width: 1em;
+      min-height: 1em;
+    }
+    
+    /* Fallback for when icons don't load - show a small colored square */
+    i[data-lucide]:empty::before {
+      content: "●";
+      font-size: 0.75em;
+      opacity: 0.6;
+    }
+    
+    /* Chart container styles for proper tooltip display */
+    .chart-container {
+      position: relative;
+      overflow: visible !important;
+    }
+    
+    /* Ensure chart tooltips can overflow their containers */
+    canvas {
+      position: relative;
+      z-index: 1;
+    }
+    
+    /* Smooth transitions for dropdown */
+    #individual-agent-charts {
+      transition: all 0.3s ease-in-out;
+      overflow: hidden;
+    }
+    
+    /* Button hover effects */
+    #toggle-individual-agents:hover {
+      background-color: #f9fafb;
+    }
+    
+    /* Individual agent chart styling */
+    .agent-chart-section {
+      border-left: 3px solid #e5e7eb;
+      transition: border-color 0.2s ease;
+    }
+    
+    .agent-chart-section:hover {
+      border-left-color: #3b82f6;
+    }
+
+    /* Performance optimizations */
+    * {
+      /* Reduce layout thrashing */
+      box-sizing: border-box;
+    }
+    
+    /* Optimize table rendering */
+    table {
+      table-layout: fixed;
+      width: 100%;
+    }
+    
+    /* Optimize animations */
+    .animate-pulse {
+      animation: pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+    }
+    
+    /* Prevent unnecessary repaints */
+    .chart-container canvas {
+      will-change: auto;
+    }
+    
+    /* Optimize text rendering */
+    body {
+      text-rendering: optimizeSpeed;
+      -webkit-font-smoothing: antialiased;
+      -moz-osx-font-smoothing: grayscale;
+    }
+    
+    /* Reduce reflow during updates */
+    .overview-cards > div,
+    .agent-table tr {
+      contain: layout style;
+    }
+  </style>
+</head>
+<body class="bg-gray-50 text-gray-900 font-sans antialiased">
+  <div class="min-h-screen">
+    <!-- Header -->
+    <header class="max-w-6xl mx-auto px-6">
+      <div class="flex justify-between items-center border-b border-gray-200 py-3">
+        <div>
+          <h1 class="text-xl font-medium text-gray-900">{{APP_NAME}}</h1>
+        </div>
+        <div class="flex items-center gap-5">
+          <div id="status-badge" class="flex items-center gap-2 text-sm font-medium">
+            <div class="w-2 h-2 rounded-full"></div>
+            <span>Loading...</span>
+          </div>
+          
+          <!-- Refresh Controls -->
+          <div class="flex items-center gap-4">
+            <!-- Last Refresh Indicator -->
+            <div class="flex items-center gap-2 text-sm text-gray-500">
+              <span id="last-refresh-text">Last refresh: --</span>
+              <button id="manual-refresh-btn" class="flex items-center gap-1 text-gray-400 hover:text-gray-700 transition-colors">
+                <i data-lucide="refresh-cw" class="w-4 h-4"></i>
+              </button>
+            </div>
+
+            <!-- Auto Refresh Toggle -->
+            <div class="flex items-center gap-3">
+              <span class="text-sm text-gray-500">Auto Refresh</span>
+              <div id="auto-toggle" class="w-10 h-6 bg-blue-500 rounded-full relative cursor-pointer transition-all duration-200">
+                <div class="absolute top-0.5 left-0.5 w-5 h-5 bg-white rounded-full transition-all duration-200 translate-x-4"></div>
+              </div>
+            </div>
+
+            <!-- Refresh Rate Display with Dropdown -->
+            <div class="relative">
+              <button id="refresh-rate-btn" class="flex items-center gap-2 text-sm text-gray-500 hover:text-gray-700 transition-colors cursor-pointer">
+                <span>Refresh rate: </span>
+                <span id="refresh-rate-display">10 s</span>
+                <i data-lucide="chevron-down" class="w-3 h-3"></i>
+              </button>
+              <div id="refresh-dropdown" class="absolute right-0 top-full mt-1 w-48 bg-white border border-gray-100 rounded-lg shadow-lg z-50 hidden">
+                <div class="p-2">
+                  <button class="refresh-option w-full text-left px-3 py-2 text-sm text-gray-700 hover:bg-gray-50 rounded" data-interval="1000">1 second</button>
+                  <button class="refresh-option w-full text-left px-3 py-2 text-sm text-gray-700 hover:bg-gray-50 rounded" data-interval="5000">5 seconds</button>
+                  <button class="refresh-option w-full text-left px-3 py-2 text-sm text-gray-700 hover:bg-gray-50 rounded" data-interval="10000">10 seconds</button>
+                  <button class="refresh-option w-full text-left px-3 py-2 text-sm text-gray-700 hover:bg-gray-50 rounded" data-interval="30000">30 seconds</button>
+                  <button class="refresh-option w-full text-left px-3 py-2 text-sm text-gray-700 hover:bg-gray-50 rounded" data-interval="60000">1 minute</button>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </header>
+
+    <!-- Main Content -->
+    <main class="max-w-6xl mx-auto px-6 py-4">
+      <div id="main-content" class="flex justify-center items-center py-16 text-gray-500">
+        <div class="text-center">
+          <div class="w-8 h-8 border-2 border-brand-500 border-t-transparent rounded-full animate-spin mx-auto mb-4"></div>
+          <div>Loading dashboard...</div>
+        </div>
+      </div>
+    </main>
+
+    <!-- Footer -->
+    <footer class="max-w-6xl mx-auto px-6">
+        <div class="flex justify-between items-center border-t border-gray-200 py-4 text-xs text-gray-500">
+        &nbsp;
+        </div>
+    </footer>
+  </div>
+
+  <script src="/observability/static/dashboard.js"></script>
+</body>
+</html> 

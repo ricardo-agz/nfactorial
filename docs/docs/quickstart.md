@@ -34,45 +34,34 @@ export ANTHROPIC_API_KEY=...
 ## Create your first agent
 
 ```python
-from factorial import Agent, Orchestrator, gpt_41
+from factorial import Agent, Orchestrator, AgentWorkerConfig, gpt_41
 
-# Define tools
-tools = [
-    {
-        "type": "function",
-        "function": {
-            "name": "get_weather",
-            "description": "Get the current weather",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "location": {"type": "string"},
-                },
-                "required": ["location"],
-            },
-        },
-    }
-]
 
-# Define tool actions
 def get_weather(location: str) -> str:
     return f"The weather in {location} is sunny and 72°F"
 
-# Create agent
+
 agent = Agent(
     instructions="You help users get weather information.",
     model=gpt_41,
-    tools=tools,
-    tool_actions={"get_weather": get_weather},
+    tools=[get_weather],
 )
 
 # Create orchestrator
-orchestrator = Orchestrator()
-orchestrator.register_runner(agent)
+orchestrator = Orchestrator(
+    redis_host="localhost",
+    redis_port=6379,
+    redis_db=0,
+    redis_max_connections=50,
+)
+orchestrator.register_runner(
+    agent=agent, agent_worker_config=AgentWorkerConfig(workers=1)
+)
 
 # Run the system
 if __name__ == "__main__":
     orchestrator.run()
+
 ```
 
 ## Submit a task

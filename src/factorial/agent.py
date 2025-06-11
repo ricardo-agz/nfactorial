@@ -320,8 +320,8 @@ class ToolExecutionResults:
 class BaseAgent(Generic[ContextType]):
     def __init__(
         self,
-        description: str,
-        instructions: str,
+        instructions: str | None = None,
+        description: str | None = None,
         tools: list[FunctionTool[ContextType] | Callable[..., Any]] | None = None,
         model: Model | Callable[[ContextType], Model] | None = None,
         model_settings: ModelSettings[ContextType] | None = None,
@@ -335,7 +335,7 @@ class BaseAgent(Generic[ContextType]):
         output_type: type[BaseModel] | None = None,
     ):
         self.name = to_snake_case(self.__class__.__name__)
-        self.description = description
+        self.description = description or self.__class__.__name__
         self.instructions = instructions
         self.tools, self.tool_actions = convert_tools_list(tools or [])
         self.http_client = http_client or httpx.AsyncClient(timeout=request_timeout)
@@ -664,9 +664,11 @@ class BaseAgent(Generic[ContextType]):
     def _prepare_messages(self, agent_ctx: ContextType) -> list[dict[str, Any]]:
         """Prepare messages for LLM request. Override to customize message preparation."""
         if agent_ctx.turn == 0:
-            messages = [
-                {"role": "system", "content": self._prepare_instructions(agent_ctx)}
-            ]
+            messages = (
+                [{"role": "system", "content": self._prepare_instructions(agent_ctx)}]
+                if self.instructions
+                else []
+            )
             if agent_ctx.messages:
                 messages.extend(
                     [message for message in agent_ctx.messages if message["content"]]

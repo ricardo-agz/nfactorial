@@ -76,7 +76,6 @@ const elements = {
 
 /**
  * Safely creates Lucide icons without throwing errors
- * Handles cases where Lucide library might not be loaded
  * @returns {void}
  */
 function safeCreateIcons() {
@@ -85,7 +84,7 @@ function safeCreateIcons() {
       lucide.createIcons();
     }
   } catch (e) {
-    console.warn('Failed to load icons', e);
+    console.warn('Failed to create icons:', e);
   }
 }
 
@@ -1525,24 +1524,12 @@ function createSkeletonTable() {
 }
 
 // ============================================================================
-// WAIT FOR LUCIDE AND INITIALIZE
+// APPLICATION STARTUP
 // ============================================================================
-
-/**
- * Waits for Lucide and initializes the dashboard
- * @returns {void}
- */
-function waitForLucideAndInitialize() {
-  if (typeof lucide !== 'undefined' && lucide.createIcons) {
-    initialize();
-  } else {
-    setTimeout(waitForLucideAndInitialize, 100);
-  }
-}
 
 // Start the application
 if (document.readyState === 'loading') {
-  document.addEventListener('DOMContentLoaded', waitForLucideAndInitialize);
+  document.addEventListener('DOMContentLoaded', initialize);
 } else {
-  setTimeout(waitForLucideAndInitialize, 100);
+  initialize();
 }

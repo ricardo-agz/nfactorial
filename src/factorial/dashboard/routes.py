@@ -37,13 +37,17 @@ class MetricsCollector:
         timeline_duration: int,
         bucket_duration: int,
         retention_duration: int,
-        cache_ttl: float = 5.0,
+        namespace: str,
+        total_configured_workers: int,
+        cache_ttl: float = 15.0,
     ):
         self._r = redis_client
         self._start_ts = time.time()
         self._timeline_duration = timeline_duration
         self._bucket_duration = bucket_duration
         self._retention_duration = retention_duration
+        self._namespace = namespace
+        self._total_configured_workers = total_configured_workers
         self._cache_ttl = cache_ttl
 
         # Simple in-memory cache
@@ -98,13 +102,17 @@ class MetricsCollector:
             agent_activity_timelines = {}
 
             # Step 1: Collect current queue states using pipeline
-            pipe = self._r.pipeline(transaction=True)
+            pipe = self._r.pipeline(transaction=False)
             for agent_name in agent_names:
                 # Use exact Redis key patterns from queue.py
-                queue_main_key = f"queue:{agent_name}:main"
-                processing_heartbeats_key = f"processing:{agent_name}:heartbeats"
-                queue_backoff_key = f"queue:{agent_name}:backoff"
-                agent_idle_gauge_key = f"metrics:gauge:{agent_name}:idle"
+                queue_main_key = f"{self._namespace}:queue:{agent_name}:main"
+                processing_heartbeats_key = (
+                    f"{self._namespace}:processing:{agent_name}:heartbeats"
+                )
+                queue_backoff_key = f"{self._namespace}:queue:{agent_name}:backoff"
+                agent_idle_gauge_key = (
+                    f"{self._namespace}:metrics:gauge:{agent_name}:idle"
+                )
 
                 pipe.llen(queue_main_key)  # Get main queue length
                 pipe.zcard(processing_heartbeats_key)  # Get processing count
@@ -151,10 +159,12 @@ class MetricsCollector:
 
             # Step 2: Collect metrics for each bucket using pipeline
             for bucket_timestamp in bucket_timestamps:
-                pipe = self._r.pipeline(transaction=True)
+                pipe = self._r.pipeline(transaction=False)
 
                 # Get global metrics using exact key pattern from queue.py
-                global_metrics_key = f"metrics:__all__:{bucket_timestamp}"
+                global_metrics_key = (
+                    f"{self._namespace}:metrics:__all__:{bucket_timestamp}"
+                )
                 pipe.hmget(
                     global_metrics_key,
                     "completed_count",
@@ -177,7 +187,9 @@ class MetricsCollector:
 
                 # Get per-agent metrics
                 for agent_name in agent_names:
-                    agent_metrics_key = f"metrics:{agent_name}:{bucket_timestamp}"
+                    agent_metrics_key = (
+                        f"{self._namespace}:metrics:{agent_name}:{bucket_timestamp}"
+                    )
                     pipe.hmget(
                         agent_metrics_key,
                         "completed_count",
@@ -266,9 +278,9 @@ class MetricsCollector:
                 (total_completed / total_attempts * 100) if total_attempts > 0 else 0.0
             )
 
-            # Calculate current throughput using recent activity (last 5 minutes)
-            # instead of the entire timeline duration to get actual current throughput
-            recent_window_seconds = 300  # 5 minutes for current throughput
+            # Calculate current throughput using recent activity (last 2 minutes)
+            # Use the most recent buckets for more current throughput
+            recent_window_seconds = self._bucket_duration * 2  # Last 2 buckets
             current_time = time.time()
             recent_cutoff = current_time - recent_window_seconds
 
@@ -287,23 +299,11 @@ class MetricsCollector:
             recent_total = recent_completed + recent_failed
             recent_minutes = recent_window_seconds / 60.0
 
-            # Calculate system throughput based on processing capacity, not just completion rate
-            # If we have recent activity and average processing time, use capacity-based calculation
-            system_avg_duration = (
-                activity_timeline["completed"]["total_duration"]
-                / activity_timeline["completed"]["total_tasks"]
-                if activity_timeline["completed"]["total_tasks"] > 0
-                else 0.0
+            # Calculate system throughput based on actual completion rate
+            # Throughput = tasks completed per minute
+            system_throughput = (
+                recent_completed / recent_minutes if recent_minutes > 0 else 0.0
             )
-
-            if system_avg_duration > 0 and recent_total > 0:
-                # Capacity-based throughput: 60 seconds / avg_duration_seconds = tasks per minute
-                system_throughput = 60.0 / system_avg_duration
-            else:
-                # Fallback to completion rate if no processing time data
-                system_throughput = (
-                    recent_total / recent_minutes if recent_minutes > 0 else 0.0
-                )
 
             # Get display name for activity window
             if self._timeline_duration < 3600:
@@ -362,23 +362,13 @@ class MetricsCollector:
 
                 agent_recent_total = agent_recent_completed + agent_recent_failed
 
-                # Calculate agent throughput based on processing capacity
-                agent_avg_duration = (
-                    metrics.get("total_duration", 0) / metrics.get("completed", 1)
-                    if metrics.get("completed", 0) > 0
+                # Calculate agent throughput based on actual completion rate
+                # Throughput = tasks completed per minute
+                agent_throughput = (
+                    agent_recent_completed / recent_minutes
+                    if recent_minutes > 0
                     else 0.0
                 )
-
-                if agent_avg_duration > 0 and agent_recent_total > 0:
-                    # Capacity-based throughput: 60 seconds / avg_duration_seconds = tasks per minute
-                    agent_throughput = 60.0 / agent_avg_duration
-                else:
-                    # Fallback to completion rate if no processing time data
-                    agent_throughput = (
-                        agent_recent_total / recent_minutes
-                        if recent_minutes > 0
-                        else 0.0
-                    )
 
                 performance_data.append(
                     {
@@ -414,7 +404,7 @@ class MetricsCollector:
                     "total_agents": len(agents),
                     "total_tasks_queued": system_totals["queued"],
                     "total_tasks_processing": system_totals["processing"],
-                    "total_workers": system_totals["processing"],
+                    "total_workers": self._total_configured_workers,
                     "redis_connected": True,
                     "uptime_seconds": int(time.time() - self._start_ts),
                     "overall_success_rate_percent": system_success_rate,
@@ -527,22 +517,29 @@ def add_observability_routes(
     app: FastAPI,
     redis_client: redis.Redis,
     agents: list[BaseAgent[Any]],
+    runners: list[Any],
     metrics_config: Any,
-    dashboard_name: str = "Robonet Dashboard",
+    dashboard_name: str = "Factorial Dashboard",
+    namespace: str = "factorial",
 ) -> None:
-    """Add observability routes with Lua scripts and caching"""
+    """Add observability routes to the FastAPI app"""
 
-    # Extract timeline configuration
-    timeline_duration = getattr(metrics_config, "timeline_duration", 3600)
-    bucket_duration = getattr(metrics_config, "bucket_duration", 60)
-    retention_duration = getattr(metrics_config, "retention_duration", 7200)
+    # Calculate total configured workers from all runners
+    total_configured_workers = 0
+    for runner in runners:
+        # Each runner has agent workers + maintenance workers
+        agent_workers = runner.agent_worker_config.workers
+        maintenance_workers = runner.maintenance_worker_config.workers
+        total_configured_workers += agent_workers + maintenance_workers
 
+    # Create metrics collector with namespace
     collector = MetricsCollector(
-        redis_client,
-        timeline_duration=timeline_duration,
-        bucket_duration=bucket_duration,
-        retention_duration=retention_duration,
-        cache_ttl=10.0,
+        redis_client=redis_client,
+        timeline_duration=metrics_config.timeline_duration,
+        bucket_duration=metrics_config.bucket_duration,
+        retention_duration=metrics_config.retention_duration,
+        namespace=namespace,
+        total_configured_workers=total_configured_workers,
     )
 
     # Mount static files

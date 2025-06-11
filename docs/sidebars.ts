@@ -24,9 +24,9 @@ const sidebars: SidebarsConfig = {
         'orchestrator',
         'tools',
         'context',
+        'events',
       ],
     },
-    'examples',
   ],
 };
 

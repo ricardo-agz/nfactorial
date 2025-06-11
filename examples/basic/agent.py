@@ -24,84 +24,20 @@ env_path = os.path.join(current_dir, ".env")
 load_dotenv(env_path, override=True)
 
 
-tools = [
-    {
-        "type": "function",
-        "function": {
-            "name": "search",
-            "description": "Search the web for information",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string"},
-                },
-                "required": ["query"],
-                "additionalProperties": False,
-            },
-        },
-        "strict": True,
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "scrape",
-            "description": "Scrape a website",
-            "parameters": {
-                "type": "object",
-                "properties": {"url": {"type": "string"}},
-                "required": ["url"],
-                "additionalProperties": False,
-            },
-        },
-        "strict": True,
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "plan",
-            "description": "Plan a task",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "overview": {"type": "string"},
-                    "steps": {"type": "array", "items": {"type": "string"}},
-                },
-                "required": ["overview", "steps"],
-                "additionalProperties": False,
-            },
-        },
-        "strict": True,
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "reflect",
-            "description": "Reflect on a task",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "reflection": {"type": "string"},
-                },
-                "required": ["reflection"],
-                "additionalProperties": False,
-            },
-        },
-        "strict": True,
-    },
-]
-
-
 def plan(
     overview: str, steps: list[str], agent_ctx: AgentContext
 ) -> tuple[str, dict[str, Any]]:
+    """Plan a task"""
     return f"{overview}\n{' -> '.join(steps)}", {"overview": overview, "steps": steps}
 
 
 def reflect(reflection: str, agent_ctx: AgentContext) -> tuple[str, str]:
+    """Reflect on a task"""
     return reflection, reflection
 
 
 def search(query: str) -> tuple[str, list[dict[str, Any]]]:
+    """Search the web for information"""
     exa = Exa(api_key=os.getenv("EXA_API_KEY"))
 
     result = exa.search_and_contents(  # type: ignore
@@ -120,6 +56,7 @@ def search(query: str) -> tuple[str, list[dict[str, Any]]]:
 
 
 def scrape(url: str) -> tuple[str, str]:
+    """Scrape a website"""
     exa = Exa(api_key=os.getenv("EXA_API_KEY"))
 
     response = exa.get_contents(
@@ -127,7 +64,7 @@ def scrape(url: str) -> tuple[str, str]:
         text=True,
     )
 
-    return str(response), response.data.results[0]
+    return str(response), response.results[0]
 
 
 class FinalOutput(BaseModel):
@@ -138,13 +75,7 @@ basic_agent = Agent(
     description="Basic Agent",
     model=gpt_41_nano,
     instructions="You are a helpful assistant. Always start out by making a plan.",
-    tools=tools,
-    tool_actions={
-        "search": search,
-        "plan": plan,
-        "reflect": reflect,
-        "scrape": scrape,
-    },
+    tools=[plan, reflect, search, scrape],
     model_settings=ModelSettings[AgentContext](
         temperature=0.0,
         tool_choice=lambda context: (
@@ -172,7 +103,6 @@ orchestrator = Orchestrator(
         port=8081,
         cors_origins=["*"],
     ),
-    name="orchestrator",
 )
 
 orchestrator.register_runner(

@@ -8,7 +8,7 @@ import json
 import asyncio
 from dataclasses import replace
 
-from factorial.context import Task, TaskStatus, ContextType
+from factorial.task import Task, TaskStatus, ContextType
 from factorial.agent import BaseAgent, ExecutionContext
 from factorial.events import QueueEvent, AgentEvent, EventPublisher
 from factorial.logging import get_logger, colored
@@ -41,62 +41,64 @@ logger = get_logger("factorial.queue")
 # ***** REDIS KEY SPACE *****
 
 # HASH: task_id -> full task data (status, agent, payload, metadata)
-TASKS_DATA = "tasks:data:{task_id}"
+TASKS_DATA = "{namespace}:tasks:data:{task_id}"
 # HASH: task_id -> status
-TASK_STATUS = "tasks:status"  # queued | processing | completed | failed | cancelled
+TASK_STATUS = (
+    "{namespace}:tasks:status"  # queued | processing | completed | failed | cancelled
+)
 # HASH: task_id -> agent
-TASK_AGENT = "tasks:agent"
+TASK_AGENT = "{namespace}:tasks:agent"
 # HASH: task_id -> agent payload
-TASK_PAYLOAD = "tasks:payload"
+TASK_PAYLOAD = "{namespace}:tasks:payload"
 # HASH: task_id -> num pickups (int)
-TASK_PICKUPS = "tasks:pickups"
+TASK_PICKUPS = "{namespace}:tasks:pickups"
 # HASH: task_id -> num retries (int)
-TASK_RETRIES = "tasks:retries"
+TASK_RETRIES = "{namespace}:tasks:retries"
 # HASH: task_id -> {created_at, owner_id}
-TASK_META = "tasks:meta"
+TASK_META = "{namespace}:tasks:meta"
 
 # ===== QUEUE MANAGEMENT =====
-QUEUE_BASE = "queue"
+QUEUE_BASE = "{namespace}:queue"
 # LIST: task_ids waiting to be processed
-QUEUE_MAIN = "queue:{agent}:main"
+QUEUE_MAIN = "{namespace}:queue:{agent}:main"
 # ZSET: task_id -> timestamp of failure
-QUEUE_FAILED = "queue:{agent}:failed"
+QUEUE_FAILED = "{namespace}:queue:{agent}:failed"
 # ZSET: task_id -> timestamp of completion
-QUEUE_COMPLETIONS = "queue:{agent}:completed"
+QUEUE_COMPLETIONS = "{namespace}:queue:{agent}:completed"
 # ZSET: task_id -> timestamp of cancellation
-QUEUE_CANCELLED = "queue:{agent}:cancelled"
+QUEUE_CANCELLED = "{namespace}:queue:{agent}:cancelled"
 # ZSET: task_id -> timestamp of when task is ready to be picked up again
-QUEUE_BACKOFF = "queue:{agent}:backoff"
+QUEUE_BACKOFF = "{namespace}:queue:{agent}:backoff"
 # ZSET: task_id -> timestamp of orphaned task
-QUEUE_ORPHANED = "queue:{agent}:orphaned"
+QUEUE_ORPHANED = "{namespace}:queue:{agent}:orphaned"
 
 # ===== ACTIVE TASK PROCESSING =====
 # ZSET: task_id -> timestamp of last heartbeat
-PROCESSING_HEARTBEATS = "processing:{agent}:heartbeats"
+PROCESSING_HEARTBEATS = "{namespace}:processing:{agent}:heartbeats"
 
 # ===== STEERING & CONTROL =====
 # SET: task_ids marked for cancellation
-TASK_CANCELLATIONS = "cancel:pending"
+TASK_CANCELLATIONS = "{namespace}:cancel:pending"
 # HASH: message_id -> steering_message_json
-TASK_STEERING = "steer:{task_id}:messages"
+TASK_STEERING = "{namespace}:steer:{task_id}:messages"
 
 # ===== PENDING TOOL EXECUTION =====
 # HASH: tool_call_id -> result_json or <|PENDING|>
-PENDING_TOOL_RESULTS = "tool:{agent}:{task_id}:results"
+PENDING_TOOL_RESULTS = "{namespace}:tool:{agent}:{task_id}:results"
 
 # ===== COMMUNICATION =====
 # PUBSUB: real-time updates to task owners
-UPDATES_CHANNEL = "updates:{owner_id}"
+UPDATES_CHANNEL = "{namespace}:updates:{owner_id}"
 
 # ===== METRICS =====
 # HASH: {completed, failed, ..., completed_duration, failed_duration, ...} (bucket is a timestamp of a time bucket)
 # completed, failed, cancelled, retried
-AGENT_ACTIVITY_METRICS = "metrics:{agent}:{bucket}"
-GLOBAL_ACTIVITY_METRICS = "metrics:__all__:{bucket}"
+AGENT_ACTIVITY_METRICS = "{namespace}:metrics:{agent}:{bucket}"
+GLOBAL_ACTIVITY_METRICS = "{namespace}:metrics:__all__:{bucket}"
 
 # COUNTER: number of idle workers for this agent
-GAUGE_IDLE = "metrics:gauge:{agent}:idle"
-GAUGE_IDLE_ALL = "metrics:gauge:__all__:idle"
+GAUGE_IDLE = "{namespace}:metrics:gauge:{agent}:idle"
+GAUGE_IDLE_ALL = "{namespace}:metrics:gauge:__all__:idle"
 
 
 # ===== SENTINEL VALUES =====
@@ -148,7 +150,7 @@ Workflow:
 
 5. (Optional) Await tool results:
     Seperate consumer or webhook listens for tool result completions
-    complete_async_tool(tool_call_id, result)
+    complete_deferred_tool(tool_call_id, result)
     Update set the result in the PENDING_TOOL_RESULTS key
     If all tool calls have completed, update the task context with the completed results and move task back to queue
 
@@ -208,15 +210,17 @@ def is_valid_task_id(task_id: str) -> bool:
     return True
 
 
-async def get_task_data(redis_client: redis.Redis, task_id: str) -> dict[str, Any]:
+async def get_task_data(
+    redis_client: redis.Redis, namespace: str, task_id: str
+) -> dict[str, Any]:
     pipe = redis_client.pipeline(transaction=True)
     pipe.multi()
-    pipe.hget(TASK_STATUS, task_id)
-    pipe.hget(TASK_AGENT, task_id)
-    pipe.hget(TASK_PAYLOAD, task_id)
-    pipe.hget(TASK_PICKUPS, task_id)
-    pipe.hget(TASK_RETRIES, task_id)
-    pipe.hget(TASK_META, task_id)
+    pipe.hget(TASK_STATUS.format(namespace=namespace), task_id)
+    pipe.hget(TASK_AGENT.format(namespace=namespace), task_id)
+    pipe.hget(TASK_PAYLOAD.format(namespace=namespace), task_id)
+    pipe.hget(TASK_PICKUPS.format(namespace=namespace), task_id)
+    pipe.hget(TASK_RETRIES.format(namespace=namespace), task_id)
+    pipe.hget(TASK_META.format(namespace=namespace), task_id)
 
     status, agent, payload_json, pickups, retries, meta_json = await pipe.execute()
 
@@ -247,22 +251,30 @@ async def get_task_data(redis_client: redis.Redis, task_id: str) -> dict[str, An
     return task_data
 
 
-async def get_task_status(redis_client: redis.Redis, task_id: str) -> TaskStatus:
+async def get_task_status(
+    redis_client: redis.Redis, namespace: str, task_id: str
+) -> TaskStatus:
     if not is_valid_task_id(task_id):
         raise InvalidTaskIdError(task_id)
 
-    status: str | bytes = await redis_client.hget(TASK_STATUS, task_id)  # type: ignore
+    status: str | bytes = await redis_client.hget(
+        TASK_STATUS.format(namespace=namespace), task_id
+    )  # type: ignore
     if not status:
         raise TaskNotFoundError(task_id)
 
     return TaskStatus(decode(status))
 
 
-async def get_task_agent(redis_client: redis.Redis, task_id: str) -> str:
+async def get_task_agent(
+    redis_client: redis.Redis, namespace: str, task_id: str
+) -> str:
     if not is_valid_task_id(task_id):
         raise InvalidTaskIdError(task_id)
 
-    agent: str | bytes = await redis_client.hget(TASK_AGENT, task_id)  # type: ignore
+    agent: str | bytes = await redis_client.hget(
+        TASK_AGENT.format(namespace=namespace), task_id
+    )  # type: ignore
     if not agent:
         raise TaskNotFoundError(task_id)
 
@@ -270,13 +282,18 @@ async def get_task_agent(redis_client: redis.Redis, task_id: str) -> str:
 
 
 async def enqueue_task(
-    redis_client: redis.Redis, agent: BaseAgent[Any], task: Task[ContextType]
+    redis_client: redis.Redis,
+    namespace: str,
+    agent: BaseAgent[Any],
+    task: Task[ContextType],
 ) -> None:
-    queue_main_key = QUEUE_MAIN.format(agent=agent.name)
-    task_statuses_key = TASK_STATUS
-    task_agents_key = TASK_AGENT
-    task_payloads_key = TASK_PAYLOAD
-    task_metas_key = TASK_META
+    queue_main_key = QUEUE_MAIN.format(namespace=namespace, agent=agent.name)
+    task_statuses_key = TASK_STATUS.format(namespace=namespace)
+    task_agents_key = TASK_AGENT.format(namespace=namespace)
+    task_payloads_key = TASK_PAYLOAD.format(namespace=namespace)
+    task_metas_key = TASK_META.format(namespace=namespace)
+    task_pickups_key = TASK_PICKUPS.format(namespace=namespace)
+    task_retries_key = TASK_RETRIES.format(namespace=namespace)
 
     if not is_valid_task_id(task.id):
         raise InvalidTaskIdError(task.id)
@@ -287,8 +304,8 @@ async def enqueue_task(
         task_statuses_key=task_statuses_key,
         task_agents_key=task_agents_key,
         task_payloads_key=task_payloads_key,
-        task_pickups_key=TASK_PICKUPS,
-        task_retries_key=TASK_RETRIES,
+        task_pickups_key=task_pickups_key,
+        task_retries_key=task_retries_key,
         task_metas_key=task_metas_key,
         task_id=task.id,
         task_agent=agent.name,
@@ -301,34 +318,48 @@ async def enqueue_task(
 
 async def cancel_task(
     redis_client: redis.Redis,
+    namespace: str,
     task_id: str,
     metrics_bucket_duration: int = 300,
     metrics_retention_duration: int = 86400,
 ) -> None:
     """Cancel a task using unified cancellation script"""
-    agent = await get_task_agent(redis_client, task_id)
+    agent_name = await get_task_agent(redis_client, namespace, task_id)
 
     bucket_id = int(time.time() / metrics_bucket_duration) * metrics_bucket_duration
     agent_metrics_bucket_key = AGENT_ACTIVITY_METRICS.format(
-        agent=agent.name, bucket=bucket_id
+        namespace=namespace, agent=agent_name, bucket=bucket_id
     )
-    global_metrics_bucket_key = GLOBAL_ACTIVITY_METRICS.format(bucket=bucket_id)
+    global_metrics_bucket_key = GLOBAL_ACTIVITY_METRICS.format(
+        namespace=namespace, bucket=bucket_id
+    )
+    queue_cancelled_key = QUEUE_CANCELLED.format(namespace=namespace, agent=agent_name)
+    queue_backoff_key = QUEUE_BACKOFF.format(namespace=namespace, agent=agent_name)
+    queue_orphaned_key = QUEUE_ORPHANED.format(namespace=namespace, agent=agent_name)
+    pending_cancellations_key = TASK_CANCELLATIONS.format(namespace=namespace)
+    task_statuses_key = TASK_STATUS.format(namespace=namespace)
+    task_agents_key = TASK_AGENT.format(namespace=namespace)
+    task_payloads_key = TASK_PAYLOAD.format(namespace=namespace)
+    task_pickups_key = TASK_PICKUPS.format(namespace=namespace)
+    task_retries_key = TASK_RETRIES.format(namespace=namespace)
+    task_metas_key = TASK_META.format(namespace=namespace)
+    pending_tool_results_key = PENDING_TOOL_RESULTS.format(
+        namespace=namespace, agent=agent_name, task_id=task_id
+    )
 
     cancel_script = await create_cancel_task_script(redis_client)
     result: CancelTaskScriptResult = await cancel_script.execute(
-        queue_cancelled_key=QUEUE_CANCELLED.format(agent=agent),
-        queue_backoff_key=QUEUE_BACKOFF.format(agent=agent),
-        queue_orphaned_key=QUEUE_ORPHANED.format(agent=agent),
-        pending_cancellations_key=TASK_CANCELLATIONS,
-        task_statuses_key=TASK_STATUS,
-        task_agents_key=TASK_AGENT,
-        task_payloads_key=TASK_PAYLOAD,
-        task_pickups_key=TASK_PICKUPS,
-        task_retries_key=TASK_RETRIES,
-        task_metas_key=TASK_META,
-        pending_tool_results_key=PENDING_TOOL_RESULTS.format(
-            agent=agent, task_id=task_id
-        ),
+        queue_cancelled_key=queue_cancelled_key,
+        queue_backoff_key=queue_backoff_key,
+        queue_orphaned_key=queue_orphaned_key,
+        pending_cancellations_key=pending_cancellations_key,
+        task_statuses_key=task_statuses_key,
+        task_agents_key=task_agents_key,
+        task_payloads_key=task_payloads_key,
+        task_pickups_key=task_pickups_key,
+        task_retries_key=task_retries_key,
+        task_metas_key=task_metas_key,
+        pending_tool_results_key=pending_tool_results_key,
         agent_metrics_bucket_key=agent_metrics_bucket_key,
         global_metrics_bucket_key=global_metrics_bucket_key,
         task_id=task_id,
@@ -350,15 +381,16 @@ async def cancel_task(
 
 async def steer_task(
     redis_client: redis.Redis,
+    namespace: str,
     task_id: str,
     messages: list[dict[str, Any]],
 ) -> None:
     """Steer a task"""
-    task_status = await get_task_status(redis_client, task_id)
+    task_status = await get_task_status(redis_client, namespace, task_id)
     if task_status in [TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED]:
         raise InactiveTaskError(task_id)
 
-    task_steering_key = TASK_STEERING.format(task_id=task_id)
+    task_steering_key = TASK_STEERING.format(namespace=namespace, task_id=task_id)
     # message id format: {timestamp_ms}_{random_hex} e.g. 1717234200000_a3f4b5c6
     message_mapping = {
         f"{int(time.time() * 1000)}_{secrets.token_hex(3)}": json.dumps(message)
@@ -369,12 +401,15 @@ async def steer_task(
 
 async def get_steering_messages(
     redis_client: redis.Redis,
+    namespace: str,
     task_id: str,
 ) -> list[tuple[str, dict[str, Any]]]:
     """Get steering messages for a task"""
-    await get_task_status(redis_client, task_id)  # Raise if task does not exist
+    await get_task_status(
+        redis_client, namespace, task_id
+    )  # Raise if task does not exist
 
-    steering_key = TASK_STEERING.format(task_id=task_id)
+    steering_key = TASK_STEERING.format(namespace=namespace, task_id=task_id)
     message_data: list[tuple[str, dict[str, Any]]] = []
     steering_messages = cast(
         dict[str | bytes, str | bytes],
@@ -391,30 +426,35 @@ async def get_steering_messages(
     return message_data
 
 
-async def complete_async_tool(
+async def complete_deferred_tool(
     redis_client: redis.Redis,
+    namespace: str,
     agent: BaseAgent[Any],
     task_id: str,
     tool_call_id: str,
     result: Any,
 ) -> bool:
-    """Complete a tool call"""
-    task_data = await get_task_data(redis_client, task_id)
+    """Complete a deferred tool call"""
+    task_data = await get_task_data(redis_client, namespace, task_id)
     task_status = TaskStatus(task_data["status"])
     if task_status in [TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED]:
         raise InactiveTaskError(task_id)
 
     # Check if task is marked for cancellation
-    is_cancelled = await redis_client.sismember(TASK_CANCELLATIONS, task_id)  # type: ignore
+    is_cancelled = await redis_client.sismember(
+        TASK_CANCELLATIONS.format(namespace=namespace), task_id
+    )  # type: ignore
     if is_cancelled:
         # Cancel the task instead of completing the tool call
-        await cancel_task(redis_client, task_id)
+        await cancel_task(redis_client, namespace, task_id)
         return False
 
-    tool_results_key = PENDING_TOOL_RESULTS.format(agent=agent.name, task_id=task_id)
-    agent_queue_key = QUEUE_MAIN.format(agent=agent.name)
+    tool_results_key = PENDING_TOOL_RESULTS.format(
+        namespace=namespace, agent=agent.name, task_id=task_id
+    )
+    agent_queue_key = QUEUE_MAIN.format(namespace=namespace, agent=agent.name)
 
-    task_dict = await get_task_data(redis_client, task_id)
+    task_dict = await get_task_data(redis_client, namespace, task_id)
     if not task_dict:
         logger.error(f"Failed to process task {task_id}: Task data not found")
         return False
@@ -459,14 +499,14 @@ async def complete_async_tool(
     tool_completion_script = await create_tool_completion_script(redis_client)
     success = await tool_completion_script.execute(
         queue_main_key=agent_queue_key,
-        queue_orphaned_key=QUEUE_ORPHANED.format(agent=agent.name),
+        queue_orphaned_key=QUEUE_ORPHANED.format(namespace=namespace, agent=agent.name),
         pending_tool_results_key=tool_results_key,
-        task_statuses_key=TASK_STATUS,
-        task_agents_key=TASK_AGENT,
-        task_payloads_key=TASK_PAYLOAD,
-        task_pickups_key=TASK_PICKUPS,
-        task_retries_key=TASK_RETRIES,
-        task_metas_key=TASK_META,
+        task_statuses_key=TASK_STATUS.format(namespace=namespace),
+        task_agents_key=TASK_AGENT.format(namespace=namespace),
+        task_payloads_key=TASK_PAYLOAD.format(namespace=namespace),
+        task_pickups_key=TASK_PICKUPS.format(namespace=namespace),
+        task_retries_key=TASK_RETRIES.format(namespace=namespace),
+        task_metas_key=TASK_META.format(namespace=namespace),
         task_id=task.id,
         updated_task_context_json=updated_context.to_json(),
     )
@@ -478,14 +518,15 @@ async def complete_async_tool(
 
 
 async def publish_update(
-    redis_client: redis.Redis, owner_id: str, payload: dict[str, Any]
+    redis_client: redis.Redis, namespace: str, owner_id: str, payload: dict[str, Any]
 ) -> None:
-    user_update_channel = UPDATES_CHANNEL.format(owner_id=owner_id)
+    user_update_channel = UPDATES_CHANNEL.format(namespace=namespace, owner_id=owner_id)
     await redis_client.publish(user_update_channel, json.dumps(payload))  # type: ignore
 
 
 async def get_task_batch(
     batch_script: BatchPickupScript,
+    namespace: str,
     agent: BaseAgent[Any],
     batch_size: int,
     metrics_bucket_duration: int,
@@ -501,21 +542,25 @@ async def get_task_batch(
     timestamp = time.time()
     bucket_id = int(timestamp / metrics_bucket_duration) * metrics_bucket_duration
 
-    queue_main_key = QUEUE_MAIN.format(agent=agent.name)
-    queue_cancelled_key = QUEUE_CANCELLED.format(agent=agent.name)
-    queue_orphaned_key = QUEUE_ORPHANED.format(agent=agent.name)
-    processing_heartbeats_key = PROCESSING_HEARTBEATS.format(agent=agent.name)
-    task_cancellations_key = TASK_CANCELLATIONS
-    task_statuses_key = TASK_STATUS
-    task_agents_key = TASK_AGENT
-    task_payloads_key = TASK_PAYLOAD
-    task_pickups_key = TASK_PICKUPS
-    task_retries_key = TASK_RETRIES
-    task_metas_key = TASK_META
-    agent_metrics_bucket_key = AGENT_ACTIVITY_METRICS.format(
-        agent=agent.name, bucket=bucket_id
+    queue_main_key = QUEUE_MAIN.format(namespace=namespace, agent=agent.name)
+    queue_cancelled_key = QUEUE_CANCELLED.format(namespace=namespace, agent=agent.name)
+    queue_orphaned_key = QUEUE_ORPHANED.format(namespace=namespace, agent=agent.name)
+    processing_heartbeats_key = PROCESSING_HEARTBEATS.format(
+        namespace=namespace, agent=agent.name
     )
-    global_metrics_bucket_key = GLOBAL_ACTIVITY_METRICS.format(bucket=bucket_id)
+    task_cancellations_key = TASK_CANCELLATIONS.format(namespace=namespace)
+    task_statuses_key = TASK_STATUS.format(namespace=namespace)
+    task_agents_key = TASK_AGENT.format(namespace=namespace)
+    task_payloads_key = TASK_PAYLOAD.format(namespace=namespace)
+    task_pickups_key = TASK_PICKUPS.format(namespace=namespace)
+    task_retries_key = TASK_RETRIES.format(namespace=namespace)
+    task_metas_key = TASK_META.format(namespace=namespace)
+    agent_metrics_bucket_key = AGENT_ACTIVITY_METRICS.format(
+        namespace=namespace, agent=agent.name, bucket=bucket_id
+    )
+    global_metrics_bucket_key = GLOBAL_ACTIVITY_METRICS.format(
+        namespace=namespace, bucket=bucket_id
+    )
 
     try:
         result: BatchPickupScriptResult = await batch_script.execute(
@@ -554,13 +599,16 @@ async def get_task_batch(
 
 async def heartbeat_loop(
     redis_client: redis.Redis,
+    namespace: str,
     task_id: str,
     agent: BaseAgent[Any],
     stop_event: asyncio.Event,
     interval: int,
 ) -> None:
     """Simple heartbeat loop that runs until stopped"""
-    agent_heartbeats = PROCESSING_HEARTBEATS.format(agent=agent.name)
+    agent_heartbeats = PROCESSING_HEARTBEATS.format(
+        namespace=namespace, agent=agent.name
+    )
 
     try:
         while not stop_event.is_set():
@@ -587,13 +635,14 @@ async def heartbeat_loop(
 
 async def handle_cancelled_tasks(
     redis_client: redis.Redis,
+    namespace: str,
     cancelled_task_ids: list[str],
     agent: BaseAgent[Any],
 ) -> None:
     """Send cancellation events for cancelled tasks concurrently"""
 
     async def cancel_task(task_id: str) -> None:
-        task_data = await get_task_data(redis_client, task_id)
+        task_data = await get_task_data(redis_client, namespace, task_id)
         if not task_data:
             logger.error(
                 f"Failed to complete task cancellation for {task_id}: Task data not found"
@@ -610,7 +659,9 @@ async def handle_cancelled_tasks(
 
         event_publisher = EventPublisher(
             redis_client=redis_client,
-            channel=UPDATES_CHANNEL.format(owner_id=task.metadata.owner_id),
+            channel=UPDATES_CHANNEL.format(
+                namespace=namespace, owner_id=task.metadata.owner_id
+            ),
         )
 
         try:
@@ -641,6 +692,7 @@ async def handle_cancelled_tasks(
 
 async def process_task(
     redis_client: redis.Redis,
+    namespace: str,
     task_id: str,
     completion_script: TaskCompletionScript,
     steering_script: TaskSteeringScript,
@@ -655,24 +707,30 @@ async def process_task(
     # logger.info(f"▶️  Task started   {colored(f'[{task_id}]', 'dim')}")
     bucket_id = int(time.time() / metrics_bucket_duration) * metrics_bucket_duration
 
-    queue_main_key = QUEUE_MAIN.format(agent=agent.name)
-    queue_completions_key = QUEUE_COMPLETIONS.format(agent=agent.name)
-    queue_backoff_key = QUEUE_BACKOFF.format(agent=agent.name)
-    queue_failed_key = QUEUE_FAILED.format(agent=agent.name)
-    queue_orphaned_key = QUEUE_ORPHANED.format(agent=agent.name)
-    processing_heartbeats_key = PROCESSING_HEARTBEATS.format(agent=agent.name)
-    task_steering_key = TASK_STEERING.format(task_id=task_id)
+    queue_main_key = QUEUE_MAIN.format(namespace=namespace, agent=agent.name)
+    queue_completions_key = QUEUE_COMPLETIONS.format(
+        namespace=namespace, agent=agent.name
+    )
+    queue_backoff_key = QUEUE_BACKOFF.format(namespace=namespace, agent=agent.name)
+    queue_failed_key = QUEUE_FAILED.format(namespace=namespace, agent=agent.name)
+    queue_orphaned_key = QUEUE_ORPHANED.format(namespace=namespace, agent=agent.name)
+    processing_heartbeats_key = PROCESSING_HEARTBEATS.format(
+        namespace=namespace, agent=agent.name
+    )
+    task_steering_key = TASK_STEERING.format(namespace=namespace, task_id=task_id)
     pending_tool_results_key = PENDING_TOOL_RESULTS.format(
-        agent=agent.name, task_id=task_id
+        namespace=namespace, agent=agent.name, task_id=task_id
     )
     agent_metrics_bucket_key = AGENT_ACTIVITY_METRICS.format(
-        agent=agent.name, bucket=bucket_id
+        namespace=namespace, agent=agent.name, bucket=bucket_id
     )
-    global_metrics_bucket_key = GLOBAL_ACTIVITY_METRICS.format(bucket=bucket_id)
-    agent_idle_gauge_key = GAUGE_IDLE.format(agent=agent.name)
-    global_idle_gauge_key = GAUGE_IDLE_ALL
+    global_metrics_bucket_key = GLOBAL_ACTIVITY_METRICS.format(
+        namespace=namespace, bucket=bucket_id
+    )
+    agent_idle_gauge_key = GAUGE_IDLE.format(namespace=namespace, agent=agent.name)
+    global_idle_gauge_key = GAUGE_IDLE_ALL.format(namespace=namespace)
 
-    task_data = await get_task_data(redis_client, task_id)
+    task_data = await get_task_data(redis_client, namespace, task_id)
     if not task_data:
         logger.error(f"Failed to process task {task_id}: Task data not found")
         return
@@ -689,6 +747,7 @@ async def process_task(
     heartbeat_task = asyncio.create_task(
         heartbeat_loop(
             redis_client=redis_client,
+            namespace=namespace,
             task_id=task_id,
             agent=agent,
             stop_event=stop_heartbeat,
@@ -698,7 +757,9 @@ async def process_task(
 
     event_publisher = EventPublisher(
         redis_client=redis_client,
-        channel=UPDATES_CHANNEL.format(owner_id=task.metadata.owner_id),
+        channel=UPDATES_CHANNEL.format(
+            namespace=namespace, owner_id=task.metadata.owner_id
+        ),
     )
 
     task_failed = False
@@ -723,6 +784,7 @@ async def process_task(
 
         steering_messages_data = await get_steering_messages(
             redis_client=redis_client,
+            namespace=namespace,
             task_id=task.id,
         )
 
@@ -748,12 +810,12 @@ async def process_task(
             try:
                 await steering_script.execute(
                     queue_orphaned_key=queue_orphaned_key,
-                    task_statuses_key=TASK_STATUS,
-                    task_agents_key=TASK_AGENT,
-                    task_payloads_key=TASK_PAYLOAD,
-                    task_pickups_key=TASK_PICKUPS,
-                    task_retries_key=TASK_RETRIES,
-                    task_metas_key=TASK_META,
+                    task_statuses_key=TASK_STATUS.format(namespace=namespace),
+                    task_agents_key=TASK_AGENT.format(namespace=namespace),
+                    task_payloads_key=TASK_PAYLOAD.format(namespace=namespace),
+                    task_pickups_key=TASK_PICKUPS.format(namespace=namespace),
+                    task_retries_key=TASK_RETRIES.format(namespace=namespace),
+                    task_metas_key=TASK_META.format(namespace=namespace),
                     steering_messages_key=task_steering_key,
                     steering_message_ids=steering_message_ids,
                     updated_task_payload_json=steered_task.payload.to_json(),
@@ -795,12 +857,12 @@ async def process_task(
                 queue_failed_key=queue_failed_key,
                 queue_backoff_key=queue_backoff_key,
                 queue_orphaned_key=queue_orphaned_key,
-                task_statuses_key=TASK_STATUS,
-                task_agents_key=TASK_AGENT,
-                task_payloads_key=TASK_PAYLOAD,
-                task_pickups_key=TASK_PICKUPS,
-                task_retries_key=TASK_RETRIES,
-                task_metas_key=TASK_META,
+                task_statuses_key=TASK_STATUS.format(namespace=namespace),
+                task_agents_key=TASK_AGENT.format(namespace=namespace),
+                task_payloads_key=TASK_PAYLOAD.format(namespace=namespace),
+                task_pickups_key=TASK_PICKUPS.format(namespace=namespace),
+                task_retries_key=TASK_RETRIES.format(namespace=namespace),
+                task_metas_key=TASK_META.format(namespace=namespace),
                 processing_heartbeats_key=processing_heartbeats_key,
                 pending_tool_results_key=pending_tool_results_key,
                 agent_metrics_bucket_key=agent_metrics_bucket_key,
@@ -837,12 +899,12 @@ async def process_task(
                 queue_failed_key=queue_failed_key,
                 queue_backoff_key=queue_backoff_key,
                 queue_orphaned_key=queue_orphaned_key,
-                task_statuses_key=TASK_STATUS,
-                task_agents_key=TASK_AGENT,
-                task_payloads_key=TASK_PAYLOAD,
-                task_pickups_key=TASK_PICKUPS,
-                task_retries_key=TASK_RETRIES,
-                task_metas_key=TASK_META,
+                task_statuses_key=TASK_STATUS.format(namespace=namespace),
+                task_agents_key=TASK_AGENT.format(namespace=namespace),
+                task_payloads_key=TASK_PAYLOAD.format(namespace=namespace),
+                task_pickups_key=TASK_PICKUPS.format(namespace=namespace),
+                task_retries_key=TASK_RETRIES.format(namespace=namespace),
+                task_metas_key=TASK_META.format(namespace=namespace),
                 pending_tool_results_key=pending_tool_results_key,
                 agent_metrics_bucket_key=agent_metrics_bucket_key,
                 global_metrics_bucket_key=global_metrics_bucket_key,
@@ -875,12 +937,12 @@ async def process_task(
                 queue_failed_key=queue_failed_key,
                 queue_backoff_key=queue_backoff_key,
                 queue_orphaned_key=queue_orphaned_key,
-                task_statuses_key=TASK_STATUS,
-                task_agents_key=TASK_AGENT,
-                task_payloads_key=TASK_PAYLOAD,
-                task_pickups_key=TASK_PICKUPS,
-                task_retries_key=TASK_RETRIES,
-                task_metas_key=TASK_META,
+                task_statuses_key=TASK_STATUS.format(namespace=namespace),
+                task_agents_key=TASK_AGENT.format(namespace=namespace),
+                task_payloads_key=TASK_PAYLOAD.format(namespace=namespace),
+                task_pickups_key=TASK_PICKUPS.format(namespace=namespace),
+                task_retries_key=TASK_RETRIES.format(namespace=namespace),
+                task_metas_key=TASK_META.format(namespace=namespace),
                 pending_tool_results_key=pending_tool_results_key,
                 agent_metrics_bucket_key=agent_metrics_bucket_key,
                 global_metrics_bucket_key=global_metrics_bucket_key,
@@ -916,12 +978,12 @@ async def process_task(
             queue_failed_key=queue_failed_key,
             queue_backoff_key=queue_backoff_key,
             queue_orphaned_key=queue_orphaned_key,
-            task_statuses_key=TASK_STATUS,
-            task_agents_key=TASK_AGENT,
-            task_payloads_key=TASK_PAYLOAD,
-            task_pickups_key=TASK_PICKUPS,
-            task_retries_key=TASK_RETRIES,
-            task_metas_key=TASK_META,
+            task_statuses_key=TASK_STATUS.format(namespace=namespace),
+            task_agents_key=TASK_AGENT.format(namespace=namespace),
+            task_payloads_key=TASK_PAYLOAD.format(namespace=namespace),
+            task_pickups_key=TASK_PICKUPS.format(namespace=namespace),
+            task_retries_key=TASK_RETRIES.format(namespace=namespace),
+            task_metas_key=TASK_META.format(namespace=namespace),
             pending_tool_results_key=pending_tool_results_key,
             agent_metrics_bucket_key=agent_metrics_bucket_key,
             global_metrics_bucket_key=global_metrics_bucket_key,
@@ -962,12 +1024,12 @@ async def process_task(
             queue_failed_key=queue_failed_key,
             queue_backoff_key=queue_backoff_key,
             queue_orphaned_key=queue_orphaned_key,
-            task_statuses_key=TASK_STATUS,
-            task_agents_key=TASK_AGENT,
-            task_payloads_key=TASK_PAYLOAD,
-            task_pickups_key=TASK_PICKUPS,
-            task_retries_key=TASK_RETRIES,
-            task_metas_key=TASK_META,
+            task_statuses_key=TASK_STATUS.format(namespace=namespace),
+            task_agents_key=TASK_AGENT.format(namespace=namespace),
+            task_payloads_key=TASK_PAYLOAD.format(namespace=namespace),
+            task_pickups_key=TASK_PICKUPS.format(namespace=namespace),
+            task_retries_key=TASK_RETRIES.format(namespace=namespace),
+            task_metas_key=TASK_META.format(namespace=namespace),
             pending_tool_results_key=pending_tool_results_key,
             agent_metrics_bucket_key=agent_metrics_bucket_key,
             global_metrics_bucket_key=global_metrics_bucket_key,
@@ -1021,6 +1083,7 @@ async def process_task(
 
 async def recover_stale_tasks(
     recovery_script: StaleRecoveryScript,
+    namespace: str,
     agent: BaseAgent[Any],
     heartbeat_timeout: int,
     max_retries: int,
@@ -1032,26 +1095,30 @@ async def recover_stale_tasks(
     cutoff_timestamp = time.time() - heartbeat_timeout
     bucket_id = int(time.time() / metrics_bucket_duration) * metrics_bucket_duration
 
-    queue_main_key = QUEUE_MAIN.format(agent=agent.name)
-    queue_orphaned_key = QUEUE_ORPHANED.format(agent=agent.name)
-    queue_failed_key = QUEUE_FAILED.format(agent=agent.name)
-    processing_heartbeats_key = PROCESSING_HEARTBEATS.format(agent=agent.name)
-    agent_metrics_bucket_key = AGENT_ACTIVITY_METRICS.format(
-        agent=agent.name, bucket=bucket_id
+    queue_main_key = QUEUE_MAIN.format(namespace=namespace, agent=agent.name)
+    queue_orphaned_key = QUEUE_ORPHANED.format(namespace=namespace, agent=agent.name)
+    queue_failed_key = QUEUE_FAILED.format(namespace=namespace, agent=agent.name)
+    processing_heartbeats_key = PROCESSING_HEARTBEATS.format(
+        namespace=namespace, agent=agent.name
     )
-    global_metrics_bucket_key = GLOBAL_ACTIVITY_METRICS.format(bucket=bucket_id)
+    agent_metrics_bucket_key = AGENT_ACTIVITY_METRICS.format(
+        namespace=namespace, agent=agent.name, bucket=bucket_id
+    )
+    global_metrics_bucket_key = GLOBAL_ACTIVITY_METRICS.format(
+        namespace=namespace, bucket=bucket_id
+    )
 
     try:
         result: StaleRecoveryScriptResult = await recovery_script.execute(
             queue_main_key=queue_main_key,
             queue_failed_key=queue_failed_key,
             queue_orphaned_key=queue_orphaned_key,
-            task_statuses_key=TASK_STATUS,
-            task_agents_key=TASK_AGENT,
-            task_payloads_key=TASK_PAYLOAD,
-            task_pickups_key=TASK_PICKUPS,
-            task_retries_key=TASK_RETRIES,
-            task_metas_key=TASK_META,
+            task_statuses_key=TASK_STATUS.format(namespace=namespace),
+            task_agents_key=TASK_AGENT.format(namespace=namespace),
+            task_payloads_key=TASK_PAYLOAD.format(namespace=namespace),
+            task_pickups_key=TASK_PICKUPS.format(namespace=namespace),
+            task_retries_key=TASK_RETRIES.format(namespace=namespace),
+            task_metas_key=TASK_META.format(namespace=namespace),
             processing_heartbeats_key=processing_heartbeats_key,
             agent_metrics_bucket_key=agent_metrics_bucket_key,
             global_metrics_bucket_key=global_metrics_bucket_key,
@@ -1091,25 +1158,28 @@ async def recover_stale_tasks(
 
 async def recover_backoff_tasks(
     redis_client: redis.Redis,
+    namespace: str,
     agent: BaseAgent[Any],
     batch_size: int,
 ) -> int:
     """Move tasks from backoff queue back to main queue when their backoff time has expired"""
-    queue_backoff_key = QUEUE_BACKOFF.format(agent=agent.name)
-    queue_main_key = QUEUE_MAIN.format(agent=agent.name)
+    queue_backoff_key = QUEUE_BACKOFF.format(namespace=namespace, agent=agent.name)
+    queue_main_key = QUEUE_MAIN.format(namespace=namespace, agent=agent.name)
 
     try:
         backoff_recovery_script = await create_backoff_recovery_script(redis_client)
         recovered_task_ids = await backoff_recovery_script.execute(
             queue_backoff_key=queue_backoff_key,
             queue_main_key=queue_main_key,
-            queue_orphaned_key=QUEUE_ORPHANED.format(agent=agent.name),
-            task_statuses_key=TASK_STATUS,
-            task_agents_key=TASK_AGENT,
-            task_payloads_key=TASK_PAYLOAD,
-            task_pickups_key=TASK_PICKUPS,
-            task_retries_key=TASK_RETRIES,
-            task_metas_key=TASK_META,
+            queue_orphaned_key=QUEUE_ORPHANED.format(
+                namespace=namespace, agent=agent.name
+            ),
+            task_statuses_key=TASK_STATUS.format(namespace=namespace),
+            task_agents_key=TASK_AGENT.format(namespace=namespace),
+            task_payloads_key=TASK_PAYLOAD.format(namespace=namespace),
+            task_pickups_key=TASK_PICKUPS.format(namespace=namespace),
+            task_retries_key=TASK_RETRIES.format(namespace=namespace),
+            task_metas_key=TASK_META.format(namespace=namespace),
             max_batch_size=batch_size,
         )
 
@@ -1127,6 +1197,7 @@ async def recover_backoff_tasks(
 
 async def remove_expired_tasks(
     task_expiration_script: TaskExpirationScript,
+    namespace: str,
     agent: BaseAgent[Any],
     task_ttl_config: Any,  # Will be TaskTTLConfig from manager.py
     max_cleanup_batch: int,
@@ -1139,10 +1210,12 @@ async def remove_expired_tasks(
     failed_cutoff = current_time - task_ttl_config.failed_ttl
     cancelled_cutoff = current_time - task_ttl_config.cancelled_ttl
 
-    queue_completions_key = QUEUE_COMPLETIONS.format(agent=agent.name)
-    queue_failed_key = QUEUE_FAILED.format(agent=agent.name)
-    queue_cancelled_key = QUEUE_CANCELLED.format(agent=agent.name)
-    queue_orphaned_key = QUEUE_ORPHANED.format(agent=agent.name)
+    queue_completions_key = QUEUE_COMPLETIONS.format(
+        namespace=namespace, agent=agent.name
+    )
+    queue_failed_key = QUEUE_FAILED.format(namespace=namespace, agent=agent.name)
+    queue_cancelled_key = QUEUE_CANCELLED.format(namespace=namespace, agent=agent.name)
+    queue_orphaned_key = QUEUE_ORPHANED.format(namespace=namespace, agent=agent.name)
 
     try:
         result: TaskExpirationScriptResult = await task_expiration_script.execute(
@@ -1150,12 +1223,12 @@ async def remove_expired_tasks(
             queue_failed_key=queue_failed_key,
             queue_cancelled_key=queue_cancelled_key,
             queue_orphaned_key=queue_orphaned_key,
-            task_statuses_key=TASK_STATUS,
-            task_agents_key=TASK_AGENT,
-            task_payloads_key=TASK_PAYLOAD,
-            task_pickups_key=TASK_PICKUPS,
-            task_retries_key=TASK_RETRIES,
-            task_metas_key=TASK_META,
+            task_statuses_key=TASK_STATUS.format(namespace=namespace),
+            task_agents_key=TASK_AGENT.format(namespace=namespace),
+            task_payloads_key=TASK_PAYLOAD.format(namespace=namespace),
+            task_pickups_key=TASK_PICKUPS.format(namespace=namespace),
+            task_retries_key=TASK_RETRIES.format(namespace=namespace),
+            task_metas_key=TASK_META.format(namespace=namespace),
             completed_cutoff_timestamp=completed_cutoff,
             failed_cutoff_timestamp=failed_cutoff,
             cancelled_cutoff_timestamp=cancelled_cutoff,
@@ -1190,6 +1263,7 @@ async def remove_expired_tasks(
 async def maintenance_loop(
     shutdown_event: asyncio.Event,
     redis_pool: redis.ConnectionPool,
+    namespace: str,
     agent: BaseAgent[Any],
     heartbeat_timeout: int,
     max_retries: int,
@@ -1220,6 +1294,7 @@ async def maintenance_loop(
                     batch_size=batch_size,
                     metrics_bucket_duration=metrics_bucket_duration,
                     metrics_retention_duration=metrics_retention_duration,
+                    namespace=namespace,
                 )
 
                 # Recover tasks from backoff queue
@@ -1227,6 +1302,7 @@ async def maintenance_loop(
                     redis_client=redis_client,
                     agent=agent,
                     batch_size=batch_size,
+                    namespace=namespace,
                 )
 
                 # Then, remove expired tasks
@@ -1235,6 +1311,7 @@ async def maintenance_loop(
                     agent=agent,
                     task_ttl_config=task_ttl_config,
                     max_cleanup_batch=max_cleanup_batch,
+                    namespace=namespace,
                 )
 
                 # Wait before next check, but allow early exit on shutdown
@@ -1270,6 +1347,7 @@ async def maintenance_loop(
 async def worker_loop(
     shutdown_event: asyncio.Event,
     redis_pool: redis.ConnectionPool,
+    namespace: str,
     worker_id: str,
     agent: BaseAgent[Any],
     batch_size: int,
@@ -1296,6 +1374,7 @@ async def worker_loop(
                 batch_size=batch_size,
                 metrics_bucket_duration=metrics_bucket_duration,
                 metrics_ttl=metrics_retention_duration,
+                namespace=namespace,
             )
             tasks_to_process_ids: list[str] = task_batch[0]
             tasks_to_cancel_ids: list[str] = task_batch[1]
@@ -1309,6 +1388,7 @@ async def worker_loop(
                     asyncio.create_task(
                         handle_cancelled_tasks(
                             redis_client=redis_client,
+                            namespace=namespace,
                             cancelled_task_ids=tasks_to_cancel_ids,
                             agent=agent,
                         )
@@ -1321,6 +1401,7 @@ async def worker_loop(
                     asyncio.create_task(
                         process_task(
                             redis_client=redis_client,
+                            namespace=namespace,
                             task_id=task_id,
                             completion_script=completion_script,
                             steering_script=steering_script,
@@ -1349,6 +1430,7 @@ async def worker_loop(
                 if tasks_to_cancel_ids:
                     await handle_cancelled_tasks(
                         redis_client=redis_client,
+                        namespace=namespace,
                         cancelled_task_ids=tasks_to_cancel_ids,
                         agent=agent,
                     )

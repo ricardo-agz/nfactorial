@@ -45,17 +45,17 @@ Control how many workers process tasks:
 from factorial import AgentWorkerConfig
 
 config = AgentWorkerConfig(
-    workers=10,              # Number of worker processes
-    batch_size=25,           # Tasks per batch
-    max_retries=5,           # Retry failed tasks
+    workers=10,              # Number of concurrent async workers (coroutines)
+    batch_size=25,           # Tasks processed per batch
+    max_retries=5,           # How many times to requeue failed tasks
     heartbeat_interval=5,    # Heartbeat frequency (seconds)
-    turn_timeout=120,        # Timeout per agent turn
+    turn_timeout=120,        # Timeout for a single agent turn (seconds)
 )
 ```
 
-### Maintenance Configuration
+### Maintenance Worker Configuration
 
-Configure task cleanup and recovery:
+Maintenance workers clean up expired tasks and recover any failed tasks that have been dropped by a crashed worker.
 
 ```python
 from factorial import MaintenanceWorkerConfig, TaskTTLConfig
@@ -99,13 +99,25 @@ async def check_status(task_id: str):
 asyncio.run(check_status(task_id))
 ```
 
-### Get Task Results
+### Get Task Data
 
 ```python
-async def get_results(task_id: str):
+async def get_task_data(task_id: str):
     task_data = await orchestrator.get_task_data(task_id)
     if task_data:
-        print(f"Result: {task_data}")
+        print(f"Data: {task_data}")
+
+asyncio.run(get_task_data(task_id))
+```
+
+### Get Task Result
+
+```python
+async def get_task_result(task_id: str):
+    task_data = await orchestrator.get_task_data(task_id)
+    if task_data:
+        result = task_data["payload"].get("output")
+        print(f"Result: {result}")
 
 asyncio.run(get_results(task_id))
 ```
@@ -167,77 +179,3 @@ config = MetricsTimelineConfig(
     retention_multiplier=2.0,    # Keep data for 2x timeline
 )
 ```
-
-## Scaling
-
-### Horizontal Scaling
-
-Run multiple orchestrator instances:
-
-```python
-# Instance 1
-orchestrator1 = Orchestrator(redis_host="redis-cluster")
-orchestrator1.register_runner(agent, worker_config)
-orchestrator1.run()
-
-# Instance 2
-orchestrator2 = Orchestrator(redis_host="redis-cluster")
-orchestrator2.register_runner(agent, worker_config)
-orchestrator2.run()
-```
-
-### Load Balancing
-
-Tasks are automatically distributed across available workers using Redis queues.
-
-### Resource Management
-
-```python
-# High-throughput configuration
-config = AgentWorkerConfig(
-    workers=50,              # More workers
-    batch_size=15,           # Smaller batches for faster response
-    heartbeat_interval=2,    # Frequent heartbeats
-    turn_timeout=60,         # Shorter timeouts
-)
-
-# Memory-optimized configuration
-config = AgentWorkerConfig(
-    workers=5,               # Fewer workers
-    batch_size=50,           # Larger batches
-    heartbeat_interval=10,   # Less frequent heartbeats
-    turn_timeout=300,        # Longer timeouts
-)
-```
-
-## Production Deployment
-
-### Environment Variables
-
-```bash
-export REDIS_HOST=redis.example.com
-export REDIS_PORT=6379
-export OPENAI_API_KEY=sk-...
-export XAI_API_KEY=xai-...
-```
-
-### Docker Deployment
-
-```dockerfile
-FROM python:3.11-slim
-
-COPY requirements.txt .
-RUN pip install -r requirements.txt
-
-COPY . .
-
-CMD ["python", "main.py"]
-```
-
-### Health Checks
-
-The orchestrator exposes health endpoints:
-
-- `GET /` - Basic health check
-- `GET /observability` - Dashboard
-- WebSocket `/observability/ws` - Real-time updates 

@@ -4,77 +4,81 @@ slug: /
 
 # Factorial
 
-Factorial is a Python framework for building AI agents with advanced orchestration capabilities. It provides a lightweight, production-ready system for creating intelligent agents that can work together to solve complex tasks.
+Factorial is a Python framework for reliably running high-concurrency agents asynchronously. It's designed for production workloads where you need to process thousands of agent tasks concurrently with built-in retries, monitoring, and distributed execution.
 
-## Key Features
+Factorial has a small set of core primitives:
 
-- **Simple Agent Creation**: Build agents with just a few lines of code
-- **Advanced Orchestration**: Coordinate multiple agents seamlessly  
-- **Tool Integration**: Extensible tool system for external integrations
-- **Distributed Execution**: Built-in support for scalable, distributed processing
-- **Real-time Monitoring**: Comprehensive observability and debugging tools
+* **Agents**, which are simply a system prompt + tools in an LLM -> tool execution loop
+* **Orchestrator**, which coordinates task distribution and manages worker processes  
+* **Tools**, which are Python functions that agents can call to interact with external systems
 
-## Core Concepts
+In combination with Redis for coordination, these primitives let you build scalable agent systems that handle real-world production loads without complex infrastructure setup.
 
-Factorial is built around three main primitives:
+## Why use Factorial
 
-### 🤖 Agents
-LLMs equipped with instructions and tools for specific tasks. Agents handle the core logic of processing requests and making decisions.
+The framework has a few driving design principles:
 
-### 🎯 Orchestrator  
-Coordinates multiple agents to work together on complex workflows. The orchestrator manages task distribution and agent communication.
+1. **Works great out of the box** with sensible defaults and minimal configuration
+2. **Highly robust and scalable** with built-in fault tolerance and distributed execution
+3. **Highly configurable and overridable** with no hidden under-the-hood prompt bloat
 
-### 🛠️ Tools
-Extensible functions that agents can call to interact with external systems, APIs, databases, and more.
+Here are the main features:
+
+* **Distributed execution**: Run agents across multiple workers and machines with Redis-based coordination  
+* **Fault tolerance**: Automatic retries, backoff strategies, and recovery of dropped tasks from crashed workers
+* **Real-time events**: Stream progress updates and results via WebSocket or Redis pub/sub 
+* **In-flight agent task management**: Cancel, steer, and monitor running tasks
+* **Observability**: Built-in metrics dashboard and comprehensive logging  
+* **Deferred tools**: Support for long-running operations that complete outside the agent execution
 
 ## Quick Example
 
 ```python
-from factorial import BaseAgent, AgentContext
+from factorial import Agent, AgentContext, Orchestrator, AgentWorkerConfig
 
-# Define a simple tool
-def get_weather(city: str, agent_ctx: AgentContext) -> str:
+
+def get_weather(city: str) -> str:
+    """Get weather for a city"""
     return f"The weather in {city} is sunny and 72°F"
 
 # Create an agent
-weather_agent = BaseAgent(
+weather_agent = Agent(
     description="Weather Assistant",
     instructions="You help users get weather information.",
-    tools=[{
-        "type": "function",
-        "function": {
-            "name": "get_weather",
-            "description": "Get weather for a city",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "city": {"type": "string"}
-                },
-                "required": ["city"]
-            }
-        }
-    }],
-    tool_actions={"get_weather": get_weather}
+    tools=[get_weather],
 )
 
-# Use the agent
-context = AgentContext(query="What's the weather in San Francisco?")
-task = weather_agent.create_task(owner_id="user123", payload=context)
-result = weather_agent.run_task(task.id)
+# Set up orchestrator
+orchestrator = Orchestrator()
+orchestrator.register_runner(
+    agent=weather_agent,
+    agent_worker_config=AgentWorkerConfig(workers=2, batch_size=10),
+)
+
+# Enqueue a task
+task = weather_agent.create_task(
+    owner_id="user123",
+    payload=AgentContext(query="What's the weather in San Francisco?"),
+)
+await orchestrator.enqueue_task(agent=weather_agent, task=task)
+
+# Subscribe to results
+async for update in orchestrator.subscribe_to_updates(owner_id="user123"):
+    if update['event_type'] == 'agent_output':
+        print(f"Result: {update['data']}")
+        break
 ```
 
-## Why Factorial?
+## Installation
 
-The framework follows two key design principles:
-
-1. **Enough features to be worth using**, but few enough primitives to make it quick to learn
-2. **Works great out of the box**, but you can customize exactly what happens
-
-Whether you're building a simple chatbot or a complex multi-agent system, Factorial provides the tools you need without unnecessary complexity.
+```bash
+pip install nfactorial
+```
 
 ## Next Steps
 
 - [**Quickstart**](./quickstart): Get up and running in 5 minutes
 - [**Agents**](./agents): Learn how to create and configure agents
+- [**Orchestrator**](./orchestrator): Set up distributed processing
 - [**Tools**](./tools): Build custom tools for your agents
-- [**Examples**](./examples): See practical examples and patterns
+- [**Events**](./events): Real-time monitoring and progress tracking

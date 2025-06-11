@@ -4,16 +4,17 @@ import os
 import signal
 import httpx
 import redis.asyncio as redis
-from typing import Any, Literal
+from typing import Any, Literal, AsyncGenerator
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from contextlib import asynccontextmanager
 
 from factorial.agent import BaseAgent
-from factorial.queue import worker_loop, maintenance_loop
+from factorial.queue import worker_loop, maintenance_loop, UPDATES_CHANNEL
 from factorial.llms import MultiClient
 from factorial.utils import to_snake_case
 from factorial.logging import get_logger
-from factorial.context import Task, ContextType
+from factorial.task import Task, ContextType
 
 logger = get_logger(__name__)
 
@@ -137,6 +138,7 @@ class Runner:
         metrics_config: MetricsTimelineConfig,
         agent_worker_config: AgentWorkerConfig,
         maintenance_worker_config: MaintenanceWorkerConfig,
+        namespace: str,
     ):
         agent.client = agent.client or llm_client
 
@@ -148,6 +150,7 @@ class Runner:
         self.metrics_config = metrics_config
         self.agent_worker_config = agent_worker_config
         self.maintenance_worker_config = maintenance_worker_config
+        self.namespace = namespace
 
     def set_shutdown_event(self, shutdown_event: asyncio.Event):
         self.shutdown_event = shutdown_event
@@ -174,6 +177,7 @@ class Runner:
                     task_timeout=self.agent_worker_config.turn_timeout,
                     metrics_bucket_duration=self.metrics_config.bucket_duration,
                     metrics_retention_duration=self.metrics_config.retention_duration,
+                    namespace=self.namespace,
                 )
             )
             for i in range(self.agent_worker_config.workers)
@@ -191,6 +195,7 @@ class Runner:
                     max_cleanup_batch=self.maintenance_worker_config.max_cleanup_batch,
                     metrics_bucket_duration=self.maintenance_worker_config.metrics_timeline.bucket_duration,
                     metrics_retention_duration=self.maintenance_worker_config.metrics_timeline.retention_duration,
+                    namespace=self.namespace,
                 )
             )
             for _ in range(self.maintenance_worker_config.workers)
@@ -209,7 +214,6 @@ class Orchestrator:
         xai_api_key: str | None = None,
         observability_config: ObservabilityConfig = ObservabilityConfig(),
         metrics_config: MetricsTimelineConfig = MetricsTimelineConfig(),
-        name: str | None = None,
         namespace: str | None = None,
     ):
         self.shutdown_event = asyncio.Event()
@@ -232,11 +236,153 @@ class Orchestrator:
         self.observability_config = observability_config
         self.metrics_config = metrics_config
         self._agents_by_name: dict[str, BaseAgent[Any]] = {}
-        self.name = name or namespace or "factorial"
-        self.namespace = namespace or name or "factorial"
+        self.namespace = namespace or "factorial"
 
         if self.observability_config.dashboard_name is None:
-            self.observability_config.dashboard_name = f"{self.name.title()} Dashboard"
+            self.observability_config.dashboard_name = (
+                f"{self.namespace.title()} Dashboard"
+            )
+
+    @property
+    def namespace(self) -> str:
+        return self._namespace
+
+    @namespace.setter
+    def namespace(self, value: str):
+        self._namespace = value
+
+    def get_updates_channel(self, owner_id: str) -> str:
+        return UPDATES_CHANNEL.format(namespace=self.namespace, owner_id=owner_id)
+
+    @asynccontextmanager
+    async def _pubsub_context(self, owner_id: str):
+        """Context manager for Redis pubsub with proper cleanup"""
+        redis_client = await self.get_redis_client()
+        pubsub = redis_client.pubsub()
+        channel = self.get_updates_channel(owner_id=owner_id)
+
+        try:
+            await pubsub.subscribe(channel)
+            yield redis_client, pubsub, channel
+        finally:
+            await pubsub.unsubscribe(channel)
+            await pubsub.aclose()
+            await redis_client.close()
+
+    async def subscribe_to_updates(
+        self,
+        owner_id: str,
+        timeout: float = 5.0,
+        ignore_subscribe_messages: bool = True,
+        task_ids: list[str] | None = None,
+        event_types: list[str] | None = None,
+        event_pattern: str | None = None,
+    ) -> AsyncGenerator[dict[str, Any], None]:
+        """
+        Subscribe to updates for a specific owner_id and yield messages as they arrive.
+
+        Args:
+            owner_id: The owner ID to subscribe to updates for
+            timeout: Timeout in seconds for waiting for messages (default: 5.0)
+            ignore_subscribe_messages: Whether to ignore Redis subscription confirmation messages
+            task_ids: Optional list of task IDs to filter for (only events for these tasks)
+            event_types: Optional list of event types to filter for (e.g., ["run_completed", "run_failed"])
+            event_pattern: Optional regex pattern to match against event_type (e.g., "run_.*" for all run events)
+
+        Yields:
+            dict: Parsed JSON message data from the updates channel (filtered based on criteria)
+
+        Examples:
+            # All updates for a user
+            async for update in orchestrator.subscribe_to_updates(owner_id="user123"):
+                print(f"Received update: {update}")
+
+            # Only completion and failure events
+            async for update in orchestrator.subscribe_to_updates(
+                owner_id="user123",
+                event_types=["run_completed", "run_failed"]
+            ):
+                print(f"Task finished: {update}")
+
+            # Only events for specific tasks
+            async for update in orchestrator.subscribe_to_updates(
+                owner_id="user123",
+                task_ids=["task-123", "task-456"]
+            ):
+                print(f"Specific task update: {update}")
+
+            # All progress events using pattern
+            async for update in orchestrator.subscribe_to_updates(
+                owner_id="user123",
+                event_pattern=r"progress_update_.*"
+            ):
+                print(f"Progress: {update}")
+        """
+        import json
+        import re
+
+        # Compile regex pattern if provided
+        compiled_pattern = re.compile(event_pattern) if event_pattern else None
+
+        def should_include_event(event_data: dict[str, Any]) -> bool:
+            """Check if event matches the filter criteria"""
+
+            # Filter by task_ids
+            if task_ids is not None:
+                event_task_id = event_data.get("task_id")
+                if event_task_id not in task_ids:
+                    return False
+
+            # Filter by event_types
+            if event_types is not None:
+                event_type = event_data.get("event_type")
+                if event_type not in event_types:
+                    return False
+
+            # Filter by event_pattern
+            if compiled_pattern is not None:
+                event_type = event_data.get("event_type", "")
+                if not compiled_pattern.match(event_type):
+                    return False
+
+            return True
+
+        async with self._pubsub_context(owner_id) as (redis_client, pubsub, channel):
+            while True:
+                try:
+                    msg = await pubsub.get_message(
+                        ignore_subscribe_messages=ignore_subscribe_messages,
+                        timeout=timeout,
+                    )
+
+                    if msg and msg["type"] == "message":
+                        data = msg["data"]
+                        if isinstance(data, bytes):
+                            data = data.decode("utf-8")
+
+                        try:
+                            event_data = json.loads(data)
+
+                            # Apply filters
+                            if should_include_event(event_data):
+                                yield {"data": event_data}
+
+                        except json.JSONDecodeError:
+                            # If it's not valid JSON, yield raw message only if no filters
+                            if (
+                                task_ids is None
+                                and event_types is None
+                                and event_pattern is None
+                            ):
+                                yield {"raw": data}
+
+                except asyncio.TimeoutError:
+                    # Timeout is expected, continue listening
+                    continue
+                except Exception as e:
+                    # Log error but don't break the loop
+                    logger.error(f"Error receiving message from channel {channel}: {e}")
+                    continue
 
     def register_runner(
         self,
@@ -264,6 +410,7 @@ class Orchestrator:
             agent_worker_config=agent_worker_config,
             maintenance_worker_config=maintenance_worker_config,
             metrics_config=self.metrics_config,
+            namespace=self.namespace,
         )
 
         runner.set_shutdown_event(self.shutdown_event)
@@ -288,7 +435,12 @@ class Orchestrator:
 
         redis_client = await self.get_redis_client()
         try:
-            await q_enqueue_task(redis_client=redis_client, agent=agent, task=task)
+            await q_enqueue_task(
+                redis_client=redis_client,
+                namespace=self.namespace,
+                agent=agent,
+                task=task,
+            )
         finally:
             await redis_client.close()
 
@@ -303,6 +455,7 @@ class Orchestrator:
         try:
             await q_cancel_task(
                 redis_client=redis_client,
+                namespace=self.namespace,
                 task_id=task_id,
                 metrics_bucket_duration=self.metrics_config.bucket_duration,
                 metrics_retention_duration=self.metrics_config.retention_duration,
@@ -322,8 +475,51 @@ class Orchestrator:
         try:
             await q_steer_task(
                 redis_client=redis_client,
+                namespace=self.namespace,
                 task_id=task_id,
                 messages=messages,
+            )
+        finally:
+            await redis_client.close()
+
+    async def complete_deferred_tool(
+        self,
+        task_id: str,
+        tool_call_id: str,
+        result: Any,
+    ) -> bool:
+        """Complete a deferred tool call
+
+        Args:
+            task_id: The ID of the task containing the deferred tool
+            tool_call_id: The ID of the specific tool call to complete
+            result: The result to provide for the tool call
+
+        Returns:
+            bool: True if the tool was completed successfully, False otherwise
+
+        Raises:
+            TaskNotFoundError: If the task doesn't exist
+            InactiveTaskError: If the task is not active (completed, failed, or cancelled)
+        """
+        from factorial.queue import complete_deferred_tool, get_task_agent
+
+        redis_client = await self.get_redis_client()
+        try:
+            # Get the agent for this task
+            agent_name = await get_task_agent(redis_client, self.namespace, task_id)
+            agent = self.get_agent(agent_name)
+
+            if not agent:
+                raise ValueError(f"Agent {agent_name} not found in orchestrator")
+
+            return await complete_deferred_tool(
+                redis_client=redis_client,
+                namespace=self.namespace,
+                agent=agent,
+                task_id=task_id,
+                tool_call_id=tool_call_id,
+                result=result,
             )
         finally:
             await redis_client.close()
@@ -334,7 +530,9 @@ class Orchestrator:
 
         redis_client = await self.get_redis_client()
         try:
-            return await q_get_task_status(redis_client=redis_client, task_id=task_id)
+            return await q_get_task_status(
+                redis_client=redis_client, namespace=self.namespace, task_id=task_id
+            )
         finally:
             await redis_client.close()
 
@@ -344,7 +542,9 @@ class Orchestrator:
 
         redis_client = await self.get_redis_client()
         try:
-            return await q_get_task_data(redis_client=redis_client, task_id=task_id)
+            return await q_get_task_data(
+                redis_client=redis_client, namespace=self.namespace, task_id=task_id
+            )
         finally:
             await redis_client.close()
 
@@ -365,12 +565,13 @@ class Orchestrator:
         from factorial.dashboard.routes import add_observability_routes
 
         dashboard_name = (
-            self.observability_config.dashboard_name or f"{self.name.title()} Dashboard"
+            self.observability_config.dashboard_name
+            or f"{self.namespace.title()} Dashboard"
         )
 
         app = FastAPI(
             title=dashboard_name,
-            description="Minimal real-time dashboard for distributed AI agent system",
+            description="Minimal real-time dashboard for the Factorial orchestrator",
             version="1.0.0",
             redoc_url=None,
             docs_url=None,
@@ -395,11 +596,13 @@ class Orchestrator:
             metrics_config = self.runners[0].maintenance_worker_config.metrics_timeline
 
         add_observability_routes(
-            app,
-            redis_client,
-            agents,
-            metrics_config,
-            dashboard_name,
+            app=app,
+            redis_client=redis_client,
+            agents=agents,
+            runners=self.runners,
+            metrics_config=metrics_config,
+            dashboard_name=dashboard_name,
+            namespace=self.namespace,
         )
 
         @app.get("/")

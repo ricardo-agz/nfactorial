@@ -41,10 +41,10 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/yourusername/nfactorial"
-Repository = "https://github.com/yourusername/nfactorial"
-Documentation = "https://github.com/yourusername/nfactorial"
-Issues = "https://github.com/yourusername/nfactorial/issues"
+Homepage = "https://factorial.sh"
+Repository = "https://github.com/ricardo-agz/nfactorial"
+Documentation = "https://factorial.sh"
+Issues = "https://github.com/ricardo-agz/nfactorial/issues"
 
 [tool.setuptools.packages.find]
 where = ["src"]

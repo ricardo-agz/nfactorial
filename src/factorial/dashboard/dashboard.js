@@ -781,7 +781,7 @@ function updateOverviewCards(system) {
         <div class="text-xs text-gray-600">Tasks/Min</div>
       </div>
       <i data-lucide="zap" class="w-4 h-4 text-green-500 absolute top-4 right-4"></i>
-      <div class="mt-2 text-xs text-gray-500">Recent throughput (last 5m)</div>
+      <div class="mt-2 text-xs text-gray-500">recent average throughput</div>
     </div>
 
     <div class="bg-white border border-gray-200 rounded-lg p-4 relative">
@@ -1500,7 +1500,7 @@ function createSkeletonTable() {
             <th class="px-6 py-3 text-center text-xs font-medium text-gray-500 uppercase tracking-wider">Queue</th>
             <th class="px-6 py-3 text-center text-xs font-medium text-gray-500 uppercase tracking-wider">Processing</th>
             <th class="px-6 py-3 text-center text-xs font-medium text-gray-500 uppercase tracking-wider">Backoff</th>
-            <th class="px-6 py-3 text-center text-xs font-medium text-gray-500 uppercase tracking-wider">Throughput</th>
+            <th class="px-6 py-3 text-center text-xs font-medium text-gray-500 uppercase tracking-wider">Completed/Min</th>
             <th class="px-6 py-3 text-center text-xs font-medium text-gray-500 uppercase tracking-wider">Success Rate</th>
             <th class="px-6 py-3 text-center text-xs font-medium text-gray-500 uppercase tracking-wider">Avg Time</th>
             <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Last Active</th>

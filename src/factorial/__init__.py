@@ -4,11 +4,14 @@ from factorial.agent import (
     ModelSettings,
     TurnCompletion,
     ResolvedModelSettings,
-    ToolActionResult,
-    ToolActionReturn,
-    ToolActionFunction,
     publish_progress,
     retry,
+)
+from factorial.tools import (
+    FunctionTool,
+    FunctionToolAction,
+    FunctionToolActionResult,
+    function_tool,
 )
 from factorial.orchestrator import (
     Orchestrator,
@@ -18,7 +21,8 @@ from factorial.orchestrator import (
     ObservabilityConfig,
     MetricsTimelineConfig,
 )
-from factorial.context import AgentContext, ContextType, Task, TaskStatus
+from factorial.context import AgentContext
+from factorial.task import ContextType, Task, TaskStatus
 from factorial.events import AgentEvent, QueueEvent, EventPublisher
 from factorial.llms import (
     Model,
@@ -37,9 +41,10 @@ __all__ = [
     "ModelSettings",
     "ResolvedModelSettings",
     "TurnCompletion",
-    "ToolActionResult",
-    "ToolActionReturn",
-    "ToolActionFunction",
+    "FunctionTool",
+    "FunctionToolAction",
+    "FunctionToolActionResult",
+    "function_tool",
     "publish_progress",
     "retry",
     "Orchestrator",

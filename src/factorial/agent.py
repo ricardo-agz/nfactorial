@@ -7,7 +7,7 @@ from typing import (
     final,
     Generic,
     TypeVar,
-    Union,
+    overload,
 )
 from functools import wraps
 from dataclasses import dataclass, field
@@ -15,19 +15,28 @@ from pydantic import BaseModel
 import json
 import asyncio
 import inspect
-from contextvars import ContextVar
 import httpx
 from openai.types.chat import (
     ChatCompletion,
     ChatCompletionMessageToolCall,
 )
 
-from factorial.context import Task, AgentContext, ContextType
+from factorial.context import AgentContext, ExecutionContext, execution_context
+from factorial.task import Task, ContextType
 from factorial.llms import Model, MultiClient
 from factorial.utils import serialize_data, to_snake_case
 from factorial.events import EventPublisher, AgentEvent
 from factorial.logging import get_logger
 from factorial.exceptions import RETRYABLE_EXCEPTIONS
+from factorial.tools import (
+    FunctionTool,
+    FunctionToolActionResult,
+    FunctionToolAction,
+    convert_tools_list,
+    create_final_output_tool,
+    _function_to_json_schema,
+    function_tool,
+)
 
 
 logger = get_logger(__name__)
@@ -35,13 +44,6 @@ logger = get_logger(__name__)
 
 ContextT = TypeVar("ContextT", bound=AgentContext)
 T = TypeVar("T")
-
-ToolActionReturn = Union[Any, "ToolActionResult", tuple[str, Any]]
-ToolActionFunction = Union[
-    Callable[..., ToolActionReturn], Callable[..., Awaitable[ToolActionReturn]]
-]
-
-execution_context: ContextVar["ExecutionContext"] = ContextVar("execution_context")
 
 
 def deferred_result(
@@ -59,31 +61,53 @@ def deferred_result(
     return decorator
 
 
-@dataclass
-class ExecutionContext:
-    """Per-request context (not stored on agent)"""
-
-    task_id: str
-    owner_id: str
-    retries: int
-    iterations: int
-    events: EventPublisher
-
-    @classmethod
-    def current(cls) -> "ExecutionContext":
-        """Get current execution context"""
-        return execution_context.get()
-
-
+@overload
 def retry(
+    func: Callable[..., Awaitable[T]],
+) -> Callable[..., Awaitable[T]]: ...
+
+
+@overload
+def retry(
+    func: None = None,
+    *,
     max_attempts: int = 3,
     delay: float = 1.0,
     max_delay: float = 60.0,
     exponential_base: float = 2.0,
     jitter: bool = True,
+) -> Callable[[Callable[..., Awaitable[T]]], Callable[..., Awaitable[T]]]: ...
+
+
+def retry(
+    func: Callable[..., Awaitable[T]] | None = None,
+    *,
+    max_attempts: int = 3,
+    delay: float = 1.0,
+    max_delay: float = 60.0,
+    exponential_base: float = 2.0,
+    jitter: bool = True,
+) -> (
+    Callable[..., Awaitable[T]]
+    | Callable[[Callable[..., Awaitable[T]]], Callable[..., Awaitable[T]]]
 ):
-    def decorator(func: Callable[..., Awaitable[T]]) -> Callable[..., Awaitable[T]]:
-        @wraps(func)
+    """Decorator to add retry logic to agent methods.
+
+    Can be used as a decorator with or without arguments:
+
+    @retry
+    async def my_method(self, ...):
+        ...
+
+    @retry(max_attempts=5, delay=2.0)
+    async def my_method(self, ...):
+        ...
+    """
+
+    def _create_retry_decorator(
+        the_func: Callable[..., Awaitable[T]],
+    ) -> Callable[..., Awaitable[T]]:
+        @wraps(the_func)
         async def wrapper(self: "BaseAgent[Any]", *args: Any, **kwargs: Any) -> T:
             if max_attempts <= 0:
                 raise ValueError("max_attempts must be greater than 0")
@@ -91,7 +115,7 @@ def retry(
             last_exception: Exception | None = None
             for attempt in range(max_attempts):
                 try:
-                    return await func(self, *args, **kwargs)
+                    return await the_func(self, *args, **kwargs)
                 except Exception as e:
                     if isinstance(e, RETRYABLE_EXCEPTIONS):
                         last_exception = e
@@ -111,20 +135,61 @@ def retry(
 
         return wrapper
 
-    return decorator
+    # If func is provided, we were used as @retry (no parentheses)
+    if func is not None:
+        return _create_retry_decorator(func)
+
+    # Otherwise, we were used as @retry(...), so return a decorator
+    return _create_retry_decorator
 
 
+@overload
 def publish_progress(
+    func: Callable[..., Awaitable[T]],
+) -> Callable[..., Awaitable[T]]: ...
+
+
+@overload
+def publish_progress(
+    func: None = None,
+    *,
     func_name: str | None = None,
     include_context: bool = True,
     include_args: bool = True,
     include_result: bool = True,
-):
-    def decorator(func: Callable[..., Awaitable[T]]) -> Callable[..., Awaitable[T]]:
-        nonlocal func_name
-        func_name = func_name or func.__name__
+) -> Callable[[Callable[..., Awaitable[T]]], Callable[..., Awaitable[T]]]: ...
 
-        @wraps(func)
+
+def publish_progress(
+    func: Callable[..., Awaitable[T]] | None = None,
+    *,
+    func_name: str | None = None,
+    include_context: bool = True,
+    include_args: bool = True,
+    include_result: bool = True,
+) -> (
+    Callable[..., Awaitable[T]]
+    | Callable[[Callable[..., Awaitable[T]]], Callable[..., Awaitable[T]]]
+):
+    """Decorator to publish progress events for agent methods.
+
+    Can be used as a decorator with or without arguments:
+
+    @publish_progress
+    async def my_method(self, ...):
+        ...
+
+    @publish_progress(func_name="custom_name", include_result=False)
+    async def my_method(self, ...):
+        ...
+    """
+
+    def _create_progress_decorator(
+        the_func: Callable[..., Awaitable[T]],
+    ) -> Callable[..., Awaitable[T]]:
+        actual_func_name = func_name or the_func.__name__
+
+        @wraps(the_func)
         async def wrapper(self: "BaseAgent[Any]", *args: Any, **kwargs: Any) -> T:
             async def publish(
                 event_suffix: str,
@@ -142,7 +207,7 @@ def publish_progress(
 
                     await ctx.events.publish_event(
                         AgentEvent(
-                            event_type=f"progress_update_{func_name}_{event_suffix}",
+                            event_type=f"progress_update_{actual_func_name}_{event_suffix}",
                             task_id=ctx.task_id,
                             owner_id=ctx.owner_id,
                             agent_name=self.name,
@@ -165,9 +230,16 @@ def publish_progress(
             await publish("started", start_data)
 
             try:
-                result = await func(self, *args, **kwargs)
+                result = await the_func(self, *args, **kwargs)
 
                 completion_data: dict[str, Any] = {}
+                if include_args:
+                    completion_data.update(
+                        {
+                            "args": args,
+                            "kwargs": kwargs,
+                        }
+                    )
                 if include_result:
                     completion_data["result"] = serialize_data(result)
 
@@ -189,7 +261,12 @@ def publish_progress(
 
         return wrapper
 
-    return decorator
+    # If func is provided, we were used as @publish_progress (no parentheses)
+    if func is not None:
+        return _create_progress_decorator(func)
+
+    # Otherwise, we were used as @publish_progress(...), so return a decorator
+    return _create_progress_decorator
 
 
 @dataclass
@@ -209,21 +286,29 @@ class ModelSettings(Generic[ContextT]):
     parallel_tool_calls: bool | Callable[[ContextT], bool] | None = None
     max_completion_tokens: int | Callable[[ContextT], int] | None = None
 
+    def resolve(self, agent_ctx: ContextT) -> "ResolvedModelSettings":
+        return ResolvedModelSettings(
+            temperature=self.temperature(agent_ctx)
+            if callable(self.temperature)
+            else self.temperature,
+            tool_choice=self.tool_choice(agent_ctx)
+            if callable(self.tool_choice)
+            else self.tool_choice,
+            parallel_tool_calls=self.parallel_tool_calls(agent_ctx)
+            if callable(self.parallel_tool_calls)
+            else self.parallel_tool_calls,
+            max_completion_tokens=self.max_completion_tokens(agent_ctx)
+            if callable(self.max_completion_tokens)
+            else self.max_completion_tokens,
+        )
+
 
 @dataclass
-class ResolvedModelSettings(Generic[ContextT]):
-    model: Model
+class ResolvedModelSettings:
     temperature: float | None
     tool_choice: str | dict[str, Any] | None
     parallel_tool_calls: bool | None
     max_completion_tokens: int | None
-
-
-class ToolActionResult(BaseModel):
-    output_str: str
-    output_data: Any
-    tool_call: ChatCompletionMessageToolCall | None = None
-    pending_result: bool = False
 
 
 @dataclass
@@ -232,24 +317,12 @@ class ToolExecutionResults:
     pending_tool_call_ids: list[str]
 
 
-def create_final_output_tool(output_type: type[BaseModel]) -> dict[str, Any]:
-    return {
-        "type": "function",
-        "function": {
-            "name": "final_output",
-            "description": "Complete the task and return the final output to the user",
-            "parameters": output_type.model_json_schema(),
-        },
-    }
-
-
 class BaseAgent(Generic[ContextType]):
     def __init__(
         self,
         description: str,
         instructions: str,
-        tools: list[dict[str, Any]],
-        tool_actions: dict[str, ToolActionFunction],
+        tools: list[FunctionTool[ContextType] | Callable[..., Any]] | None = None,
         model: Model | Callable[[ContextType], Model] | None = None,
         model_settings: ModelSettings[ContextType] | None = None,
         context_window_limit: int | None = None,
@@ -264,31 +337,21 @@ class BaseAgent(Generic[ContextType]):
         self.name = to_snake_case(self.__class__.__name__)
         self.description = description
         self.instructions = instructions
-        self.tools = tools
-        self.tool_actions = tool_actions
+        self.tools, self.tool_actions = convert_tools_list(tools or [])
         self.http_client = http_client or httpx.AsyncClient(timeout=request_timeout)
         self.client = client or MultiClient(http_client=self.http_client)
         self.request_timeout = request_timeout
         self.event_publisher: EventPublisher | None = None
         self.model = model
-        self.model_settings = model_settings
+        self.model_settings = model_settings or ModelSettings()
         self.context_window_limit = context_window_limit
         self.max_turns = max_turns
         self.parse_tool_args = parse_tool_args
         self.context_class = context_class
         self.output_type = output_type
-
-        if self.output_type:
-            self.tools.append(create_final_output_tool(self.output_type))
-
-        missing = [
-            t["function"]["name"]
-            for t in self.tools
-            if t["function"]["name"] not in self.tool_actions
-            and t["function"]["name"] != "final_output"
-        ]
-        if missing:
-            raise ValueError(f"Missing tool actions for: {missing}")
+        self.final_output_tool = (
+            create_final_output_tool(self.output_type) if self.output_type else None
+        )
 
     def create_task(
         self,
@@ -311,29 +374,22 @@ class BaseAgent(Generic[ContextType]):
         self,
         agent_ctx: ContextType,
         messages: list[dict[str, Any]],
-        tools: list[dict[str, Any]] | None = None,
-        temperature: float | None = None,
-        max_completion_tokens: int | None = None,
-        tool_choice: str | dict[str, Any] | None = None,
-        parallel_tool_calls: bool | None = None,
-        model: Model | None = None,
-        **kwargs: Any,
     ) -> ChatCompletion:
         """Execute LLM completion. Override to customize."""
-        model_settings = self._resolve_model_settings(agent_ctx)
+        model_settings = self.resolve_model_settings(agent_ctx)
+        tools = self.resolve_tools(agent_ctx)
+        model = self.resolve_model(agent_ctx)
+
         response = cast(
             ChatCompletion,
             await self.client.completion(
-                model=model or model_settings.model,
+                model=model,
                 messages=messages,
-                tools=tools or self.tools,
-                temperature=temperature or model_settings.temperature,
-                max_completion_tokens=max_completion_tokens
-                or model_settings.max_completion_tokens,
-                tool_choice=tool_choice or model_settings.tool_choice,
-                parallel_tool_calls=parallel_tool_calls
-                or model_settings.parallel_tool_calls,
-                **kwargs,
+                tools=tools,
+                temperature=model_settings.temperature,
+                max_completion_tokens=model_settings.max_completion_tokens,
+                tool_choice=model_settings.tool_choice,
+                parallel_tool_calls=model_settings.parallel_tool_calls,
             ),
         )
 
@@ -343,11 +399,13 @@ class BaseAgent(Generic[ContextType]):
         self,
         tool_call: ChatCompletionMessageToolCall,
         agent_ctx: ContextType,
-    ) -> ToolActionResult:
+    ) -> FunctionToolActionResult:
         """Execute a tool action. Override to customize."""
         tool_name = tool_call.function.name
         tool_args = tool_call.function.arguments
         action = self.tool_actions.get(tool_name)
+
+        execution_ctx = ExecutionContext.current()
 
         if not action:
             raise ValueError(f"Agent {self.name} has no tool action for {tool_name}")
@@ -380,6 +438,19 @@ class BaseAgent(Generic[ContextType]):
                 ):
                     parsed_tool_args[param_name] = agent_ctx
                     break
+                # Case 3: Parameter named 'execution_ctx'
+                elif param_name == "execution_ctx":
+                    parsed_tool_args[param_name] = execution_ctx
+                    break
+                # Case 4: Parameter with ExecutionContext subclass type annotation
+                elif (
+                    param.annotation
+                    and param.annotation != inspect.Parameter.empty
+                    and isinstance(param.annotation, type)
+                    and issubclass(param.annotation, ExecutionContext)
+                ):
+                    parsed_tool_args[param_name] = execution_ctx
+                    break
 
             result = (
                 await action(**parsed_tool_args)
@@ -387,7 +458,7 @@ class BaseAgent(Generic[ContextType]):
                 else action(**parsed_tool_args)
             )
 
-        if isinstance(result, ToolActionResult):
+        if isinstance(result, FunctionToolActionResult):
             result.tool_call = tool_call
             result.pending_result = is_deferred_result
             return result
@@ -407,7 +478,7 @@ class BaseAgent(Generic[ContextType]):
                 output_str = str(result)
                 output_data = result
 
-            return ToolActionResult(
+            return FunctionToolActionResult(
                 tool_call=tool_call,
                 output_str=output_str,
                 output_data=output_data,
@@ -415,11 +486,11 @@ class BaseAgent(Generic[ContextType]):
             )
 
     def format_tool_result(
-        self, tool_call_id: str, result: Any | ToolActionResult | Exception
+        self, tool_call_id: str, result: Any | FunctionToolActionResult | Exception
     ) -> str:
         if isinstance(result, Exception):
             return f'<tool_call_error tool="{tool_call_id}">\nError running tool:\n{result}\n</tool_call_error>'
-        elif isinstance(result, ToolActionResult):
+        elif isinstance(result, FunctionToolActionResult):
             return f'<tool_call_result tool="{tool_call_id}">\n{result.output_str}\n</tool_call_result>'
         else:
             return f'<tool_call_result tool="{tool_call_id}">\n{str(result)}\n</tool_call_result>'
@@ -454,7 +525,7 @@ class BaseAgent(Generic[ContextType]):
                 new_messages.append(
                     {"role": "tool", "tool_call_id": tc.id, "content": content}
                 )
-            elif isinstance(result, ToolActionResult) and result.pending_result:
+            elif isinstance(result, FunctionToolActionResult) and result.pending_result:
                 pending_tool_call_ids.append(tc.id)
             else:
                 content = self.format_tool_result(tc.id, result)
@@ -495,11 +566,13 @@ class BaseAgent(Generic[ContextType]):
         messages.append(assistant_msg)
 
         if self._is_done(response):
+            output = self._extract_output(response)
+            agent_ctx.output = output  # Store the final output in the agent context
             agent_ctx.messages = messages
             return TurnCompletion(
                 is_done=True,
                 context=agent_ctx,
-                output=self._extract_output(response),
+                output=output,
             )
 
         # Handle tool calls and append results to messages
@@ -539,51 +612,37 @@ class BaseAgent(Generic[ContextType]):
         return TurnCompletion(is_done=False, context=agent_ctx)
 
     # ===== Helper Methods ===== #
+    def resolve_tools(self, agent_ctx: ContextType) -> list[dict[str, Any]]:
+        tools = [
+            tool.to_openai_tool_schema()
+            for tool in self.tools
+            if (
+                tool.is_enabled(agent_ctx)
+                if callable(tool.is_enabled)
+                else tool.is_enabled
+            )
+        ]
+        if self.final_output_tool:
+            tools.append(self.final_output_tool)
+
+        return tools
+
+    def resolve_model(self, agent_ctx: ContextType) -> Model:
+        model = self.model(agent_ctx) if callable(self.model) else self.model
+        if not model:
+            raise ValueError("No model is configured for agent")
+
+        return model
+
+    def resolve_model_settings(self, agent_ctx: ContextType) -> ResolvedModelSettings:
+        return self.model_settings.resolve(agent_ctx)
+
     def _is_done(self, response: ChatCompletion) -> bool:
         """Check if agent should complete"""
         tool_calls = response.choices[0].message.tool_calls
         return (not tool_calls and self.output_type is None) or any(
             tc.function.name == "final_output" for tc in tool_calls or []
         )
-
-    def _resolve_model_settings(
-        self, agent_ctx: ContextType
-    ) -> ResolvedModelSettings[ContextType]:
-        """Get resolved model settings for the current context."""
-        if not self.model_settings:
-            return ResolvedModelSettings(
-                model=self.model(agent_ctx) if callable(self.model) else self.model,
-                temperature=None,
-                tool_choice=None,
-                parallel_tool_calls=None,
-                max_completion_tokens=None,
-            )
-
-        resolved_settings: ResolvedModelSettings[ContextType] = ResolvedModelSettings(
-            model=self.model(agent_ctx) if callable(self.model) else self.model,
-            temperature=(
-                self.model_settings.temperature(agent_ctx)
-                if callable(self.model_settings.temperature)
-                else self.model_settings.temperature
-            ),
-            tool_choice=(
-                self.model_settings.tool_choice(agent_ctx)
-                if callable(self.model_settings.tool_choice)
-                else self.model_settings.tool_choice
-            ),
-            parallel_tool_calls=(
-                self.model_settings.parallel_tool_calls(agent_ctx)
-                if callable(self.model_settings.parallel_tool_calls)
-                else self.model_settings.parallel_tool_calls
-            ),
-            max_completion_tokens=(
-                self.model_settings.max_completion_tokens(agent_ctx)
-                if callable(self.model_settings.max_completion_tokens)
-                else self.model_settings.max_completion_tokens
-            ),
-        )
-
-        return resolved_settings
 
     def _prepare_instructions(self, agent_ctx: ContextType) -> str:
         """Prepare instructions for LLM request. Override to customize instructions preparation."""
@@ -641,31 +700,20 @@ class BaseAgent(Generic[ContextType]):
 
     # ===== Core logic ===== #
 
+    def get_execution_context(self) -> ExecutionContext:
+        return ExecutionContext.current()
+
     @retry(max_attempts=3, delay=0.5)
     @publish_progress(func_name="completion")
     async def _completion_with_retry_and_progress(
         self,
         agent_ctx: ContextType,
         messages: list[dict[str, Any]],
-        tools: list[dict[str, Any]] | None = None,
-        temperature: float | None = None,
-        max_completion_tokens: int | None = None,
-        tool_choice: str | dict[str, Any] | None = None,
-        parallel_tool_calls: bool | None = None,
-        model: Model | None = None,
-        **kwargs: Any,
     ) -> ChatCompletion:
         """Internal method that wraps completion with retry and progress publishing"""
         return await self.completion(
             agent_ctx,
             messages,
-            tools,
-            temperature,
-            max_completion_tokens,
-            tool_choice,
-            parallel_tool_calls,
-            model,
-            **kwargs,
         )
 
     @retry(max_attempts=2, delay=0.25)
@@ -674,7 +722,7 @@ class BaseAgent(Generic[ContextType]):
         self,
         tool_call: ChatCompletionMessageToolCall,
         agent_ctx: ContextType,
-    ) -> ToolActionResult:
+    ) -> FunctionToolActionResult:
         """Internal method that wraps tool_action with retry and progress publishing"""
         return await self.tool_action(tool_call, agent_ctx)
 
@@ -739,3 +787,20 @@ class Agent(BaseAgent[AgentContext]):
     """Base agent class that uses AgentContext by default. Use this for simple agents."""
 
     pass
+
+
+@function_tool(name="get_weather")
+def get_weather(agent_ctx: AgentContext, location: str) -> str:
+    return f"The weather in {location} is sunny."
+
+
+@function_tool
+def get_time(agent_ctx: AgentContext) -> str:
+    return "The current time is 12:00 PM."
+
+
+my_agennt = Agent(
+    description="Dummy agent",
+    instructions="You are a helpful assistant",
+    tools=[get_weather, get_time],
+)

@@ -101,3 +101,5 @@ asyncio.run(main())
 ## View the dashboard
 
 Open http://localhost:8080/observability to see the real-time dashboard with task queues, metrics, and agent performance.
+
+![Dashboard](../static/img/dashboard.png)

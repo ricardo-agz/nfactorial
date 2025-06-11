@@ -11,7 +11,6 @@ from factorial import AgentContext
 from agent import basic_agent, orchestrator
 
 
-UPDATE_CHANNEL = "updates:{owner_id}"
 WS_REDIS_SUB_TIMEOUT = 5.0  # seconds
 
 
@@ -53,7 +52,7 @@ app.add_middleware(
 async def websocket_updates(websocket: WebSocket, user_id: str):
     await websocket.accept()
     pubsub: PubSub = redis_client.pubsub()  # type: ignore
-    channel = UPDATE_CHANNEL.format(owner_id=user_id)
+    channel = orchestrator.get_updates_channel(owner_id=user_id)
     print(
         f"WebSocket connection established for user_id={user_id}, subscribing to channel={channel}"
     )

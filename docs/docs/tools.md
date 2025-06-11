@@ -1,235 +1,155 @@
 # Tools
 
-Tools allow agents to take actions in the world. Each tool consists of a schema definition and a Python function implementation.
+Tools allow agents to take actions in the world. Each tool is a Python function that the agent can call during execution.
 
 ## Defining Tools
 
-Tools are defined using OpenAI's function calling schema:
+The simplest way to create a tool is by just writing a python function with typed args and a docstring
 
 ```python
-tools = [
-    {
-        "type": "function",
-        "function": {
-            "name": "search_web",
-            "description": "Search the web for information",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string", "description": "Search query"},
-                    "max_results": {"type": "integer", "default": 5},
-                },
-                "required": ["query"],
-                "additionalProperties": False,
-            },
-        },
-        "strict": True,
-    }
-]
+from factorial import function_tool, AgentContext
+
+def get_weather(location: str) -> str:
+    """Get the current weather for a location"""
+    # Your implementation here
+    return f"The weather in {location} is sunny and 72°F"
+
+def search_web(query: str, max_results: int = 5) -> str:
+    """Search the web for information"""
+    # Your implementation here
+    return f"Found {max_results} results..."
 ```
 
-## Tool Actions
+## Using Tools in Agents
 
-Each tool needs a corresponding Python function:
+Pass tools to your agent during initialization:
 
 ```python
-def search_web(query: str, max_results: int = 5) -> str:
-    """Search the web and return results."""
-    # Your implementation here
-    results = perform_search(query, max_results)
-    return f"Found {len(results)} results for '{query}'"
+from factorial import Agent, AgentContext
 
-# Map tool names to functions
-tool_actions = {
-    "search_web": search_web,
-}
+agent = Agent(
+    description="Weather assistant",
+    instructions="You help users get weather information",
+    tools=[get_weather, search_web],
+)
 ```
 
 ## Return Values
 
-Tool functions can return different types of values:
+Tools can return different types of values:
 
-### Simple String
+### Single Output
+The output will be shown as-is to the LLM
 
 ```python
+@function_tool
 def get_time() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 ```
 
-### Tuple (Display, Data)
-
-Return both a display string and structured data:
+### Tuple Output (Display, Data)
+The first value will be shown as-is to the LLM, the second value will be what is published
+with the tool comletion progress. 
+This is useful when you want to render the results of the tool call in a UI
 
 ```python
-def fetch_user(user_id: str) -> tuple[str, dict]:
+@function_tool
+def fetch_user(user_id: str) -> tuple[str, dict[str, Any]]:
     user = database.get_user(user_id)
     display = f"User: {user['name']} ({user['email']})"
     return display, user
 ```
 
-### ToolActionResult
+## Custom Tool Configuration
 
-For advanced control over tool execution:
+You can customize tool names and descriptions:
 
 ```python
-from factorial import ToolActionResult
-
-def complex_tool(param: str) -> ToolActionResult:
-    result = process_data(param)
-    return ToolActionResult(
-        output_str=f"Processed: {param}",
-        output_data=result,
-        pending_result=False,
-    )
+@function_tool(
+    name="weather_lookup",
+    description="Get detailed weather information for any city"
+)
+def get_weather(location: str) -> str:
+    return f"Weather in {location}: sunny, 72°F"
 ```
 
-## Accessing Agent Context
+If no description is provided, the function's docstring is used.
 
-Tool functions can access the agent's context:
+## Conditional Tools
 
-```python
-from factorial import AgentContext
-
-def context_aware_tool(query: str, agent_ctx: AgentContext) -> str:
-    # Access conversation history
-    previous_messages = agent_ctx.messages
-    current_turn = agent_ctx.turn
-    
-    # Use context in your logic
-    return f"Processing query '{query}' on turn {current_turn}"
-```
-
-## Async Tools
-
-Tools can be asynchronous:
+Tools can be enabled or disabled based on context:
 
 ```python
-import asyncio
-import httpx
+def is_premium_user(agent_ctx: CustomAgentContext) -> bool:
+    return agent_ctx.user_tier == "premium"
 
-async def fetch_url(url: str) -> str:
-    async with httpx.AsyncClient() as client:
-        response = await client.get(url)
-        return response.text
-
-# Async tools work automatically
-tool_actions = {
-    "fetch_url": fetch_url,
-}
+@function_tool(is_enabled=is_premium_user)
+def premium_feature(query: str) -> str:
+    return "Premium feature result"
 ```
 
 ## Error Handling
 
-Tools should handle errors gracefully:
+You may choose to either return the error as a string, which will be shown to the LLM, or simply raise an exception, which will also be formatted
+and shown to the LLM. 
+
+
+## Deferred Tools
+
+Deferred tools are designed for long-running operations that complete externally, leaving the agent in a pending state until the tool result is provided. This is useful for operations that take significant time to complete (like external API calls, user input, or webhook-based workflows).
+
+### How Deferred Tools Work
+
+When a deferred tool is called:
+
+1. **Tool Execution**: The tool function executes normally but is marked as having a pending result
+2. **Task State**: The task enters a `PENDING_TOOL_RESULTS` state and is removed from active processing and into an idle queue
+3. **External Completion**: An external system must call `complete_deferred_tool()` to provide the result
+4. **Task Resumption**: Once all pending tool calls are completed, the task resumes processing
+
+### Defining Deferred Tools
+
+Use the `@deferred_result` decorator with a timeout value:
 
 ```python
-def safe_divide(a: float, b: float) -> str:
-    try:
-        if b == 0:
-            return "Error: Cannot divide by zero"
-        result = a / b
-        return f"{a} ÷ {b} = {result}"
-    except Exception as e:
-        return f"Error: {str(e)}"
-```
-
-## Long-Running Tools
-
-For tools that take a long time to complete:
-
-```python
-from factorial import deferred_result
+from factorial import deferred_result, ExecutionContext
 
 @deferred_result(timeout=300.0)  # 5 minute timeout
-async def long_running_task(data: str) -> str:
-    # This will run in the background
-    await asyncio.sleep(60)  # Simulate long work
-    return f"Processed: {data}"
+async def send_email_for_confirmation(
+    recipient: str, 
+    subject: str, 
+    body: str,
+    execution_ctx: ExecutionContext,
+) -> str:
+    """Send an email and wait for user confirmation before proceeding"""
+    user = await get_user(id=execution_ctx.owner_id)
+
+    # notify the user that an email needs confirmation to be sent
+    await send_email_to_user_for_confirmation(user, recipient, subject, body)
 ```
 
-## File Operations
+### Completing Deferred Tools
 
-Tools for file handling:
+External systems complete deferred tools using the `complete_deferred_tool()` function:
 
 ```python
-import os
-from pathlib import Path
-
-def read_file(filepath: str) -> str:
-    try:
-        path = Path(filepath)
-        if not path.exists():
-            return f"Error: File {filepath} not found"
-        
-        content = path.read_text()
-        return f"File content ({len(content)} chars):\n{content}"
-    except Exception as e:
-        return f"Error reading file: {str(e)}"
-
-def write_file(filepath: str, content: str) -> str:
-    try:
-        path = Path(filepath)
-        path.write_text(content)
-        return f"Successfully wrote {len(content)} characters to {filepath}"
-    except Exception as e:
-        return f"Error writing file: {str(e)}"
+success = await orchestrator.complete_deferred_tool(
+    task_id="task_123",
+    tool_call_id="call_abc123",
+    result="User confirmed the email was received successfully"
+)
 ```
 
-## API Integration
+### Task Lifecycle with Deferred Tools
 
-Tools for external API calls:
-
-```python
-import httpx
-import json
-
-async def call_api(endpoint: str, method: str = "GET", data: dict = None) -> str:
-    try:
-        async with httpx.AsyncClient() as client:
-            if method.upper() == "GET":
-                response = await client.get(endpoint)
-            elif method.upper() == "POST":
-                response = await client.post(endpoint, json=data)
-            else:
-                return f"Error: Unsupported method {method}"
-            
-            response.raise_for_status()
-            return f"API Response ({response.status_code}):\n{response.text}"
-    except Exception as e:
-        return f"API Error: {str(e)}"
-```
-
-## Database Tools
-
-Tools for database operations:
-
-```python
-import sqlite3
-
-def query_database(sql: str) -> str:
-    try:
-        conn = sqlite3.connect("database.db")
-        cursor = conn.cursor()
-        cursor.execute(sql)
-        
-        if sql.strip().upper().startswith("SELECT"):
-            results = cursor.fetchall()
-            return f"Query returned {len(results)} rows:\n{results}"
-        else:
-            conn.commit()
-            return f"Query executed successfully, {cursor.rowcount} rows affected"
-    except Exception as e:
-        return f"Database error: {str(e)}"
-    finally:
-        conn.close()
-```
-
-## Best Practices
-
-1. **Clear descriptions**: Write detailed descriptions for better LLM understanding
-2. **Input validation**: Validate parameters before processing
-3. **Error handling**: Return meaningful error messages
-4. **Type hints**: Use proper type annotations
-5. **Documentation**: Document complex tools with examples
-6. **Security**: Validate and sanitize inputs, especially for file/database operations
-7. **Timeouts**: Set appropriate timeouts for long-running operations 
+1. **Normal Execution**: Agent processes the task normally
+2. **Deferred Tool Call**: When a deferred tool is called:
+   - Tool function executes and returns immediately
+   - Task status changes to `PENDING_TOOL_RESULTS`
+   - Tool call IDs are stored with a `<|PENDING|>` sentinel value in Redis
+3. **External Processing**: Your external system processes the long-running operation
+4. **Result Completion**: Call `complete_deferred_tool()` with the final result
+5. **Task Resumption**: Once all pending tools are completed:
+   - Results are added to the conversation as tool responses
+   - Task status changes back to `ACTIVE`
+   - Task is returned to the processing queue

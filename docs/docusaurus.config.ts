@@ -83,7 +83,7 @@ const config: Config = {
       additionalLanguages: ['python'],
     },
     colorMode: {
-      defaultMode: 'dark',
+      defaultMode: 'light',
       disableSwitch: false,
       respectPrefersColorScheme: false,
     },

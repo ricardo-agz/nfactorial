@@ -245,7 +245,18 @@
   /* Fix mobile menu visibility issues */
   .navbar-sidebar {
     background-color: var(--ifm-navbar-background-color) !important;
-    z-index: 9999;
+    z-index: 9999 !important;
+    position: fixed !important;
+    top: 0 !important;
+    left: 0 !important;
+    width: 100% !important;
+    height: 100vh !important;
+    overflow-y: auto !important;
+  }
+  
+  /* Ensure sidebar content is properly positioned in dark mode */
+  [data-theme='dark'] .navbar-sidebar {
+    z-index: 10000 !important;
   }
   
   .navbar-sidebar .navbar__items {

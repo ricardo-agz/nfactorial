@@ -387,8 +387,8 @@ class Orchestrator:
     def register_runner(
         self,
         agent: BaseAgent[Any],
-        agent_worker_config: AgentWorkerConfig,
-        maintenance_worker_config: MaintenanceWorkerConfig,
+        agent_worker_config: AgentWorkerConfig = AgentWorkerConfig(),
+        maintenance_worker_config: MaintenanceWorkerConfig = MaintenanceWorkerConfig(),
     ):
         num_connections = agent_worker_config.workers * agent_worker_config.batch_size
         http_client = httpx.AsyncClient(

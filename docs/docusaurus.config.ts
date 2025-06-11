@@ -6,7 +6,7 @@ import type * as Preset from '@docusaurus/preset-classic';
 
 const config: Config = {
   title: 'Factorial',
-  tagline: 'A Python framework for building AI agents with advanced orchestration capabilities',
+  tagline: 'Factorial is a Python framework for building and running reliable, high-concurrency agents asynchronously.',
   favicon: 'img/favicon.ico',
 
   // Future flags, see https://docusaurus.io/docs/api/docusaurus-config#future
@@ -15,15 +15,15 @@ const config: Config = {
   },
 
   // Set the production url of your site here
-  url: 'https://your-docusaurus-site.example.com',
+  url: 'https://factorial.sh',
   // Set the /<baseUrl>/ pathname under which your site is served
   // For GitHub pages deployment, it is often '/<projectName>/'
   baseUrl: '/',
 
   // GitHub pages deployment config.
   // If you aren't using GitHub pages, you don't need these.
-  organizationName: 'factorial', // Usually your GitHub org/user name.
-  projectName: 'factorial', // Usually your repo name.
+  organizationName: 'ricardo-agz', // Usually your GitHub org/user name.
+  projectName: 'nfactorial', // Usually your repo name.
 
   onBrokenLinks: 'throw',
   onBrokenMarkdownLinks: 'warn',
@@ -53,8 +53,7 @@ const config: Config = {
   ],
 
   themeConfig: {
-    // Replace with your project's social card
-    image: 'img/docusaurus-social-card.jpg',
+    image: 'img/social-card.png',
     navbar: {
       title: 'Factorial',
       logo: {
@@ -71,7 +70,7 @@ const config: Config = {
       },
       items: [
         {
-          href: 'https://github.com/factorial/factorial',
+          href: 'https://github.com/ricardo-agz/nfactorial',
           label: 'GitHub',
           position: 'right',
         },

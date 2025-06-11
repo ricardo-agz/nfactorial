@@ -14,7 +14,6 @@ def get_weather(location: str) -> str:
     return f"The weather in {location} is sunny and 72°F"
 
 agent = Agent(
-    description="Weather Assistant",
     instructions="You are a helpful weather assistant. Always be friendly and informative.",
     tools=[get_weather],
 )

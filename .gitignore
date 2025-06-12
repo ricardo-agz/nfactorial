@@ -31,6 +31,9 @@ examples/**/vite/dist/
 examples/**/vite/.cache/
 examples/**/vite/.temp/
 examples/**/*.log
+examples/**/package-lock.json
+examples/**/yarn.lock
+examples/**/pnpm-lock.yaml
 
 # IDE and editor files
 .vscode/

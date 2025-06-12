@@ -1,7 +1,6 @@
 from enum import Enum
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-import typing
 import uuid
 import json
 from typing import Generic, Type, Any, cast, TypeVar
@@ -30,14 +29,14 @@ class TaskMetadata:
     owner_id: str
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
-    def to_dict(self):
+    def to_dict(self) -> dict[str, Any]:
         return {
             "owner_id": self.owner_id,
             "created_at": self.created_at.timestamp(),
         }
 
     @classmethod
-    def from_dict(cls, data: dict[str, typing.Any]):
+    def from_dict(cls, data: dict[str, Any]):
         data["created_at"] = datetime.fromtimestamp(
             float(data["created_at"]), tz=timezone.utc
         )
@@ -74,7 +73,7 @@ class Task(Generic[ContextType]):
             ),
         )
 
-    def to_dict(self):
+    def to_dict(self) -> dict[str, Any]:
         return {
             "id": self.id,
             "status": self.status.value,

@@ -848,9 +848,6 @@ async def process_task(
         )
 
         if turn_completion.pending_tool_call_ids:
-            logger.info(
-                f"This should not be happening? {turn_completion.pending_tool_call_ids}"
-            )
             res = await completion_script.execute(
                 queue_main_key=queue_main_key,
                 queue_completions_key=queue_completions_key,

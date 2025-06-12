@@ -51,21 +51,13 @@ class MultiClient:
         if openai_api_key or os.environ.get("OPENAI_API_KEY"):
             self.openai = AsyncOpenAI(
                 api_key=openai_api_key or os.environ.get("OPENAI_API_KEY"),
-                http_client=http_client,
+                http_client=self.http_client,
             )
         if xai_api_key or os.environ.get("XAI_API_KEY"):
-            # Create separate HTTP client for XAI to avoid conflicts
-            xai_http_client = httpx.AsyncClient(
-                limits=httpx.Limits(
-                    max_connections=max_connections,
-                    max_keepalive_connections=max_keepalive_connections,
-                ),
-                timeout=httpx.Timeout(timeout),
-            )
             self.xai = AsyncOpenAI(
                 base_url="https://api.x.ai/v1",
                 api_key=xai_api_key or os.environ.get("XAI_API_KEY"),
-                http_client=xai_http_client,
+                http_client=self.http_client,
             )
 
     async def completion(
@@ -99,8 +91,12 @@ class MultiClient:
             kwargs["response_format"] = response_format
 
         if model.provider == Provider.OPENAI:
+            if not self.openai:
+                raise ValueError("OpenAI client not initialized")
             return await self.openai.chat.completions.create(**kwargs)
         if model.provider == Provider.XAI:
+            if not self.xai:
+                raise ValueError("XAI client not initialized")
             return await self.xai.chat.completions.create(**kwargs)
 
         raise ValueError(f"Unsupported provider: {model.provider}")

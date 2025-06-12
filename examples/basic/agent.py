@@ -7,7 +7,7 @@ from factorial import (
     AgentContext,
     Orchestrator,
     ModelSettings,
-    gpt_41_nano,
+    gpt_41_mini,
     AgentWorkerConfig,
     MaintenanceWorkerConfig,
     TaskTTLConfig,
@@ -55,27 +55,15 @@ def search(query: str) -> tuple[str, list[dict[str, Any]]]:
     return str(result), data
 
 
-def scrape(url: str) -> tuple[str, str]:
-    """Scrape a website"""
-    exa = Exa(api_key=os.getenv("EXA_API_KEY"))
-
-    response = exa.get_contents(
-        [url],
-        text=True,
-    )
-
-    return str(response), response.results[0]
-
-
 class FinalOutput(BaseModel):
     final_output: str
 
 
 basic_agent = Agent(
     description="Basic Agent",
-    model=gpt_41_nano,
+    model=gpt_41_mini,
     instructions="You are a helpful assistant. Always start out by making a plan.",
-    tools=[plan, reflect, search, scrape],
+    tools=[plan, reflect, search],
     model_settings=ModelSettings[AgentContext](
         temperature=0.0,
         tool_choice=lambda context: (

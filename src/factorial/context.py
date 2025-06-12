@@ -1,10 +1,9 @@
-from dataclasses import dataclass, asdict, field
-import json
+from dataclasses import dataclass
 from typing import Any
 from contextvars import ContextVar
 
+from pydantic import BaseModel
 from factorial.events import EventPublisher
-from factorial.utils import decode
 
 
 execution_context: ContextVar["ExecutionContext"] = ContextVar("execution_context")
@@ -26,23 +25,36 @@ class ExecutionContext:
         return execution_context.get()
 
 
-@dataclass
-class AgentContext:
+class AgentContext(BaseModel):
+    """
+    Agent state passed to the agent for turn execution.
+
+    Base Fields:
+    - query: str
+    - messages: list[dict[str, Any]] = []
+    - turn: int = 0
+    - output: Any = None
+    """
+
     query: str
-    messages: list[dict[str, Any]] = field(default_factory=list)
+    messages: list[dict[str, Any]] = []
     turn: int = 0
     output: Any = None
 
-    def to_dict(self):
-        return asdict(self)
+    class Config:
+        extra = "allow"  # Users can add extra fields
+        arbitrary_types_allowed = True  # For Any type flexibility
+
+    def to_dict(self) -> dict[str, Any]:
+        return self.model_dump()
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]):
         return cls(**data)
 
     def to_json(self) -> str:
-        return json.dumps(self.to_dict())
+        return self.model_dump_json()
 
     @classmethod
     def from_json(cls, json_str: str):
-        return cls.from_dict(json.loads(decode(json_str)))
+        return cls.model_validate_json(json_str)

@@ -12,6 +12,7 @@ from factorial.tools import (
     FunctionToolAction,
     FunctionToolActionResult,
     function_tool,
+    deferred_result,
 )
 from factorial.orchestrator import (
     Orchestrator,
@@ -21,7 +22,7 @@ from factorial.orchestrator import (
     ObservabilityConfig,
     MetricsTimelineConfig,
 )
-from factorial.context import AgentContext
+from factorial.context import AgentContext, ExecutionContext
 from factorial.task import ContextType, Task, TaskStatus
 from factorial.events import AgentEvent, QueueEvent, EventPublisher
 from factorial.llms import (
@@ -38,6 +39,7 @@ __all__ = [
     "BaseAgent",
     "Agent",
     "AgentContext",
+    "ExecutionContext",
     "ModelSettings",
     "ResolvedModelSettings",
     "TurnCompletion",
@@ -66,4 +68,5 @@ __all__ = [
     "gpt_41",
     "gpt_41_mini",
     "gpt_41_nano",
+    "deferred_result",
 ]

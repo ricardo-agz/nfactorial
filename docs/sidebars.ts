@@ -27,6 +27,14 @@ const sidebars: SidebarsConfig = {
         'events',
       ],
     },
+    {
+      type: 'category',
+      label: 'Examples',
+      items: [
+        'examples/basic_agent',
+        'examples/code_agent',
+      ],
+    },
   ],
 };
 

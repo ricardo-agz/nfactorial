@@ -1,0 +1,67 @@
+version: "3.8"
+
+services:
+  redis:
+    image: redis:latest
+    ports:
+      - "6379:6379"
+    command: redis-server --appendonly yes
+
+  agent:
+    build:
+      context: ../../
+      dockerfile: examples/code_agent/Dockerfile.agent
+    environment:
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - XAI_API_KEY=${XAI_API_KEY}
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_DB=0
+      - REDIS_MAX_CONNECTIONS=1000
+    ports:
+      - "8081:8081"
+    depends_on:
+      - redis
+    volumes:
+      # Mount source code for development
+      - ../../src:/app/src
+      - ./:/app
+    # Restart on file changes (optional)
+    restart: unless-stopped
+
+  server:
+    build:
+      context: ../../
+      dockerfile: examples/code_agent/Dockerfile.server
+    environment:
+      - REDIS_HOST=redis
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - XAI_API_KEY=${XAI_API_KEY}
+    ports:
+      - "8000:8000"
+    depends_on:
+      - redis
+    volumes:
+      # Mount source code for development
+      - ../../src:/app/src
+      - ./:/app
+    # Restart on file changes (optional)
+    restart: unless-stopped
+
+  ui:
+    build:
+      context: ./ui
+      dockerfile: Dockerfile
+    ports:
+      - "5173:5173"
+    depends_on:
+      - server
+    volumes:
+      # Mount UI source code for development
+      - ./ui/src:/app/src
+      - ./ui/public:/app/public
+      - ./ui/package.json:/app/package.json
+      - ./ui/vite.config.js:/app/vite.config.js
+      - ./ui/index.html:/app/index.html
+    # Restart on file changes (optional)
+    restart: unless-stopped

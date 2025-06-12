@@ -470,3 +470,94 @@ if __name__ == "__main__":
 8. **Security**: Validate inputs and sanitize outputs, especially for file operations
 9. **Performance**: Consider async operations for I/O-bound tasks
 10. **Modularity**: Keep agents focused on specific domains or capabilities 
+
+## Search-Enabled Planning Agent
+
+An example agent that combines basic planning with real-time web search powered by [Exa](https://exa.ai/). This is the same agent found under `examples/basic` in the repository.
+
+```python
+from factorial import Agent, AgentContext, Orchestrator, ModelSettings, gpt_41_mini
+from exa_py import Exa
+
+# --- Tool definitions ------------------------------------------------------
+
+def plan(overview: str, steps: list[str], agent_ctx: AgentContext) -> tuple[str, dict]:
+    """Create a step-by-step plan for the requested task."""
+    return f"{overview}\n{' -> '.join(steps)}", {"overview": overview, "steps": steps}
+
+
+def reflect(reflection: str, agent_ctx: AgentContext) -> tuple[str, str]:
+    """Reflect on the work done so far and decide next action."""
+    return reflection, reflection
+
+
+def search(query: str) -> tuple[str, list[dict]]:
+    """Search the web for up-to-date information using Exa search."""
+    exa = Exa(api_key="YOUR_EXA_API_KEY")
+    result = exa.search_and_contents(query=query, num_results=10, text={"max_characters": 500})
+    links = [{"title": r.title, "url": r.url} for r in result.results]
+    return str(result), links
+
+# --- Agent definition ------------------------------------------------------
+
+search_agent = Agent(
+    description="Search Assistant with Planning",
+    instructions="You are a helpful assistant. Always start by making a plan before searching.",
+    tools=[plan, reflect, search],
+    model=gpt_41_mini,
+    model_settings=ModelSettings(
+        temperature=0.0,
+        tool_choice=lambda ctx: (
+            {"type": "function", "function": {"name": "plan"}} if ctx.turn == 0 else "required"
+        ),
+    ),
+)
+
+# --- Running the agent -----------------------------------------------------
+
+orchestrator = Orchestrator()
+
+context = AgentContext(query="Summarize the latest advances in quantum computing")
+
+task = search_agent.create_task(owner_id="demo", payload=context)
+# Enqueue and process the task (this is a blocking call in the example)
+result = orchestrator.run_task(task.id)
+print(result.response)
+```
+
+---
+
+## IDE Agent (Code-Editing Assistant)
+
+This agent showcases how to build an interactive IDE assistant capable of reading, editing, and executing code. It lives under `examples/ide_agent`.
+
+```python
+from factorial import Orchestrator
+from examples.ide_agent.agent import ide_agent  # already fully configured
+
+# A simple Python file the agent will edit
+code_snippet = """
+
+def add(a, b):
+    return a + b
+"""
+
+# Compose the agent context with both the user query and the current code
+context = ide_agent.context_class(
+    query="Rename the function `add` to `sum_numbers` and update the call site.",
+    code=code_snippet,
+)
+
+task = ide_agent.create_task(owner_id="dev42", payload=context)
+
+orchestrator = Orchestrator()
+# Register the runner (production code would reuse a long-running orchestrator)
+orchestrator.register_runner(agent=ide_agent)
+
+# Execute the task – the agent will think, perform the `edit_code` tool, and (optionally)
+# ask the user for approval via `request_code_execution` before running the file.
+result = orchestrator.run_task(task.id)
+print(result.response)
+```
+
+These two examples demonstrate how Factorial agents can tackle both information-retrieval and developer-productivity use-cases with only a handful of lines of code. 

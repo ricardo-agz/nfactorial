@@ -31,10 +31,8 @@ from factorial.exceptions import RETRYABLE_EXCEPTIONS
 from factorial.tools import (
     FunctionTool,
     FunctionToolActionResult,
-    FunctionToolAction,
     convert_tools_list,
     create_final_output_tool,
-    _function_to_json_schema,
     function_tool,
 )
 
@@ -44,21 +42,6 @@ logger = get_logger(__name__)
 
 ContextT = TypeVar("ContextT", bound=AgentContext)
 T = TypeVar("T")
-
-
-def deferred_result(
-    timeout: float,
-) -> Callable[[Callable[..., Awaitable[T]]], Callable[..., Awaitable[T]]]:
-    def decorator(func: Callable[..., Awaitable[T]]) -> Callable[..., Awaitable[T]]:
-        @wraps(func)
-        async def wrapper(*args: Any, **kwargs: Any) -> T:
-            return await func(*args, **kwargs)
-
-        wrapper.deferred_result = True  # type: ignore
-        wrapper.timeout = timeout  # type: ignore
-        return wrapper
-
-    return decorator
 
 
 @overload
@@ -320,7 +303,7 @@ class ToolExecutionResults:
 class BaseAgent(Generic[ContextType]):
     def __init__(
         self,
-        instructions: str | None = None,
+        instructions: str | Callable[..., str] | None = None,
         description: str | None = None,
         tools: list[FunctionTool[ContextType] | Callable[..., Any]] | None = None,
         model: Model | Callable[[ContextType], Model] | None = None,
@@ -422,35 +405,40 @@ class BaseAgent(Generic[ContextType]):
         else:
             parsed_tool_args = json.loads(tool_args)
 
-            # Check if function expects agent context
-            sig = inspect.signature(action)
-            for param_name, param in sig.parameters.items():
+            for param_name, param in inspect.signature(action).parameters.items():
+                # Skip if the argument is already provided by the LLM call
+                if param_name in parsed_tool_args:
+                    continue
+
                 # Case 1: Parameter named 'agent_ctx'
                 if param_name == "agent_ctx":
                     parsed_tool_args[param_name] = agent_ctx
-                    break
-                # Case 2: Parameter with AgentContext subclass type annotation
-                elif (
+                    continue
+
+                # Case 2: Parameter type is a subclass of AgentContext
+                if (
                     param.annotation
-                    and param.annotation != inspect.Parameter.empty
+                    and param.annotation is not inspect.Parameter.empty
                     and isinstance(param.annotation, type)
                     and issubclass(param.annotation, AgentContext)
                 ):
                     parsed_tool_args[param_name] = agent_ctx
-                    break
+                    continue
+
                 # Case 3: Parameter named 'execution_ctx'
-                elif param_name == "execution_ctx":
+                if param_name == "execution_ctx":
                     parsed_tool_args[param_name] = execution_ctx
-                    break
-                # Case 4: Parameter with ExecutionContext subclass type annotation
-                elif (
+                    continue
+
+                # Case 4: Parameter type is a subclass of ExecutionContext
+                if (
                     param.annotation
-                    and param.annotation != inspect.Parameter.empty
+                    and param.annotation is not inspect.Parameter.empty
                     and isinstance(param.annotation, type)
                     and issubclass(param.annotation, ExecutionContext)
                 ):
                     parsed_tool_args[param_name] = execution_ctx
-                    break
+                    continue
 
             result = (
                 await action(**parsed_tool_args)
@@ -544,7 +532,7 @@ class BaseAgent(Generic[ContextType]):
     ) -> TurnCompletion[ContextType]:
         """Run a single turn. Override for custom logic."""
 
-        messages = self._prepare_messages(agent_ctx)
+        messages = self.prepare_messages(agent_ctx)
 
         response = await self._completion_with_retry_and_progress(
             agent_ctx,
@@ -637,6 +625,34 @@ class BaseAgent(Generic[ContextType]):
     def resolve_model_settings(self, agent_ctx: ContextType) -> ResolvedModelSettings:
         return self.model_settings.resolve(agent_ctx)
 
+    def resolve_instructions(self, agent_ctx: ContextType) -> str:
+        """Resolve instructions, handling both string and callable instructions."""
+        instructions = self.instructions
+
+        if callable(instructions):
+            sig = inspect.signature(instructions)
+            params = list(sig.parameters.values())
+
+            # Always pass agent_ctx as first argument
+            args = [agent_ctx]
+
+            # Check if any parameter has ExecutionContext type annotation
+            has_execution_ctx = any(
+                param.annotation
+                and param.annotation != inspect.Parameter.empty
+                and isinstance(param.annotation, type)
+                and issubclass(param.annotation, ExecutionContext)
+                for param in params
+            )
+
+            if has_execution_ctx:
+                execution_ctx = ExecutionContext.current()
+                args.append(execution_ctx)
+
+            instructions = instructions(*args)
+
+        return instructions or ""
+
     def _is_done(self, response: ChatCompletion) -> bool:
         """Check if agent should complete"""
         tool_calls = response.choices[0].message.tool_calls
@@ -647,7 +663,8 @@ class BaseAgent(Generic[ContextType]):
     def _prepare_instructions(self, agent_ctx: ContextType) -> str:
         """Prepare instructions for LLM request. Override to customize instructions preparation."""
 
-        instructions = self.instructions
+        instructions = self.resolve_instructions(agent_ctx)
+
         if self.max_turns:
             instructions += f"\n\nYou must reach a final response in {self.max_turns} turns or less."
         if (
@@ -661,7 +678,7 @@ class BaseAgent(Generic[ContextType]):
 
         return instructions
 
-    def _prepare_messages(self, agent_ctx: ContextType) -> list[dict[str, Any]]:
+    def prepare_messages(self, agent_ctx: ContextType) -> list[dict[str, Any]]:
         """Prepare messages for LLM request. Override to customize message preparation."""
         if agent_ctx.turn == 0:
             messages = (

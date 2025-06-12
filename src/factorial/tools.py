@@ -12,8 +12,10 @@ from typing import (
 )
 from dataclasses import dataclass
 from pydantic import BaseModel
+from functools import wraps
 from openai.types.chat import ChatCompletionMessageToolCall
 import inspect
+import asyncio
 
 from factorial.context import AgentContext, ExecutionContext
 
@@ -25,6 +27,7 @@ FunctionToolAction = Union[
     Callable[..., Awaitable[FunctionToolActionReturn]],
 ]
 F = Callable[..., Any]
+T = TypeVar("T")
 
 
 class FunctionToolActionResult(BaseModel):
@@ -258,3 +261,34 @@ def create_final_output_tool(output_type: type[BaseModel]) -> dict[str, Any]:
             "parameters": output_type.model_json_schema(),
         },
     }
+
+
+def deferred_result(
+    timeout: float,
+) -> Callable[
+    [Callable[..., T] | Callable[..., Awaitable[T]]], Callable[..., Awaitable[T]]
+]:
+    def decorator(
+        func: Callable[..., T] | Callable[..., Awaitable[T]],
+    ) -> Callable[..., Awaitable[T]]:
+        """Wrap the tool function so it can be awaited regardless of being sync or async.
+
+        The orchestrator always awaits the result of the tool wrapper.  If the wrapped
+        function is synchronous we simply call it and return the value; if it is a
+        coroutine function we *await* it.  This prevents the "NoneType can't be used in
+        'await' expression" error when developers create synchronous deferred tools.
+        """
+
+        @wraps(func)
+        async def wrapper(*args: Any, **kwargs: Any) -> T:
+            if asyncio.iscoroutinefunction(func):
+                # Async tool — await normally
+                return await func(*args, **kwargs)  # type: ignore[arg-type]
+            # Sync tool — run directly
+            return func(*args, **kwargs)  # type: ignore[return-value,arg-type]
+
+        wrapper.deferred_result = True  # type: ignore[attr-defined]
+        wrapper.timeout = timeout  # type: ignore[attr-defined]
+        return wrapper
+
+    return decorator

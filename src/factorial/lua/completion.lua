@@ -57,6 +57,8 @@ if pending_tool_call_ids_json and pending_sentinel then
     end
     -- Set task status to pending tool call results
     redis.call('HSET', task_statuses_key, task_id, "pending_tool_results")
+    -- Persist the latest payload so context changes (e.g., turn counter, messages) are not lost
+    redis.call('HSET', task_payloads_key, task_id, updated_task_payload_json)
 
     -- Update idle gauge
     redis.call('INCR', agent_idle_gauge_key)
@@ -75,6 +77,8 @@ if action == "complete" then
     redis.call('ZADD', queue_completions_key, timestamp, task_id)
     -- Set task status to completed
     redis.call('HSET', task_statuses_key, task_id, "completed")
+    -- Persist the latest payload so context changes (e.g., turn counter, messages) are not lost
+    redis.call('HSET', task_payloads_key, task_id, updated_task_payload_json)
 
     -- Update timeline metrics
     inc_metrics(

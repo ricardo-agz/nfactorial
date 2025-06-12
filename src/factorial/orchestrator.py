@@ -365,16 +365,11 @@ class Orchestrator:
 
                             # Apply filters
                             if should_include_event(event_data):
-                                yield {"data": event_data}
+                                yield event_data
 
                         except json.JSONDecodeError:
-                            # If it's not valid JSON, yield raw message only if no filters
-                            if (
-                                task_ids is None
-                                and event_types is None
-                                and event_pattern is None
-                            ):
-                                yield {"raw": data}
+                            logger.error(f"Error decoding JSON: {data}")
+                            continue
 
                 except asyncio.TimeoutError:
                     # Timeout is expected, continue listening

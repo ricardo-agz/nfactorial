@@ -576,9 +576,9 @@ class ToolCompletionScript(AsyncScript):
     ) -> bool:
         return await super().__call__(  # type: ignore
             keys=[
-                pending_tool_results_key,
                 queue_main_key,
                 queue_orphaned_key,
+                pending_tool_results_key,
                 task_statuses_key,
                 task_agents_key,
                 task_payloads_key,

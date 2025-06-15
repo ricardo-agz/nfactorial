@@ -22,8 +22,8 @@ from factorial.orchestrator import (
     ObservabilityConfig,
     MetricsTimelineConfig,
 )
-from factorial.context import AgentContext, ExecutionContext
-from factorial.task import ContextType, Task, TaskStatus
+from factorial.context import AgentContext, ExecutionContext, ContextType
+from factorial.queue.task import Task, TaskStatus
 from factorial.events import AgentEvent, QueueEvent, EventPublisher
 from factorial.llms import (
     Model,

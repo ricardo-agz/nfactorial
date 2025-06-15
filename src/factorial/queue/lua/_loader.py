@@ -252,26 +252,29 @@ class TaskCompletionScript(AsyncScript):
     * KEYS[3] = queue_failed_key (str)
     * KEYS[4] = queue_backoff_key (str)
     * KEYS[5] = queue_orphaned_key (str)
-    * KEYS[6] = task_statuses_key (str)
-    * KEYS[7] = task_agents_key (str)
-    * KEYS[8] = task_payloads_key (str)
-    * KEYS[9] = task_pickups_key (str)
-    * KEYS[10] = task_retries_key (str)
-    * KEYS[11] = task_metas_key (str)
-    * KEYS[12] = processing_heartbeats_key (str)
-    * KEYS[13] = pending_tool_results_key (str)
-    * KEYS[14] = agent_metrics_bucket_key (str)
-    * KEYS[15] = global_metrics_bucket_key (str)
-    * KEYS[16] = agent_idle_gauge_key (str)
-    * KEYS[17] = global_idle_gauge_key (str)
+    * KEYS[6] = queue_pending_key (str)
+    * KEYS[7] = task_statuses_key (str)
+    * KEYS[8] = task_agents_key (str)
+    * KEYS[9] = task_payloads_key (str)
+    * KEYS[10] = task_pickups_key (str)
+    * KEYS[11] = task_retries_key (str)
+    * KEYS[12] = task_metas_key (str)
+    * KEYS[13] = processing_heartbeats_key (str)
+    * KEYS[14] = pending_tool_results_key (str)
+    * KEYS[15] = pending_child_task_results_key (str)
+    * KEYS[16] = agent_metrics_bucket_key (str)
+    * KEYS[17] = global_metrics_bucket_key (str)
+    * KEYS[18] = parent_pending_child_task_results_key (str | None)
 
     Args:
     * ARGV[1] = task_id (str)
     * ARGV[2] = action (str)
     * ARGV[3] = updated_task_payload_json (str)
     * ARGV[4] = metrics_ttl (int)
-    * ARGV[5] = pending_sentinel (str)
-    * ARGV[6] = pending_tool_call_ids_json (str)
+    * ARGV[5] = pending_sentinel (str | None)
+    * ARGV[6] = pending_tool_call_ids_json (str | None)
+    * ARGV[7] = pending_child_task_ids_json (str | None)
+    * ARGV[8] = final_output_json (str | None)
     """
 
     async def execute(
@@ -282,6 +285,7 @@ class TaskCompletionScript(AsyncScript):
         queue_failed_key: str,
         queue_backoff_key: str,
         queue_orphaned_key: str,
+        queue_pending_key: str,
         task_statuses_key: str,
         task_agents_key: str,
         task_payloads_key: str,
@@ -290,53 +294,53 @@ class TaskCompletionScript(AsyncScript):
         task_metas_key: str,
         processing_heartbeats_key: str,
         pending_tool_results_key: str,
+        pending_child_task_results_key: str,
         agent_metrics_bucket_key: str,
         global_metrics_bucket_key: str,
-        agent_idle_gauge_key: str,
-        global_idle_gauge_key: str,
         task_id: str,
         action: str,
         updated_task_payload_json: str,
         metrics_ttl: int,
-        pending_sentinel: str | None = None,
+        pending_sentinel: str,
+        parent_pending_child_task_results_key: str | None = None,
         pending_tool_call_ids_json: str | None = None,
+        pending_child_task_ids_json: str | None = None,
+        final_output_json: str | None = None,
     ) -> bool:
-        args = [
-            task_id,
-            action,
-            updated_task_payload_json,
-            metrics_ttl,
+        keys = [
+            queue_main_key,
+            queue_completions_key,
+            queue_failed_key,
+            queue_backoff_key,
+            queue_orphaned_key,
+            queue_pending_key,
+            task_statuses_key,
+            task_agents_key,
+            task_payloads_key,
+            task_pickups_key,
+            task_retries_key,
+            task_metas_key,
+            processing_heartbeats_key,
+            pending_tool_results_key,
+            pending_child_task_results_key,
+            agent_metrics_bucket_key,
+            global_metrics_bucket_key,
         ]
-
-        if pending_sentinel is not None and pending_tool_call_ids_json is not None:
-            args.append(pending_sentinel)
-            args.append(pending_tool_call_ids_json)
-        elif pending_tool_call_ids_json is not None:
-            raise ValueError(
-                "pending_sentinel must be provided if pending_tool_call_ids_json is provided"
-            )
+        if parent_pending_child_task_results_key:
+            keys.append(parent_pending_child_task_results_key)
 
         return await super().__call__(  # type: ignore
-            keys=[
-                queue_main_key,
-                queue_completions_key,
-                queue_failed_key,
-                queue_backoff_key,
-                queue_orphaned_key,
-                task_statuses_key,
-                task_agents_key,
-                task_payloads_key,
-                task_pickups_key,
-                task_retries_key,
-                task_metas_key,
-                processing_heartbeats_key,
-                pending_tool_results_key,
-                agent_metrics_bucket_key,
-                global_metrics_bucket_key,
-                agent_idle_gauge_key,
-                global_idle_gauge_key,
+            keys=keys,
+            args=[
+                task_id,
+                action,
+                updated_task_payload_json,
+                metrics_ttl,
+                pending_sentinel,
+                pending_tool_call_ids_json or "",
+                pending_child_task_ids_json or "",
+                final_output_json or "",
             ],
-            args=args,
         )
 
 
@@ -546,13 +550,14 @@ class ToolCompletionScript(AsyncScript):
     Keys:
     * KEYS[1] = queue_main_key (str)
     * KEYS[2] = queue_orphaned_key (str)
-    * KEYS[3] = pending_tool_results_key (str)
-    * KEYS[4] = task_statuses_key (str)
-    * KEYS[5] = task_agents_key (str)
-    * KEYS[6] = task_payloads_key (str)
-    * KEYS[7] = task_pickups_key (str)
-    * KEYS[8] = task_retries_key (str)
-    * KEYS[9] = task_metas_key (str)
+    * KEYS[3] = queue_pending_key (str)
+    * KEYS[4] = pending_tool_results_key (str)
+    * KEYS[5] = task_statuses_key (str)
+    * KEYS[6] = task_agents_key (str)
+    * KEYS[7] = task_payloads_key (str)
+    * KEYS[8] = task_pickups_key (str)
+    * KEYS[9] = task_retries_key (str)
+    * KEYS[10] = task_metas_key (str)
 
     Args:
     * ARGV[1] = task_id (str)
@@ -564,6 +569,7 @@ class ToolCompletionScript(AsyncScript):
         *,
         queue_main_key: str,
         queue_orphaned_key: str,
+        queue_pending_key: str,
         pending_tool_results_key: str,
         task_statuses_key: str,
         task_agents_key: str,
@@ -573,11 +579,12 @@ class ToolCompletionScript(AsyncScript):
         task_metas_key: str,
         task_id: str,
         updated_task_context_json: str,
-    ) -> bool:
+    ) -> tuple[bool, str]:
         return await super().__call__(  # type: ignore
             keys=[
                 queue_main_key,
                 queue_orphaned_key,
+                queue_pending_key,
                 pending_tool_results_key,
                 task_statuses_key,
                 task_agents_key,
@@ -600,6 +607,74 @@ async def create_tool_completion_script(
     Creates a simple atomic script to move completed task back to queue and cleanup
     """
     return get_cached_script(redis_client, "tool_completion", ToolCompletionScript)
+
+
+class ChildTaskCompletionScript(AsyncScript):
+    """
+    Simple atomic script to move completed task back to queue and cleanup
+
+    Keys:
+    * KEYS[1] = queue_main_key (str)
+    * KEYS[2] = queue_orphaned_key (str)
+    * KEYS[3] = queue_pending_key (str)
+    * KEYS[4] = pending_child_task_results_key (str)
+    * KEYS[5] = task_statuses_key (str)
+    * KEYS[6] = task_agents_key (str)
+    * KEYS[7] = task_payloads_key (str)
+    * KEYS[8] = task_pickups_key (str)
+    * KEYS[9] = task_retries_key (str)
+    * KEYS[10] = task_metas_key (str)
+
+    Args:
+    * ARGV[1] = task_id (str)
+    * ARGV[2] = updated_task_context_json (str)
+    """
+
+    async def execute(
+        self,
+        *,
+        queue_main_key: str,
+        queue_orphaned_key: str,
+        queue_pending_key: str,
+        pending_child_task_results_key: str,
+        task_statuses_key: str,
+        task_agents_key: str,
+        task_payloads_key: str,
+        task_pickups_key: str,
+        task_retries_key: str,
+        task_metas_key: str,
+        task_id: str,
+        updated_task_context_json: str,
+    ) -> tuple[bool, str]:
+        return await super().__call__(  # type: ignore
+            keys=[
+                queue_main_key,
+                queue_orphaned_key,
+                queue_pending_key,
+                pending_child_task_results_key,
+                task_statuses_key,
+                task_agents_key,
+                task_payloads_key,
+                task_pickups_key,
+                task_retries_key,
+                task_metas_key,
+            ],
+            args=[
+                task_id,
+                updated_task_context_json,
+            ],
+        )
+
+
+async def create_child_task_completion_script(
+    redis_client: redis.Redis,
+) -> ChildTaskCompletionScript:
+    """
+    Creates a simple atomic script to move completed task back to queue and cleanup
+    """
+    return get_cached_script(
+        redis_client, "child_completion", ChildTaskCompletionScript
+    )
 
 
 class EnqueueTaskScript(AsyncScript):
@@ -735,6 +810,7 @@ class CancelTaskScriptResult:
     success: bool
     current_status: str | None
     message: str
+    owner_id: str | None
 
 
 class CancelTaskScript(AsyncScript):
@@ -745,16 +821,18 @@ class CancelTaskScript(AsyncScript):
     * KEYS[1] = queue_cancelled_key (str)
     * KEYS[2] = queue_backoff_key (str)
     * KEYS[3] = queue_orphaned_key (str)
-    * KEYS[4] = pending_cancellations_key (str)
-    * KEYS[5] = task_statuses_key (str)
-    * KEYS[6] = task_agents_key (str)
-    * KEYS[7] = task_payloads_key (str)
-    * KEYS[8] = task_pickups_key (str)
-    * KEYS[9] = task_retries_key (str)
-    * KEYS[10] = task_metas_key (str)
-    * KEYS[11] = pending_tool_results_key (str)
-    * KEYS[12] = agent_metrics_bucket_key (str)
-    * KEYS[13] = global_metrics_bucket_key (str)
+    * KEYS[4] = queue_pending_key (str)
+    * KEYS[5] = pending_cancellations_key (str)
+    * KEYS[6] = task_statuses_key (str)
+    * KEYS[7] = task_agents_key (str)
+    * KEYS[8] = task_payloads_key (str)
+    * KEYS[9] = task_pickups_key (str)
+    * KEYS[10] = task_retries_key (str)
+    * KEYS[11] = task_metas_key (str)
+    * KEYS[12] = pending_tool_results_key (str)
+    * KEYS[13] = pending_child_task_results_key (str)
+    * KEYS[14] = agent_metrics_bucket_key (str)
+    * KEYS[15] = global_metrics_bucket_key (str)
 
     Args:
     * ARGV[1] = task_id (str)
@@ -767,6 +845,7 @@ class CancelTaskScript(AsyncScript):
         queue_cancelled_key: str,
         queue_backoff_key: str,
         queue_orphaned_key: str,
+        queue_pending_key: str,
         pending_cancellations_key: str,
         task_statuses_key: str,
         task_agents_key: str,
@@ -775,16 +854,18 @@ class CancelTaskScript(AsyncScript):
         task_retries_key: str,
         task_metas_key: str,
         pending_tool_results_key: str,
+        pending_child_task_results_key: str,
         agent_metrics_bucket_key: str,
         global_metrics_bucket_key: str,
         task_id: str,
         metrics_ttl: int,
     ) -> CancelTaskScriptResult:
-        result: tuple[bool, str | None, str] = await super().__call__(  # type: ignore
+        result: tuple[bool, str | None, str, str | None] = await super().__call__(  # type: ignore
             keys=[
                 queue_cancelled_key,
                 queue_backoff_key,
                 queue_orphaned_key,
+                queue_pending_key,
                 pending_cancellations_key,
                 task_statuses_key,
                 task_agents_key,
@@ -793,6 +874,7 @@ class CancelTaskScript(AsyncScript):
                 task_retries_key,
                 task_metas_key,
                 pending_tool_results_key,
+                pending_child_task_results_key,
                 agent_metrics_bucket_key,
                 global_metrics_bucket_key,
             ],
@@ -804,8 +886,9 @@ class CancelTaskScript(AsyncScript):
 
         return CancelTaskScriptResult(
             success=bool(decode(result[0])),
-            current_status=decode(result[1]) if result[1] is not None else None,
+            current_status=decode(result[1]) if result[1] != "" else None,
             message=decode(result[2]),
+            owner_id=decode(result[3]) if result[3] != "" else None,
         )
 
 

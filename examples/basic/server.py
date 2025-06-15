@@ -1,4 +1,4 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import redis.asyncio as redis
 from redis.asyncio.client import Redis as RedisType, PubSub
@@ -103,22 +103,22 @@ class SteerRequest(BaseModel):
 
 @app.post("/api/enqueue")
 async def enqueue(request: EnqueueRequest):
-    task = basic_agent.create_task(
+    payload = AgentContext(
+        messages=request.message_history,
+        query=request.query,
+        turn=0,
+    )
+    task = await orchestrator.create_agent_task(
+        agent=basic_agent,
         owner_id=request.user_id,
-        payload=AgentContext(
-            messages=request.message_history,
-            query=request.query,
-            turn=0,
-        ),
+        payload=payload,
     )
 
-    # Use the control plane's enqueue method with proper configuration
-    await orchestrator.enqueue_task(agent=basic_agent, task=task)
     return {"task_id": task.id}
 
 
 @app.post("/api/steer")
-async def steer_task_endpoint(request: SteerRequest):
+async def steer_task_endpoint(request: SteerRequest) -> dict[str, Any]:
     try:
         await orchestrator.steer_task(
             task_id=request.task_id,
@@ -133,12 +133,14 @@ async def steer_task_endpoint(request: SteerRequest):
             "message": f"Steering messages sent for task {request.task_id}",
         }
     except Exception as e:
-        print(f"Failed to steer task {request.task_id}: {e}")
-        return {"success": False, "error": str(e)}
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to steer task {request.task_id}: {str(e)}",
+        )
 
 
 @app.post("/api/cancel")
-async def cancel_task_endpoint(request: CancelRequest):
+async def cancel_task_endpoint(request: CancelRequest) -> dict[str, Any]:
     try:
         await orchestrator.cancel_task(task_id=request.task_id)
 
@@ -150,72 +152,12 @@ async def cancel_task_endpoint(request: CancelRequest):
             "message": f"Task {request.task_id} marked for cancellation",
         }
     except Exception as e:
-        print(f"Failed to cancel task {request.task_id}: {e}")
-        return {"success": False, "error": str(e)}
-
-
-@app.get("/api/task/{task_id}/status")
-async def get_task_status_endpoint(task_id: str):
-    """Get the status of a specific task"""
-    try:
-        status = await orchestrator.get_task_status(task_id)
-        return {"task_id": task_id, "status": status}
-    except Exception as e:
-        print(f"Failed to get status for task {task_id}: {e}")
-        return {"success": False, "error": str(e)}
-
-
-@app.get("/api/task/{task_id}")
-async def get_task_data_endpoint(task_id: str):
-    """Get the full data of a specific task"""
-    try:
-        task_data = await orchestrator.get_task_data(task_id)
-        if not task_data:
-            return {"success": False, "error": "Task not found"}
-        return {"task_id": task_id, "data": task_data}
-    except Exception as e:
-        print(f"Failed to get data for task {task_id}: {e}")
-        return {"success": False, "error": str(e)}
-
-
-@app.get("/api/agents")
-async def get_agents_endpoint():
-    """Get information about registered agents"""
-    try:
-        agents_info = []
-        for agent_name, agent in orchestrator._agents_by_name.items():
-            metrics_config = orchestrator.get_metrics_config(agent_name)
-            agents_info.append(
-                {
-                    "name": agent_name,
-                    "class": agent.__class__.__name__,
-                    "metrics_config": (
-                        {
-                            "bucket_duration": (
-                                metrics_config.bucket_duration
-                                if metrics_config
-                                else None
-                            ),
-                            "retention_duration": (
-                                metrics_config.retention_duration
-                                if metrics_config
-                                else None
-                            ),
-                            "timeline_duration": (
-                                metrics_config.timeline_duration
-                                if metrics_config
-                                else None
-                            ),
-                        }
-                        if metrics_config
-                        else None
-                    ),
-                }
-            )
-        return {"agents": agents_info}
-    except Exception as e:
-        print(f"Failed to get agents info: {e}")
-        return {"success": False, "error": str(e)}
+        import traceback
+        print(f"Error cancelling task {request.task_id}: {str(e)}", traceback.format_exc())
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to cancel task {request.task_id}: {str(e)}",
+        )
 
 
 if __name__ == "__main__":

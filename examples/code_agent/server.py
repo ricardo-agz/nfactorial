@@ -3,6 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.exceptions import HTTPException
 from pydantic import BaseModel
 import json
+from typing import Any
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
 from agent import ide_agent, orchestrator, IdeAgentContext
@@ -49,22 +50,24 @@ class CancelRequest(BaseModel):
 
 @app.post("/api/enqueue")
 async def enqueue(request: EnqueueRequest):
-    task = ide_agent.create_task(
-        owner_id=request.user_id,
-        payload=IdeAgentContext(
-            messages=request.message_history,
-            query=request.query,
-            turn=0,
-            code=request.code,
-        ),
+    payload = IdeAgentContext(
+        messages=request.message_history,
+        query=request.query,
+        turn=0,
+        code=request.code,
     )
 
-    await orchestrator.enqueue_task(agent=ide_agent, task=task)
+    task = await orchestrator.create_agent_task(
+        agent=ide_agent,
+        owner_id=request.user_id,
+        payload=payload,
+    )
+
     return {"task_id": task.id}
 
 
 @app.post("/api/cancel")
-async def cancel_task_endpoint(request: CancelRequest):
+async def cancel_task_endpoint(request: CancelRequest) -> dict[str, Any]:
     try:
         await orchestrator.cancel_task(task_id=request.task_id)
 
@@ -76,8 +79,10 @@ async def cancel_task_endpoint(request: CancelRequest):
             "message": f"Task {request.task_id} marked for cancellation",
         }
     except Exception as e:
-        print(f"Failed to cancel task {request.task_id}: {e}")
-        return {"success": False, "error": str(e)}
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to cancel task {request.task_id}: {str(e)}",
+        )
 
 
 class CompleteToolRequest(BaseModel):

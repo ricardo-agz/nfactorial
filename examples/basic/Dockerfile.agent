@@ -19,5 +19,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy example code
 COPY examples/basic/ ./
 
+# Expose the observability port
+EXPOSE 8081
+
 # Run the agent
 CMD ["python", "agent.py"] 

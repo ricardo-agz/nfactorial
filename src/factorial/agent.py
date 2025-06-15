@@ -1,3 +1,4 @@
+from __future__ import annotations
 import random
 from typing import (
     Any,
@@ -6,8 +7,9 @@ from typing import (
     cast,
     final,
     Generic,
-    TypeVar,
     overload,
+    TypeVar,
+    TYPE_CHECKING,
 )
 from functools import wraps
 from dataclasses import dataclass, field
@@ -21,8 +23,12 @@ from openai.types.chat import (
     ChatCompletionMessageToolCall,
 )
 
-from factorial.context import AgentContext, ExecutionContext, execution_context
-from factorial.task import Task, ContextType
+from factorial.context import (
+    AgentContext,
+    ExecutionContext,
+    execution_context,
+    ContextType,
+)
 from factorial.llms import Model, MultiClient
 from factorial.utils import serialize_data, to_snake_case
 from factorial.events import EventPublisher, AgentEvent
@@ -36,11 +42,8 @@ from factorial.tools import (
     function_tool,
 )
 
-
 logger = get_logger(__name__)
 
-
-ContextT = TypeVar("ContextT", bound=AgentContext)
 T = TypeVar("T")
 
 
@@ -258,18 +261,22 @@ class TurnCompletion(Generic[ContextType]):
     context: ContextType
     output: Any = None
     pending_tool_call_ids: list[str] = field(default_factory=list)
+    pending_child_task_ids: list[str] = field(default_factory=list)
 
 
 @dataclass
-class ModelSettings(Generic[ContextT]):
-    temperature: float | Callable[[ContextT], float] | None = None
+class ModelSettings(Generic[ContextType]):
+    temperature: float | Callable[[ContextType], float] | None = None
     tool_choice: (
-        str | dict[str, Any] | Callable[[ContextT], str | dict[str, Any] | None] | None
+        str
+        | dict[str, Any]
+        | Callable[[ContextType], str | dict[str, Any] | None]
+        | None
     ) = None
-    parallel_tool_calls: bool | Callable[[ContextT], bool] | None = None
-    max_completion_tokens: int | Callable[[ContextT], int] | None = None
+    parallel_tool_calls: bool | Callable[[ContextType], bool] | None = None
+    max_completion_tokens: int | Callable[[ContextType], int] | None = None
 
-    def resolve(self, agent_ctx: ContextT) -> "ResolvedModelSettings":
+    def resolve(self, agent_ctx: ContextType) -> "ResolvedModelSettings":
         return ResolvedModelSettings(
             temperature=self.temperature(agent_ctx)
             if callable(self.temperature)
@@ -335,21 +342,6 @@ class BaseAgent(Generic[ContextType]):
         self.final_output_tool = (
             create_final_output_tool(self.output_type) if self.output_type else None
         )
-
-    def create_task(
-        self,
-        owner_id: str,
-        payload: ContextType,
-    ) -> Task[ContextType]:
-        """Create a task with the correct context type for this agent"""
-        return Task.create(
-            owner_id=owner_id,
-            agent=self.name,
-            payload=payload,
-        )
-
-    def deserialize_task(self, task_json: str) -> Task[ContextType]:
-        return Task.from_json(task_json)
 
     # ===== Overridable Methods ===== #
 
@@ -483,6 +475,14 @@ class BaseAgent(Generic[ContextType]):
         else:
             return f'<tool_call_result tool="{tool_call_id}">\n{str(result)}\n</tool_call_result>'
 
+    def format_child_task_result(
+        self, child_task_id: str, result: Any | Exception
+    ) -> str:
+        if isinstance(result, Exception):
+            return f'<sub_task_error sub_task_id="{child_task_id}">\nError running sub task:\n{result}\n</sub_task_error>'
+        else:
+            return f'<sub_task_result sub_task_id="{child_task_id}">\n{str(result)}\n</sub_task_result>'
+
     async def execute_tools(
         self,
         tool_calls: list[ChatCompletionMessageToolCall],
@@ -581,7 +581,7 @@ class BaseAgent(Generic[ContextType]):
             pending_tool_call_ids=pending_tool_call_ids,
         )
 
-    def process_long_running_tool_results(
+    def process_deferred_tool_results(
         self,
         agent_ctx: ContextType,
         tool_call_results: list[tuple[str, Any]],
@@ -595,6 +595,36 @@ class BaseAgent(Generic[ContextType]):
             updated_messages.append(
                 {"role": "tool", "tool_call_id": tool_call_id, "content": content}
             )
+        agent_ctx.messages = updated_messages
+
+        return TurnCompletion(is_done=False, context=agent_ctx)
+
+    def process_child_task_results(
+        self,
+        agent_ctx: ContextType,
+        child_task_results: list[tuple[str, Any]],
+    ) -> TurnCompletion[ContextType]:
+        updated_messages = agent_ctx.messages.copy()
+        formatted_child_task_results = []
+
+        for child_task_id, result in child_task_results:
+            if isinstance(result, Exception):
+                logger.error(
+                    f"Child task {child_task_id} failed: {result}", exc_info=result
+                )
+            formatted_child_task_results.append(
+                self.format_child_task_result(child_task_id, result)
+            )
+
+        if formatted_child_task_results:
+            joined_results = "\n\n".join(formatted_child_task_results)
+            updated_messages.append(
+                {
+                    "role": "assistant",
+                    "content": f"<sub_task_results>\n{joined_results}\n</sub_task_results>",
+                }
+            )
+
         agent_ctx.messages = updated_messages
 
         return TurnCompletion(is_done=False, context=agent_ctx)

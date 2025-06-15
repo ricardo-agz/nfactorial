@@ -19,7 +19,7 @@ services:
       - REDIS_DB=0
       - REDIS_MAX_CONNECTIONS=1000
     ports:
-      - "8081:8081"
+      - "8080:8080"
     depends_on:
       - redis
     volumes:

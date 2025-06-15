@@ -17,7 +17,7 @@ const COLORS = {
     completed: '#059669',
     failed: '#EF4444',
     cancelled: '#6B7280',
-    pending_tool_results: '#F59E0B'
+    pending: '#F59E0B',
   },
   activity: {
     completed: '#10B981',
@@ -29,7 +29,7 @@ const COLORS = {
 const STATUS_CONFIG = {
   active: { label: 'Active', color: 'text-green-600', dot: 'bg-green-500' },
   busy: { label: 'Busy', color: 'text-blue-600', dot: 'bg-blue-500' },
-  idle: { label: 'Idle', color: 'text-gray-600', dot: 'bg-gray-400' },
+  pending: { label: 'Pending', color: 'text-gray-600', dot: 'bg-gray-400' },
   ready: { label: 'Ready', color: 'text-green-600', dot: 'bg-green-400' },
   warning: { label: 'Warning', color: 'text-yellow-600', dot: 'bg-yellow-500' },
   offline: { label: 'Offline', color: 'text-red-600', dot: 'bg-red-500' },
@@ -251,7 +251,7 @@ function updateTaskDistributionLegend(distribution, legendContainer) {
     { label: 'Completed', color: COLORS.task.completed, value: distribution.completed },
     { label: 'Failed', color: COLORS.task.failed, value: distribution.failed },
     { label: 'Cancelled', color: COLORS.task.cancelled, value: distribution.cancelled },
-    { label: 'Idle', color: COLORS.task.pending_tool_results, value: distribution.idle }
+    { label: 'Pending', color: COLORS.task.pending, value: distribution.pending }
   ];
 
   legendContainer.innerHTML = `
@@ -291,7 +291,7 @@ function updateExistingTaskChart(distribution, totalTasks, chartContainer) {
     chart.data.datasets[0].data = [
       distribution.queued, distribution.processing, distribution.backoff,
       distribution.completed, distribution.failed, distribution.cancelled,
-      distribution.pending_tool_results
+      distribution.pending
     ];
     chart.data.datasets[0].backgroundColor = Object.values(COLORS.task);
     chart.options.plugins.legend.display = false;
@@ -317,7 +317,7 @@ function createNewTaskChart(ctx, distribution, totalTasks, chartContainer) {
     ? [1, 0, 0, 0, 0, 0, 0]
     : [distribution.queued, distribution.processing, distribution.backoff,
        distribution.completed, distribution.failed, distribution.cancelled,
-       distribution.pending_tool_results];
+       distribution.pending];
 
   const backgroundColor = totalTasks === 0
     ? ['#E5E7EB', ...Object.values(COLORS.task).slice(1)]
@@ -326,7 +326,7 @@ function createNewTaskChart(ctx, distribution, totalTasks, chartContainer) {
   state.charts.taskDistribution = new Chart(ctx, {
     type: 'doughnut',
     data: {
-      labels: ['Queued', 'Processing', 'Backoff', 'Completed', 'Failed', 'Cancelled', 'Pending Tools'],
+      labels: ['Queued', 'Processing', 'Backoff', 'Completed', 'Failed', 'Cancelled', 'Pending'],
       datasets: [{
         data: chartData,
         backgroundColor,

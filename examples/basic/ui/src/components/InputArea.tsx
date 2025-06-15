@@ -152,7 +152,7 @@ export const InputArea: React.FC<InputAreaProps> = ({
                     type="button"
                     onClick={cancelCurrentTask}
                     disabled={cancelling}
-                    className="p-1.5 rounded bg-gray-200 hover:bg-gray-300 text-gray-600 disabled:text-gray-400 disabled:bg-gray-300 transition-colors"
+                    className="p-1.5 rounded bg-gray-200 hover:bg-gray-300 text-gray-600 disabled:text-gray-400 disabled:bg-gray-300 transition-colors cursor-pointer disabled:cursor-not-allowed"
                     title="Cancel task"
                   >
                     {cancelling ? (

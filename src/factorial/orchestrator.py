@@ -9,12 +9,13 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 
+from factorial.queue import worker_loop, maintenance_loop, Task
+from factorial.queue.keys import RedisKeys
+from factorial.context import ContextType
 from factorial.agent import BaseAgent
-from factorial.queue import worker_loop, maintenance_loop, UPDATES_CHANNEL
 from factorial.llms import MultiClient
 from factorial.utils import to_snake_case
 from factorial.logging import get_logger
-from factorial.task import Task, ContextType
 
 logger = get_logger(__name__)
 
@@ -156,13 +157,17 @@ class Runner:
         self.shutdown_event = shutdown_event
 
     def create_worker_tasks(
-        self, shutdown_event: asyncio.Event
+        self,
+        shutdown_event: asyncio.Event,
+        agents: list[BaseAgent[Any]],
     ) -> list[asyncio.Task[Any]]:
         heartbeat_timeout = (
             self.agent_worker_config.heartbeat_interval
             * self.agent_worker_config.missed_heartbeats_threshold
             + self.agent_worker_config.missed_heartbeats_grace_period
         )
+
+        agents_by_name = {agent.name: agent for agent in agents}
 
         return [
             asyncio.create_task(
@@ -171,6 +176,7 @@ class Runner:
                     redis_pool=self.redis_pool,
                     worker_id=f"{self.queue}-worker-{i + 1}",
                     agent=self.agent,
+                    agents_by_name=agents_by_name,
                     batch_size=self.agent_worker_config.batch_size,
                     max_retries=self.agent_worker_config.max_retries,
                     heartbeat_interval=self.agent_worker_config.heartbeat_interval,
@@ -235,7 +241,7 @@ class Orchestrator:
         self.runners: list[Runner] = []
         self.observability_config = observability_config
         self.metrics_config = metrics_config
-        self._agents_by_name: dict[str, BaseAgent[Any]] = {}
+        self.agents_by_name: dict[str, BaseAgent[Any]] = {}
         self.namespace = namespace or "factorial"
 
         if self.observability_config.dashboard_name is None:
@@ -251,8 +257,18 @@ class Orchestrator:
     def namespace(self, value: str):
         self._namespace = value
 
+    @property
+    def agents(self) -> list[BaseAgent[Any]]:
+        return list(self.agents_by_name.values())
+
+    @agents.setter
+    def agents(self, value: list[BaseAgent[Any]]):
+        self.agents_by_name = {agent.name: agent for agent in value}
+
     def get_updates_channel(self, owner_id: str) -> str:
-        return UPDATES_CHANNEL.format(namespace=self.namespace, owner_id=owner_id)
+        return RedisKeys.for_owner(
+            namespace=self.namespace, owner_id=owner_id
+        ).updates_channel
 
     @asynccontextmanager
     async def _pubsub_context(self, owner_id: str):
@@ -410,15 +426,26 @@ class Orchestrator:
 
         runner.set_shutdown_event(self.shutdown_event)
         self.runners.append(runner)
-        self._agents_by_name[agent.name] = agent
+        self.agents_by_name[agent.name] = agent
 
     def get_agent(self, agent_name: str) -> BaseAgent[Any] | None:
         """Get an agent by name"""
-        return self._agents_by_name.get(agent_name)
+        return self.agents_by_name.get(agent_name)
 
     async def get_redis_client(self) -> redis.Redis:
         """Get a Redis client from the pool"""
         return redis.Redis(connection_pool=self.redis_pool, decode_responses=True)
+
+    async def create_agent_task(
+        self,
+        agent: BaseAgent[Any],
+        payload: ContextType,
+        owner_id: str,
+    ) -> Task[ContextType]:
+        """Create a task with the correct context type for this agent"""
+        task = Task.create(owner_id=owner_id, agent=agent.name, payload=payload)
+        await self.enqueue_task(agent, task)
+        return task
 
     async def enqueue_task(
         self,
@@ -452,6 +479,7 @@ class Orchestrator:
                 redis_client=redis_client,
                 namespace=self.namespace,
                 task_id=task_id,
+                agents_by_name=self.agents_by_name,
                 metrics_bucket_duration=self.metrics_config.bucket_duration,
                 metrics_retention_duration=self.metrics_config.retention_duration,
             )
@@ -497,21 +525,14 @@ class Orchestrator:
             TaskNotFoundError: If the task doesn't exist
             InactiveTaskError: If the task is not active (completed, failed, or cancelled)
         """
-        from factorial.queue import complete_deferred_tool, get_task_agent
+        from factorial.queue import complete_deferred_tool as q_complete_deferred_tool
 
         redis_client = await self.get_redis_client()
         try:
-            # Get the agent for this task
-            agent_name = await get_task_agent(redis_client, self.namespace, task_id)
-            agent = self.get_agent(agent_name)
-
-            if not agent:
-                raise ValueError(f"Agent {agent_name} not found in orchestrator")
-
-            return await complete_deferred_tool(
+            return await q_complete_deferred_tool(
                 redis_client=redis_client,
                 namespace=self.namespace,
-                agent=agent,
+                agents_by_name=self.agents_by_name,
                 task_id=task_id,
                 tool_call_id=tool_call_id,
                 result=result,
@@ -645,7 +666,7 @@ class Orchestrator:
         try:
             workers: list[asyncio.Task[Any]] = []
             for runner in self.runners:
-                workers += runner.create_worker_tasks(shutdown_event)
+                workers += runner.create_worker_tasks(shutdown_event, self.agents)
 
             logger.info(
                 f"Started {len(workers)} total workers for {len(self.runners)} agents"
@@ -715,7 +736,8 @@ class Orchestrator:
                 )
                 loop.run_until_complete(
                     asyncio.gather(
-                        self.start_workers(self.shutdown_event), observability_task
+                        self.start_workers(self.shutdown_event),
+                        observability_task,
                     )
                 )
             else:

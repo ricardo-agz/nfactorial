@@ -93,7 +93,7 @@ class MetricsCollector:
             )
 
             # Initialize result structure
-            system_totals = {"queued": 0, "processing": 0, "idle": 0, "backoff": 0}
+            system_totals = {"queued": 0, "processing": 0, "pending": 0, "backoff": 0}
             activity_timeline = {
                 metric_type: {"buckets": [], "total_tasks": 0, "total_duration": 0}
                 for metric_type in ["completed", "failed", "cancelled", "retried"]
@@ -110,14 +110,12 @@ class MetricsCollector:
                     f"{self._namespace}:processing:{agent_name}:heartbeats"
                 )
                 queue_backoff_key = f"{self._namespace}:queue:{agent_name}:backoff"
-                agent_idle_gauge_key = (
-                    f"{self._namespace}:metrics:gauge:{agent_name}:idle"
-                )
+                queue_pending_key = f"{self._namespace}:queue:{agent_name}:pending"
 
                 pipe.llen(queue_main_key)  # Get main queue length
                 pipe.zcard(processing_heartbeats_key)  # Get processing count
                 pipe.zcard(queue_backoff_key)  # Get backoff count
-                pipe.get(agent_idle_gauge_key)  # Get idle count
+                pipe.zcard(queue_pending_key)  # Get pending count
                 pipe.zrange(
                     processing_heartbeats_key, -1, -1, withscores=True
                 )  # Get last heartbeat
@@ -130,7 +128,7 @@ class MetricsCollector:
                 queued = int(queue_results[base_idx] or 0)
                 processing = int(queue_results[base_idx + 1] or 0)
                 backoff = int(queue_results[base_idx + 2] or 0)
-                idle = int(queue_results[base_idx + 3] or 0)
+                pending = int(queue_results[base_idx + 3] or 0)
                 last_heartbeat_data = queue_results[base_idx + 4]
                 last_heartbeat = (
                     float(last_heartbeat_data[0][1]) if last_heartbeat_data else None
@@ -140,7 +138,7 @@ class MetricsCollector:
                     "queued": queued,
                     "processing": processing,
                     "backoff": backoff,
-                    "idle": idle,
+                    "pending": pending,
                     "last_heartbeat": last_heartbeat,
                     "completed": 0,
                     "failed": 0,
@@ -155,7 +153,7 @@ class MetricsCollector:
                 system_totals["queued"] += queued
                 system_totals["processing"] += processing
                 system_totals["backoff"] += backoff
-                system_totals["idle"] += idle
+                system_totals["pending"] += pending
 
             # Step 2: Collect metrics for each bucket using pipeline
             for bucket_timestamp in bucket_timestamps:
@@ -419,7 +417,7 @@ class MetricsCollector:
                     "failed": activity_timeline["failed"]["total_tasks"],
                     "cancelled": activity_timeline["cancelled"]["total_tasks"],
                     "retried": activity_timeline["retried"]["total_tasks"],
-                    "idle": system_totals["idle"],
+                    "pending": system_totals["pending"],
                     "pending_tool_results": 0,
                 },
                 "queues": [
@@ -428,6 +426,7 @@ class MetricsCollector:
                         "main_queue_size": metrics["queued"],
                         "processing_count": metrics["processing"],
                         "backoff_count": metrics["backoff"],
+                        "pending_count": metrics["pending"],
                         "completed_count": metrics.get("completed", 0),
                         "failed_count": metrics.get("failed", 0),
                         "stale_tasks_count": 0,

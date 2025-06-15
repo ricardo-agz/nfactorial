@@ -30,6 +30,7 @@ export const useWebSocket = ({
 }: UseWebSocketProps) => {
   const wsRef = useRef<WebSocket | null>(null);
   const thinkingRef = useRef<ThinkingProgress | null>(null);
+  const processedTasksRef = useRef<Set<string>>(new Set());
 
   const handleWSMessage = useCallback((evt: MessageEvent) => {
     const event: AgentEvent = JSON.parse(evt.data);
@@ -131,6 +132,8 @@ export const useWebSocket = ({
         break;
 
       case 'agent_output': {
+        if (processedTasksRef.current.has(event.task_id)) break;
+
         const content =
           typeof event.data === 'string'
             ? event.data
@@ -166,10 +169,14 @@ export const useWebSocket = ({
         setSteering(false);
         setSteerMode(false);
         setSteeringStatus(null);
+
+        processedTasksRef.current.add(event.task_id);
         break;
       }
 
       case 'run_cancelled': {
+        if (processedTasksRef.current.has(event.task_id)) break;
+
         const snap = thinkingRef.current;
         let message = 'Task was cancelled.';
         let snapshotThinking: ThinkingProgress | undefined;
@@ -202,10 +209,14 @@ export const useWebSocket = ({
         setSteering(false);
         setSteerMode(false);
         setSteeringStatus(null);
+
+        processedTasksRef.current.add(event.task_id);
         break;
       }
 
       case 'run_failed': {
+        if (processedTasksRef.current.has(event.task_id)) break;
+
         const snap = thinkingRef.current;
         let message = 'Failed to get agent response.';
         let snapshotThinking: ThinkingProgress | undefined;
@@ -238,6 +249,8 @@ export const useWebSocket = ({
         setSteering(false);
         setSteerMode(false);
         setSteeringStatus(null);
+
+        processedTasksRef.current.add(event.task_id);
         break;
       }
 

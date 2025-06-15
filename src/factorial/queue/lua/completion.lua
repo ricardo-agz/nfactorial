@@ -3,26 +3,29 @@ local queue_completions_key = KEYS[2]
 local queue_failed_key = KEYS[3]
 local queue_backoff_key = KEYS[4]
 local queue_orphaned_key = KEYS[5]
-local task_statuses_key = KEYS[6]
-local task_agents_key = KEYS[7]
-local task_payloads_key = KEYS[8]
-local task_pickups_key = KEYS[9]
-local task_retries_key = KEYS[10]
-local task_metas_key = KEYS[11]
-local processing_heartbeats_key = KEYS[12]
-local pending_tool_results_key = KEYS[13]
-local agent_metrics_bucket_key = KEYS[14]
-local global_metrics_bucket_key = KEYS[15]
-local agent_idle_gauge_key = KEYS[16]
-local global_idle_gauge_key = KEYS[17]
+local queue_pending_key = KEYS[6]
+local task_statuses_key = KEYS[7]
+local task_agents_key = KEYS[8]
+local task_payloads_key = KEYS[9]
+local task_pickups_key = KEYS[10]
+local task_retries_key = KEYS[11]
+local task_metas_key = KEYS[12]
+local processing_heartbeats_key = KEYS[13]
+local pending_tool_results_key = KEYS[14]
+local pending_child_tasks_key = KEYS[15]
+local agent_metrics_bucket_key = KEYS[16]
+local global_metrics_bucket_key = KEYS[17]
+local parent_pending_child_tasks_key = KEYS[18] -- Optional
 
 local task_id = ARGV[1]
 local action = ARGV[2]                    -- complete, continue, retry, fail, pending
 local updated_task_payload_json = ARGV[3] -- Only used for continue/fail
 local metrics_ttl = tonumber(ARGV[4])
--- Optional parameters - may not be provided
 local pending_sentinel = ARGV[5]
+-- Optional parameters - "" if not used
 local pending_tool_call_ids_json = ARGV[6]
+local pending_child_task_ids_json = ARGV[7]
+local final_output_json = ARGV[8]
 
 local time_result = redis.call('TIME')
 local timestamp = tonumber(time_result[1]) + (tonumber(time_result[2]) / 1000000)
@@ -48,9 +51,10 @@ local meta_json = task_result.meta
 local pickups = task_result.pickups
 local retries = task_result.retries
 local meta = cjson.decode(meta_json)
+local parent_task_id = meta.parent_id
 
 -- Handle pending tool call results only if both parameters are provided
-if pending_tool_call_ids_json and pending_sentinel then
+if pending_tool_call_ids_json ~= "" then
     local pending_tool_call_ids = cjson.decode(pending_tool_call_ids_json)
     for _, tool_call_id in ipairs(pending_tool_call_ids) do
         redis.call('HSET', pending_tool_results_key, tool_call_id, pending_sentinel)
@@ -59,17 +63,30 @@ if pending_tool_call_ids_json and pending_sentinel then
     redis.call('HSET', task_statuses_key, task_id, "pending_tool_results")
     -- Persist the latest payload so context changes (e.g., turn counter, messages) are not lost
     redis.call('HSET', task_payloads_key, task_id, updated_task_payload_json)
+    -- Add to parked queue
+    redis.call('ZADD', queue_pending_key, timestamp, task_id)
 
-    -- Update idle gauge
-    redis.call('INCR', agent_idle_gauge_key)
-    redis.call('INCR', global_idle_gauge_key)
+    return true
+end
+
+if pending_child_task_ids_json ~= "" then
+    local pending_child_task_ids = cjson.decode(pending_child_task_ids_json)
+    for _, child_task_id in ipairs(pending_child_task_ids) do
+        redis.call('HSET', pending_child_tasks_key, child_task_id, pending_sentinel)
+    end
+    -- Set task status to pending child tasks
+    redis.call('HSET', task_statuses_key, task_id, "pending_child_tasks")
+    -- Persist the latest payload so context changes (e.g., turn counter, messages) are not lost
+    redis.call('HSET', task_payloads_key, task_id, updated_task_payload_json)
+    -- Add to parked queue
+    redis.call('ZADD', queue_pending_key, timestamp, task_id)
 
     return true
 end
 
 if action == "complete" then
     -- Check if task is in a valid state for completion
-    if status ~= "processing" and status ~= "pending_tool_results" then
+    if status ~= "processing" and status ~= "pending_tool_results" and status ~= "pending_child_tasks" then
         return false
     end
 
@@ -85,6 +102,11 @@ if action == "complete" then
         { agent_metrics_bucket_key, global_metrics_bucket_key },
         { 'completed', pickups, retries, meta_json, metrics_ttl }
     )
+
+    -- If the task is a child task, update the parent task's pending child task results
+    if parent_task_id and parent_pending_child_tasks_key then
+        redis.call('HSET', parent_pending_child_tasks_key, task_id, final_output_json)
+    end
 
     return true
 elseif action == "continue" then
@@ -134,7 +156,7 @@ elseif action == "backoff" then
     return true
 elseif action == "fail" then
     -- Check if task is in a valid state for failure
-    if status ~= "processing" and status ~= "pending_tool_results" then
+    if status ~= "processing" and status ~= "pending_tool_results" and status ~= "pending_child_tasks" then
         return false
     end
 

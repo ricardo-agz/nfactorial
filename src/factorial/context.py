@@ -1,12 +1,14 @@
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, TypeVar
 from contextvars import ContextVar
-
 from pydantic import BaseModel
+
 from factorial.events import EventPublisher
 
 
 execution_context: ContextVar["ExecutionContext"] = ContextVar("execution_context")
+
+ContextType = TypeVar("ContextType", bound="AgentContext")
 
 
 @dataclass

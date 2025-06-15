@@ -19,5 +19,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy example code
 COPY examples/code_agent/ ./
 
+# Expose the server port
+EXPOSE 8000
+
 # Run the server
 CMD ["python", "server.py"] 

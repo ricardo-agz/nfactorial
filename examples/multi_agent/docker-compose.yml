@@ -60,7 +60,6 @@ services:
       # Mount UI source code for development
       - ./ui/src:/app/src
       - ./ui/public:/app/public
-      - ./ui/package.json:/app/package.json
       - ./ui/vite.config.js:/app/vite.config.js
       - ./ui/index.html:/app/index.html
     # Restart on file changes (optional)

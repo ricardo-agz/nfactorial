@@ -370,6 +370,15 @@ async def process_task(
         interval=heartbeat_interval,
     ):
         try:
+            execution_ctx = ExecutionContext(
+                task_id=task.id,
+                owner_id=task.metadata.owner_id,
+                retries=task.retries,
+                iterations=task.payload.turn,
+                events=event_publisher,
+                enqueue_child_task=_enqueue_child_task,
+            )
+
             if task.payload.turn == 0 and task.retries == 0:
                 await event_publisher.publish_event(
                     AgentEvent(
@@ -380,14 +389,11 @@ async def process_task(
                     )
                 )
 
-            execution_ctx = ExecutionContext(
-                task_id=task.id,
-                owner_id=task.metadata.owner_id,
-                retries=task.retries,
-                iterations=task.payload.turn,
-                events=event_publisher,
-                enqueue_child_task=_enqueue_child_task,
-            )
+                await agent._safe_call(
+                    agent.on_run_start,
+                    task.payload,
+                    execution_ctx,
+                )
 
             task = await apply_steering_if_available(
                 redis_client=redis_client,
@@ -452,6 +458,15 @@ async def process_task(
                     final_output=turn_completion.output,
                 )
 
+                # Lifecycle callback – run end (success)
+                await agent._safe_call(
+                    agent.on_run_end,
+                    turn_completion.context,
+                    execution_ctx,
+                    turn_completion.output,
+                    None,
+                )
+
                 if parent_task_id:
                     await resume_if_no_remaining_child_tasks(
                         redis_client=redis_client,
@@ -505,6 +520,16 @@ async def process_task(
                 pending_child_task_ids=None,
                 final_output=output,
             )
+
+            # Lifecycle callback – run end (permanent failure)
+            if action is CompletionAction.FAIL:
+                await agent._safe_call(
+                    agent.on_run_end,
+                    task.payload,
+                    execution_ctx,
+                    None,
+                    e,
+                )
 
             if parent_task_id and action is CompletionAction.FAIL:
                 await resume_if_no_remaining_child_tasks(

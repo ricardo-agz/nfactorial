@@ -111,7 +111,7 @@ class MainAgent(BaseAgent[MainAgentContext]):
     def __init__(self):
         super().__init__(
             name="main_agent",
-            description="Basic Agent",
+            description="Main Agent",
             model=gpt_41_mini,
             instructions="You are a helpful assistant. Always start out by making a plan.",
             tools=[plan, reflect, research, search],
@@ -129,6 +129,16 @@ class MainAgent(BaseAgent[MainAgentContext]):
             ),
             context_class=MainAgentContext,
             output_type=FinalOutput,
+            on_run_start=lambda context, execution_ctx: print(
+                "Run started", flush=True
+            ),
+            on_run_end=lambda context, execution_ctx, output, error: print(
+                "Run ended", output, error, flush=True
+            ),
+            on_turn_start=lambda context, execution_ctx: print(
+                "Turn started", flush=True
+            ),
+            on_turn_end=lambda context, execution_ctx: print("Turn ended", flush=True),
         )
 
 

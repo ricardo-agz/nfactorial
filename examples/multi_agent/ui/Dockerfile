@@ -2,6 +2,9 @@ FROM node:18-alpine
 
 WORKDIR /app
 
+# Ensure dev dependencies are installed (needed for Vite dev server)
+ENV NODE_ENV=development
+
 # Copy package files
 COPY package*.json ./
 

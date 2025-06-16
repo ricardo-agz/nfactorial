@@ -324,6 +324,18 @@ class BaseAgent(Generic[ContextType]):
         parse_tool_args: bool = True,
         context_class: type = AgentContext,
         output_type: type[BaseModel] | None = None,
+        # ---- Lifecycle callbacks ---- #
+        on_run_start: Callable[[ContextType, ExecutionContext], Awaitable[None] | None]
+        | None = None,
+        on_run_end: Callable[
+            [ContextType, ExecutionContext, Any | None, Exception | None],
+            Awaitable[None] | None,
+        ]
+        | None = None,
+        on_turn_start: Callable[[ContextType, ExecutionContext], Awaitable[None] | None]
+        | None = None,
+        on_turn_end: Callable[[ContextType, ExecutionContext], Awaitable[None] | None]
+        | None = None,
     ):
         self.name = to_snake_case(name or self.__class__.__name__)
         self.description = description or self.__class__.__name__
@@ -343,6 +355,12 @@ class BaseAgent(Generic[ContextType]):
         self.final_output_tool = (
             create_final_output_tool(self.output_type) if self.output_type else None
         )
+
+        # Lifecycle callbacks
+        self.on_run_start = on_run_start
+        self.on_run_end = on_run_end
+        self.on_turn_start = on_turn_start
+        self.on_turn_end = on_turn_end
 
     # ===== Overridable Methods ===== #
 
@@ -552,6 +570,10 @@ class BaseAgent(Generic[ContextType]):
     ) -> TurnCompletion[ContextType]:
         """Run a single turn. Override for custom logic."""
 
+        # Lifecycle callback – turn start
+        execution_ctx = ExecutionContext.current()
+        await self._safe_call(self.on_turn_start, agent_ctx, execution_ctx)
+
         messages = self.prepare_messages(agent_ctx)
 
         response = await self._completion_with_retry_and_progress(
@@ -577,11 +599,15 @@ class BaseAgent(Generic[ContextType]):
             output = self._extract_output(response)
             agent_ctx.output = output  # Store the final output in the agent context
             agent_ctx.messages = messages
-            return TurnCompletion(
+            completion = TurnCompletion(
                 is_done=True,
                 context=agent_ctx,
                 output=output,
             )
+
+            # Lifecycle callback – turn end
+            await self._safe_call(self.on_turn_end, agent_ctx, execution_ctx)
+            return completion
 
         # Handle tool calls and append results to messages
         pending_tool_call_ids: list[str] = []
@@ -597,12 +623,16 @@ class BaseAgent(Generic[ContextType]):
 
         agent_ctx.messages = messages
         agent_ctx.turn += 1
-        return TurnCompletion(
+        completion = TurnCompletion(
             is_done=False,
             context=agent_ctx,
             pending_tool_call_ids=pending_tool_call_ids,
             pending_child_task_ids=pending_child_task_ids,
         )
+
+        # Lifecycle callback – turn end
+        await self._safe_call(self.on_turn_end, agent_ctx, execution_ctx)
+        return completion
 
     def process_deferred_tool_results(
         self,
@@ -850,10 +880,23 @@ class BaseAgent(Generic[ContextType]):
             logger.error(
                 f"Agent {self.name} failed to execute turn {agent_ctx.turn}", exc_info=e
             )
+
             raise e
 
         finally:
             execution_context.reset(token)
+
+    async def _safe_call(self, func: Callable[..., Any] | None, *args: Any) -> None:
+        """Safely call a (possibly async) callback without letting it crash the agent."""
+        if func is None:
+            return
+
+        try:
+            result = func(*args)
+            if inspect.isawaitable(result):
+                await result  # type: ignore[func-returns-value]
+        except Exception:
+            logger.exception("Error in lifecycle callback", exc_info=True)
 
 
 class Agent(BaseAgent[AgentContext]):

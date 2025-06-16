@@ -1,6 +1,9 @@
-# Basic Agent Example
+# Research Agent Example
 
-AI agent that can search the web, make plans, and reflect on tasks.
+AI agent that can search the web, make plans, spin up independent research subagents, and reflect on tasks.
+
+![Multi-Agent](../../docs/static/img/multi-agent.png)
+
 
 ## Quick Start with Docker
 
@@ -49,4 +52,4 @@ cd ui && npm run dev  # UI
 
 ### URLs
 - UI: http://localhost:5173
-- Dashboard: http://localhost:8081
+- Dashboard: http://localhost:8080

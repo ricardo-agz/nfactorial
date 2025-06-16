@@ -31,7 +31,7 @@ const sidebars: SidebarsConfig = {
       type: 'category',
       label: 'Examples',
       items: [
-        'examples/basic_agent',
+        'examples/multi_agent',
         'examples/code_agent',
       ],
     },

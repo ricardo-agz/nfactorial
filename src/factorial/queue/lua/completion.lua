@@ -170,6 +170,11 @@ elseif action == "fail" then
         { 'failed', pickups, retries, meta_json, metrics_ttl }
     )
 
+    -- If the task is a child task, update the parent task's pending child task results
+    if parent_task_id and parent_pending_child_tasks_key then
+        redis.call('HSET', parent_pending_child_tasks_key, task_id, final_output_json)
+    end
+
     return true
 else
     error("invalid_action")

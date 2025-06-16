@@ -13,14 +13,14 @@ COPY src ./src/
 RUN pip install -e .
 
 # Copy example requirements and install additional dependencies
-COPY examples/basic/requirements.txt ./
+COPY examples/multi_agent/requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy example code
-COPY examples/basic/ ./
+COPY examples/multi_agent/ ./
 
 # Expose the observability port
-EXPOSE 8081
+EXPOSE 8080
 
 # Run the agent
 CMD ["python", "agent.py"] 

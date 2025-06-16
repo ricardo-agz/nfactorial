@@ -14,6 +14,7 @@ from factorial.exceptions import (
     CorruptedTaskDataError,
 )
 from factorial.queue.keys import RedisKeys
+from factorial.utils import is_valid_task_id
 
 
 class TaskStatus(str, Enum):
@@ -231,11 +232,3 @@ async def get_task_steering_messages(
         message_data.append((message_id_str, json.loads(message_str)))
 
     return message_data
-
-
-def is_valid_task_id(task_id: str) -> bool:
-    try:
-        uuid.UUID(task_id)
-    except ValueError:
-        return False
-    return True

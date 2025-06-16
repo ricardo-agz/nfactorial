@@ -1,8 +1,8 @@
-# Basic Search Agent
+# Multi-Agent Research
 
-A simple agent with the ability to search the web and the ability to steer and cancel tasks mid-flight.
+A complx research agent that can search the web and spin up multiple independent research sub-agents. 
 
-![Dashboard](../../static/img/basic-agent.png)
+![Dashboard](../../static/img/multi-agent.png)
 
 ## 1. Create the agent
 
@@ -61,7 +61,74 @@ if __name__ == "__main__":
 
 `register_runner` spins up a pool of workers that pull tasks from Redis and drive the agent.
 
-## 3. Expose an API & WebSocket
+## 3. Forking tools: spawn independent child tasks
+
+Let's say we want to give our agent the ability to spin up multiple independent research subagents and wait for their results. We can do so by creating a new tool that spawns multiple child tasks using the `@forking_tool`.
+
+First, create the research subagent:
+
+```python
+from factorial import BaseModel
+
+class SubAgentOutput(BaseModel):
+    findings: list[str]
+
+search_agent = Agent(
+    name="research_subagent",
+    description="Research Sub-Agent",
+    model=gpt_41_mini,
+    instructions="You are an intelligent research assistant.",
+    tools=[plan, reflect, search],
+    output_type=SubAgentOutput,
+)
+```
+
+Register the subagent's runner in your orchestrator:
+
+```python
+orchestrator.register_runner(
+    agent=search_agent,
+    agent_worker_config=AgentWorkerConfig(workers=25, turn_timeout=120),
+)
+```
+
+Now create the forking tool that spawns child tasks:
+
+```python
+from factorial.tools import forking_tool
+from factorial.context import ExecutionContext
+
+@forking_tool(timeout=600)
+async def research(
+    queries: list[str],
+    agent_ctx: AgentContext,
+    execution_ctx: ExecutionContext,
+) -> list[str]:
+    """Spawn child search tasks for each query."""
+    
+    # Create payloads for each child task
+    payloads = [AgentContext(query=q) for q in queries]
+    
+    # Spawn child tasks and get their IDs
+    child_ids = await execution_ctx.spawn_child_tasks(search_agent, payloads)
+    
+    return child_ids
+```
+
+**Key points:**
+
+- `@forking_tool(timeout=600)` marks the tool as one that spawns child tasks
+- The tool MUST return the list of the child task ids for the parent agent to wait and listen for their completion.
+- The parent task pauses until all child tasks complete
+- Child results get automatically formatted and added to the conversation
+
+When the agent calls this tool, it:
+1. Creates child tasks for each query
+2. Returns the child task IDs
+3. Pauses execution of the parent agent
+4. Resumes when all children complete, with results in the conversation
+
+## 4. Expose an API & WebSocket
 
 `server.py`
 
@@ -141,10 +208,9 @@ async def cancel_task_endpoint(request: CancelRequest):
         }
     except Exception as e:
         return {"success": False, "error": str(e)}
-
 ```
 
-## 4. Queue your first task
+## 5. Queue your first task
 
 ```bash
 curl -X POST http://localhost:8000/api/enqueue \
@@ -158,7 +224,7 @@ curl -X POST http://localhost:8000/api/enqueue \
 
 The response contains the `task_id`. Open the WebSocket at `ws://localhost:8000/ws/demo` to watch progress in real-time.
 
-## 5. Steering & cancellation
+## 6. Steering & cancellation
 
 ```bash
 # append a follow-up instruction
@@ -173,7 +239,7 @@ curl -X POST http://localhost:8000/api/cancel \
 `steer` publishes `run_steering_applied` / `run_steering_failed` events.  
 `cancel` publishes `run_cancelled`.
 
-## 6. Run everything
+## 7. Run everything
 
 ```bash
 # run orchestrator

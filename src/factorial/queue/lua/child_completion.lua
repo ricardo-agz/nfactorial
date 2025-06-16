@@ -26,10 +26,10 @@ redis.call('ZREM', queue_pending_key, task_id)
 
 if task_result.state == "ok" then
     -- Only move the task back to the main queue if it is still waiting for
-    -- child task results (status == 'pending_child_task_results'). This prevents a
+    -- child task results (status == 'pending_child_tasks'). This prevents a
     -- race condition where multiple concurrent completions for the same task
     -- could re-enqueue the task more than once.
-    if task_result.status ~= 'pending_child_task_results' then
+    if task_result.status ~= 'pending_child_tasks' then
         return { false, 'already_completed' }
     end
 

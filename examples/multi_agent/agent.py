@@ -3,6 +3,7 @@ import os
 from dotenv import load_dotenv
 
 from factorial import (
+    BaseAgent,
     Agent,
     AgentContext,
     Orchestrator,
@@ -13,7 +14,10 @@ from factorial import (
     TaskTTLConfig,
     ObservabilityConfig,
     MetricsTimelineConfig,
+    function_tool,
 )
+from factorial.tools import forking_tool
+from factorial.context import ExecutionContext
 from factorial.utils import BaseModel
 from exa_py import Exa
 
@@ -59,11 +63,17 @@ class FinalOutput(BaseModel):
     final_output: str
 
 
-basic_agent = Agent(
-    description="Basic Agent",
+class SearchOutput(BaseModel):
+    findings: list[str]
+
+
+search_agent = Agent(
+    name="research_subagent",
+    description="Research Sub-Agent",
     model=gpt_41_mini,
-    instructions="You are a helpful assistant. Always start out by making a plan.",
+    instructions="You are an intelligent research assistant.",
     tools=[plan, reflect, search],
+    output_type=SearchOutput,  # Forces final_output tool
     model_settings=ModelSettings[AgentContext](
         temperature=0.0,
         tool_choice=lambda context: (
@@ -75,8 +85,54 @@ basic_agent = Agent(
             else "required"
         ),
     ),
-    output_type=FinalOutput,
 )
+
+
+class MainAgentContext(AgentContext):
+    has_used_research: bool = False
+
+
+@function_tool(is_enabled=lambda context: not context.has_used_research)
+@forking_tool(timeout=600)
+async def research(
+    queries: list[str],
+    agent_ctx: MainAgentContext,
+    execution_ctx: ExecutionContext,
+) -> list[str]:
+    """Spawn child search tasks for each query and wait for them to complete."""
+
+    payloads = [AgentContext(query=q) for q in queries]
+    child_ids = await execution_ctx.spawn_child_tasks(search_agent, payloads)
+    agent_ctx.has_used_research = True
+    return child_ids
+
+
+class MainAgent(BaseAgent[MainAgentContext]):
+    def __init__(self):
+        super().__init__(
+            name="main_agent",
+            description="Basic Agent",
+            model=gpt_41_mini,
+            instructions="You are a helpful assistant. Always start out by making a plan.",
+            tools=[plan, reflect, research, search],
+            model_settings=ModelSettings[AgentContext](
+                temperature=0.0,
+                tool_choice=lambda context: (
+                    {
+                        "type": "function",
+                        "function": {"name": "plan"},
+                    }
+                    if context.turn == 0
+                    else "required"
+                ),
+                parallel_tool_calls=False,
+            ),
+            context_class=MainAgentContext,
+            output_type=FinalOutput,
+        )
+
+
+basic_agent = MainAgent()
 
 orchestrator = Orchestrator(
     redis_host=os.getenv("REDIS_HOST", "localhost"),
@@ -90,6 +146,19 @@ orchestrator = Orchestrator(
         host="0.0.0.0",
         port=8081,
         cors_origins=["*"],
+    ),
+)
+
+orchestrator.register_runner(
+    agent=search_agent,
+    agent_worker_config=AgentWorkerConfig(
+        workers=25,
+        batch_size=15,
+        max_retries=3,
+        heartbeat_interval=2,
+        missed_heartbeats_threshold=3,
+        missed_heartbeats_grace_period=1,
+        turn_timeout=60,
     ),
 )
 

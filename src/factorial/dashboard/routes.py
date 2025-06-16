@@ -156,10 +156,14 @@ class MetricsCollector:
                 system_totals["pending"] += pending
 
             # Step 2: Collect metrics for each bucket using pipeline
-            for bucket_timestamp in bucket_timestamps:
-                pipe = self._r.pipeline(transaction=False)
+            # Build a single pipeline for all buckets to minimize network round-trips
+            metric_types = ["completed", "failed", "cancelled", "retried"]
 
-                # Get global metrics using exact key pattern from queue.py
+            pipe = self._r.pipeline(transaction=False)
+
+            # Queue HMGETs for every bucket (global + per-agent) in one pipeline
+            for bucket_timestamp in bucket_timestamps:
+                # Global metrics
                 global_metrics_key = (
                     f"{self._namespace}:metrics:__all__:{bucket_timestamp}"
                 )
@@ -183,7 +187,7 @@ class MetricsCollector:
                     "retried_total_retries",
                 )
 
-                # Get per-agent metrics
+                # Per-agent metrics for this bucket
                 for agent_name in agent_names:
                     agent_metrics_key = (
                         f"{self._namespace}:metrics:{agent_name}:{bucket_timestamp}"
@@ -208,17 +212,22 @@ class MetricsCollector:
                         "retried_total_retries",
                     )
 
-                results = await pipe.execute()
+            # Execute the pipeline once (single network round-trip)
+            results = await pipe.execute()
 
-                # Process global metrics
-                global_metrics = results[0]
-                metric_types = ["completed", "failed", "cancelled", "retried"]
+            num_keys_per_bucket = 1 + len(agent_names)
+
+            for bucket_idx, bucket_timestamp in enumerate(bucket_timestamps):
+                base_result_idx = bucket_idx * num_keys_per_bucket
+
+                # -------- Global metrics --------
+                global_metrics = results[base_result_idx]
                 for i, metric_type in enumerate(metric_types):
-                    base_idx = i * 4
-                    count = int(global_metrics[base_idx] or 0)
-                    total_duration = float(global_metrics[base_idx + 1] or 0)
-                    total_turns = int(global_metrics[base_idx + 2] or 0)
-                    total_retries = int(global_metrics[base_idx + 3] or 0)
+                    m_base = i * 4
+                    count = int(global_metrics[m_base] or 0)
+                    total_duration = float(global_metrics[m_base + 1] or 0)
+                    total_turns = int(global_metrics[m_base + 2] or 0)
+                    total_retries = int(global_metrics[m_base + 3] or 0)
 
                     activity_timeline[metric_type]["buckets"].append(
                         {
@@ -232,15 +241,15 @@ class MetricsCollector:
                     activity_timeline[metric_type]["total_tasks"] += count
                     activity_timeline[metric_type]["total_duration"] += total_duration
 
-                # Process per-agent metrics
+                # -------- Per-agent metrics --------
                 for agent_idx, agent_name in enumerate(agent_names):
-                    agent_metrics_result = results[agent_idx + 1]
+                    agent_metrics_result = results[base_result_idx + 1 + agent_idx]
                     for i, metric_type in enumerate(metric_types):
-                        base_idx = i * 4
-                        count = int(agent_metrics_result[base_idx] or 0)
-                        total_duration = float(agent_metrics_result[base_idx + 1] or 0)
-                        total_turns = int(agent_metrics_result[base_idx + 2] or 0)
-                        total_retries = int(agent_metrics_result[base_idx + 3] or 0)
+                        m_base = i * 4
+                        count = int(agent_metrics_result[m_base] or 0)
+                        total_duration = float(agent_metrics_result[m_base + 1] or 0)
+                        total_turns = int(agent_metrics_result[m_base + 2] or 0)
+                        total_retries = int(agent_metrics_result[m_base + 3] or 0)
 
                         agent_activity_timelines[agent_name][metric_type][
                             "buckets"

@@ -31,6 +31,9 @@ const App: React.FC = () => {
     useState<ThinkingProgress | null>(null);
   const [currentTaskId, setCurrentTaskId] = useState<string | null>(null);
 
+  /* Track progress for research sub-agent tasks */
+  const [subAgentProgress, setSubAgentProgress] = useState<Record<string, ThinkingProgress>>({});
+
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
   useWebSocket({
@@ -43,6 +46,7 @@ const App: React.FC = () => {
     setSteering,
     setSteerMode,
     setSteeringStatus,
+    setSubAgentProgress,
   });
 
   const { sendPrompt, cancelCurrentTask, sendSteeringMessage } = useChat({
@@ -67,6 +71,28 @@ const App: React.FC = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages, currentThinking]);
 
+  // Helper to format message content, handling <sub_task_results> blocks
+  const renderContent = (content: string) => {
+    if (content.includes('<sub_task_result')) {
+      const regex = /<sub_task_result[^>]*>([\s\S]*?)<\/sub_task_result>/g;
+      const items: string[] = [];
+      let match;
+      while ((match = regex.exec(content)) !== null) {
+        items.push(match[1].trim());
+      }
+      if (items.length) {
+        return (
+          <ul className="list-disc pl-4 space-y-1 text-sm text-gray-800">
+            {items.map((it, idx) => (
+              <li key={idx}>{it}</li>
+            ))}
+          </ul>
+        );
+      }
+    }
+    return <p className="text-sm text-gray-800 whitespace-pre-wrap">{content}</p>;
+  };
+
   const renderedMessages = useMemo(
     () =>
       messages.map(m => (
@@ -79,9 +105,14 @@ const App: React.FC = () => {
             </div>
           ) : (
             <div className="flex flex-col gap-2">
-              {m.thinking && <ThinkingDropdown thinking={m.thinking} />}
+              {m.thinking && (
+                <ThinkingDropdown
+                  thinking={m.thinking}
+                  subAgentProgress={subAgentProgress}
+                />
+              )}
               <div className="bg-white border border-gray-200 rounded-lg px-3 py-2">
-                <p className="text-sm text-gray-800">{m.content}</p>
+                {renderContent(m.content)}
               </div>
             </div>
           )}
@@ -121,7 +152,10 @@ const App: React.FC = () => {
           {(loading && currentThinking) ||
           (currentThinking && currentThinking.is_complete) ? (
             <div className="mb-4">
-              <ThinkingDropdown thinking={currentThinking as ThinkingProgress} />
+              <ThinkingDropdown
+                thinking={currentThinking as ThinkingProgress}
+                subAgentProgress={subAgentProgress}
+              />
             </div>
           ) : null}
 

@@ -28,6 +28,7 @@ from factorial.queue.operations import (
     resume_if_no_remaining_child_tasks,
     process_cancelled_tasks,
     get_task_batch,
+    enqueue_task,
 )
 from factorial.queue.keys import RedisKeys, PENDING_SENTINEL
 
@@ -317,12 +318,42 @@ async def process_task(
                 pending_child_task_ids_json=json.dumps(pending_child_task_ids)
                 if pending_child_task_ids
                 else None,
-                final_output_json=json.dumps(final_output) if final_output else None,
+                final_output_json=json.dumps(final_output),
             )
         except Exception as e:
             logger.error(f"Error completing task: {e}", exc_info=e)
             # Re-raise the exception so the calling code knows the completion failed
             raise
+
+    async def _enqueue_child_task(
+        child_agent: BaseAgent[Any],
+        child_payload: ContextType,  # type: ignore[type-var]
+    ) -> str:
+        """Lightweight wrapper to enqueue a child task.
+
+        The function automatically sets the current *task.id* as the
+        parent_id in the child task's metadata so the orchestrator can
+        link the two tasks and handle result propagation/resume logic.
+        Returns the *child task_id*.
+        """
+
+        # Create the child task and link to the parent via metadata
+        child_task: Task[ContextType] = Task.create(
+            owner_id=task.metadata.owner_id,
+            agent=child_agent.name,
+            payload=child_payload,
+        )  # type: ignore[arg-type]
+
+        child_task.metadata.parent_id = task.id  # Link parent
+
+        await enqueue_task(
+            redis_client=redis_client,
+            namespace=namespace,
+            agent=child_agent,
+            task=child_task,
+        )
+
+        return child_task.id
 
     event_publisher = EventPublisher(
         redis_client=redis_client,
@@ -355,6 +386,7 @@ async def process_task(
                 retries=task.retries,
                 iterations=task.payload.turn,
                 events=event_publisher,
+                enqueue_child_task=_enqueue_child_task,
             )
 
             task = await apply_steering_if_available(

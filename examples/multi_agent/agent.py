@@ -129,12 +129,16 @@ class MainAgent(BaseAgent[MainAgentContext]):
             ),
             context_class=MainAgentContext,
             output_type=FinalOutput,
-            on_run_start=lambda context, execution_ctx: print("Run started"),
-            on_run_end=lambda context, execution_ctx, output, error: print(
-                "Run ended", output, error
+            on_run_start=lambda context, execution_ctx: print(
+                "Run started", flush=True
             ),
-            on_turn_start=lambda context, execution_ctx: print("Turn started"),
-            on_turn_end=lambda context, execution_ctx: print("Turn ended"),
+            on_run_end=lambda context, execution_ctx, output, error: print(
+                "Run ended", output, error, flush=True
+            ),
+            on_turn_start=lambda context, execution_ctx: print(
+                "Turn started", flush=True
+            ),
+            on_turn_end=lambda context, execution_ctx: print("Turn ended", flush=True),
         )
 
 

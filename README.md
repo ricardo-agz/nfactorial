@@ -1,18 +1,15 @@
 # nFactorial
 
-Factorial is a Python framework for reliably running high-concurrency agents asynchronously. 
-It's designed for production workloads where you need to process thousands of agent tasks concurrently with built-in retries, monitoring, and distributed execution.
+Factorial is a distributed task queue for building reliable multi-agent systems. It makes the following trivial to implement:
+
+* **Agent Reliability**: Automatic retries, backoff strategies, and recovery of dropped tasks from crashed workers.
+* **In-flight Task Management**: Cancel, steer, and monitor running tasks. 
+* **Spawning Sub Agents**: Having an agent spawn multiple sub agents and wait for their completion before continuing.
+* **Deferred Tools**: Pause the agent while it waits for long running tools to complete externally or wait for user approval before continuing.
+* **Observability**: Built-in metrics dashboard and comprehensive logging
 
 ![Dashboard](https://raw.githubusercontent.com/ricardo-agz/nfactorial/main/docs/static/img/dashboard.png)
 
-## Features
-
-* **Distributed execution**: Run agents across multiple workers and machines with Redis-based coordination
-* **Fault tolerance**: Automatic retries, backoff strategies, and recovery of dropped tasks from crashed workers
-* **Real-time events**: Stream progress updates and results via WebSocket or Redis pub/sub
-* **In-flight agent task management**: Cancel, steer, and monitor running tasks
-* **Observability**: Built-in metrics dashboard and comprehensive logging
-* **Deferred tools**: Support for long-running operations that complete outside the agent execution
 
 ## Installation
 

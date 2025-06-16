@@ -10,7 +10,7 @@ services:
   agent:
     build:
       context: ../../
-      dockerfile: examples/basic/Dockerfile.agent
+      dockerfile: examples/multi_agent/Dockerfile.agent
     environment:
       - OPENAI_API_KEY=${OPENAI_API_KEY}
       - EXA_API_KEY=${EXA_API_KEY}
@@ -19,7 +19,7 @@ services:
       - REDIS_DB=0
       - REDIS_MAX_CONNECTIONS=1000
     ports:
-      - "8081:8081"
+      - "8080:8080"
     depends_on:
       - redis
     volumes:
@@ -32,7 +32,7 @@ services:
   server:
     build:
       context: ../../
-      dockerfile: examples/basic/Dockerfile.server
+      dockerfile: examples/multi_agent/Dockerfile.server
     environment:
       - REDIS_HOST=redis
       - OPENAI_API_KEY=${OPENAI_API_KEY}

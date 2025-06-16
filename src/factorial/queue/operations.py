@@ -17,8 +17,8 @@ from factorial.queue.task import (
     get_task_status,
     get_task_data,
     get_task_agent,
-    is_valid_task_id,
 )
+from factorial.utils import is_valid_task_id
 from factorial.exceptions import (
     InactiveTaskError,
     TaskNotFoundError,
@@ -117,7 +117,7 @@ async def enqueue_task(
     namespace: str,
     agent: BaseAgent[Any],
     task: Task[ContextType],
-) -> None:
+) -> str:
     keys = RedisKeys.format(namespace=namespace, agent=agent.name)
 
     if not is_valid_task_id(task.id):
@@ -139,6 +139,8 @@ async def enqueue_task(
         task_retries=0,
         task_meta_json=task.metadata.to_json(),
     )
+
+    return task.id
 
 
 async def cancel_task(
@@ -236,7 +238,7 @@ async def resume_if_no_remaining_child_tasks(
     task_data = await get_task_data(redis_client, namespace, task_id)
     task_status = TaskStatus(task_data["status"])
     if task_status in [TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED]:
-        raise InactiveTaskError(task_id)
+        return False
 
     agent_name = task_data["agent"]
     agent = agents_by_name[agent_name]

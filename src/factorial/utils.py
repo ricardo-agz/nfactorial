@@ -1,3 +1,4 @@
+import uuid
 import re
 from typing import Any
 from pydantic import BaseModel
@@ -29,3 +30,11 @@ def serialize_data(data: Any) -> Any:
 
 def decode(data: bytes | str) -> str:
     return data.decode("utf-8") if isinstance(data, bytes) else data
+
+
+def is_valid_task_id(task_id: str) -> bool:
+    try:
+        uuid.UUID(task_id)
+    except ValueError:
+        return False
+    return True

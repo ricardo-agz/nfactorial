@@ -1,9 +1,8 @@
 import { useCallback, useRef, useEffect } from 'react';
 import { AgentEvent, ThinkingProgress, Message } from '../types';
 
-const env = import.meta.env;
-
-const WS_BASE = env.VITE_WS_BASE_URL;
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const WS_BASE: string = (import.meta as any).env.VITE_WS_BASE_URL;
 
 interface UseWebSocketProps {
   userId: string;
@@ -15,6 +14,7 @@ interface UseWebSocketProps {
   setSteering: (steering: boolean) => void;
   setSteerMode: (steerMode: boolean) => void;
   setSteeringStatus: (status: 'idle' | 'sending' | 'applied' | 'failed' | null) => void;
+  setSubAgentProgress?: React.Dispatch<React.SetStateAction<Record<string, ThinkingProgress>>>;
 }
 
 export const useWebSocket = ({
@@ -27,10 +27,12 @@ export const useWebSocket = ({
   setSteering,
   setSteerMode,
   setSteeringStatus,
+  setSubAgentProgress,
 }: UseWebSocketProps) => {
   const wsRef = useRef<WebSocket | null>(null);
   const thinkingRef = useRef<ThinkingProgress | null>(null);
   const processedTasksRef = useRef<Set<string>>(new Set());
+  const subAgentProgressRef = useRef<Record<string, ThinkingProgress>>({});
 
   const handleWSMessage = useCallback((evt: MessageEvent) => {
     const event: AgentEvent = JSON.parse(evt.data);
@@ -43,6 +45,134 @@ export const useWebSocket = ({
         return next;
       });
     };
+
+    const updateSubAgentThinking = (
+      taskId: string,
+      updater: (prev: ThinkingProgress | null) => ThinkingProgress | null,
+    ) => {
+      setSubAgentProgress?.(prev => {
+        const current = prev[taskId] ?? null;
+        const next    = updater(current);
+        if (!next) return prev; // do nothing if null
+        const updated = { ...prev, [taskId]: next };
+        subAgentProgressRef.current = updated;
+        return updated;
+      });
+    };
+
+    if (subAgentProgressRef.current[event.task_id]) {
+      switch (event.event_type) {
+        case 'progress_update_tool_action_started': {
+          const toolCall = event.data?.args?.[0];
+          if (!toolCall) break;
+
+          updateSubAgentThinking(event.task_id, prev => {
+            const base: ThinkingProgress = prev ?? {
+              task_id    : event.task_id,
+              tool_calls : {},
+              is_complete: false,
+            };
+            return {
+              ...base,
+              tool_calls: {
+                ...base.tool_calls,
+                [toolCall.id]: {
+                  id       : toolCall.id,
+                  tool_name: toolCall.function.name,
+                  arguments: toolCall.function.arguments,
+                  status   : 'started',
+                },
+              },
+            };
+          });
+          break;
+        }
+
+        case 'progress_update_tool_action_completed': {
+          const resp     = event.data?.result;
+          const toolCall = resp?.tool_call;
+          if (!toolCall) break;
+
+          updateSubAgentThinking(event.task_id, prev => {
+            if (!prev) return null;
+            return {
+              ...prev,
+              tool_calls: {
+                ...prev.tool_calls,
+                [toolCall.id]: {
+                  ...prev.tool_calls[toolCall.id],
+                  status: 'completed',
+                  result: resp.output_data,
+                },
+              },
+            };
+          });
+          break;
+        }
+
+        case 'progress_update_tool_action_failed': {
+          const toolCall = event.data?.args?.[0];
+          if (!toolCall) break;
+
+          updateSubAgentThinking(event.task_id, prev => {
+            if (!prev) return null;
+            return {
+              ...prev,
+              tool_calls: {
+                ...prev.tool_calls,
+                [toolCall.id]: {
+                  ...prev.tool_calls[toolCall.id],
+                  status: 'failed',
+                  error : event.error,
+                },
+              },
+            };
+          });
+          break;
+        }
+
+        case 'progress_update_completion_failed':
+          updateSubAgentThinking(event.task_id, prev => (prev ? { ...prev, error: event.error } : null));
+          break;
+
+        case 'agent_output': {
+          const finalData = event.data;
+
+          updateSubAgentThinking(event.task_id, prev => {
+            if (!prev) return null;
+            return {
+              ...prev,
+              is_complete : true,
+              final_output: finalData,
+            };
+          });
+
+          processedTasksRef.current.add(event.task_id);
+          break;
+        }
+
+        case 'run_cancelled': {
+          updateSubAgentThinking(event.task_id, prev => (
+            prev ? { ...prev, is_complete: true, error: 'Task cancelled by user' } : null
+          ));
+          processedTasksRef.current.add(event.task_id);
+          break;
+        }
+
+        case 'run_failed': {
+          updateSubAgentThinking(event.task_id, prev => (
+            prev ? { ...prev, is_complete: true, error: event.error || 'Agent failed to complete the task' } : null
+          ));
+          processedTasksRef.current.add(event.task_id);
+          break;
+        }
+
+        default:
+          console.log('Unhandled sub-agent event:', event);
+      }
+
+      return; // We've handled the event as sub-agent, stop processing further for main agent path
+    }
 
     switch (event.event_type) {
       case 'progress_update_tool_action_started': {
@@ -90,6 +220,24 @@ export const useWebSocket = ({
             },
           };
         });
+
+        if (resp?.tool_call?.function?.name === 'research' && Array.isArray(resp.output_data)) {
+          const taskIds: string[] = resp.output_data;
+          setSubAgentProgress?.(prev => {
+            const updated = { ...prev };
+            taskIds.forEach(id => {
+              if (!updated[id]) {
+                updated[id] = {
+                  task_id    : id,
+                  tool_calls : {},
+                  is_complete: false,
+                };
+              }
+            });
+            subAgentProgressRef.current = updated;
+            return updated;
+          });
+        }
         break;
       }
 
@@ -257,7 +405,7 @@ export const useWebSocket = ({
       default:
         console.log('Unhandled event:', event);
     }
-  }, [setCurrentThinking, setMessages, setLoading, setCurrentTaskId, setCancelling, setSteering, setSteerMode, setSteeringStatus]);
+  }, [setCurrentThinking, setMessages, setLoading, setCurrentTaskId, setCancelling, setSteering, setSteerMode, setSteeringStatus, setSubAgentProgress]);
 
   useEffect(() => {
     const ws = new WebSocket(`${WS_BASE}/${userId}`);
@@ -273,6 +421,14 @@ export const useWebSocket = ({
       return prev;
     });
   }, [setCurrentThinking]);
+
+  // Keep subAgentProgressRef in sync
+  useEffect(() => {
+    return setSubAgentProgress?.(prev => {
+      subAgentProgressRef.current = prev;
+      return prev;
+    });
+  }, [setSubAgentProgress]);
 
   return wsRef;
 }; 

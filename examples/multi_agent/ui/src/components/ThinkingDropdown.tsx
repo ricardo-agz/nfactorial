@@ -2,13 +2,16 @@ import React, { useState } from 'react';
 import { ChevronDown, ChevronRight } from 'lucide-react';
 import { ThinkingProgress } from '../types';
 import { ToolIcon, ToolArguments, ToolResultDisplay } from './ToolResult';
+import { SubAgentCarousel } from './SubAgentCarousel';
 
 interface ThinkingDropdownProps {
   thinking: ThinkingProgress;
+  subAgentProgress?: Record<string, ThinkingProgress>;
 }
 
 export const ThinkingDropdown: React.FC<ThinkingDropdownProps> = ({
   thinking,
+  subAgentProgress,
 }) => {
   const [open, setOpen] = useState(true);
   const calls = Object.values(thinking.tool_calls);
@@ -68,7 +71,11 @@ export const ThinkingDropdown: React.FC<ThinkingDropdownProps> = ({
 
                   {call.status === 'completed' && call.result && (
                     <div>
-                      <ToolResultDisplay name={call.tool_name} result={call.result} />
+                      {call.tool_name === 'research' && Array.isArray(call.result) && subAgentProgress ? (
+                        <SubAgentCarousel taskIds={call.result as string[]} progressMap={subAgentProgress} />
+                      ) : (
+                        <ToolResultDisplay name={call.tool_name} result={call.result} />
+                      )}
                     </div>
                   )}
 

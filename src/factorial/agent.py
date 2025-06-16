@@ -9,7 +9,6 @@ from typing import (
     Generic,
     overload,
     TypeVar,
-    TYPE_CHECKING,
 )
 from functools import wraps
 from dataclasses import dataclass, field
@@ -30,7 +29,7 @@ from factorial.context import (
     ContextType,
 )
 from factorial.llms import Model, MultiClient
-from factorial.utils import serialize_data, to_snake_case
+from factorial.utils import serialize_data, to_snake_case, is_valid_task_id
 from factorial.events import EventPublisher, AgentEvent
 from factorial.logging import get_logger
 from factorial.exceptions import RETRYABLE_EXCEPTIONS
@@ -305,11 +304,13 @@ class ResolvedModelSettings:
 class ToolExecutionResults:
     new_messages: list[dict[str, Any]]
     pending_tool_call_ids: list[str]
+    pending_child_task_ids: list[str]
 
 
 class BaseAgent(Generic[ContextType]):
     def __init__(
         self,
+        name: str | None = None,
         instructions: str | Callable[..., str] | None = None,
         description: str | None = None,
         tools: list[FunctionTool[ContextType] | Callable[..., Any]] | None = None,
@@ -324,7 +325,7 @@ class BaseAgent(Generic[ContextType]):
         context_class: type = AgentContext,
         output_type: type[BaseModel] | None = None,
     ):
-        self.name = to_snake_case(self.__class__.__name__)
+        self.name = to_snake_case(name or self.__class__.__name__)
         self.description = description or self.__class__.__name__
         self.instructions = instructions
         self.tools, self.tool_actions = convert_tools_list(tools or [])
@@ -386,6 +387,7 @@ class BaseAgent(Generic[ContextType]):
             raise ValueError(f"Agent {self.name} has no tool action for {tool_name}")
 
         is_deferred_result = getattr(action, "deferred_result", False)
+        is_forking_tool = getattr(action, "forking_tool", False)
 
         if not self.parse_tool_args:
             result = (
@@ -438,9 +440,18 @@ class BaseAgent(Generic[ContextType]):
                 else action(**parsed_tool_args)
             )
 
+        pending_child_task_ids: list[str] = []
+        if (
+            is_forking_tool
+            and isinstance(result, (list, tuple))
+            and all([is_valid_task_id(item) for item in result])
+        ):
+            pending_child_task_ids = list(result)
+
         if isinstance(result, FunctionToolActionResult):
             result.tool_call = tool_call
             result.pending_result = is_deferred_result
+            result.pending_child_task_ids = pending_child_task_ids
             return result
         else:
             if (
@@ -463,6 +474,7 @@ class BaseAgent(Generic[ContextType]):
                 output_str=output_str,
                 output_data=output_data,
                 pending_result=is_deferred_result,
+                pending_child_task_ids=pending_child_task_ids,
             )
 
     def format_tool_result(
@@ -491,6 +503,7 @@ class BaseAgent(Generic[ContextType]):
         """Execute tool calls and add results to messages"""
         new_messages: list[dict[str, Any]] = []
         pending_tool_call_ids: list[str] = []
+        all_pending_child_task_ids: list[str] = []
 
         # Run tools in parallel
         tasks = [
@@ -504,6 +517,12 @@ class BaseAgent(Generic[ContextType]):
 
         # Add results to messages
         for tc, result in zip(tool_calls, results):
+            if (
+                isinstance(result, FunctionToolActionResult)
+                and result.pending_child_task_ids
+            ):
+                all_pending_child_task_ids.extend(result.pending_child_task_ids)
+
             if isinstance(result, Exception):
                 logger.error(
                     f"Tool {tc.function.name} failed: {result}", exc_info=result
@@ -524,6 +543,7 @@ class BaseAgent(Generic[ContextType]):
         return ToolExecutionResults(
             new_messages=new_messages,
             pending_tool_call_ids=pending_tool_call_ids,
+            pending_child_task_ids=all_pending_child_task_ids,
         )
 
     async def run_turn(
@@ -565,6 +585,7 @@ class BaseAgent(Generic[ContextType]):
 
         # Handle tool calls and append results to messages
         pending_tool_call_ids: list[str] = []
+        pending_child_task_ids: list[str] = []
         if response.choices[0].message.tool_calls:
             results = await self.execute_tools(
                 response.choices[0].message.tool_calls,
@@ -572,6 +593,7 @@ class BaseAgent(Generic[ContextType]):
             )
             messages += results.new_messages
             pending_tool_call_ids += results.pending_tool_call_ids
+            pending_child_task_ids += results.pending_child_task_ids
 
         agent_ctx.messages = messages
         agent_ctx.turn += 1
@@ -579,6 +601,7 @@ class BaseAgent(Generic[ContextType]):
             is_done=False,
             context=agent_ctx,
             pending_tool_call_ids=pending_tool_call_ids,
+            pending_child_task_ids=pending_child_task_ids,
         )
 
     def process_deferred_tool_results(
@@ -686,6 +709,7 @@ class BaseAgent(Generic[ContextType]):
     def _is_done(self, response: ChatCompletion) -> bool:
         """Check if agent should complete"""
         tool_calls = response.choices[0].message.tool_calls
+
         return (not tool_calls and self.output_type is None) or any(
             tc.function.name == "final_output" for tc in tool_calls or []
         )

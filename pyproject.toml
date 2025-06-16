@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nfactorial"
-version = "0.1.4"
-description = "A Python framework for building AI agents with advanced orchestration capabilities"
+version = "0.1.6"
+description = "A distributed task queue for building reliable multi-agent systems."
 readme = "README.md"
 requires-python = ">=3.9"
 classifiers = [

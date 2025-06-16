@@ -111,7 +111,7 @@ class MainAgent(BaseAgent[MainAgentContext]):
     def __init__(self):
         super().__init__(
             name="main_agent",
-            description="Basic Agent",
+            description="Main Agent",
             model=gpt_41_mini,
             instructions="You are a helpful assistant. Always start out by making a plan.",
             tools=[plan, reflect, research, search],

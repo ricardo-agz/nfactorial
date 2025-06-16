@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nfactorial"
-version = "0.1.7"
+version = "0.1.9"
 description = "A distributed task queue for building reliable multi-agent systems."
 readme = "README.md"
 requires-python = ">=3.9"
@@ -53,7 +53,12 @@ where = ["src"]
 "" = "src"
 
 [tool.setuptools.package-data]
-factorial = ["lua/*.lua"]
+factorial = [
+    "queue/lua/*.lua",
+    "dashboard/*.html",
+    "dashboard/*.js",
+    "dashboard/assets/*",
+]
 
 [tool.black]
 line-length = 88

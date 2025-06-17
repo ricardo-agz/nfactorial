@@ -1,7 +1,8 @@
 import uuid
 import re
-from typing import Any
+from typing import Any, Callable, get_origin
 from pydantic import BaseModel
+import inspect
 
 
 def to_snake_case(camel: str) -> str:
@@ -38,3 +39,72 @@ def is_valid_task_id(task_id: str) -> bool:
     except ValueError:
         return False
     return True
+
+
+def _has_valid_arity(sig: inspect.Signature, required: int) -> bool:
+    """Return True if *sig* has exactly *required* mandatory positional params."""
+    required_positional = [
+        p
+        for p in sig.parameters.values()
+        if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)
+        and p.default is inspect.Parameter.empty
+    ]
+    return len(required_positional) == required
+
+
+def _compatible(annotation: Any, expected: type) -> bool:
+    """Return True if *annotation* is empty or a subclass of *expected*."""
+    if annotation is inspect.Parameter.empty:
+        return True  # no type hint
+    try:
+        origin = get_origin(annotation) or annotation
+        return isinstance(origin, type) and issubclass(origin, expected)
+    except Exception:
+        return False
+
+
+def validate_callback_signature(
+    cb_name: str,
+    fn: Callable[..., Any] | None,
+    expected_required: tuple[type, ...],
+) -> None:
+    """Validate lifecycle callback *fn* against expected positional parameters.
+
+    Parameters
+    ----------
+    cb_name: str
+        Human-readable name of the callback (used in error messages).
+    fn: Callable | None
+        The callback function to validate.  If ``None`` the function returns silently.
+    expected_required: tuple[type, ...]
+        Tuple of expected types for the **mandatory positional** parameters.  The
+        length of this tuple defines the required arity.
+
+    Raises
+    ------
+    TypeError
+        If the function has the wrong arity or incompatible type annotations.
+    """
+    if fn is None:
+        return
+
+    sig = inspect.signature(fn)
+
+    if not _has_valid_arity(sig, len(expected_required)):
+        required_positional = [
+            p.name
+            for p in sig.parameters.values()
+            if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)
+            and p.default is inspect.Parameter.empty
+        ]
+        raise TypeError(
+            f"{cb_name} callback must have exactly {len(expected_required)} required "
+            f"positional parameter(s) (got {len(required_positional)}: {required_positional})."
+        )
+
+    for param, expected in zip(sig.parameters.values(), expected_required):
+        if not _compatible(param.annotation, expected):
+            raise TypeError(
+                f"{cb_name} callback – parameter '{param.name}' should be compatible "
+                f"with {expected.__name__} but has annotation {param.annotation}."
+            )

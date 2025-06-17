@@ -11,7 +11,7 @@ from typing import (
     overload,
 )
 from dataclasses import dataclass
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 from functools import wraps
 from openai.types.chat import ChatCompletionMessageToolCall
 import inspect
@@ -31,8 +31,12 @@ T = TypeVar("T")
 
 
 class FunctionToolActionResult(BaseModel):
+    # Allow pydantic to accept Exception and other arbitrary types
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
     output_str: str
     output_data: Any
+    error: Exception | None = None
     tool_call: ChatCompletionMessageToolCall | None = None
     pending_result: bool = False
     pending_child_task_ids: list[str] = []

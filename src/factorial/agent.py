@@ -21,6 +21,7 @@ from openai.types.chat import (
     ChatCompletion,
     ChatCompletionMessageToolCall,
 )
+from datetime import datetime
 
 from factorial.context import (
     AgentContext,
@@ -29,7 +30,12 @@ from factorial.context import (
     ContextType,
 )
 from factorial.llms import Model, MultiClient
-from factorial.utils import serialize_data, to_snake_case, is_valid_task_id
+from factorial.utils import (
+    serialize_data,
+    to_snake_case,
+    is_valid_task_id,
+    validate_callback_signature as _vcs,
+)
 from factorial.events import EventPublisher, AgentEvent
 from factorial.logging import get_logger
 from factorial.exceptions import RETRYABLE_EXCEPTIONS
@@ -259,8 +265,36 @@ class TurnCompletion(Generic[ContextType]):
     is_done: bool
     context: ContextType
     output: Any = None
+    tool_call_results: list[tuple[ChatCompletionMessageToolCall, Any | Exception]] = (
+        field(default_factory=list)
+    )
     pending_tool_call_ids: list[str] = field(default_factory=list)
     pending_child_task_ids: list[str] = field(default_factory=list)
+
+
+@dataclass
+class RunCompletion(Generic[ContextType]):
+    """Summary object for the *entire* run passed to ``on_run_end``.
+
+    Timestamps are stored instead of a raw *duration* so consumers can
+    calculate different metrics, and we expose a convenience ``duration``
+    property.
+    """
+
+    output: Any | None
+    started_at: datetime
+    finished_at: datetime
+    error: Exception | None = None
+
+    @property
+    def duration(self) -> float:
+        """Runtime in **seconds**."""
+
+        return (self.finished_at - self.started_at).total_seconds()
+
+    @property
+    def succeeded(self) -> bool:
+        return self.error is None
 
 
 @dataclass
@@ -303,6 +337,7 @@ class ResolvedModelSettings:
 @dataclass
 class ToolExecutionResults:
     new_messages: list[dict[str, Any]]
+    tool_call_results: list[tuple[ChatCompletionMessageToolCall, Any | Exception]]
     pending_tool_call_ids: list[str]
     pending_child_task_ids: list[str]
 
@@ -328,13 +363,16 @@ class BaseAgent(Generic[ContextType]):
         on_run_start: Callable[[ContextType, ExecutionContext], Awaitable[None] | None]
         | None = None,
         on_run_end: Callable[
-            [ContextType, ExecutionContext, Any | None, Exception | None],
+            [ContextType, ExecutionContext, RunCompletion[ContextType]],
             Awaitable[None] | None,
         ]
         | None = None,
         on_turn_start: Callable[[ContextType, ExecutionContext], Awaitable[None] | None]
         | None = None,
-        on_turn_end: Callable[[ContextType, ExecutionContext], Awaitable[None] | None]
+        on_turn_end: Callable[
+            [ContextType, ExecutionContext, TurnCompletion[ContextType]],
+            Awaitable[None] | None,
+        ]
         | None = None,
     ):
         self.name = to_snake_case(name or self.__class__.__name__)
@@ -361,6 +399,20 @@ class BaseAgent(Generic[ContextType]):
         self.on_run_end = on_run_end
         self.on_turn_start = on_turn_start
         self.on_turn_end = on_turn_end
+
+        # --- Validate lifecycle callback signatures ---------------------------------- #
+        _vcs("on_run_start", self.on_run_start, (AgentContext, ExecutionContext))
+        _vcs("on_turn_start", self.on_turn_start, (AgentContext, ExecutionContext))
+        _vcs(
+            "on_turn_end",
+            self.on_turn_end,
+            (AgentContext, ExecutionContext, TurnCompletion),
+        )
+        _vcs(
+            "on_run_end",
+            self.on_run_end,
+            (AgentContext, ExecutionContext, RunCompletion),
+        )
 
     # ===== Overridable Methods ===== #
 
@@ -495,6 +547,21 @@ class BaseAgent(Generic[ContextType]):
                 pending_child_task_ids=pending_child_task_ids,
             )
 
+    def extract_tool_call_result(
+        self,
+        tool_call: ChatCompletionMessageToolCall,
+        result: Any | FunctionToolActionResult | Exception,
+    ) -> tuple[str, Any | None, Exception | None]:
+        if isinstance(result, Exception):
+            str_result = f'<tool_call_error tool="{tool_call.id}">\nError running tool:\n{result}\n</tool_call_error>'
+            return str_result, None, result
+        elif isinstance(result, FunctionToolActionResult):
+            str_result = f'<tool_call_result tool="{tool_call.id}">\n{result.output_str}\n</tool_call_result>'
+            return str_result, result.output_data, None
+        else:
+            str_result = f'<tool_call_result tool="{tool_call.id}">\n{str(result)}\n</tool_call_result>'
+            return str_result, result, None
+
     def format_tool_result(
         self, tool_call_id: str, result: Any | FunctionToolActionResult | Exception
     ) -> str:
@@ -522,6 +589,9 @@ class BaseAgent(Generic[ContextType]):
         new_messages: list[dict[str, Any]] = []
         pending_tool_call_ids: list[str] = []
         all_pending_child_task_ids: list[str] = []
+        tool_call_results: list[
+            tuple[ChatCompletionMessageToolCall, Any | Exception]
+        ] = []
 
         # Run tools in parallel
         tasks = [
@@ -535,6 +605,17 @@ class BaseAgent(Generic[ContextType]):
 
         # Add results to messages
         for tc, result in zip(tool_calls, results):
+            tool_call_results.append(
+                (
+                    tc,
+                    result
+                    if isinstance(result, Exception)
+                    else result.output_data
+                    if isinstance(result, FunctionToolActionResult)
+                    else result,
+                )
+            )
+
             if (
                 isinstance(result, FunctionToolActionResult)
                 and result.pending_child_task_ids
@@ -560,6 +641,7 @@ class BaseAgent(Generic[ContextType]):
 
         return ToolExecutionResults(
             new_messages=new_messages,
+            tool_call_results=tool_call_results,
             pending_tool_call_ids=pending_tool_call_ids,
             pending_child_task_ids=all_pending_child_task_ids,
         )
@@ -606,10 +688,15 @@ class BaseAgent(Generic[ContextType]):
             )
 
             # Lifecycle callback – turn end
-            await self._safe_call(self.on_turn_end, agent_ctx, execution_ctx)
+            await self._safe_call(
+                self.on_turn_end, agent_ctx, execution_ctx, completion
+            )
             return completion
 
         # Handle tool calls and append results to messages
+        tool_call_results: list[
+            tuple[ChatCompletionMessageToolCall, Any | Exception]
+        ] = []
         pending_tool_call_ids: list[str] = []
         pending_child_task_ids: list[str] = []
         if response.choices[0].message.tool_calls:
@@ -620,6 +707,7 @@ class BaseAgent(Generic[ContextType]):
             messages += results.new_messages
             pending_tool_call_ids += results.pending_tool_call_ids
             pending_child_task_ids += results.pending_child_task_ids
+            tool_call_results += results.tool_call_results
 
         agent_ctx.messages = messages
         agent_ctx.turn += 1
@@ -628,10 +716,11 @@ class BaseAgent(Generic[ContextType]):
             context=agent_ctx,
             pending_tool_call_ids=pending_tool_call_ids,
             pending_child_task_ids=pending_child_task_ids,
+            tool_call_results=tool_call_results,
         )
 
         # Lifecycle callback – turn end
-        await self._safe_call(self.on_turn_end, agent_ctx, execution_ctx)
+        await self._safe_call(self.on_turn_end, agent_ctx, execution_ctx, completion)
         return completion
 
     def process_deferred_tool_results(

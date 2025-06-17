@@ -7,7 +7,7 @@ import json
 import asyncio
 from dataclasses import replace
 from contextlib import asynccontextmanager, suppress
-from factorial.agent import BaseAgent, ExecutionContext
+from factorial.agent import BaseAgent, ExecutionContext, RunCompletion
 from factorial.context import ContextType
 from factorial.events import QueueEvent, AgentEvent, EventPublisher
 from factorial.logging import get_logger, colored
@@ -31,6 +31,7 @@ from factorial.queue.operations import (
     enqueue_task,
 )
 from factorial.queue.keys import RedisKeys, PENDING_SENTINEL
+from datetime import datetime, timezone
 
 
 logger = get_logger("factorial.queue")
@@ -463,8 +464,11 @@ async def process_task(
                     agent.on_run_end,
                     turn_completion.context,
                     execution_ctx,
-                    turn_completion.output,
-                    None,
+                    RunCompletion(
+                        output=turn_completion.output,
+                        started_at=task.metadata.created_at,
+                        finished_at=datetime.now(timezone.utc),
+                    ),
                 )
 
                 if parent_task_id:
@@ -527,8 +531,12 @@ async def process_task(
                     agent.on_run_end,
                     task.payload,
                     execution_ctx,
-                    None,
-                    e,
+                    RunCompletion(
+                        output=None,
+                        error=e,
+                        started_at=task.metadata.created_at,
+                        finished_at=datetime.now(timezone.utc),
+                    ),
                 )
 
             if parent_task_id and action is CompletionAction.FAIL:

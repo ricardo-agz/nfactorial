@@ -426,6 +426,20 @@ class BaseAgent(Generic[ContextType]):
         tools = self.resolve_tools(agent_ctx)
         model = self.resolve_model(agent_ctx)
 
+        # If ``max_turns`` is set we need to *force* the agent to finish on the final allowed turn.
+        is_last_turn = (
+            self.max_turns is not None and agent_ctx.turn >= self.max_turns - 1
+        )
+
+        if is_last_turn:
+            if self.final_output_tool is not None:
+                model_settings.tool_choice = {
+                    "type": "function",
+                    "function": {"name": "final_output"},
+                }
+            else:
+                model_settings.tool_choice = "none"
+
         response = cast(
             ChatCompletion,
             await self.client.completion(
@@ -992,20 +1006,3 @@ class Agent(BaseAgent[AgentContext]):
     """Base agent class that uses AgentContext by default. Use this for simple agents."""
 
     pass
-
-
-@function_tool(name="get_weather")
-def get_weather(agent_ctx: AgentContext, location: str) -> str:
-    return f"The weather in {location} is sunny."
-
-
-@function_tool
-def get_time(agent_ctx: AgentContext) -> str:
-    return "The current time is 12:00 PM."
-
-
-my_agennt = Agent(
-    description="Dummy agent",
-    instructions="You are a helpful assistant",
-    tools=[get_weather, get_time],
-)

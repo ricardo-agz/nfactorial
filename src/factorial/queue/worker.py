@@ -11,7 +11,7 @@ from factorial.agent import BaseAgent, ExecutionContext, RunCompletion
 from factorial.context import ContextType
 from factorial.events import QueueEvent, AgentEvent, EventPublisher
 from factorial.logging import get_logger, colored
-from factorial.exceptions import RETRYABLE_EXCEPTIONS
+from factorial.exceptions import RETRYABLE_EXCEPTIONS, FatalAgentError
 from factorial.queue.task import (
     Task,
     get_task_data,
@@ -218,6 +218,10 @@ def classify_failure(
     • everything else       → RETRY   unless max retries hit
     • If max retries hit    → FAIL with a JSON error message
     """
+    # Immediate fail for unrecoverable errors
+    if isinstance(exc, FatalAgentError):
+        return CompletionAction.FAIL, json.dumps({"error": str(exc)})
+
     if isinstance(exc, asyncio.TimeoutError):
         base_action = CompletionAction.RETRY
         msg = {"error": f"Task timed out: {exc}"}

@@ -5,17 +5,19 @@ from typing import (
     TypeVar,
     Union,
     Generic,
+    Annotated,
     get_type_hints,
     get_origin,
     get_args,
     overload,
 )
 from dataclasses import dataclass
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 from functools import wraps
 from openai.types.chat import ChatCompletionMessageToolCall
 import inspect
 import asyncio
+from enum import Enum  # local import to avoid unnecessary global import
 
 from factorial.context import AgentContext, ExecutionContext
 
@@ -78,7 +80,42 @@ class FunctionTool(Generic[ContextT]):
 
 
 def _python_type_to_json_schema(python_type: type) -> dict[str, Any]:
-    """Convert a Python type to JSON schema object."""
+    """Convert a Python type (including Annotated and Pydantic types) to JSON schema object."""
+
+    # ------------------------------------------------------------------
+    # Handle ``typing.Annotated`` so we can capture metadata such as
+    # descriptions coming from ``pydantic.Field`` or simple strings.
+    # ------------------------------------------------------------------
+    if hasattr(python_type, "__metadata__"):
+        # Annotated types have their metadata stored in ``__metadata__`` and
+        # the underlying type as the first argument of ``get_args``.
+        annotated_args = get_args(python_type)
+        if not annotated_args:
+            # Fallback – treat as plain string
+            python_type = str  # type: ignore[assignment]
+        else:
+            base_type = annotated_args[0]
+            metadata = annotated_args[1:]
+
+            # Recursively build the base schema first
+            base_schema = _python_type_to_json_schema(base_type)
+
+            # Merge in metadata – we only look for ``description`` and ``enum``
+            # for now, but this can be extended easily.
+            for meta in metadata:
+                # Case 1: Simple string is treated as a description
+                if isinstance(meta, str):
+                    base_schema["description"] = meta
+                # Case 2: Pydantic Field or FieldInfo-like objects
+                elif hasattr(meta, "description") and getattr(meta, "description"):
+                    base_schema["description"] = getattr(meta, "description")
+
+                # Enum values (if provided via Field(..., enum=[...]))
+                if hasattr(meta, "enum") and getattr(meta, "enum") is not None:
+                    base_schema["enum"] = list(getattr(meta, "enum"))  # type: ignore[arg-type]
+
+            return base_schema
+
     origin = get_origin(python_type)
 
     # Handle Union types (including Optional)
@@ -103,6 +140,27 @@ def _python_type_to_json_schema(python_type: type) -> dict[str, Any]:
     if origin is dict:
         return {"type": "object"}
 
+    # Handle Python ``enum.Enum`` subclasses. We map them to a JSON schema with
+    # an ``enum`` list containing all member *values* and set the type based on
+    # the value type (string vs integer).
+    if isinstance(python_type, type) and issubclass(python_type, Enum):
+        enum_values = [member.value for member in python_type]  # type: ignore[arg-type]
+
+        # Determine JSON type – if **all** enum values are ints → integer, else → string
+        json_type = (
+            "integer" if all(isinstance(v, int) for v in enum_values) else "string"
+        )
+
+        return {
+            "type": json_type,
+            "enum": enum_values,
+            "description": getattr(python_type, "__doc__", None) or None,
+        }
+
+    # Handle Pydantic BaseModel classes
+    if isinstance(python_type, type) and issubclass(python_type, BaseModel):
+        return python_type.model_json_schema()
+
     # Handle basic types
     if python_type is str:
         return {"type": "string"}
@@ -116,13 +174,20 @@ def _python_type_to_json_schema(python_type: type) -> dict[str, Any]:
         return {"type": "string"}  # Default fallback
 
 
-def _function_to_json_schema(func: F) -> dict[str, Any]:
-    """Convert a Python function to JSON schema for its parameters."""
+def _function_to_json_schema(func: F) -> tuple[dict[str, Any], bool]:
+    """Convert a Python function to JSON schema for its parameters.
+
+    Returns a tuple of (schema, has_optional). ``has_optional`` is **True**
+    if the function has *any* parameter that is optional (either via a
+    default value **or** via ``Optional`` / ``Union[NoneType]``). This flag
+    is later used to decide whether the tool can be in strict mode.
+    """
     sig = inspect.signature(func)
     type_hints = get_type_hints(func)
 
     properties: dict[str, Any] = {}
     required: list[str] = []
+    has_optional_param = False
 
     for param_name, param in sig.parameters.items():
         # Skip 'agent_ctx' and 'execution_ctx' parameters as they're injected by the agent
@@ -144,14 +209,17 @@ def _function_to_json_schema(func: F) -> dict[str, Any]:
 
         properties[param_name] = json_schema
 
-        # Check if parameter is required (no default value and not Optional)
-        if param.default is inspect.Parameter.empty:
-            origin = get_origin(param_type)
-            args = get_args(param_type)
-            is_optional = origin is Union and type(None) in args
+        origin = get_origin(param_type)
+        args = get_args(param_type)
+        is_optional_annotation = origin is Union and type(None) in args
 
-            if not is_optional:
-                required.append(param_name)
+        # A parameter is required **only** when all of the following are true:
+        #   1. No default value provided, *and*
+        #   2. The type annotation is **not** Optional/Union[..., None]
+        if param.default is inspect.Parameter.empty and not is_optional_annotation:
+            required.append(param_name)
+        else:
+            has_optional_param = True
 
     schema: dict[str, Any] = {
         "type": "object",
@@ -162,7 +230,7 @@ def _function_to_json_schema(func: F) -> dict[str, Any]:
     if required:
         schema["required"] = required
 
-    return schema
+    return schema, has_optional_param
 
 
 @overload
@@ -216,14 +284,21 @@ def function_tool(
         else:
             tool_description = description
 
-        params_schema = _function_to_json_schema(the_func)
+        params_schema, has_optional = _function_to_json_schema(the_func)
+
+        # ------------------------------------------------------------------
+        # Strict-mode logic: if *any* parameter is optional the function **cannot**
+        # be in strict mode because strict mode mandates all properties are
+        # required.
+        # ------------------------------------------------------------------
+        effective_strict_json_schema = strict_json_schema and not has_optional
 
         return FunctionTool(
             name=tool_name,
             description=tool_description,
             params_json_schema=params_schema,
             on_invoke_tool=the_func,
-            strict_json_schema=strict_json_schema,
+            strict_json_schema=effective_strict_json_schema,
             is_enabled=is_enabled,
         )
 

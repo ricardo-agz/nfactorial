@@ -379,6 +379,11 @@ class BaseAgent(Generic[ContextType]):
             Awaitable[None] | None,
         ]
         | None = None,
+        on_pending_tool_results: Callable[
+            [ContextType, list[tuple[str, Any]]],
+            Awaitable[None] | None,
+        ]
+        | None = None,
     ):
         self.name = to_snake_case(name or self.__class__.__name__)
         self.description = description or self.__class__.__name__
@@ -405,6 +410,7 @@ class BaseAgent(Generic[ContextType]):
         self.on_turn_start = on_turn_start
         self.on_turn_end = on_turn_end
         self.on_pending_tool_call = on_pending_tool_call
+        self.on_pending_tool_results = on_pending_tool_results
 
         # --- Validate lifecycle callback signatures ---------------------------------- #
         _vcs("on_run_start", self.on_run_start, (AgentContext, ExecutionContext))
@@ -423,6 +429,11 @@ class BaseAgent(Generic[ContextType]):
             "on_pending_tool_call",
             self.on_pending_tool_call,
             (AgentContext, ExecutionContext, ChatCompletionMessageToolCall),
+        )
+        _vcs(
+            "on_pending_tool_results",
+            self.on_pending_tool_results,
+            (AgentContext, list),
         )
 
     # ===== Overridable Methods ===== #

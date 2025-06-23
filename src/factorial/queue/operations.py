@@ -92,6 +92,13 @@ async def complete_deferred_tool(
         task.payload, completed_results
     ).context
 
+    # Lifecycle callback – resume from pending tool calls
+    await agent._safe_call(
+        agent.on_pending_tool_results,
+        updated_context,
+        completed_results,
+    )
+
     # Move task back to queue
     tool_completion_script = await create_tool_completion_script(redis_client)
     success, message = await tool_completion_script.execute(

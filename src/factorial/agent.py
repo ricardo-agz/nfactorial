@@ -1037,7 +1037,12 @@ class BaseAgent(Generic[ContextType]):
             execution_context.reset(token)
 
     async def _safe_call(self, func: Callable[..., Any] | None, *args: Any) -> None:
-        """Safely call a (possibly async) callback without letting it crash the agent."""
+        """Safely call a (possibly async) callback without letting it crash the agent.
+
+        *All* exceptions are logged, but only non-fatal ones are swallowed. If the
+        callback raises ``FatalAgentError`` we re-raise so the orchestrator can
+        treat the task as a hard failure.
+        """
         if func is None:
             return
 
@@ -1045,7 +1050,12 @@ class BaseAgent(Generic[ContextType]):
             result = func(*args)
             if inspect.isawaitable(result):
                 await result  # type: ignore[func-returns-value]
+        except FatalAgentError as e:
+            # Log and propagate so the caller can handle a fatal error.
+            logger.error("FatalAgentError in lifecycle callback", exc_info=e)
+            raise
         except Exception:
+            # Non-fatal errors are logged but swallowed to avoid taking down the task.
             logger.exception("Error in lifecycle callback", exc_info=True)
 
 

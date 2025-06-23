@@ -374,6 +374,11 @@ class BaseAgent(Generic[ContextType]):
             Awaitable[None] | None,
         ]
         | None = None,
+        on_pending_tool_call: Callable[
+            [ContextType, ExecutionContext, ChatCompletionMessageToolCall],
+            Awaitable[None] | None,
+        ]
+        | None = None,
     ):
         self.name = to_snake_case(name or self.__class__.__name__)
         self.description = description or self.__class__.__name__
@@ -399,6 +404,7 @@ class BaseAgent(Generic[ContextType]):
         self.on_run_end = on_run_end
         self.on_turn_start = on_turn_start
         self.on_turn_end = on_turn_end
+        self.on_pending_tool_call = on_pending_tool_call
 
         # --- Validate lifecycle callback signatures ---------------------------------- #
         _vcs("on_run_start", self.on_run_start, (AgentContext, ExecutionContext))
@@ -412,6 +418,11 @@ class BaseAgent(Generic[ContextType]):
             "on_run_end",
             self.on_run_end,
             (AgentContext, ExecutionContext, RunCompletion),
+        )
+        _vcs(
+            "on_pending_tool_call",
+            self.on_pending_tool_call,
+            (AgentContext, ExecutionContext, ChatCompletionMessageToolCall),
         )
 
     # ===== Overridable Methods ===== #
@@ -672,6 +683,13 @@ class BaseAgent(Generic[ContextType]):
                 )
             elif isinstance(result, FunctionToolActionResult) and result.pending_result:
                 pending_tool_call_ids.append(tc.id)
+                # Invoke lifecycle callback for pending tool calls
+                await self._safe_call(
+                    self.on_pending_tool_call,
+                    agent_ctx,
+                    ExecutionContext.current(),
+                    tc,
+                )
             else:
                 content = self.format_tool_result(tc.id, result)
                 new_messages.append(

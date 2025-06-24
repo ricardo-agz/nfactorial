@@ -380,7 +380,7 @@ class BaseAgent(Generic[ContextType]):
         ]
         | None = None,
         on_pending_tool_results: Callable[
-            [ContextType, list[tuple[str, Any]]],
+            [ContextType, ExecutionContext, list[tuple[str, Any]]],
             Awaitable[None] | None,
         ]
         | None = None,
@@ -433,7 +433,7 @@ class BaseAgent(Generic[ContextType]):
         _vcs(
             "on_pending_tool_results",
             self.on_pending_tool_results,
-            (AgentContext, list),
+            (AgentContext, ExecutionContext, list),
         )
 
     # ===== Overridable Methods ===== #

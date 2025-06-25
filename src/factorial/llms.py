@@ -109,6 +109,20 @@ class MultiClient:
             await self.xai._client.aclose()
 
 
+o3 = Model(
+    name="o3",
+    provider=Provider.OPENAI,
+    provider_model_id="o3",
+    context_window=200_000,
+)
+
+o4_mini = Model(
+    name="o4-mini",
+    provider=Provider.OPENAI,
+    provider_model_id="o4-mini",
+    context_window=200_000,
+)
+
 gpt_41 = Model(
     name="gpt-4.1",
     provider=Provider.OPENAI,

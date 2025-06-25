@@ -52,6 +52,12 @@ class RateLimitError(Exception):
     pass
 
 
+class FatalAgentError(Exception):
+    """Exception raised to indicate an unrecoverable error which should fail the task immediately (no retry)."""
+
+    pass
+
+
 RETRYABLE_EXCEPTIONS = (
     OpenAIRateLimitError,
     OpenAIInternalServerError,
@@ -73,4 +79,5 @@ __all__ = [
     "OpenAIInternalServerError",
     "OpenAITimeoutError",
     "OpenAIConnectionError",
+    "FatalAgentError",
 ]

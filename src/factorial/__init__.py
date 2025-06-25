@@ -28,6 +28,8 @@ from factorial.events import AgentEvent, QueueEvent, EventPublisher
 from factorial.llms import (
     Model,
     MultiClient,
+    o3,
+    o4_mini,
     grok_3,
     grok_3_mini,
     gpt_41,
@@ -63,6 +65,8 @@ __all__ = [
     "EventPublisher",
     "Model",
     "MultiClient",
+    "o3",
+    "o4_mini",
     "grok_3",
     "grok_3_mini",
     "gpt_41",

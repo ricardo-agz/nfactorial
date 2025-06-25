@@ -11,7 +11,7 @@ from factorial.agent import BaseAgent, ExecutionContext, RunCompletion
 from factorial.context import ContextType
 from factorial.events import QueueEvent, AgentEvent, EventPublisher
 from factorial.logging import get_logger, colored
-from factorial.exceptions import RETRYABLE_EXCEPTIONS
+from factorial.exceptions import RETRYABLE_EXCEPTIONS, FatalAgentError
 from factorial.queue.task import (
     Task,
     get_task_data,
@@ -218,6 +218,10 @@ def classify_failure(
     • everything else       → RETRY   unless max retries hit
     • If max retries hit    → FAIL with a JSON error message
     """
+    # Immediate fail for unrecoverable errors
+    if isinstance(exc, FatalAgentError):
+        return CompletionAction.FAIL, json.dumps({"error": str(exc)})
+
     if isinstance(exc, asyncio.TimeoutError):
         base_action = CompletionAction.RETRY
         msg = {"error": f"Task timed out: {exc}"}
@@ -362,6 +366,9 @@ async def process_task(
     )
 
     task_failed = False
+    final_action: CompletionAction | None = (
+        None  # records the action taken on completion when failing
+    )
 
     async with heartbeat_context(
         redis_client=redis_client,
@@ -518,6 +525,8 @@ async def process_task(
                 logger.error(f"Failed to send task failed event: {err}")
 
             action, output = classify_failure(e, task.retries, max_retries)
+            final_action = action
+
             await complete(
                 action=CompletionAction(action),
                 pending_tool_call_ids=None,
@@ -526,7 +535,7 @@ async def process_task(
             )
 
             # Lifecycle callback – run end (permanent failure)
-            if action is CompletionAction.FAIL:
+            if final_action is CompletionAction.FAIL:
                 await agent._safe_call(
                     agent.on_run_end,
                     task.payload,
@@ -539,7 +548,7 @@ async def process_task(
                     ),
                 )
 
-            if parent_task_id and action is CompletionAction.FAIL:
+            if parent_task_id and final_action is CompletionAction.FAIL:
                 await resume_if_no_remaining_child_tasks(
                     redis_client=redis_client,
                     namespace=namespace,
@@ -550,7 +559,8 @@ async def process_task(
         finally:
             # Only emit retry/failure events if the task actually failed
             if task_failed:
-                if task.retries >= max_retries:
+                # If the task was marked as a permanent failure, don't treat it as a retry.
+                if final_action is CompletionAction.FAIL or task.retries >= max_retries:
                     logger.error(
                         f"❌ Task failed permanently {colored(f'[{task.id}]', 'dim')}"
                     )

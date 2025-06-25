@@ -38,7 +38,7 @@ from factorial.utils import (
 )
 from factorial.events import EventPublisher, AgentEvent
 from factorial.logging import get_logger
-from factorial.exceptions import RETRYABLE_EXCEPTIONS
+from factorial.exceptions import RETRYABLE_EXCEPTIONS, FatalAgentError
 from factorial.tools import (
     FunctionTool,
     FunctionToolActionResult,
@@ -374,6 +374,20 @@ class BaseAgent(Generic[ContextType]):
             Awaitable[None] | None,
         ]
         | None = None,
+        on_pending_tool_call: Callable[
+            [ContextType, ExecutionContext, ChatCompletionMessageToolCall],
+            Awaitable[None] | None,
+        ]
+        | None = None,
+        on_pending_tool_results: Callable[
+            [ContextType, ExecutionContext, list[tuple[str, Any]]],
+            Awaitable[None] | None,
+        ]
+        | None = None,
+        on_run_cancelled: Callable[
+            [ContextType, ExecutionContext], Awaitable[None] | None
+        ]
+        | None = None,
     ):
         self.name = to_snake_case(name or self.__class__.__name__)
         self.description = description or self.__class__.__name__
@@ -399,6 +413,9 @@ class BaseAgent(Generic[ContextType]):
         self.on_run_end = on_run_end
         self.on_turn_start = on_turn_start
         self.on_turn_end = on_turn_end
+        self.on_pending_tool_call = on_pending_tool_call
+        self.on_pending_tool_results = on_pending_tool_results
+        self.on_run_cancelled = on_run_cancelled
 
         # --- Validate lifecycle callback signatures ---------------------------------- #
         _vcs("on_run_start", self.on_run_start, (AgentContext, ExecutionContext))
@@ -412,6 +429,21 @@ class BaseAgent(Generic[ContextType]):
             "on_run_end",
             self.on_run_end,
             (AgentContext, ExecutionContext, RunCompletion),
+        )
+        _vcs(
+            "on_pending_tool_call",
+            self.on_pending_tool_call,
+            (AgentContext, ExecutionContext, ChatCompletionMessageToolCall),
+        )
+        _vcs(
+            "on_pending_tool_results",
+            self.on_pending_tool_results,
+            (AgentContext, ExecutionContext, list),
+        )
+        _vcs(
+            "on_run_cancelled",
+            self.on_run_cancelled,
+            (AgentContext, ExecutionContext),
         )
 
     # ===== Overridable Methods ===== #
@@ -525,12 +557,37 @@ class BaseAgent(Generic[ContextType]):
             )
 
         pending_child_task_ids: list[str] = []
-        if (
-            is_forking_tool
-            and isinstance(result, (list, tuple))
-            and all([is_valid_task_id(item) for item in result])
-        ):
-            pending_child_task_ids = list(result)
+        if is_forking_tool:
+            # Determine candidate ID list depending on the return shape
+            candidate_ids: list[str] | tuple[str, ...] | None = None
+
+            # Case 1 – raw list/tuple of IDs returned by the tool
+            if isinstance(result, (list, tuple)) and all(
+                isinstance(item, str) for item in result
+            ):
+                candidate_ids = result  # type: ignore[assignment]
+
+            # Case 2 – (message: str, ids: list/tuple[str])
+            if (
+                candidate_ids is None
+                and isinstance(result, tuple)
+                and len(result) == 2
+                and isinstance(result[0], str)
+                and isinstance(result[1], (list, tuple))
+            ):
+                candidate_ids = result[1]  # type: ignore[assignment]
+
+            # Validate candidate IDs (if any)
+            if candidate_ids is not None:
+                if all(
+                    isinstance(item, str) and is_valid_task_id(item)
+                    for item in candidate_ids
+                ):
+                    pending_child_task_ids = list(candidate_ids)
+                else:
+                    raise ValueError(
+                        f"Forking tool '{tool_call.function.name}' returned invalid task IDs: {candidate_ids}"
+                    )
 
         if isinstance(result, FunctionToolActionResult):
             result.tool_call = tool_call
@@ -647,11 +704,22 @@ class BaseAgent(Generic[ContextType]):
                 )
             elif isinstance(result, FunctionToolActionResult) and result.pending_result:
                 pending_tool_call_ids.append(tc.id)
+                # Invoke lifecycle callback for pending tool calls
+                await self._safe_call(
+                    self.on_pending_tool_call,
+                    agent_ctx,
+                    ExecutionContext.current(),
+                    tc,
+                )
             else:
                 content = self.format_tool_result(tc.id, result)
                 new_messages.append(
                     {"role": "tool", "tool_call_id": tc.id, "content": content}
                 )
+
+            # Propagate unrecoverable errors immediately so the worker can fail the task.
+            if isinstance(result, FatalAgentError):
+                raise result
 
         return ToolExecutionResults(
             new_messages=new_messages,
@@ -833,7 +901,7 @@ class BaseAgent(Generic[ContextType]):
 
             if has_execution_ctx:
                 execution_ctx = ExecutionContext.current()
-                args.append(execution_ctx)
+                args.append(cast(Any, execution_ctx))
 
             instructions = instructions(*args)
 
@@ -990,7 +1058,12 @@ class BaseAgent(Generic[ContextType]):
             execution_context.reset(token)
 
     async def _safe_call(self, func: Callable[..., Any] | None, *args: Any) -> None:
-        """Safely call a (possibly async) callback without letting it crash the agent."""
+        """Safely call a (possibly async) callback without letting it crash the agent.
+
+        *All* exceptions are logged, but only non-fatal ones are swallowed. If the
+        callback raises ``FatalAgentError`` we re-raise so the orchestrator can
+        treat the task as a hard failure.
+        """
         if func is None:
             return
 
@@ -998,7 +1071,12 @@ class BaseAgent(Generic[ContextType]):
             result = func(*args)
             if inspect.isawaitable(result):
                 await result  # type: ignore[func-returns-value]
+        except FatalAgentError as e:
+            # Log and propagate so the caller can handle a fatal error.
+            logger.error("FatalAgentError in lifecycle callback", exc_info=e)
+            raise
         except Exception:
+            # Non-fatal errors are logged but swallowed to avoid taking down the task.
             logger.exception("Error in lifecycle callback", exc_info=True)
 
 

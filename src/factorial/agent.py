@@ -384,6 +384,10 @@ class BaseAgent(Generic[ContextType]):
             Awaitable[None] | None,
         ]
         | None = None,
+        on_run_cancelled: Callable[
+            [ContextType, ExecutionContext], Awaitable[None] | None
+        ]
+        | None = None,
     ):
         self.name = to_snake_case(name or self.__class__.__name__)
         self.description = description or self.__class__.__name__
@@ -411,6 +415,7 @@ class BaseAgent(Generic[ContextType]):
         self.on_turn_end = on_turn_end
         self.on_pending_tool_call = on_pending_tool_call
         self.on_pending_tool_results = on_pending_tool_results
+        self.on_run_cancelled = on_run_cancelled
 
         # --- Validate lifecycle callback signatures ---------------------------------- #
         _vcs("on_run_start", self.on_run_start, (AgentContext, ExecutionContext))
@@ -434,6 +439,11 @@ class BaseAgent(Generic[ContextType]):
             "on_pending_tool_results",
             self.on_pending_tool_results,
             (AgentContext, ExecutionContext, list),
+        )
+        _vcs(
+            "on_run_cancelled",
+            self.on_run_cancelled,
+            (AgentContext, ExecutionContext),
         )
 
     # ===== Overridable Methods ===== #
@@ -891,7 +901,7 @@ class BaseAgent(Generic[ContextType]):
 
             if has_execution_ctx:
                 execution_ctx = ExecutionContext.current()
-                args.append(execution_ctx)
+                args.append(cast(Any, execution_ctx))
 
             instructions = instructions(*args)
 

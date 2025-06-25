@@ -92,10 +92,24 @@ async def complete_deferred_tool(
         task.payload, completed_results
     ).context
 
+    event_publisher = EventPublisher(
+        redis_client=redis_client,
+        channel=keys.updates_channel,
+    )
+
+    execution_ctx = ExecutionContext(
+        task_id=task.id,
+        owner_id=task.metadata.owner_id,
+        retries=task.retries,
+        iterations=task.payload.turn,
+        events=event_publisher,
+    )
+
     # Lifecycle callback – resume from pending tool calls
     await agent._safe_call(
         agent.on_pending_tool_results,
         updated_context,
+        execution_ctx,
         completed_results,
     )
 
@@ -342,7 +356,12 @@ async def run_agent_cancellation(
             iterations=task.payload.turn,
             events=event_publisher,
         )
-        await agent.cancel(task.payload, execution_ctx)
+        # Lifecycle callback – run cancelled
+        await agent._safe_call(
+            agent.on_run_cancelled,
+            task.payload,
+            execution_ctx,
+        )
         logger.info(f"🚫 Task cancelled {colored(f'[{task.id}]', 'dim')}")
 
         await event_publisher.publish_event(

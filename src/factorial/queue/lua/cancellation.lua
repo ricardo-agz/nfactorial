@@ -52,7 +52,11 @@ redis.call('ZREM', queue_backoff_key, task_id)
 
 if status == "pending_tool_results" or status == "pending_child_tasks" then
     if status == "pending_child_tasks" then
-        local child_task_ids = redis.call('SMEMBERS', pending_child_task_results_key)
+        -- The pending_child_task_results_key is stored as a **hash** where each
+        -- field name is a child task ID and the value is either a PENDING sentinel
+        -- or the serialized final output once the child task completes. We only
+        -- care about the *IDs*, so read the hash field names with HKEYS.
+        local child_task_ids = redis.call('HKEYS', pending_child_task_results_key)
         if #child_task_ids > 0 then
             redis.call('SADD', pending_cancellations_key, unpack(child_task_ids))
         end

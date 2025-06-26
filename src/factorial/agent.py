@@ -9,6 +9,8 @@ from typing import (
     Generic,
     overload,
     TypeVar,
+    get_origin,
+    get_args,
 )
 from functools import wraps
 from dataclasses import dataclass, field
@@ -549,6 +551,55 @@ class BaseAgent(Generic[ContextType]):
                 ):
                     parsed_tool_args[param_name] = execution_ctx
                     continue
+
+            # ────────────────────────────────────────────────────────────
+            # Second pass: coerce parsed JSON args into Pydantic models.
+            # Supports both single ``BaseModel`` parameters and
+            # ``list[BaseModel]`` collections.
+            # ────────────────────────────────────────────────────────────
+            for _pname, _param in inspect.signature(action).parameters.items():
+                if _pname not in parsed_tool_args:
+                    continue
+
+                _expected = _param.annotation
+                if _expected is inspect.Parameter.empty:
+                    continue
+
+                try:
+                    _origin = get_origin(_expected)
+
+                    # Case 1 – standalone BaseModel
+                    if (
+                        isinstance(_expected, type)
+                        and issubclass(_expected, BaseModel)
+                        and isinstance(parsed_tool_args[_pname], dict)
+                    ):
+                        parsed_tool_args[_pname] = _expected(**parsed_tool_args[_pname])
+
+                    # Case 2 – list[BaseModel]
+                    elif _origin is list:
+                        _item_type = (
+                            get_args(_expected)[0] if get_args(_expected) else None
+                        )
+                        if (
+                            _item_type
+                            and isinstance(_item_type, type)
+                            and issubclass(_item_type, BaseModel)
+                            and isinstance(parsed_tool_args[_pname], list)
+                        ):
+                            parsed_tool_args[_pname] = [
+                                _item_type(**_it)
+                                if not isinstance(_it, _item_type)
+                                else _it  # type: ignore[arg-type]
+                                for _it in parsed_tool_args[_pname]
+                            ]
+                except Exception as _e:
+                    logger.debug(
+                        "Failed to coerce argument '%s' to %s: %s",
+                        _pname,
+                        _expected,
+                        _e,
+                    )
 
             result = (
                 await action(**parsed_tool_args)

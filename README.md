@@ -51,3 +51,23 @@ if __name__ == "__main__":
     orchestrator.run()
 
 ```
+
+
+## Usage Examples:
+
+### IDE Coding Agent
+
+`/docs/examples/code_agent`
+
+![Dashboard](https://raw.githubusercontent.com/ricardo-agz/nfactorial/main/docs/static/img/code-agent.png)
+
+### Multi-Agent
+
+`/docs/examples/multi_agent`
+
+![Dashboard](https://raw.githubusercontent.com/ricardo-agz/nfactorial/main/docs/static/img/multi-agent.png)
+
+### Deliberations.ai
+[Check it out](https://www.deliberations.ai/)
+
+![Dashboard](https://raw.githubusercontent.com/ricardo-agz/nfactorial/main/docs/static/img/deliberations-demo-small.png)

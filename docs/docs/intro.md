@@ -4,32 +4,44 @@ slug: /
 
 # Factorial
 
-Factorial is a Python framework for reliably running high-concurrency agents asynchronously. It's designed for production workloads where you need to process thousands of agent tasks concurrently with built-in retries, monitoring, and distributed execution.
+**Build distributed agents that spawn other agents**
 
-Factorial has a small set of core primitives:
+nFactorial is a distributed task queue for building reliable multi-agent systems. It makes the following trivial to implement:
 
-* **Agents**, which are simply a system prompt + tools in an LLM -> tool execution loop
-* **Orchestrator**, which coordinates task distribution and manages worker processes  
-* **Tools**, which are Python functions that agents can call to interact with external systems
+* **Agent Reliability**: Automatic retries, backoff strategies, and recovery of dropped tasks from crashed workers.
+* **In-flight Task Management**: Cancel, steer, and monitor running tasks. 
+* **Spawning Sub Agents**: Having an agent spawn multiple sub agents and wait for their completion before continuing.
+* **Deferred Tools**: Pause the agent while it waits for long running tools to complete externally or wait for user approval before continuing.
+* **Observability**: Built-in metrics dashboard and comprehensive logging
 
-In combination with Redis for coordination, these primitives let you build scalable agent systems that handle real-world production loads without complex infrastructure setup.
+## Installation
 
-## Why use Factorial
+```bash
+pip install nfactorial
+```
 
-The framework has a few driving design principles:
+---
 
-1. **Works great out of the box** with sensible defaults and minimal configuration
-2. **Highly robust and scalable** with built-in fault tolerance and distributed execution
-3. **Highly configurable and overridable** with no hidden under-the-hood prompt bloat
 
-Here are the main features:
 
-* **Distributed execution**: Run agents across multiple workers and machines with Redis-based coordination  
-* **Fault tolerance**: Automatic retries, backoff strategies, and recovery of dropped tasks from crashed workers
+## Why use nFactorial
+
+nFactorial has a 2 core components:
+
+* **Agent (and Tools)**, which is simply a system prompt + python functions that interact with external systems in an LLM -> tool execution loop
+* **Orchestrator**, which spins up workers for each agent and orchestrates the task execution and agent states.
+
+In practice, this lets you easily build agents much like you would with another frameworks such as the OpenAI agents SDK, but with the reliability of using something like Celery or Temporal.
+
+**Here are the main features:**
+
+* **Distributed execution**: Run agents across multiple workers with Redis powering the underlying queue.
+* **Fault tolerance**: Automatic retries, backoff strategies, and recovery of dropped tasks from crashed workers.
 * **Real-time events**: Stream progress updates and results via WebSocket or Redis pub/sub 
-* **In-flight agent task management**: Cancel, steer, and monitor running tasks
-* **Observability**: Built-in metrics dashboard and comprehensive logging  
-* **Deferred tools**: Support for long-running operations that complete outside the agent execution
+* **Agent-lifecycle hooks**: Easily inject logic to run before/after each turn or run, on completion, failure, or cancellation. 
+* **In-flight agent task management**: Cancel or steer (inject in-flight messages) ongoing agent runs.
+* **Observability**: Built-in metrics dashboard to visualize active agents and workers and track succesful completions, errors, and other agent states.
+* **Deferred tools**: Easily implement tools that pause the agent execution until completion, such as those that require completion via a webhook or require user approval before the agent can continue.
 
 ## Quick Example
 
@@ -69,11 +81,6 @@ async for update in orchestrator.subscribe_to_updates(owner_id="user123"):
         break
 ```
 
-## Installation
-
-```bash
-pip install nfactorial
-```
 
 ## Next Steps
 

@@ -6,7 +6,7 @@ slug: /
 
 **Build distributed agents that spawn other agents**
 
-nFactorial is a distributed task queue for building reliable multi-agent systems. It makes the following trivial to implement:
+nFactorial is a distributed task queue for building reliable, high-concurrency multi-agent systems. It makes the following trivial to implement:
 
 * **Agent Reliability**: Automatic retries, backoff strategies, and recovery of dropped tasks from crashed workers.
 * **In-flight Task Management**: Cancel, steer, and monitor running tasks. 

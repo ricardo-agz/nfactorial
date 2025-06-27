@@ -12,7 +12,7 @@ nFactorial is a distributed task queue for building reliable, high-concurrency m
 * **In-flight Task Management**: Cancel, steer, and monitor running tasks. 
 * **Spawning Sub Agents**: Having an agent spawn multiple sub agents and wait for their completion before continuing.
 * **Deferred Tools**: Pause the agent while it waits for long running tools to complete externally or wait for user approval before continuing.
-* **Observability**: Built-in metrics dashboard and comprehensive logging
+* **Observability**: Built-in dashboard to visualize agent states, completions, and failures.
 
 ## Installation
 

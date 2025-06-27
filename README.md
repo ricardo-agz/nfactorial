@@ -70,4 +70,4 @@ if __name__ == "__main__":
 ### Deliberations.ai
 [Check it out](https://www.deliberations.ai/)
 
-![Dashboard](https://raw.githubusercontent.com/ricardo-agz/nfactorial/main/docs/static/img/deliberations-demo-small.png)
+![Dashboard](https://raw.githubusercontent.com/ricardo-agz/nfactorial/main/docs/static/img/deliberations-demo-small.gif)

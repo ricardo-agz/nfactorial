@@ -9,6 +9,7 @@ from factorial import (
     Orchestrator,
     ModelSettings,
     gpt_41_mini,
+    claude_4_sonnet,
     AgentWorkerConfig,
     deferred_result,
 )
@@ -138,7 +139,7 @@ class IDEAgent(BaseAgent[IdeAgentContext]):
             context_class=IdeAgentContext,
             instructions=instructions,
             tools=[think, edit_code, request_code_execution],
-            model=gpt_41_mini,
+            model=claude_4_sonnet,
             model_settings=ModelSettings(
                 temperature=0.1,
             ),

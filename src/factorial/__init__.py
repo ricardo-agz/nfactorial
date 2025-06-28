@@ -35,6 +35,11 @@ from factorial.llms import (
     gpt_41,
     gpt_41_mini,
     gpt_41_nano,
+    claude_4_opus,
+    claude_4_sonnet,
+    claude_37_sonnet,
+    claude_35_sonnet,
+    claude_35_haiku,
 )
 
 __all__ = [
@@ -72,5 +77,10 @@ __all__ = [
     "gpt_41",
     "gpt_41_mini",
     "gpt_41_nano",
+    "claude_4_opus",
+    "claude_4_sonnet",
+    "claude_37_sonnet",
+    "claude_35_sonnet",
+    "claude_35_haiku",
     "deferred_result",
 ]

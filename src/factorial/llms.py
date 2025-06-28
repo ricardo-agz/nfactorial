@@ -15,6 +15,7 @@ load_dotenv()
 
 class Provider(Enum):
     OPENAI = "openai"
+    ANTHROPIC = "anthropic"
     XAI = "xai"
 
 
@@ -31,6 +32,7 @@ class MultiClient:
         self,
         openai_api_key: str | None = None,
         xai_api_key: str | None = None,
+        anthropic_api_key: str | None = None,
         http_client: httpx.AsyncClient | None = None,
         max_connections: int = 1500,
         max_keepalive_connections: int = 1000,
@@ -57,6 +59,12 @@ class MultiClient:
             self.xai = AsyncOpenAI(
                 base_url="https://api.x.ai/v1",
                 api_key=xai_api_key or os.environ.get("XAI_API_KEY"),
+                http_client=self.http_client,
+            )
+        if anthropic_api_key or os.environ.get("ANTHROPIC_API_KEY"):
+            self.anthropic = AsyncOpenAI(
+                base_url="https://api.anthropic.com/v1",
+                api_key=anthropic_api_key or os.environ.get("ANTHROPIC_API_KEY"),
                 http_client=self.http_client,
             )
 
@@ -98,6 +106,10 @@ class MultiClient:
             if not self.xai:
                 raise ValueError("XAI client not initialized")
             return await self.xai.chat.completions.create(**kwargs)
+        if model.provider == Provider.ANTHROPIC:
+            if not self.anthropic:
+                raise ValueError("Anthropic client not initialized")
+            return await self.anthropic.chat.completions.create(**kwargs)
 
         raise ValueError(f"Unsupported provider: {model.provider}")
 
@@ -107,7 +119,11 @@ class MultiClient:
             await self.openai._client.aclose()
         if hasattr(self, "xai") and self.xai._client:
             await self.xai._client.aclose()
+        if hasattr(self, "anthropic") and self.anthropic._client:
+            await self.anthropic._client.aclose()
 
+
+# ---------- OPENAI MODELS ----------
 
 o3 = Model(
     name="o3",
@@ -143,6 +159,46 @@ gpt_41_nano = Model(
     provider_model_id="gpt-4.1-nano",
     context_window=1_047_576,
 )
+
+# ---------- ANTHROPIC MODELS ----------
+
+
+claude_4_opus = Model(
+    name="claude-4-opus",
+    provider=Provider.ANTHROPIC,
+    provider_model_id="claude-4-opus-20250219",
+    context_window=200_000,
+)
+
+claude_4_sonnet = Model(
+    name="claude-4-sonnet",
+    provider=Provider.ANTHROPIC,
+    provider_model_id="claude-sonnet-4-20250514",
+    context_window=200_000,
+)
+
+claude_37_sonnet = Model(
+    name="claude-3.7-sonnet",
+    provider=Provider.ANTHROPIC,
+    provider_model_id="claude-3.7-sonnet-20250219",
+    context_window=200_000,
+)
+
+claude_35_sonnet = Model(
+    name="claude-3.5-sonnet",
+    provider=Provider.ANTHROPIC,
+    provider_model_id="claude-3.5-sonnet-20241022",
+    context_window=200_000,
+)
+
+claude_35_haiku = Model(
+    name="claude-3.5-haiku",
+    provider=Provider.ANTHROPIC,
+    provider_model_id="claude-3.5-haiku-20241022",
+    context_window=200_000,
+)
+
+# ---------- XAI MODELS ----------
 
 grok_3 = Model(
     name="grok-3",

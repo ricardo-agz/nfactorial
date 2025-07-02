@@ -14,6 +14,8 @@ from typing import (
 )
 from functools import wraps
 from dataclasses import dataclass, field
+from openai import AsyncStream
+from openai.types.chat.chat_completion import Choice
 from pydantic import BaseModel
 import json
 import asyncio
@@ -21,7 +23,9 @@ import inspect
 import httpx
 from openai.types.chat import (
     ChatCompletion,
+    ChatCompletionChunk,
     ChatCompletionMessageToolCall,
+    ChatCompletionMessage,
 )
 from datetime import datetime
 
@@ -353,6 +357,7 @@ class BaseAgent(Generic[ContextType]):
         tools: list[FunctionTool[ContextType] | Callable[..., Any]] | None = None,
         model: Model | Callable[[ContextType], Model] | None = None,
         model_settings: ModelSettings[ContextType] | None = None,
+        stream: bool = False,
         context_window_limit: int | None = None,
         max_turns: int | None = None,
         http_client: httpx.AsyncClient | None = None,
@@ -401,6 +406,7 @@ class BaseAgent(Generic[ContextType]):
         self.event_publisher: EventPublisher | None = None
         self.model = model
         self.model_settings = model_settings or ModelSettings()
+        self.stream = stream
         self.context_window_limit = context_window_limit
         self.max_turns = max_turns
         self.parse_tool_args = parse_tool_args
@@ -460,6 +466,8 @@ class BaseAgent(Generic[ContextType]):
         tools = self.resolve_tools(agent_ctx)
         model = self.resolve_model(agent_ctx)
 
+        execution_ctx = ExecutionContext.current()
+
         # If ``max_turns`` is set we need to *force* the agent to finish on the final allowed turn.
         is_last_turn = (
             self.max_turns is not None and agent_ctx.turn >= self.max_turns - 1
@@ -474,18 +482,150 @@ class BaseAgent(Generic[ContextType]):
             else:
                 model_settings.tool_choice = "none"
 
-        response = cast(
-            ChatCompletion,
-            await self.client.completion(
-                model=model,
-                messages=messages,
-                tools=tools,
-                temperature=model_settings.temperature,
-                max_completion_tokens=model_settings.max_completion_tokens,
-                tool_choice=model_settings.tool_choice,
-                parallel_tool_calls=model_settings.parallel_tool_calls,
-            ),
-        )
+        if not self.stream:
+            response = cast(
+                ChatCompletion,
+                await self.client.completion(
+                    model=model,
+                    messages=messages,
+                    tools=tools,
+                    temperature=model_settings.temperature,
+                    max_completion_tokens=model_settings.max_completion_tokens,
+                    tool_choice=model_settings.tool_choice,
+                    parallel_tool_calls=model_settings.parallel_tool_calls,
+                ),
+            )
+        else:
+            # progressively reconstruct both the assistant text content
+            # *and* any tool calls (potentially multiple)
+
+            content: str = ""
+            # tool-call index -> partial data
+            tool_call_acc: dict[int, dict[str, Any]] = {}
+
+            res_id: str = ""
+            created_ts: int | None = None
+            finish_reason: str | None = None
+            usage: Any | None = None  # ``usage`` is populated in the last chunk
+
+            res = cast(
+                AsyncStream[ChatCompletionChunk],
+                await self.client.completion(
+                    model=model,
+                    messages=messages,
+                    tools=tools,
+                    temperature=model_settings.temperature,
+                    max_completion_tokens=model_settings.max_completion_tokens,
+                    tool_choice=model_settings.tool_choice,
+                    parallel_tool_calls=model_settings.parallel_tool_calls,
+                    stream=True,
+                ),
+            )
+
+            async for chunk in res:
+                res_id = chunk.id
+                created_ts = chunk.created
+                delta = chunk.choices[0].delta
+
+                if delta.content:
+                    content += delta.content
+
+                # Accumulate tool call deltas (could be multiple per chunk)
+                if delta.tool_calls:
+                    for delta_tool in delta.tool_calls:
+                        idx = delta_tool.index or 0
+
+                        acc = tool_call_acc.setdefault(
+                            idx,
+                            {
+                                "id": None,
+                                "type": None,
+                                "name": None,
+                                "arguments": "",
+                            },
+                        )
+
+                        # Static fields can arrive at any time – keep the first non-None.
+                        if delta_tool.id is not None:
+                            acc["id"] = delta_tool.id
+                        if delta_tool.type is not None:
+                            acc["type"] = delta_tool.type
+
+                        # Function fragment (name/arguments)
+                        if delta_tool.function:
+                            if delta_tool.function.name is not None:
+                                acc["name"] = delta_tool.function.name
+                            if delta_tool.function.arguments:
+                                acc["arguments"] += delta_tool.function.arguments
+
+                # Capture finish reason (set in the last chunk)
+                if chunk.choices[0].finish_reason is not None:
+                    finish_reason = chunk.choices[0].finish_reason
+
+                # Capture usage if provided (usually only in last chunk)
+                if chunk.usage is not None:
+                    usage = chunk.usage
+
+                # Publish progress update for this chunk (streaming)
+                try:
+                    if execution_ctx and execution_ctx.events:
+                        await execution_ctx.events.publish_event(
+                            AgentEvent(
+                                event_type="progress_update_completion_chunk",
+                                task_id=execution_ctx.task_id,
+                                owner_id=execution_ctx.owner_id,
+                                agent_name=self.name,
+                                turn=agent_ctx.turn,
+                                data=serialize_data(chunk),
+                            )
+                        )
+                except Exception:
+                    logger.exception(
+                        "Failed to publish streaming progress update", exc_info=True
+                    )
+
+            # Convert accumulated tool call data into the structured OpenAI type
+            formatted_tool_calls: list[ChatCompletionMessageToolCall] | None = None
+            if tool_call_acc:
+                formatted_tool_calls = []
+                for idx in sorted(tool_call_acc.keys()):
+                    acc = tool_call_acc[idx]
+                    if acc["name"] is None:
+                        # Incomplete tool call – skip for safety (shouldn't happen)
+                        logger.debug(
+                            "Incomplete tool call: %s",
+                            acc,
+                        )
+                        continue
+                    formatted_tool_calls.append(
+                        ChatCompletionMessageToolCall(
+                            id=acc["id"] or f"call_{idx}",
+                            type=acc["type"] or "function",
+                            function={  # type: ignore[arg-type]
+                                "name": acc["name"],
+                                "arguments": acc["arguments"],
+                            },
+                        )
+                    )
+
+            response = ChatCompletion(
+                id=res_id,
+                model=model.name,
+                created=created_ts or int(datetime.now().timestamp()),
+                object="chat.completion",
+                choices=[
+                    Choice(
+                        index=0,
+                        message=ChatCompletionMessage(
+                            role="assistant",
+                            content=content or None,
+                            tool_calls=formatted_tool_calls,
+                        ),
+                        finish_reason=finish_reason or "stop",
+                    )
+                ],
+                usage=usage,
+            )
 
         return response
 

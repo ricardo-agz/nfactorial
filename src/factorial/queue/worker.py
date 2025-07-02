@@ -7,7 +7,7 @@ import json
 import asyncio
 from dataclasses import replace
 from contextlib import asynccontextmanager, suppress
-from factorial.agent import BaseAgent, ExecutionContext, RunCompletion
+from factorial.agent import BaseAgent, ExecutionContext, RunCompletion, serialize_data
 from factorial.context import ContextType
 from factorial.events import QueueEvent, AgentEvent, EventPublisher
 from factorial.logging import get_logger, colored
@@ -435,6 +435,8 @@ async def process_task(
                         task_id=task.id,
                         owner_id=task.metadata.owner_id,
                         agent_name=agent.name,
+                        turn=task.payload.turn,
+                        data=serialize_data(turn_completion),
                     )
                 )
 
@@ -455,6 +457,8 @@ async def process_task(
                         task_id=task.id,
                         owner_id=task.metadata.owner_id,
                         agent_name=agent.name,
+                        turn=task.payload.turn,
+                        data=serialize_data(turn_completion),
                     )
                 )
 
@@ -493,6 +497,8 @@ async def process_task(
                         task_id=task.id,
                         owner_id=task.metadata.owner_id,
                         agent_name=agent.name,
+                        turn=task.payload.turn,
+                        data=serialize_data(turn_completion),
                     )
                 )
 

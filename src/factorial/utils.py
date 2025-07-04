@@ -3,6 +3,10 @@ import re
 from typing import Any, Callable, get_origin
 from pydantic import BaseModel
 import inspect
+from dataclasses import is_dataclass
+from datetime import date, datetime, time, timedelta
+from enum import Enum
+import base64
 
 
 def to_snake_case(camel: str) -> str:
@@ -18,13 +22,40 @@ def serialize_data(data: Any) -> Any:
     elif isinstance(data, BaseModel):
         return data.model_dump()
     elif isinstance(data, dict):
-        return {k: serialize_data(v) for k, v in data.items()}  # type: ignore
-    elif isinstance(data, (list, tuple)):
-        return [serialize_data(item) for item in data]  # type: ignore
-    elif hasattr(data, "model_dump") and callable(data.model_dump):
-        return data.model_dump()
-    elif hasattr(data, "to_dict") and callable(data.to_dict):
-        return data.to_dict()
+        return {k: serialize_data(v) for k, v in data.items()}
+    elif isinstance(data, (list, tuple, set, frozenset)):
+        return [serialize_data(item) for item in data]
+    elif isinstance(data, (bytes, bytearray, memoryview)):
+        # Attempt UTF-8 decode first; fall back to base64 for binary safety
+        try:
+            return data.decode("utf-8")  # type: ignore[call-arg]
+        except UnicodeDecodeError:
+            return base64.b64encode(bytes(data)).decode("ascii")
+    elif isinstance(data, (datetime, date, time)):
+        return data.isoformat()
+    elif isinstance(data, timedelta):
+        return data.total_seconds()
+    elif isinstance(data, Enum):
+        return serialize_data(data.value)
+    elif is_dataclass(data) and not isinstance(data, type):
+        """Safely convert dataclass -> dict without deepcopy-ing un-serialisable fields."""
+        result: dict[str, Any] = {}
+        for _field in data.__dataclass_fields__.values():
+            _val = getattr(data, _field.name)
+            try:
+                result[_field.name] = serialize_data(_val)
+            except Exception:
+                # Last-ditch fallback – capture the *repr* so something useful
+                # is emitted even if the value is not JSON-serialisable.
+                try:
+                    result[_field.name] = repr(_val)
+                except Exception:
+                    result[_field.name] = "<unserialisable>"
+        return result
+    elif callable(getattr(data, "model_dump", None)):
+        return data.model_dump()  # type: ignore[attr-defined]
+    elif callable(getattr(data, "to_dict", None)):
+        return data.to_dict()  # type: ignore[attr-defined]
     else:
         return str(data)
 

@@ -64,7 +64,12 @@ async def complete_deferred_tool(
         )
         return False
 
-    keys = RedisKeys.format(namespace=namespace, task_id=task_id, agent=agent.name)
+    keys = RedisKeys.format(
+        namespace=namespace,
+        task_id=task_id,
+        agent=agent.name,
+        owner_id=task.metadata.owner_id,
+    )
 
     # Set the result
     await redis_client.hset(keys.pending_tool_results, tool_call_id, json.dumps(result))  # type: ignore

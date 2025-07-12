@@ -253,10 +253,12 @@ class BatchMetadata:
     total_tasks: int
     max_progress: int
     status: str
+    parent_id: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "owner_id": self.owner_id,
+            "parent_id": self.parent_id,
             "created_at": self.created_at.timestamp(),
             "total_tasks": self.total_tasks,
             "max_progress": self.max_progress,

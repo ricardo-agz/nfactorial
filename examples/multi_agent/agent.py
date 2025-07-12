@@ -102,9 +102,9 @@ async def research(
     """Spawn child search tasks for each query and wait for them to complete."""
 
     payloads = [AgentContext(query=q) for q in queries]
-    child_ids = await execution_ctx.spawn_child_tasks(search_agent, payloads)
+    batch = await execution_ctx.spawn_child_tasks(search_agent, payloads)
     agent_ctx.has_used_research = True
-    return child_ids
+    return batch.task_ids
 
 
 class MainAgent(BaseAgent[MainAgentContext]):
@@ -115,7 +115,7 @@ class MainAgent(BaseAgent[MainAgentContext]):
             model=gpt_41_mini,
             instructions="You are a helpful assistant. Always start out by making a plan.",
             tools=[plan, reflect, research, search],
-            model_settings=ModelSettings[AgentContext](
+            model_settings=ModelSettings[MainAgentContext](
                 temperature=0.0,
                 tool_choice=lambda context: (
                     {
@@ -129,18 +129,6 @@ class MainAgent(BaseAgent[MainAgentContext]):
             ),
             context_class=MainAgentContext,
             output_type=FinalOutput,
-            on_run_start=lambda context, execution_ctx: print(
-                "Run started", flush=True
-            ),
-            on_run_end=lambda context, execution_ctx, run_completion: print(
-                "Run ended", run_completion, flush=True
-            ),
-            on_turn_start=lambda context, execution_ctx: print(
-                "Turn started", flush=True
-            ),
-            on_turn_end=lambda context, execution_ctx, turn_completion: print(
-                "Turn ended", turn_completion, flush=True
-            ),
         )
 
 

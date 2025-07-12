@@ -60,7 +60,7 @@ class ExecutionContext:
         self,
         agent: "BaseAgent[ContextType]",
         payloads: list["ContextType"],
-    ) -> Batch:
+    ) -> "Batch":
         """Spawn multiple child tasks in a batch.
 
         This is a thin wrapper around the internal ``enqueue_batch``

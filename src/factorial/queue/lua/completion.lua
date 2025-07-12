@@ -45,10 +45,10 @@ local task_result = load_task(
 if task_result.state == "missing" then
     -- Task is missing, add to orphaned queue
     redis.call('ZADD', queue_orphaned_key, timestamp, task_id)
-    return false
+    return { false, false }
 elseif task_result.state == "corrupted" then
     -- Task data is corrupted, skip it and log it
-    return false
+    return { false, false }
 end
 
 local status = task_result.status
@@ -71,7 +71,7 @@ if pending_tool_call_ids_json ~= "" then
     -- Add to parked queue
     redis.call('ZADD', queue_pending_key, timestamp, task_id)
 
-    return true
+    return { true, false }
 end
 
 if pending_child_task_ids_json ~= "" then
@@ -86,7 +86,7 @@ if pending_child_task_ids_json ~= "" then
     -- Add to parked queue
     redis.call('ZADD', queue_pending_key, timestamp, task_id)
 
-    return true
+    return { true, false }
 end
 
 
@@ -100,9 +100,16 @@ local function update_batch_progress(task_id, task_meta, current_turn, status)
     -- Then, the progress is just progress_sum / max_progress * 100
 
     -- Look up batch id for this task
+    -- Guard against `cjson.null` which is returned when the JSON value is `null`.
     local batch_id = task_meta.batch_id
-    if not batch_id then return false end
+    if (not batch_id) or batch_id == cjson.null then
+        return false
+    end
+
     local max_turns = task_meta.max_turns
+    if max_turns == cjson.null then
+        max_turns = nil
+    end
 
     local batch_meta_json = redis.call('HGET', batch_meta_key, batch_id)
     if not batch_meta_json then return false end
@@ -155,7 +162,7 @@ end
 if action == "complete" then
     -- Check if task is in a valid state for completion
     if status ~= "processing" and status ~= "pending_tool_results" and status ~= "pending_child_tasks" then
-        return false
+        return { false, false }
     end
 
     -- Task finished successfully, add to completions queue
@@ -178,11 +185,11 @@ if action == "complete" then
 
     local batch_completed = update_batch_progress(task_id, meta, current_turn, "completed")
 
-    return { success = true, batch_completed = batch_completed }
+    return { true, batch_completed }
 elseif action == "continue" then
     -- Check if task is in a valid state for continuation
     if status ~= "processing" then
-        return false
+        return { false, false }
     end
 
     -- Task needs more processing, put back at front of main queue
@@ -192,11 +199,11 @@ elseif action == "continue" then
     redis.call('HSET', task_payloads_key, task_id, updated_task_payload_json)
 
     update_batch_progress(task_id, meta, current_turn, "active")
-    return { success = true, batch_completed = false }
+    return { true, false }
 elseif action == "retry" then
     -- Check if task is in a valid state for retry
     if status ~= "processing" then
-        return false
+        return { false, false }
     end
 
     -- Requeue and update the task status and retry count
@@ -211,11 +218,11 @@ elseif action == "retry" then
         { 'retried', pickups, retries, meta_json, metrics_ttl }
     )
 
-    return { success = true, batch_completed = false }
+    return { true, false }
 elseif action == "backoff" then
     -- Check if task is in a valid state for backoff
     if status ~= "processing" then
-        return false
+        return { false, false }
     end
 
     -- Add to backoff queue with exponential backoff
@@ -225,11 +232,11 @@ elseif action == "backoff" then
     redis.call('HINCRBY', task_retries_key, task_id, 1)
     redis.call('HSET', task_metas_key, task_id, cjson.encode(meta))
 
-    return { success = true, batch_completed = false }
+    return { true, false }
 elseif action == "fail" then
     -- Check if task is in a valid state for failure
     if status ~= "processing" and status ~= "pending_tool_results" and status ~= "pending_child_tasks" then
-        return false
+        return { false, false }
     end
 
     -- Add to failed queue and set task status to failed
@@ -248,7 +255,7 @@ elseif action == "fail" then
     end
 
     local batch_completed = update_batch_progress(task_id, meta, current_turn, "failed")
-    return { success = true, batch_completed = batch_completed }
+    return { true, batch_completed }
 else
     error("invalid_action")
 end

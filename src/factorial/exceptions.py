@@ -40,6 +40,14 @@ class CorruptedTaskDataError(Exception):
         )
 
 
+class BatchNotFoundError(Exception):
+    """Exception raised when a batch is not found"""
+
+    def __init__(self, batch_id: str):
+        self.batch_id = batch_id
+        super().__init__(f"Batch {batch_id} not found")
+
+
 class RetryableError(Exception):
     """Error that should be retried"""
 
@@ -72,6 +80,7 @@ __all__ = [
     "InvalidTaskIdError",
     "InactiveTaskError",
     "CorruptedTaskDataError",
+    "BatchNotFoundError",
     "RetryableError",
     "RateLimitError",
     "RETRYABLE_EXCEPTIONS",

@@ -42,6 +42,15 @@ class AgentEvent(BaseEvent):
     error: str | None = None
 
 
+@dataclass
+class BatchEvent(BaseEvent):
+    batch_id: str | None = None
+    progress: float | None = None
+    completed_tasks: int | None = None
+    total_tasks: int | None = None
+    status: str | None = None  # e.g., 'active', 'completed', 'cancelled'
+
+
 class EventPublisher:
     def __init__(self, redis_client: Redis, channel: str):
         self.redis_client = redis_client

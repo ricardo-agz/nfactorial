@@ -242,6 +242,14 @@ async def create_task_steering_script(redis_client: redis.Redis) -> TaskSteering
     return get_cached_script(redis_client, "steering", TaskSteeringScript)
 
 
+@dataclass
+class TaskCompletionScriptResult:
+    """Result of the task completion script"""
+
+    success: bool
+    batch_completed: bool
+
+
 class TaskCompletionScript(AsyncScript):
     """
     Handles task completion, continuation, or failure
@@ -259,22 +267,27 @@ class TaskCompletionScript(AsyncScript):
     * KEYS[10] = task_pickups_key (str)
     * KEYS[11] = task_retries_key (str)
     * KEYS[12] = task_metas_key (str)
-    * KEYS[13] = processing_heartbeats_key (str)
-    * KEYS[14] = pending_tool_results_key (str)
-    * KEYS[15] = pending_child_task_results_key (str)
-    * KEYS[16] = agent_metrics_bucket_key (str)
-    * KEYS[17] = global_metrics_bucket_key (str)
-    * KEYS[18] = parent_pending_child_task_results_key (str | None)
+    * KEYS[13] = batch_meta_key (str)
+    * KEYS[14] = batch_progress_key (str)
+    * KEYS[15] = batch_remaining_tasks_key (str)
+    * KEYS[16] = batch_completed_key (str)
+    * KEYS[17] = processing_heartbeats_key (str)
+    * KEYS[18] = pending_tool_results_key (str)
+    * KEYS[19] = pending_child_task_results_key (str)
+    * KEYS[20] = agent_metrics_bucket_key (str)
+    * KEYS[21] = global_metrics_bucket_key (str)
+    * KEYS[22] = parent_pending_child_task_results_key (str | None)
 
     Args:
     * ARGV[1] = task_id (str)
     * ARGV[2] = action (str)
     * ARGV[3] = updated_task_payload_json (str)
-    * ARGV[4] = metrics_ttl (int)
-    * ARGV[5] = pending_sentinel (str | None)
-    * ARGV[6] = pending_tool_call_ids_json (str | None)
-    * ARGV[7] = pending_child_task_ids_json (str | None)
-    * ARGV[8] = final_output_json (str | None)
+    * ARGV[4] = current_turn (int)
+    * ARGV[5] = metrics_ttl (int)
+    * ARGV[6] = pending_sentinel (str | None)
+    * ARGV[7] = pending_tool_call_ids_json (str | None)
+    * ARGV[8] = pending_child_task_ids_json (str | None)
+    * ARGV[9] = final_output_json (str | None)
     """
 
     async def execute(
@@ -297,16 +310,21 @@ class TaskCompletionScript(AsyncScript):
         pending_child_task_results_key: str,
         agent_metrics_bucket_key: str,
         global_metrics_bucket_key: str,
+        batch_meta_key: str,
+        batch_progress_key: str,
+        batch_remaining_tasks_key: str,
+        batch_completed_key: str,
         task_id: str,
         action: str,
         updated_task_payload_json: str,
         metrics_ttl: int,
         pending_sentinel: str,
+        current_turn: int,
         parent_pending_child_task_results_key: str | None = None,
         pending_tool_call_ids_json: str | None = None,
         pending_child_task_ids_json: str | None = None,
         final_output_json: str | None = None,
-    ) -> bool:
+    ) -> TaskCompletionScriptResult:
         keys = [
             queue_main_key,
             queue_completions_key,
@@ -320,6 +338,10 @@ class TaskCompletionScript(AsyncScript):
             task_pickups_key,
             task_retries_key,
             task_metas_key,
+            batch_meta_key,
+            batch_progress_key,
+            batch_remaining_tasks_key,
+            batch_completed_key,
             processing_heartbeats_key,
             pending_tool_results_key,
             pending_child_task_results_key,
@@ -329,18 +351,24 @@ class TaskCompletionScript(AsyncScript):
         if parent_pending_child_task_results_key:
             keys.append(parent_pending_child_task_results_key)
 
-        return await super().__call__(  # type: ignore
+        result: tuple[bool, bool] = await super().__call__(  # type: ignore
             keys=keys,
             args=[
                 task_id,
                 action,
                 updated_task_payload_json,
+                current_turn,
                 metrics_ttl,
                 pending_sentinel,
                 pending_tool_call_ids_json or "",
                 pending_child_task_ids_json or "",
                 final_output_json or "",
             ],
+        )
+
+        return TaskCompletionScriptResult(
+            success=bool(result[0]),
+            batch_completed=bool(result[1]),
         )
 
 
@@ -885,10 +913,10 @@ class CancelTaskScript(AsyncScript):
         )
 
         return CancelTaskScriptResult(
-            success=bool(decode(result[0])),
-            current_status=decode(result[1]) if result[1] != "" else None,
+            success=bool(result[0]),
+            current_status=decode(result[1]) if result[1] else None,
             message=decode(result[2]),
-            owner_id=decode(result[3]) if result[3] != "" else None,
+            owner_id=decode(result[3]) if result[3] else None,
         )
 
 
@@ -899,3 +927,64 @@ async def create_cancel_task_script(
     Creates a unified script for cancelling tasks in any state
     """
     return get_cached_script(redis_client, "cancellation", CancelTaskScript)
+
+
+@dataclass
+class EnqueueBatchScriptResult:
+    task_ids: list[str]
+
+
+class EnqueueBatchScript(AsyncScript):
+    """Atomically enqueue a batch of tasks (see batch_enqueue.lua)."""
+
+    async def execute(
+        self,
+        *,
+        agent_queue_key: str,
+        task_statuses_key: str,
+        task_agents_key: str,
+        task_payloads_key: str,
+        task_pickups_key: str,
+        task_retries_key: str,
+        task_metas_key: str,
+        batch_tasks_key: str,
+        batch_meta_key: str,
+        batch_id: str,
+        owner_id: str,
+        created_at: float,
+        agent_name: str,
+        tasks_json: str,
+        base_task_meta_json: str,
+        batch_meta_json: str,
+        batch_remaining_tasks_key: str,
+        batch_progress_key: str,
+    ) -> EnqueueBatchScriptResult:
+        res: str = await super().__call__(  # type: ignore
+            keys=[
+                agent_queue_key,
+                task_statuses_key,
+                task_agents_key,
+                task_payloads_key,
+                task_pickups_key,
+                task_retries_key,
+                task_metas_key,
+                batch_tasks_key,
+                batch_meta_key,
+                batch_remaining_tasks_key,
+                batch_progress_key,
+            ],
+            args=[
+                batch_id,
+                owner_id,
+                created_at,
+                agent_name,
+                tasks_json,
+                base_task_meta_json,
+                batch_meta_json,
+            ],
+        )
+        return EnqueueBatchScriptResult(task_ids=json.loads(decode(res)))
+
+
+async def create_enqueue_batch_script(redis_client: redis.Redis) -> EnqueueBatchScript:
+    return get_cached_script(redis_client, "enqueue_batch", EnqueueBatchScript)

@@ -9,6 +9,7 @@ from ._loader import (
     create_enqueue_task_script,
     create_backoff_recovery_script,
     create_cancel_task_script,
+    create_enqueue_batch_script,
     BatchPickupScript,
     TaskSteeringScript,
     TaskCompletionScript,
@@ -23,6 +24,8 @@ from ._loader import (
     StaleRecoveryScriptResult,
     TaskExpirationScriptResult,
     CancelTaskScriptResult,
+    EnqueueBatchScript,
+    EnqueueBatchScriptResult,
 )
 
 __all__ = [
@@ -36,6 +39,7 @@ __all__ = [
     "create_enqueue_task_script",
     "create_backoff_recovery_script",
     "create_cancel_task_script",
+    "create_enqueue_batch_script",
     "BatchPickupScript",
     "TaskSteeringScript",
     "TaskCompletionScript",
@@ -50,4 +54,6 @@ __all__ = [
     "StaleRecoveryScriptResult",
     "TaskExpirationScriptResult",
     "CancelTaskScriptResult",
+    "EnqueueBatchScript",
+    "EnqueueBatchScriptResult",
 ]

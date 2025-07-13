@@ -9,11 +9,13 @@ from dataclasses import replace
 from contextlib import asynccontextmanager, suppress
 from factorial.agent import BaseAgent, ExecutionContext, RunCompletion, serialize_data
 from factorial.context import ContextType
-from factorial.events import QueueEvent, AgentEvent, EventPublisher
+from factorial.events import QueueEvent, AgentEvent, EventPublisher, BatchEvent
 from factorial.logging import get_logger, colored
 from factorial.exceptions import RETRYABLE_EXCEPTIONS, FatalAgentError
 from factorial.queue.task import (
+    Batch,
     Task,
+    get_batch_data,
     get_task_data,
     get_task_steering_messages,
 )
@@ -25,6 +27,7 @@ from factorial.queue.lua import (
     create_task_completion_script,
 )
 from factorial.queue.operations import (
+    create_batch_and_enqueue,
     resume_if_no_remaining_child_tasks,
     process_cancelled_tasks,
     get_task_batch,
@@ -284,6 +287,11 @@ async def process_task(
         )
         return
 
+    event_publisher = EventPublisher(
+        redis_client=redis_client,
+        channel=keys.updates_channel,
+    )
+
     async def complete(
         action: CompletionAction,
         pending_tool_call_ids: list[str] | None,
@@ -291,7 +299,7 @@ async def process_task(
         final_output: dict[str, Any] | str | None,
     ):
         try:
-            return await completion_script.execute(
+            result = await completion_script.execute(
                 queue_main_key=keys.queue_main,
                 queue_completions_key=keys.queue_completions,
                 queue_failed_key=keys.queue_failed,
@@ -309,6 +317,11 @@ async def process_task(
                 pending_child_task_results_key=keys.pending_child_task_results,
                 agent_metrics_bucket_key=keys.agent_metrics_bucket,
                 global_metrics_bucket_key=keys.global_metrics_bucket,
+                batch_meta_key=keys.batch_meta,
+                batch_progress_key=keys.batch_progress,
+                batch_remaining_tasks_key=keys.batch_remaining_tasks,
+                batch_completed_key=keys.batch_completed,
+                current_turn=task.payload.turn,
                 parent_pending_child_task_results_key=parent_keys.pending_child_task_results
                 if parent_keys
                 else None,
@@ -325,6 +338,17 @@ async def process_task(
                 else None,
                 final_output_json=json.dumps(final_output),
             )
+
+            if result.batch_completed:
+                await event_publisher.publish_event(
+                    BatchEvent(
+                        event_type="batch_completed",
+                        batch_id=task.metadata.batch_id,
+                        owner_id=task.metadata.owner_id,
+                    )
+                )
+
+            return result.success
         except Exception as e:
             logger.error(f"Error completing task: {e}", exc_info=e)
             # Re-raise the exception so the calling code knows the completion failed
@@ -360,10 +384,39 @@ async def process_task(
 
         return child_task.id
 
-    event_publisher = EventPublisher(
-        redis_client=redis_client,
-        channel=keys.updates_channel,
-    )
+    async def _enqueue_batch(
+        agent: BaseAgent[Any],
+        payloads: list[ContextType],
+    ) -> Batch:
+        """Lightweight wrapper to enqueue a batch of child tasks."""
+        return await create_batch_and_enqueue(
+            redis_client=redis_client,
+            namespace=namespace,
+            agent=agent,
+            payloads=payloads,
+            owner_id=task.metadata.owner_id,
+            parent_id=task.id,
+        )
+
+    async def _publish_batch_progress(batch_id: str) -> None:
+        """Publish a *batch_progress* event by fetching the batch data from Redis."""
+
+        batch = await get_batch_data(redis_client, namespace, batch_id)
+        if not batch or batch.metadata.status != "active":
+            return
+
+        await event_publisher.publish_event(
+            BatchEvent(
+                event_type="batch_progress",
+                batch_id=batch_id,
+                owner_id=batch.metadata.owner_id,
+                progress=batch.progress,
+                completed_tasks=batch.metadata.total_tasks
+                - len(batch.remaining_task_ids),
+                total_tasks=batch.metadata.total_tasks,
+                status=batch.metadata.status,
+            )
+        )
 
     task_failed = False
     final_action: CompletionAction | None = (
@@ -384,7 +437,8 @@ async def process_task(
                 retries=task.retries,
                 iterations=task.payload.turn,
                 events=event_publisher,
-                enqueue_child_task=_enqueue_child_task,
+                enqueue_child_task=_enqueue_child_task,  # type: ignore[arg-type]
+                enqueue_batch=_enqueue_batch,  # type: ignore[arg-type]
             )
 
             if task.payload.turn == 0 and task.retries == 0:
@@ -502,6 +556,11 @@ async def process_task(
                     )
                 )
 
+                if task.metadata.batch_id:
+                    await _publish_batch_progress(task.metadata.batch_id)
+
+                # logger.info(f"✅ Task completed {colored(f'[{task.id}]', 'dim')}")
+
             else:
                 # Task needs to continue processing
                 task.payload = turn_completion.context
@@ -512,6 +571,10 @@ async def process_task(
                     pending_child_task_ids=None,
                     final_output=None,
                 )
+
+                # granular batch progress updates are only supported for batches with max_turns set
+                if task.metadata.batch_id and agent.max_turns:
+                    await _publish_batch_progress(task.metadata.batch_id)
 
         except Exception as e:
             task_failed = True
@@ -579,6 +642,9 @@ async def process_task(
                             error=f"Agent {agent.name} failed to complete task {task.id} due to max retries ({max_retries})",
                         )
                     )
+
+                    if task.metadata.batch_id:
+                        await _publish_batch_progress(task.metadata.batch_id)
                 else:
                     logger.info(
                         f"🔄 Task set back for retry {colored(f'[{task.id}]', 'dim')}"

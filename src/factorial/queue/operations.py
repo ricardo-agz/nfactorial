@@ -5,18 +5,23 @@ import asyncio
 import json
 from typing import Any, cast
 import redis.asyncio as redis
+import uuid
+from datetime import datetime, timezone
 
 from factorial.utils import decode
 from factorial.agent import BaseAgent, ExecutionContext
-from factorial.events import AgentEvent, EventPublisher
+from factorial.events import AgentEvent, EventPublisher, BatchEvent
 from factorial.logging import get_logger, colored
 from factorial.queue.task import (
+    Batch,
+    BatchMetadata,
     Task,
     TaskStatus,
     ContextType,
     get_task_status,
     get_task_data,
     get_task_agent,
+    get_batch_data,
 )
 from factorial.utils import is_valid_task_id
 from factorial.exceptions import (
@@ -32,6 +37,8 @@ from factorial.queue.lua import (
     create_child_task_completion_script,
     create_enqueue_task_script,
     create_tool_completion_script,
+    EnqueueBatchScript,
+    create_enqueue_batch_script,
 )
 from factorial.queue.keys import RedisKeys, PENDING_SENTINEL
 
@@ -160,13 +167,170 @@ async def enqueue_task(
         task_metas_key=keys.task_meta,
         task_id=task.id,
         task_agent=agent.name,
-        task_payload_json=task.payload.to_json(),
+        task_payload_json=task.payload.to_json() if task.payload else "{}",
         task_pickups=0,
         task_retries=0,
         task_meta_json=task.metadata.to_json(),
     )
 
     return task.id
+
+
+async def create_batch_and_enqueue(
+    redis_client: redis.Redis,
+    namespace: str,
+    agent: BaseAgent[Any],
+    payloads: list[ContextType],
+    owner_id: str,
+    parent_id: str | None = None,
+) -> Batch:
+    """Atomically enqueue a batch of tasks via batch_enqueue.lua.
+
+    Returns the *batch_id* created.
+    """
+    batch_id = str(uuid.uuid4())
+    created_at = time.time()
+
+    task_objs: list[Task[ContextType]] = []
+    for payload in payloads:
+        t: Task[ContextType] = Task.create(
+            owner_id=owner_id, agent=agent.name, payload=payload, batch_id=batch_id
+        )
+        if parent_id is not None:
+            t.metadata.parent_id = parent_id
+        task_objs.append(t)
+
+    tasks_json = [
+        {
+            "id": t.id,
+            "payload_json": t.payload.to_json(),
+        }
+        for t in task_objs
+    ]
+
+    base_task_meta = {
+        "owner_id": owner_id,
+        "parent_id": parent_id,
+        "batch_id": batch_id,
+        "created_at": created_at,
+        "max_turns": agent.max_turns,
+    }
+
+    max_progress = (
+        agent.max_turns * len(task_objs) if agent.max_turns else len(task_objs)
+    )
+    batch_meta = {
+        "owner_id": owner_id,
+        "parent_id": parent_id,
+        "created_at": created_at,
+        "total_tasks": len(task_objs),
+        "max_progress": max_progress,
+        "status": "active",
+    }
+
+    keys = RedisKeys.format(namespace=namespace, agent=agent.name)
+    script: EnqueueBatchScript = await create_enqueue_batch_script(redis_client)
+    result = await script.execute(
+        agent_queue_key=keys.queue_main,
+        task_statuses_key=keys.task_status,
+        task_agents_key=keys.task_agent,
+        task_payloads_key=keys.task_payload,
+        task_pickups_key=keys.task_pickups,
+        task_retries_key=keys.task_retries,
+        task_metas_key=keys.task_meta,
+        batch_tasks_key=keys.batch_tasks,
+        batch_meta_key=keys.batch_meta,
+        batch_id=batch_id,
+        owner_id=owner_id,
+        created_at=created_at,
+        agent_name=agent.name,
+        tasks_json=json.dumps(tasks_json),
+        base_task_meta_json=json.dumps(base_task_meta),
+        batch_meta_json=json.dumps(batch_meta),
+        batch_remaining_tasks_key=keys.batch_remaining_tasks,
+        batch_progress_key=keys.batch_progress,
+    )
+    task_ids = result.task_ids
+
+    return Batch(
+        id=batch_id,
+        metadata=BatchMetadata.from_dict(batch_meta),
+        task_ids=task_ids,
+        remaining_task_ids=task_ids,
+        progress=0.0,
+    )
+
+
+async def cancel_batch(
+    redis_client: redis.Redis,
+    namespace: str,
+    batch_id: str,
+    agents_by_name: dict[str, BaseAgent[Any]],
+    metrics_bucket_duration: int,
+    metrics_retention_duration: int,
+) -> Batch:
+    """Cancel all tasks in a batch.
+
+    * Concurrently cancel all tasks in a batch.
+    * Silently ignores cases where the task is already finished / cancelled.
+    """
+
+    batch = await get_batch_data(redis_client, namespace, batch_id)
+    keys = RedisKeys.format(namespace=namespace)
+
+    async def _safe_cancel(tid: str) -> None:
+        try:
+            await cancel_task(
+                redis_client=redis_client,
+                namespace=namespace,
+                task_id=tid,
+                agents_by_name=agents_by_name,
+                metrics_bucket_duration=metrics_bucket_duration,
+                metrics_retention_duration=metrics_retention_duration,
+            )
+        except (InactiveTaskError, TaskNotFoundError):
+            # Task already in terminal state – ignore
+            return
+        except Exception as e:
+            logger.error(f"Failed to cancel task {tid} in batch {batch_id}: {e}")
+
+    # Run cancellations in parallel (bounded to avoid overwhelming redis)
+    sem = asyncio.Semaphore(50)
+
+    async def _bounded_cancel(tid: str) -> None:
+        async with sem:
+            await _safe_cancel(tid)
+
+    await asyncio.gather(*[_bounded_cancel(tid) for tid in batch.task_ids])
+    # Refresh batch stats in case some tasks were cancelled immediately (e.g. backoff / pending)
+    batch = await get_batch_data(redis_client, namespace, batch_id)
+
+    batch.metadata.status = "cancelled"
+
+    pipe = redis_client.pipeline(transaction=True)
+    pipe.hset(keys.batch_meta, batch_id, batch.metadata.to_json())  # type: ignore[arg-type]
+    pipe.zadd(keys.batch_completed, {batch_id: time.time()})  # type: ignore[arg-type]
+    await pipe.execute()
+
+    owner_id = batch.metadata.owner_id
+    if owner_id:
+        publisher = EventPublisher(
+            redis_client,
+            RedisKeys.format(namespace=namespace, owner_id=owner_id).updates_channel,
+        )
+        await publisher.publish_event(
+            BatchEvent(
+                event_type="batch_cancelled",
+                batch_id=batch_id,
+                owner_id=owner_id,
+                status="cancelled",
+                progress=batch.progress,
+                completed_tasks=len(batch.task_ids) - len(batch.remaining_task_ids),
+                total_tasks=len(batch.task_ids),
+            )
+        )
+
+    return batch
 
 
 async def cancel_task(

@@ -12,6 +12,7 @@ from factorial.exceptions import (
     TaskNotFoundError,
     InvalidTaskIdError,
     CorruptedTaskDataError,
+    BatchNotFoundError,
 )
 from factorial.queue.keys import RedisKeys
 from factorial.utils import is_valid_task_id
@@ -34,13 +35,17 @@ class TaskStatus(str, Enum):
 class TaskMetadata:
     owner_id: str
     parent_id: str | None = None
+    batch_id: str | None = None
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    max_turns: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "owner_id": self.owner_id,
             "parent_id": self.parent_id,
+            "batch_id": self.batch_id,
             "created_at": self.created_at.timestamp(),
+            "max_turns": self.max_turns,
         }
 
     @classmethod
@@ -70,7 +75,12 @@ class Task(Generic[ContextType]):
 
     @classmethod
     def create(
-        cls, owner_id: str, agent: str, payload: ContextType
+        cls,
+        owner_id: str,
+        agent: str,
+        payload: ContextType,
+        batch_id: str | None = None,
+        max_turns: int | None = None,
     ) -> "Task[ContextType]":
         return Task(
             status=TaskStatus.QUEUED,
@@ -78,6 +88,8 @@ class Task(Generic[ContextType]):
             payload=payload,
             metadata=TaskMetadata(
                 owner_id=owner_id,
+                batch_id=batch_id,
+                max_turns=max_turns,
             ),
         )
 
@@ -86,7 +98,7 @@ class Task(Generic[ContextType]):
             "id": self.id,
             "status": self.status.value,
             "agent": self.agent,
-            "payload": self.payload.to_dict() if self.payload else None,
+            "payload": self.payload.to_dict(),
             "pickups": self.pickups,
             "retries": self.retries,
             "metadata": self.metadata.to_dict(),
@@ -111,7 +123,7 @@ class Task(Generic[ContextType]):
                 payload_str = decode(data["payload"])
                 payload = context_class.from_dict(json.loads(payload_str))
         else:
-            payload = None
+            payload = context_class.from_dict({})
 
         return cls(
             id=data["id"],
@@ -232,3 +244,91 @@ async def get_task_steering_messages(
         message_data.append((message_id_str, json.loads(message_str)))
 
     return message_data
+
+
+@dataclass
+class BatchMetadata:
+    owner_id: str
+    created_at: datetime
+    total_tasks: int
+    max_progress: int
+    status: str
+    parent_id: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "owner_id": self.owner_id,
+            "parent_id": self.parent_id,
+            "created_at": self.created_at.timestamp(),
+            "total_tasks": self.total_tasks,
+            "max_progress": self.max_progress,
+            "status": self.status,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "BatchMetadata":
+        data["created_at"] = datetime.fromtimestamp(
+            float(data["created_at"]), tz=timezone.utc
+        )
+        return cls(**data)
+
+    def to_json(self) -> str:
+        return json.dumps(self.to_dict())
+
+
+@dataclass
+class Batch:
+    id: str
+    metadata: BatchMetadata
+    task_ids: list[str]
+    remaining_task_ids: list[str] = field(default_factory=list)
+    progress: float = 0.0
+
+
+async def get_batch_data(
+    redis_client: redis.Redis,
+    namespace: str,
+    batch_id: str,
+) -> Batch:
+    keys = RedisKeys.format(namespace=namespace)
+    # Atomically fetch metadata, task_ids, and remaining_task_ids
+    pipe = redis_client.pipeline(transaction=True)
+    pipe.multi()
+    pipe.hget(keys.batch_meta, batch_id)
+    pipe.hget(keys.batch_tasks, batch_id)
+    pipe.hget(keys.batch_remaining_tasks, batch_id)
+    pipe.hget(keys.batch_progress, batch_id)
+    (
+        metadata_json_bytes,
+        task_ids_json_bytes,
+        remaining_tasks_bytes,
+        progress_bytes,
+    ) = await pipe.execute()
+
+    if (
+        metadata_json_bytes is None
+        or remaining_tasks_bytes is None
+        or progress_bytes is None
+    ):
+        raise BatchNotFoundError(batch_id)
+
+    metadata = BatchMetadata.from_dict(json.loads(decode(metadata_json_bytes)))
+    task_ids = json.loads(decode(task_ids_json_bytes)) if task_ids_json_bytes else []
+    remaining_task_ids = (
+        json.loads(decode(remaining_tasks_bytes)) if remaining_tasks_bytes else []
+    )
+
+    progress_sum = int(decode(progress_bytes))
+    progress = (
+        (progress_sum / metadata.max_progress) * 100
+        if metadata.max_progress > 0
+        else 0.0
+    )
+
+    return Batch(
+        id=batch_id,
+        task_ids=task_ids,
+        remaining_task_ids=remaining_task_ids,
+        metadata=metadata,
+        progress=progress,
+    )

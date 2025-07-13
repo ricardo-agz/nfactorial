@@ -7,6 +7,7 @@ from factorial.events import EventPublisher
 
 if TYPE_CHECKING:
     from factorial.agent import BaseAgent  # pragma: no cover
+    from factorial.queue.task import Batch  # pragma: no cover
 
 execution_context: ContextVar["ExecutionContext"] = ContextVar("execution_context")
 
@@ -25,8 +26,9 @@ class ExecutionContext:
     # Lightweight async callback injected by the orchestrator/worker that can be
     # used to enqueue child tasks.  It should accept the child agent instance
     # and its payload, and return the **task_id** of the newly created task.
-    enqueue_child_task: (
-        Callable[["BaseAgent[Any]", "ContextType"], Awaitable[str]] | None
+    enqueue_child_task: Callable[["BaseAgent[Any]", Any], Awaitable[str]] | None = None
+    enqueue_batch: (
+        Callable[["BaseAgent[Any]", list[Any]], Awaitable["Batch"]] | None
     ) = None
 
     @classmethod
@@ -36,7 +38,7 @@ class ExecutionContext:
 
     async def spawn_child_task(
         self,
-        agent: "BaseAgent[Any]",
+        agent: "BaseAgent[ContextType]",
         payload: "ContextType",
     ) -> str:
         """Enqueue a child task for *agent* with *payload*.
@@ -56,18 +58,22 @@ class ExecutionContext:
 
     async def spawn_child_tasks(
         self,
-        agent: "BaseAgent[Any]",
+        agent: "BaseAgent[ContextType]",
         payloads: list["ContextType"],
-    ) -> list[str]:
-        """Spawn multiple child tasks concurrently.
+    ) -> "Batch":
+        """Spawn multiple child tasks in a batch.
 
-        A thin wrapper around *spawn_child_task* that launches all payloads in
-        parallel using :pyfunc:`asyncio.gather` and returns the list of newly
-        created task IDs in the same order as *payloads*.
+        This is a thin wrapper around the internal ``enqueue_batch``
+        callback injected by the worker.  It ensures the callback has been
+        configured and forwards the call.  Returns the batch object.
         """
 
-        coros = [self.spawn_child_task(agent, p) for p in payloads]
-        return await asyncio.gather(*coros)
+        if self.enqueue_batch is None:
+            raise RuntimeError(
+                "enqueue_batch is not configured for this execution context"
+            )
+
+        return await self.enqueue_batch(agent, payloads)
 
 
 class AgentContext(BaseModel):

@@ -184,6 +184,57 @@ async def remove_expired_tasks(
         return 0
 
 
+# ---------------------------------------------------------------------------
+# Batch cleanup helpers
+# ---------------------------------------------------------------------------
+
+
+async def cleanup_finished_batches(
+    redis_client: redis.Redis,
+    namespace: str,
+    completed_ttl: int,
+    max_cleanup_batch: int,
+) -> int:
+    """Remove batch bookkeeping data after *completed_ttl* seconds.
+
+    The function deletes:
+      • hash entries in *batch_meta*, *batch_tasks*, *batch_remaining_tasks*, *batch_progress*
+      • the ZSET entry in *batch_completed*
+
+    Returns the number of batches cleaned.
+    """
+
+    cutoff_timestamp = time.time() - completed_ttl
+
+    keys = RedisKeys.format(namespace=namespace)
+
+    # Get expired batch IDs (bounded by max_cleanup_batch)
+    expired_batch_ids: list[str] = await redis_client.zrangebyscore(
+        keys.batch_completed,
+        "-inf",
+        cutoff_timestamp,
+        start=0,
+        num=max_cleanup_batch,
+    )  # type: ignore[arg-type]
+
+    if not expired_batch_ids:
+        return 0
+
+    pipe = redis_client.pipeline(transaction=True)
+    for bid in expired_batch_ids:
+        pipe.hdel(keys.batch_meta, bid)
+        pipe.hdel(keys.batch_tasks, bid)
+        pipe.hdel(keys.batch_remaining_tasks, bid)
+        pipe.hdel(keys.batch_progress, bid)
+        pipe.zrem(keys.batch_completed, bid)
+
+    await pipe.execute()
+
+    logger.info(f"🗑️  Cleaned {len(expired_batch_ids)} expired batches")
+
+    return len(expired_batch_ids)
+
+
 async def maintenance_loop(
     shutdown_event: asyncio.Event,
     redis_pool: redis.ConnectionPool,
@@ -236,6 +287,14 @@ async def maintenance_loop(
                     task_ttl_config=task_ttl_config,
                     max_cleanup_batch=max_cleanup_batch,
                     namespace=namespace,
+                )
+
+                # Finally, clean up finished batches older than completed_ttl
+                await cleanup_finished_batches(
+                    redis_client=redis_client,
+                    namespace=namespace,
+                    completed_ttl=task_ttl_config.completed_ttl,
+                    max_cleanup_batch=max_cleanup_batch,
                 )
 
                 # Wait before next check, but allow early exit on shutdown

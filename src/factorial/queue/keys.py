@@ -2,8 +2,6 @@ import time
 from dataclasses import dataclass
 # ***** REDIS KEY SPACE *****
 
-# HASH: task_id -> full task data (status, agent, payload, metadata)
-TASKS_DATA = "{namespace}:tasks:data:{task_id}"
 # HASH: task_id -> status
 TASK_STATUS = (
     "{namespace}:tasks:status"  # queued | processing | completed | failed | cancelled
@@ -16,8 +14,10 @@ TASK_PAYLOAD = "{namespace}:tasks:payload"
 TASK_PICKUPS = "{namespace}:tasks:pickups"
 # HASH: task_id -> num retries (int)
 TASK_RETRIES = "{namespace}:tasks:retries"
-# HASH: task_id -> {created_at, owner_id}
+# HASH: task_id -> {created_at, owner_id, parent_id, batch_id}
 TASK_META = "{namespace}:tasks:meta"
+# HASH: task_id -> {current_turn: int, max_turns: int | None, progress: float}
+TASK_PROGRESS = "{namespace}:tasks:progress"
 
 # ===== QUEUE MANAGEMENT =====
 QUEUE_BASE = "{namespace}:queue"
@@ -62,13 +62,25 @@ UPDATES_CHANNEL = "{namespace}:updates:{owner_id}"
 AGENT_ACTIVITY_METRICS = "{namespace}:metrics:{agent}:{bucket}"
 GLOBAL_ACTIVITY_METRICS = "{namespace}:metrics:__all__:{bucket}"
 
+# ===== BATCH MANAGEMENT =====
+# HASH: batch_id -> {owner_id, created_at, total_tasks, max_progress, status: 'active'|'cancelled'|'completed'}
+BATCH_META = "{namespace}:batches:metadata"
+# HASH: batch_id -> task_ids
+BATCH_TASKS = "{namespace}:batches:tasks"
+# HASH: batch_id -> remaining task_ids
+BATCH_REMAINING_TASKS = "{namespace}:batches:remaining"
+# HASH: batch_id -> progress_sum (int)
+BATCH_PROGRESS = "{namespace}:batches:progress"
+# ZSET: batch_id -> timestamp of completion
+BATCH_COMPLETED = "{namespace}:batches:completed"
+
 # ===== SENTINEL VALUES =====
 PENDING_SENTINEL = "<|*PENDING*|>"
 
 
 @dataclass
 class RedisKeys:
-    # Global keys (always present when namespace provided)
+    # Non-default first
     _task_status: str
     _task_agent: str
     _task_payload: str
@@ -76,8 +88,14 @@ class RedisKeys:
     _task_retries: str
     _task_meta: str
     _task_cancellations: str
+    # Batch keys
+    _batch_tasks: str
+    _batch_remaining_tasks: str
+    _batch_progress: str
+    _batch_completed: str
+    _batch_meta: str
 
-    # Agent-scoped keys (present when agent provided)
+    # Defaults after
     _queue_main: str | None = None
     _queue_completions: str | None = None
     _queue_backoff: str | None = None
@@ -133,6 +151,31 @@ class RedisKeys:
     def task_cancellations(self) -> str:
         """{namespace}:cancel:pending"""
         return self._task_cancellations
+
+    @property
+    def batch_completed(self) -> str:
+        """{namespace}:batches:completed"""
+        return self._batch_completed
+
+    @property
+    def batch_meta(self) -> str:
+        """{namespace}:batches:metadata"""
+        return self._batch_meta
+
+    @property
+    def batch_tasks(self) -> str:
+        """{namespace}:batches:tasks"""
+        return self._batch_tasks
+
+    @property
+    def batch_remaining_tasks(self) -> str:
+        """{namespace}:batches:remaining"""
+        return self._batch_remaining_tasks
+
+    @property
+    def batch_progress(self) -> str:
+        """{namespace}:batches:progress"""
+        return self._batch_progress
 
     @property
     def queue_main(self) -> str:
@@ -336,6 +379,12 @@ class RedisKeys:
             )
             if metrics_bucket_duration
             else None,
+            # Batch-scoped keys
+            _batch_meta=BATCH_META.format(namespace=namespace),
+            _batch_tasks=BATCH_TASKS.format(namespace=namespace),
+            _batch_remaining_tasks=BATCH_REMAINING_TASKS.format(namespace=namespace),
+            _batch_progress=BATCH_PROGRESS.format(namespace=namespace),
+            _batch_completed=BATCH_COMPLETED.format(namespace=namespace),
             # Task-scoped keys
             _task_steering=TASK_STEERING.format(namespace=namespace, task_id=task_id)
             if task_id

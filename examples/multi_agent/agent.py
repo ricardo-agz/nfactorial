@@ -31,7 +31,7 @@ load_dotenv(env_path, override=True)
 def plan(
     overview: str, steps: list[str], agent_ctx: AgentContext
 ) -> tuple[str, dict[str, Any]]:
-    """Plan a task"""
+    """Structure your plan to accomplish the task. This should be user-readable and not mention any specific tool names."""
     return f"{overview}\n{' -> '.join(steps)}", {"overview": overview, "steps": steps}
 
 
@@ -72,19 +72,13 @@ search_agent = Agent(
     description="Research Sub-Agent",
     model=gpt_41_mini,
     instructions="You are an intelligent research assistant.",
-    tools=[plan, reflect, search],
-    output_type=SearchOutput,  # Forces final_output tool
+    tools=[reflect, search],
+    output_type=SearchOutput,
     model_settings=ModelSettings[AgentContext](
-        temperature=0.0,
-        tool_choice=lambda context: (
-            {
-                "type": "function",
-                "function": {"name": "plan"},
-            }
-            if context.turn == 0
-            else "required"
-        ),
+        temperature=1.0,
+        tool_choice="required",
     ),
+    max_turns=10,
 )
 
 
@@ -102,9 +96,9 @@ async def research(
     """Spawn child search tasks for each query and wait for them to complete."""
 
     payloads = [AgentContext(query=q) for q in queries]
-    child_ids = await execution_ctx.spawn_child_tasks(search_agent, payloads)
+    batch = await execution_ctx.spawn_child_tasks(search_agent, payloads)
     agent_ctx.has_used_research = True
-    return child_ids
+    return batch.task_ids
 
 
 class MainAgent(BaseAgent[MainAgentContext]):
@@ -115,7 +109,7 @@ class MainAgent(BaseAgent[MainAgentContext]):
             model=gpt_41_mini,
             instructions="You are a helpful assistant. Always start out by making a plan.",
             tools=[plan, reflect, research, search],
-            model_settings=ModelSettings[AgentContext](
+            model_settings=ModelSettings[MainAgentContext](
                 temperature=0.0,
                 tool_choice=lambda context: (
                     {
@@ -129,18 +123,7 @@ class MainAgent(BaseAgent[MainAgentContext]):
             ),
             context_class=MainAgentContext,
             output_type=FinalOutput,
-            on_run_start=lambda context, execution_ctx: print(
-                "Run started", flush=True
-            ),
-            on_run_end=lambda context, execution_ctx, run_completion: print(
-                "Run ended", run_completion, flush=True
-            ),
-            on_turn_start=lambda context, execution_ctx: print(
-                "Turn started", flush=True
-            ),
-            on_turn_end=lambda context, execution_ctx, turn_completion: print(
-                "Turn ended", turn_completion, flush=True
-            ),
+            max_turns=15,
         )
 
 

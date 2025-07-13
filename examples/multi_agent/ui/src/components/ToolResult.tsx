@@ -12,7 +12,8 @@ import {
   ArrowUp, 
   ArrowDown,
   Clock,
-  Hash
+  Hash,
+  FileSearch
 } from 'lucide-react';
 
 interface ToolIconProps {
@@ -22,15 +23,18 @@ interface ToolIconProps {
 export const ToolIcon: React.FC<ToolIconProps> = ({ name }) => {
   switch (name) {
     case 'plan':
+    case 'brain':
+    case 'thinking':
       return <Brain className="w-3 h-3 text-blue-600" />;
     case 'search':
       return <Search className="w-3 h-3 text-blue-600" />;
     case 'reflect':
+    case 'sparkles':
       return <Sparkles className="w-3 h-3 text-blue-600" />;
     case 'scrape':
       return <Globe className="w-3 h-3 text-green-600" />;
     case 'research':
-      return <Users className="w-3 h-3 text-purple-600" />;
+      return <FileSearch className="w-3 h-3 text-purple-600" />;
     default:
       return <div className="w-3 h-3 rounded-full bg-gray-300" />;
   }
@@ -77,22 +81,6 @@ interface ToolResultDisplayProps {
   name: string;
   result: any;
 }
-
-const formatTimeAgo = (timestamp: number): string => {
-  const now = Date.now() / 1000;
-  const diff = now - timestamp;
-  
-  if (diff < 60) return 'just now';
-  if (diff < 3600) return `${Math.floor(diff / 60)}m ago`;
-  if (diff < 86400) return `${Math.floor(diff / 3600)}h ago`;
-  return `${Math.floor(diff / 86400)}d ago`;
-};
-
-const formatNumber = (num: number): string => {
-  if (num >= 1000000) return `${(num / 1000000).toFixed(1)}M`;
-  if (num >= 1000) return `${(num / 1000).toFixed(1)}k`;
-  return num.toString();
-};
 
 export const ToolResultDisplay: React.FC<ToolResultDisplayProps> = ({ name, result }) => {
   // Scrape tool result
@@ -147,43 +135,49 @@ export const ToolResultDisplay: React.FC<ToolResultDisplayProps> = ({ name, resu
 
     if (resultsArr) {
       return (
-        <div className="mt-2 space-y-1">
-          <div className="text-xs text-gray-500 mb-2">
-            {resultsArr.length} results
-          </div>
-          {resultsArr.slice(0, 6).map((item: any, idx: number) => (
-            <a
-              key={idx}
-              href={item.url}
-              target="_blank"
-              rel="noopener noreferrer"
-              className="flex items-center gap-2 p-2 rounded hover:bg-gray-50 transition-colors group text-xs"
-            >
-              <img
-                src={`https://www.google.com/s2/favicons?domain=${(() => { try { return new URL(item.url).hostname; } catch { return ''; } })()}&sz=16`}
-                alt=""
-                className="w-3 h-3 flex-shrink-0"
-                onError={e => { (e.currentTarget as HTMLImageElement).style.display = 'none'; }}
-              />
-              <div className="min-w-0 flex-1">
-                <div className="font-medium truncate text-gray-900 group-hover:text-blue-600">
-                  {item.title}
-                </div>
-                {(() => {
-                  try {
-                    return (
-                      <div className="text-gray-500 truncate">
-                        {new URL(item.url).hostname}
+        <div className="mt-2 text-xs text-gray-500">
+          <div className="flex items-center gap-1 flex-wrap">
+            {resultsArr.slice(0, 6).map((item: any, idx: number) => {
+              let host = '';
+              try { host = new URL(item.url).hostname; } catch {/* ignore */}
+
+              return (
+                <div key={idx} className="relative group">
+                  <a
+                    href={item.url}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="block"
+                  >
+                    <img
+                      src={`https://www.google.com/s2/favicons?domain=${host}&sz=64`}
+                      alt={host}
+                      className="w-4 h-4"
+                    />
+                  </a>
+                  {/* Hover card */}
+                  <div className="absolute z-10 left-1/2 -translate-x-1/2 mt-1 hidden group-hover:block">
+                    <div className="bg-white border border-gray-200 rounded shadow-lg p-2 text-xs w-48 max-w-xs">
+                      <div className="flex items-center gap-2 mb-1">
+                        <img
+                          src={`https://www.google.com/s2/favicons?domain=${host}&sz=64`}
+                          alt=""
+                          className="w-3 h-3 flex-shrink-0"
+                        />
+                        <span className="font-medium truncate text-gray-900">
+                          {item.title}
+                        </span>
                       </div>
-                    );
-                  } catch {
-                    return null;
-                  }
-                })()}
-              </div>
-              <ExternalLink className="w-3 h-3 text-gray-400 opacity-0 group-hover:opacity-100 transition-opacity" />
-            </a>
-          ))}
+                      <div className="text-gray-500 truncate">
+                        {host}
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              );
+            })}
+            <span className="ml-2">{resultsArr.length} results</span>
+          </div>
         </div>
       );
     }
@@ -213,8 +207,8 @@ export const ToolResultDisplay: React.FC<ToolResultDisplayProps> = ({ name, resu
   // Reflect results
   if (name === 'reflect') {
     return (
-      <div className="mt-2 p-2 bg-amber-50 border border-amber-200 rounded text-xs">
-        <div className="text-amber-900">{String(result)}</div>
+      <div className="mt-2 rounded text-xs">
+        <div className="">{String(result)}</div>
       </div>
     );
   }

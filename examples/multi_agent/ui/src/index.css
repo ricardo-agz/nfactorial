@@ -42,3 +42,15 @@
   background-color: rgba(0,0,0,0.25);
   border-radius: 3px;
 }
+
+/* === 4-dot spinner indicator === */
+@keyframes fourDotFade {
+  0%, 100% { opacity: 1; }
+  25%       { opacity: 0.2; }
+}
+
+.spinner-dot {
+  background-color: #000;
+  animation: fourDotFade 0.8s infinite linear;
+  opacity: 0.2; /* default low so non-animated dots look dim */
+}

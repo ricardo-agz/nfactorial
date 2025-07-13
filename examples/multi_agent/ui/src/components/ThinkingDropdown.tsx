@@ -69,7 +69,7 @@ export const ThinkingDropdown: React.FC<ThinkingDropdownProps> = ({
   return (
     <div className="bg-gray-50 rounded-lg p-3 mb-3 border border-gray-200">
       <button
-        className="flex items-center gap-2 w-full text-left group"
+        className="flex items-center gap-2 w-full text-left group cursor-pointer"
         onClick={() => setOpen(!open)}
       >
         {open ? (
@@ -77,7 +77,7 @@ export const ThinkingDropdown: React.FC<ThinkingDropdownProps> = ({
         ) : (
           <ChevronRight className="w-4 h-4 text-gray-400" />
         )}
-        <span className="text-sm font-medium text-gray-700">
+        <span className="text-xs font-normal text-gray-700">
           {thinking.is_complete ? 'Thinking complete' : 'Thinking...'}
         </span>
         {hasActive && (
@@ -106,21 +106,59 @@ export const ThinkingDropdown: React.FC<ThinkingDropdownProps> = ({
                       let querySnippet: string | undefined;
                       try {
                         const parsed = typeof call.arguments === 'string' ? JSON.parse(call.arguments) : call.arguments;
-                        if (parsed?.query) querySnippet = parsed.query as string;
+                        if (call.tool_name === 'search' && parsed?.query) querySnippet = parsed.query as string;
                       } catch {/* ignore */}
 
-                      const labelBase = call.status === 'completed'
-                        ? 'Searched'
-                        : call.status === 'failed'
-                        ? 'Search failed'
-                        : 'Searching';
+                      if (call.tool_name === 'search') {
+                        const labelBase = call.status === 'completed'
+                          ? 'Searched'
+                          : call.status === 'failed'
+                          ? 'Search failed'
+                          : 'Searching';
 
-                      return (
-                        <div className="text-xs font-medium text-gray-700 truncate leading-none" title={querySnippet ? `${labelBase}: ${querySnippet}` : labelBase}>
-                          {labelBase}
-                          {querySnippet ? `: "${querySnippet}"` : ''}
-                        </div>
-                      );
+                        return (
+                          <div className="text-xs font-medium text-gray-700 truncate leading-none" title={querySnippet ? `${labelBase}: ${querySnippet}` : labelBase}>
+                            {labelBase}
+                            {querySnippet ? `: "${querySnippet}"` : ''}
+                          </div>
+                        );
+                      }
+
+                      // Research label logic
+                      if (call.tool_name === 'research') {
+                        // Parse queries to build label
+                        let queries: string[] = [];
+                        try {
+                          const parsed = typeof call.arguments === 'string' ? JSON.parse(call.arguments) : call.arguments;
+                          queries = Array.isArray(parsed)
+                            ? parsed
+                            : Array.isArray(parsed?.queries)
+                              ? parsed.queries as string[]
+                              : [];
+                        } catch {/* ignore */}
+
+                        const count     = queries.length || 1;
+                        const preview   = queries[0] ?? '';
+                        const remaining = count - 1;
+
+                        const labelBase = call.status === 'completed'
+                          ? 'Researched'
+                          : call.status === 'failed'
+                          ? 'Research failed'
+                          : 'Researching';
+
+                        const label = `${labelBase} ${count} topic${count === 1 ? '' : 's'}`;
+
+                        return (
+                          <div className="text-xs font-medium text-gray-700 truncate leading-none" title={preview ? `${label}: ${preview}` : label}>
+                            {label}
+                            {preview && `: "${preview}"`}
+                            {remaining > 0 && ` + ${remaining} more`}
+                          </div>
+                        );
+                      }
+
+                      return null; // fallback shouldn't occur
                     })()
                   ) : (
                     <>
@@ -128,7 +166,7 @@ export const ThinkingDropdown: React.FC<ThinkingDropdownProps> = ({
                         <span className="text-xs font-medium capitalize text-gray-700">
                           {call.tool_name}
                         </span>
-                        {call.status !== 'completed' && (
+                        {call.status !== 'completed' && call.tool_name !== 'research' && (
                           <span
                             className={`text-xs px-1.5 py-0.5 rounded font-medium ${
                               call.status === 'failed' ? 'bg-red-100 text-red-700' : 'bg-blue-100 text-blue-700'

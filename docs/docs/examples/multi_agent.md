@@ -1,8 +1,8 @@
 # Multi-Agent Research
 
-A complx research agent that can search the web and spin up multiple independent research sub-agents. 
+A complex research agent that can search the web and spin up multiple independent research sub-agents. 
 
-![Dashboard](../../static/img/multi-agent.png)
+![Dashboard](../../static/img/multi-agent-progress.png)
 
 ## 1. Create the agent
 

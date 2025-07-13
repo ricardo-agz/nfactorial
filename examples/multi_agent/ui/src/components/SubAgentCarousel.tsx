@@ -174,7 +174,7 @@ interface SubAgentCardProps {
 const SubAgentCard: React.FC<SubAgentCardProps> = ({ progress, className = '' }) => {
   return (
     <div
-      className={`w-56 min-w-[14rem] h-56 bg-white border border-gray-200 rounded-lg shadow-none p-2 flex flex-col ${className}`}
+      className={`w-56 min-w-[14rem] h-56 bg-white border border-gray-200 rounded-lg shadow-none px-3 py-1 flex flex-col ${className}`}
     >
       {progress ? (
         <div className="flex-1 overflow-y-auto space-y-2 subagent-scrollbar">
@@ -197,7 +197,7 @@ const SubAgentCard: React.FC<SubAgentCardProps> = ({ progress, className = '' })
             if (!q) return null;
 
             return (
-              <div>
+              <div className="mb-3">
                 <div className="text-xs font-semibold text-gray-800 truncate" title={q}>
                   {q}
                 </div>
@@ -267,12 +267,12 @@ const ToolCallStatus: React.FC<ToolCallStatusProps> = ({ call }) => {
       />
 
       {/* Tool icon */}
-      <div className="flex-shrink-0 w-4 h-4">
+      <div className="flex-shrink-0 w-4 h-4 flex items-center justify-center">
         <ToolIcon name={call.tool_name} />
       </div>
 
       {/* Name + optional query */}
-      <div className="min-w-0 truncate">
+      <div className="min-w-0 truncate text-gray-800">
         <span className="capitalize">
           {call.tool_name}
           {querySnippet ? ': ' : ''}

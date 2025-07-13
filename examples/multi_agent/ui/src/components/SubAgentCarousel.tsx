@@ -153,7 +153,7 @@ export const SubAgentCarousel: React.FC<SubAgentCarouselProps> = ({ taskIds, pro
   const aggregatedResults = Array.from(sourceMap.values());
 
   return (
-    <div>
+    <div className="mb-2">
       {progressBar}
       <div className="max-h-64 overflow-y-auto py-2 space-y-1 subagent-scrollbar">
         {taskIds.map(id => (
@@ -412,7 +412,7 @@ function AggregatedSourcesBar({ results }: AggregatedSourcesProps) {
   const count = results.length;
 
   return (
-    <div className="flex items-center gap-1 mt-2 text-[10px] text-gray-700 select-none">
+    <div className="flex items-center gap-1 mt-1 text-[10px] text-gray-700 select-none ml-1">
       {uniqueHosts.map((host, idx) => (
         <img
           key={idx}
@@ -533,7 +533,7 @@ function ThinTaskCard({ progress, rightElement, containerClassName = '' }: ThinT
         </div>
       )}
 
-      <span className="truncate min-w-0 flex-1" title={label}>{displayLabel}</span>
+      <span className="truncate min-w-0 flex-1 text-gray-800" title={label}>{displayLabel}</span>
       {rightElement && (
         <div className="flex-shrink-0 ml-2">
           {rightElement}

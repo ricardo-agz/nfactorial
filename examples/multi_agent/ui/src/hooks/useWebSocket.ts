@@ -15,6 +15,7 @@ interface UseWebSocketProps {
   setSteerMode: (steerMode: boolean) => void;
   setSteeringStatus: (status: 'idle' | 'sending' | 'applied' | 'failed' | null) => void;
   setSubAgentProgress?: React.Dispatch<React.SetStateAction<Record<string, ThinkingProgress>>>;
+  setResearchProgress?: React.Dispatch<React.SetStateAction<number | null>>;
 }
 
 export const useWebSocket = ({
@@ -28,6 +29,7 @@ export const useWebSocket = ({
   setSteerMode,
   setSteeringStatus,
   setSubAgentProgress,
+  setResearchProgress,
 }: UseWebSocketProps) => {
   const wsRef = useRef<WebSocket | null>(null);
   const thinkingRef = useRef<ThinkingProgress | null>(null);
@@ -62,6 +64,16 @@ export const useWebSocket = ({
 
     if (subAgentProgressRef.current[event.task_id]) {
       switch (event.event_type) {
+
+        case "batch_progress": {
+          const batchId = event.data?.batch_id;
+          const newProgress = event.data?.progress;
+        }
+
+        case "batch_completed": {
+          const batchId = event.data?.batch_id;
+        }
+        
         case 'progress_update_tool_action_started': {
           const toolCall = event.data?.args?.[0];
           if (!toolCall) break;
@@ -174,6 +186,26 @@ export const useWebSocket = ({
       return; // We've handled the event as sub-agent, stop processing further for main agent path
     }
 
+    // Handle batch-level events (e.g., progress updates for research batches)
+    switch (event.event_type) {
+      case 'batch_progress': {
+        const pct =
+          typeof (event as any).progress === 'number'
+            ? (event as any).progress
+            : event.data?.progress;
+        if (pct !== undefined && setResearchProgress) {
+          setResearchProgress(pct);
+        }
+        return; // handled
+      }
+      case 'batch_completed':
+        if (setResearchProgress) setResearchProgress(100);
+        return;
+      default:
+        // continue below
+        break;
+    }
+
     switch (event.event_type) {
       case 'progress_update_tool_action_started': {
         const toolCall = event.data?.args?.[0];
@@ -222,6 +254,8 @@ export const useWebSocket = ({
         });
 
         if (resp?.tool_call?.function?.name === 'research' && Array.isArray(resp.output_data)) {
+          // Reset batch progress when a new research batch starts
+          setResearchProgress?.(0);
           const taskIds: string[] = resp.output_data;
           setSubAgentProgress?.(prev => {
             const updated = { ...prev };
@@ -318,6 +352,8 @@ export const useWebSocket = ({
         setSteerMode(false);
         setSteeringStatus(null);
 
+        // Clear research progress when main agent run completes
+        setResearchProgress?.(null);
         processedTasksRef.current.add(event.task_id);
         break;
       }
@@ -357,7 +393,7 @@ export const useWebSocket = ({
         setSteering(false);
         setSteerMode(false);
         setSteeringStatus(null);
-
+        setResearchProgress?.(null);
         processedTasksRef.current.add(event.task_id);
         break;
       }
@@ -397,7 +433,7 @@ export const useWebSocket = ({
         setSteering(false);
         setSteerMode(false);
         setSteeringStatus(null);
-
+        setResearchProgress?.(null);
         processedTasksRef.current.add(event.task_id);
         break;
       }
@@ -405,7 +441,7 @@ export const useWebSocket = ({
       default:
         console.log('Unhandled event:', event);
     }
-  }, [setCurrentThinking, setMessages, setLoading, setCurrentTaskId, setCancelling, setSteering, setSteerMode, setSteeringStatus, setSubAgentProgress]);
+  }, [setCurrentThinking, setMessages, setLoading, setCurrentTaskId, setCancelling, setSteering, setSteerMode, setSteeringStatus, setSubAgentProgress, setResearchProgress]);
 
   useEffect(() => {
     const ws = new WebSocket(`${WS_BASE}/${userId}`);

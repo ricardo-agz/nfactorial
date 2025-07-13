@@ -31,7 +31,7 @@ load_dotenv(env_path, override=True)
 def plan(
     overview: str, steps: list[str], agent_ctx: AgentContext
 ) -> tuple[str, dict[str, Any]]:
-    """Plan a task"""
+    """Structure your plan to accomplish the task. This should be user-readable and not mention any specific tool names."""
     return f"{overview}\n{' -> '.join(steps)}", {"overview": overview, "steps": steps}
 
 
@@ -72,19 +72,13 @@ search_agent = Agent(
     description="Research Sub-Agent",
     model=gpt_41_mini,
     instructions="You are an intelligent research assistant.",
-    tools=[plan, reflect, search],
-    output_type=SearchOutput,  # Forces final_output tool
+    tools=[reflect, search],
+    output_type=SearchOutput,
     model_settings=ModelSettings[AgentContext](
-        temperature=0.0,
-        tool_choice=lambda context: (
-            {
-                "type": "function",
-                "function": {"name": "plan"},
-            }
-            if context.turn == 0
-            else "required"
-        ),
+        temperature=1.0,
+        tool_choice="required",
     ),
+    max_turns=10,
 )
 
 
@@ -129,6 +123,7 @@ class MainAgent(BaseAgent[MainAgentContext]):
             ),
             context_class=MainAgentContext,
             output_type=FinalOutput,
+            max_turns=15,
         )
 
 

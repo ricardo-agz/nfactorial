@@ -34,6 +34,9 @@ const App: React.FC = () => {
   /* Track progress for research sub-agent tasks */
   const [subAgentProgress, setSubAgentProgress] = useState<Record<string, ThinkingProgress>>({});
 
+  // Batch progress percentage for current research run (0-100)
+  const [researchProgress, setResearchProgress] = useState<number | null>(null);
+
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
   useWebSocket({
@@ -47,6 +50,7 @@ const App: React.FC = () => {
     setSteerMode,
     setSteeringStatus,
     setSubAgentProgress,
+    setResearchProgress,
   });
 
   const { sendPrompt, cancelCurrentTask, sendSteeringMessage } = useChat({
@@ -109,6 +113,7 @@ const App: React.FC = () => {
                 <ThinkingDropdown
                   thinking={m.thinking}
                   subAgentProgress={subAgentProgress}
+                  researchProgress={researchProgress ?? undefined}
                 />
               )}
               <div className="bg-white border border-gray-200 rounded-lg px-3 py-2">
@@ -155,6 +160,7 @@ const App: React.FC = () => {
               <ThinkingDropdown
                 thinking={currentThinking as ThinkingProgress}
                 subAgentProgress={subAgentProgress}
+                researchProgress={researchProgress ?? undefined}
               />
             </div>
           ) : null}

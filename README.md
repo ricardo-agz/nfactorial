@@ -65,7 +65,7 @@ if __name__ == "__main__":
 
 `/docs/examples/multi_agent`
 
-![Dashboard](https://raw.githubusercontent.com/ricardo-agz/nfactorial/main/docs/static/img/multi-agent.png)
+![Dashboard](https://raw.githubusercontent.com/ricardo-agz/nfactorial/main/docs/static/img/multi-agent-progress.png)
 
 ### Deliberations.ai
 [Check it out](https://www.deliberations.ai/)

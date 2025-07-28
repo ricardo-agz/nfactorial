@@ -66,6 +66,12 @@ class FatalAgentError(Exception):
     pass
 
 
+class InvalidLLMResponseError(Exception):
+    """Exception raised when an LLM response is invalid"""
+
+    pass
+
+
 RETRYABLE_EXCEPTIONS = (
     OpenAIRateLimitError,
     OpenAIInternalServerError,
@@ -73,6 +79,7 @@ RETRYABLE_EXCEPTIONS = (
     OpenAITimeoutError,
     RetryableError,
     RateLimitError,
+    InvalidLLMResponseError,
 )
 
 __all__ = [
@@ -89,4 +96,5 @@ __all__ = [
     "OpenAITimeoutError",
     "OpenAIConnectionError",
     "FatalAgentError",
+    "InvalidLLMResponseError",
 ]

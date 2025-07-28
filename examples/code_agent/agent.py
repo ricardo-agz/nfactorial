@@ -10,6 +10,8 @@ from factorial import (
     ModelSettings,
     gpt_41_mini,
     claude_4_sonnet,
+    fireworks_kimi_k2,
+    fireworks_qwen_3_235b,
     AgentWorkerConfig,
     deferred_result,
 )
@@ -139,7 +141,7 @@ class IDEAgent(BaseAgent[IdeAgentContext]):
             context_class=IdeAgentContext,
             instructions=instructions,
             tools=[think, edit_code, request_code_execution],
-            model=claude_4_sonnet,
+            model=fireworks_kimi_k2,
             model_settings=ModelSettings(
                 temperature=0.1,
             ),

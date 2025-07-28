@@ -30,6 +30,7 @@ from factorial.llms import (
     MultiClient,
     o3,
     o4_mini,
+    grok_4,
     grok_3,
     grok_3_mini,
     gpt_41,
@@ -40,6 +41,8 @@ from factorial.llms import (
     claude_37_sonnet,
     claude_35_sonnet,
     claude_35_haiku,
+    fireworks_kimi_k2,
+    fireworks_qwen_3_235b,
 )
 
 __all__ = [
@@ -72,6 +75,7 @@ __all__ = [
     "MultiClient",
     "o3",
     "o4_mini",
+    "grok_4",
     "grok_3",
     "grok_3_mini",
     "gpt_41",
@@ -82,5 +86,7 @@ __all__ = [
     "claude_37_sonnet",
     "claude_35_sonnet",
     "claude_35_haiku",
+    "fireworks_kimi_k2",
+    "fireworks_qwen_3_235b",
     "deferred_result",
 ]

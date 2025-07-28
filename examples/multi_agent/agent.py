@@ -1,6 +1,7 @@
 from typing import Any
 import os
 from dotenv import load_dotenv
+from openai.types.chat import ChatCompletion
 
 from factorial import (
     BaseAgent,
@@ -9,6 +10,7 @@ from factorial import (
     Orchestrator,
     ModelSettings,
     gpt_41_mini,
+    fireworks_kimi_k2,
     AgentWorkerConfig,
     MaintenanceWorkerConfig,
     TaskTTLConfig,
@@ -16,6 +18,7 @@ from factorial import (
     MetricsTimelineConfig,
     function_tool,
 )
+from factorial.exceptions import InvalidLLMResponseError
 from factorial.tools import forking_tool
 from factorial.context import ExecutionContext
 from factorial.utils import BaseModel
@@ -67,19 +70,34 @@ class SearchOutput(BaseModel):
     findings: list[str]
 
 
-search_agent = Agent(
-    name="research_subagent",
-    description="Research Sub-Agent",
-    model=gpt_41_mini,
-    instructions="You are an intelligent research assistant.",
-    tools=[reflect, search],
-    output_type=SearchOutput,
-    model_settings=ModelSettings[AgentContext](
-        temperature=1.0,
-        tool_choice="required",
-    ),
-    max_turns=10,
-)
+class SearchAgent(BaseAgent[AgentContext]):
+    def __init__(self):
+        super().__init__(
+            name="research_subagent",
+            description="Research Sub-Agent",
+            model=fireworks_kimi_k2,
+            instructions="You are an intelligent research assistant.",
+            tools=[reflect, search],
+            output_type=SearchOutput,
+            model_settings=ModelSettings[AgentContext](
+                temperature=1.0,
+                tool_choice="required",
+            ),
+            max_turns=3,
+        )
+
+    async def verify_completion(
+        self,
+        agent_ctx: AgentContext,
+        response: ChatCompletion,
+    ) -> None:
+        if not response.choices[0].message.tool_calls:
+            raise InvalidLLMResponseError(
+                "Response did not invoke any tool calls or the tools did not follow the correct formatting instructions."
+            )
+
+
+search_agent = SearchAgent()
 
 
 class MainAgentContext(AgentContext):
@@ -106,8 +124,8 @@ class MainAgent(BaseAgent[MainAgentContext]):
         super().__init__(
             name="main_agent",
             description="Main Agent",
-            model=gpt_41_mini,
-            instructions="You are a helpful assistant. Always start out by making a plan.",
+            model=fireworks_kimi_k2,
+            instructions="You are a helpful assistant. Always start out by making a plan. Use the tools you have available to respond to the user if necessary. Once you're done using any necessary tools, output your final answer exactly as it will be shown to the user. asIt should be a clean and concise plaintext response.",
             tools=[plan, reflect, research, search],
             model_settings=ModelSettings[MainAgentContext](
                 temperature=0.0,
@@ -125,6 +143,16 @@ class MainAgent(BaseAgent[MainAgentContext]):
             output_type=FinalOutput,
             max_turns=15,
         )
+
+    async def verify_completion(
+        self,
+        agent_ctx: MainAgentContext,
+        response: ChatCompletion,
+    ) -> None:
+        if not response.choices[0].message.tool_calls:
+            raise InvalidLLMResponseError(
+                "Response did not invoke any tool calls or the tools did not follow the correct formatting instructions."
+            )
 
 
 basic_agent = MainAgent()

@@ -456,6 +456,14 @@ class BaseAgent(Generic[ContextType]):
 
     # ===== Overridable Methods ===== #
 
+    async def validate_completion(
+        self,
+        agent_ctx: ContextType,
+        response: ChatCompletion,
+    ) -> None:
+        """Validate the completion response. Raise an InvalidLLMResponseError if the response is invalid."""
+        pass
+
     async def completion(
         self,
         agent_ctx: ContextType,
@@ -495,6 +503,7 @@ class BaseAgent(Generic[ContextType]):
                     parallel_tool_calls=model_settings.parallel_tool_calls,
                 ),
             )
+            await self.validate_completion(agent_ctx, response)
         else:
             # progressively reconstruct both the assistant text content
             # *and* any tool calls (potentially multiple)

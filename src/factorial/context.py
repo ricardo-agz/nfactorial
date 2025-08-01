@@ -91,6 +91,7 @@ class AgentContext(BaseModel):
     messages: list[dict[str, Any]] = []
     turn: int = 0
     output: Any = None
+    attempt: int = 0
 
     class Config:
         extra = "allow"  # Users can add extra fields

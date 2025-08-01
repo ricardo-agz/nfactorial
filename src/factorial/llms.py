@@ -50,6 +50,44 @@ class Model:
     custom_tool_support: ToolSupportWrapper | None = None
 
 
+# ------------------------------------------------------------
+# Helper utilities
+# ------------------------------------------------------------
+
+
+def fallback_models(*models: "Model") -> Callable[[Any], "Model"]:  # noqa: D401
+    """Return a model-selection callable cycling through *models* by retry attempt.
+
+    The callable can be passed to the ``model`` parameter of :class:`factorial.agent.BaseAgent`.
+    Inside the agent, the current retry index is exposed via ``agent_ctx.attempt`` which is
+    automatically updated by the built-in ``@retry`` decorator.  The selector will return
+    ``models[attempt]`` for the *n*-th retry, falling back to the last model once the list is
+    exhausted.
+
+    Example
+    -------
+    >>> agent = Agent(
+    ...     model=fallback_models(llms.o3, llms.o4_mini, llms.gpt_41)
+    ... )
+    """
+
+    if not models:
+        raise ValueError("At least one model must be provided to 'fallback_models'.")
+
+    model_sequence = list(models)
+
+    def _selector(agent_ctx: Any) -> "Model":  # type: ignore[name-defined]
+        # ``attempt`` is injected by the retry wrapper (defaults to 0 on first try).
+        attempt_idx = getattr(agent_ctx, "attempt", 0)
+        if attempt_idx < 0:
+            attempt_idx = 0
+        if attempt_idx >= len(model_sequence):
+            attempt_idx = len(model_sequence) - 1
+        return model_sequence[attempt_idx]
+
+    return _selector
+
+
 class MultiClient:
     def __init__(
         self,

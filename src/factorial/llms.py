@@ -82,7 +82,7 @@ def fallback_models(*models: "Model") -> Callable[[Any], "Model"]:  # noqa: D401
         if attempt_idx < 0:
             attempt_idx = 0
         if attempt_idx >= len(model_sequence):
-            attempt_idx = len(model_sequence) - 1
+            attempt_idx = attempt_idx % len(model_sequence)
         return model_sequence[attempt_idx]
 
     return _selector
@@ -477,6 +477,27 @@ def base_tool_parser(response: str) -> tuple[str, list[ChatCompletionMessageTool
 
 
 # ---------- OPENAI MODELS ----------
+
+gpt_5 = Model(
+    name="gpt-5",
+    provider=Provider.OPENAI,
+    provider_model_id="gpt-5",
+    context_window=400_000,
+)
+
+gpt_5_mini = Model(
+    name="gpt-5-mini",
+    provider=Provider.OPENAI,
+    provider_model_id="gpt-5-mini",
+    context_window=400_000,
+)
+
+gpt_5_nano = Model(
+    name="gpt-5-nano",
+    provider=Provider.OPENAI,
+    provider_model_id="gpt-5-nano",
+    context_window=400_000,
+)
 
 o3 = Model(
     name="o3",

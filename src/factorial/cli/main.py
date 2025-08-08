@@ -3,18 +3,18 @@ from __future__ import annotations
 import sys
 import os
 import asyncio
-import json
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any
 
 import click
 
 from .constants import PROVIDERS
 from .key_storage import key_storage
 from .agent import create_agent, CLIAgentContext
+from .event_printer import event_printer
 
 # Individual model symbols remain for backward-compat logic, but we'll import llms to access all models
-from factorial import gpt_41, claude_4_sonnet, grok_4, fallback_models
+from factorial import fallback_models
 from factorial import llms as _llms  # type: ignore  # dynamic attribute inspection
 from factorial.llms import MultiClient
 
@@ -106,15 +106,11 @@ def list_keys() -> None:
 
 
 @cli.command()
-@click.argument("description", nargs=-1, required=True)
-@click.option(
-    "--path",
-    "-p",
-    "target_path",
-    default=".",
+@click.argument(
+    "path",
     type=click.Path(file_okay=False, dir_okay=True, writable=True, path_type=Path),
-    help="Directory where the project should be generated (default: current directory)",
 )
+@click.argument("description", nargs=-1, required=True)
 @click.option(
     "--model",
     "-m",
@@ -122,15 +118,21 @@ def list_keys() -> None:
     default=None,
     help="Force a particular model (e.g. 'gpt-4.1', 'claude-4-sonnet').",
 )
-def create(
-    description: tuple[str, ...], target_path: Path, model_name: str | None
-) -> None:
-    """Bootstrap a new nfactorial project."""
+def create(path: Path, description: tuple[str, ...], model_name: str | None) -> None:
+    """Bootstrap a new nfactorial project.
+
+    PATH: Where to create the project - use '.' for current directory or provide a name for a new directory
+    DESCRIPTION: Description of the project to generate"""
     prompt = " ".join(description).strip("'\"").strip()
     if not prompt:
         click.echo("Description cannot be empty", err=True)
         sys.exit(1)
-    project_dir = target_path
+
+    # Handle project directory creation
+    project_dir = path
+    if str(path) != ".":
+        # If path is not ".", treat it as a new project name
+        project_dir = Path(path.name)
     project_dir.mkdir(parents=True, exist_ok=True)
 
     # Run the create_agent to generate project files inside the target directory
@@ -196,71 +198,8 @@ def create(
 
             agent_ctx = CLIAgentContext(query=prompt)
 
-            async def _event_printer(event):  # type: ignore[arg-type]
-                """Print concise logs for completed tool executions."""
-
-                event_type: str = getattr(event, "event_type", "")
-
-                if event_type == "progress_update_tool_action_completed":
-                    # Attempt to extract tool name and key arguments (best-effort)
-                    tool_name: str | None = None
-                    file_path: str | None = None
-
-                    try:
-                        data = event.data or {}
-                        args = data.get("args", [])
-
-                        if args:
-                            tool_call = args[0]
-
-                            # Extract function meta depending on object/dict structure
-                            if isinstance(tool_call, dict):
-                                func_data = tool_call.get("function", {}) or {}
-                                tool_name = func_data.get("name")
-                                arguments = func_data.get("arguments")
-                            else:
-                                func_obj = getattr(tool_call, "function", None)
-                                tool_name = getattr(func_obj, "name", None)
-                                arguments = getattr(func_obj, "arguments", None)
-
-                            # Parse JSON arguments when available to get file_path
-                            if arguments:
-                                if isinstance(arguments, str):
-                                    try:
-                                        arg_dict = json.loads(arguments)
-                                    except json.JSONDecodeError:
-                                        arg_dict = {}
-                                elif isinstance(arguments, dict):
-                                    arg_dict = arguments
-                                else:
-                                    arg_dict = {}
-
-                                file_path = arg_dict.get("file_path")
-                    except Exception:
-                        pass  # graceful degradation – logging is best-effort
-
-                    # Craft human-friendly log messages
-                    if (
-                        tool_name in {"edit_code", "read_file", "create_file"}
-                        and file_path
-                    ):
-                        verb = (
-                            "edited"
-                            if tool_name == "edit_code"
-                            else "read"
-                            if tool_name == "read_file"
-                            else "created"
-                        )
-                        click.echo(f"[agent] {verb} file '{file_path}'")
-                    elif tool_name:
-                        click.echo(f"[agent] ran tool: {tool_name}")
-                    else:
-                        click.echo("[agent] ran a tool (name unavailable)")
-                elif event_type.endswith("_failed"):
-                    click.echo(f"[agent] ERROR during {event_type}")
-
             completion = await create_agent.run_inline(
-                agent_ctx, event_handler=_event_printer
+                agent_ctx, event_handler=event_printer
             )
             return completion
         finally:

@@ -15,6 +15,7 @@ def create_vite_app(
         with_tailwind:
             * **True** → install and configure Tailwind CSS v4+ with ``@tailwindcss/postcss`` plugin,
               create proper PostCSS configuration, and inject Tailwind CSS directives into ``src/index.css``.
+              Note: Tailwind v4+ doesn't require a tailwind.config.js file for basic setup.
             * **False** → skip Tailwind CSS setup.
     """
 
@@ -60,10 +61,7 @@ def create_vite_app(
                 )
             )
 
-            # 3. Create Tailwind configuration (tailwind.config.js)
-            logs.append(run(["npx", "tailwindcss", "init"], cwd=project_name))
-
-            # 4. Create PostCSS configuration for Tailwind v4+
+            # 3. Create PostCSS configuration for Tailwind v4+
             postcss_config = os.path.join(project_name, "postcss.config.js")
             with open(postcss_config, "w", encoding="utf-8") as fh:
                 fh.write("""export default {
@@ -75,6 +73,25 @@ def create_vite_app(
 """)
             logs.append(
                 f"# Created PostCSS configuration at {os.path.relpath(postcss_config)}"
+            )
+
+            # 4. Create Tailwind configuration file
+            tailwind_config = os.path.join(project_name, "tailwind.config.js")
+            with open(tailwind_config, "w", encoding="utf-8") as fh:
+                fh.write("""/** @type {import('tailwindcss').Config} */
+export default {
+  content: [
+    "./index.html",
+    "./src/**/*.{js,ts,jsx,tsx}",
+  ],
+  theme: {
+    extend: {},
+  },
+  plugins: [],
+}
+""")
+            logs.append(
+                f"# Created Tailwind configuration at {os.path.relpath(tailwind_config)}"
             )
 
             # 5. Inject Tailwind directives into the main CSS entry point
@@ -90,7 +107,7 @@ def create_vite_app(
         summary_lines = [f"Vite app '{project_name}' created successfully."]
         if with_tailwind:
             summary_lines.append(
-                "Tailwind CSS was installed and fully configured (tailwind.config.js, postcss.config.js, and src/index.css updated)."
+                "Tailwind CSS v4+ was installed and fully configured (postcss.config.js and src/index.css updated)."
             )
 
         # Concatenate logs and truncate if too long

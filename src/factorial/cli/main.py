@@ -8,15 +8,22 @@ from typing import Any
 
 import click
 
-from .constants import PROVIDERS
 from .key_storage import key_storage
-from .agent import create_agent, CLIAgentContext
+from .agent import NFactorialAgent, CLIAgentContext
 from .event_printer import event_printer
 
-# Individual model symbols remain for backward-compat logic, but we'll import llms to access all models
 from factorial import fallback_models
-from factorial import llms as _llms  # type: ignore  # dynamic attribute inspection
-from factorial.llms import MultiClient
+from factorial import (
+    MODELS,
+    gpt_5,
+    gpt_41,
+    claude_4_sonnet,
+    claude_37_sonnet,
+    claude_35_sonnet,
+    grok_4,
+    Provider,
+)
+from factorial.llms import MultiClient, Model
 
 try:
     import inquirer  # type: ignore
@@ -24,9 +31,65 @@ except ModuleNotFoundError:  # pragma: no cover
     inquirer = None  # type: ignore
 
 
-def _prompt_provider(providers: list[str] | None = None) -> str:
-    providers = providers or PROVIDERS
+from typing import NamedTuple
 
+
+PROVIDERS: list[Provider] = list(Provider)
+
+
+# Sorted in fallback order
+DEFAULT_MODELS = [
+    claude_4_sonnet,
+    gpt_5,
+    claude_37_sonnet,
+    gpt_41,
+    claude_35_sonnet,
+    grok_4,
+]
+
+
+class ModelSetup(NamedTuple):
+    client: MultiClient
+    lookup: dict[str, Model]
+    available_models: list[Model]
+    configured_providers: list[Provider]
+
+
+def _model_setup() -> ModelSetup:
+    lookup: dict[str, Model] = {}
+    configured_providers: set[Provider] = set()
+    for model in MODELS:
+        lookup[model.name.lower()] = model
+        lookup[model.provider_model_id.lower()] = model
+        lookup[f"{model.provider.value}@{model.name}".lower()] = model
+        lookup[f"{model.provider.value}@{model.provider_model_id}".lower()] = model
+
+    client_kwargs = {}
+    for provider in PROVIDERS:
+        key_name = f"{provider.value}_api_key"
+        env_var = f"{provider.value.upper()}_API_KEY"
+        client_kwargs[key_name] = key_storage.get_key(provider.value) or os.environ.get(
+            env_var
+        )
+        if client_kwargs[key_name]:
+            configured_providers.add(provider)
+
+    available_models = [
+        model for model in MODELS if model.provider in configured_providers
+    ]
+
+    return ModelSetup(
+        client=MultiClient(**client_kwargs),
+        lookup=lookup,
+        available_models=available_models,
+        configured_providers=list(configured_providers),
+    )
+
+
+model_setup = _model_setup()
+
+
+def _prompt_provider(providers: list[str] | None = None) -> str:
     if inquirer:
         questions = [
             inquirer.List(
@@ -61,13 +124,13 @@ def setup() -> None:
 @setup.command("add-key")
 @click.option(
     "--provider",
-    type=click.Choice(PROVIDERS),
+    type=click.Choice([p.value for p in PROVIDERS]),
     help="API provider to configure",
 )
 def add_key(provider: str | None) -> None:
     """Add or update an API key."""
     if not provider:
-        provider = _prompt_provider()
+        provider = _prompt_provider([p.value for p in PROVIDERS])
     key = click.prompt(f"Enter your {provider} API key", hide_input=True)
     key_storage.set_key(provider, key)
     click.echo(f"Successfully saved {provider} API key!")
@@ -76,17 +139,16 @@ def add_key(provider: str | None) -> None:
 @setup.command("remove-key")
 @click.option(
     "--provider",
-    type=click.Choice(PROVIDERS),
+    type=click.Choice([p.value for p in PROVIDERS]),
     help="API provider to remove",
 )
 def remove_key(provider: str | None) -> None:
     """Remove an API key."""
-    configured = [p for p in PROVIDERS if key_storage.get_key(p)]
-    if not configured:
+    if not model_setup.configured_providers:
         click.echo("No API keys configured.")
         return
     if not provider:
-        provider = _prompt_provider(configured)
+        provider = _prompt_provider([p.value for p in model_setup.configured_providers])
     key_storage.remove_key(provider)
     click.echo(f"Removed {provider} API key (if it existed).")
 
@@ -96,13 +158,14 @@ def list_keys() -> None:
     """List currently configured API keys."""
     click.echo("Configured API keys:")
     click.echo("-" * 40)
-    for provider in PROVIDERS:
-        key = key_storage.get_key(provider)
+    for provider in model_setup.configured_providers:
+        provider_name = provider.value
+        key = key_storage.get_key(provider_name)
         if key:
             masked = f"{key[:4]}...{key[-4:]}"
-            click.echo(f"{provider:10} {masked}")
+            click.echo(f"{provider_name:10} {masked}")
         else:
-            click.echo(f"{provider:10} Not configured")
+            click.echo(f"{provider_name:10} Not configured")
 
 
 @cli.command()
@@ -129,78 +192,58 @@ def create(path: Path, description: tuple[str, ...], model_name: str | None) -> 
         sys.exit(1)
 
     # Handle project directory creation
-    project_dir = path
-    if str(path) != ".":
-        # If path is not ".", treat it as a new project name
-        project_dir = Path(path.name)
-    project_dir.mkdir(parents=True, exist_ok=True)
+    if str(path) == ".":
+        # Use current directory
+        project_dir = Path.cwd()
+    else:
+        # Create new directory with the given path
+        project_dir = path.resolve()
+        project_dir.mkdir(parents=True, exist_ok=True)
 
-    # Run the create_agent to generate project files inside the target directory
+    model_setup = _model_setup()
+    if not model_setup.configured_providers:
+        click.echo(
+            "No API keys configured. Please set up API keys using 'nfactorial setup add-key' command or environment variables.",
+            err=True,
+        )
+        sys.exit(1)
+
+    # Model preference: CLI flag → automatic based on keys → default
+    if model_name:
+        model = model_setup.lookup.get(model_name.lower())
+        if not model:
+            click.echo(
+                "Unknown model '{0}'. Available models: {1}".format(
+                    model_name,
+                    ", ".join([model.name for model in MODELS]),
+                ),
+                err=True,
+            )
+            sys.exit(1)
+    else:
+        if not model_setup.available_models:
+            click.echo(
+                "No models available with configured API keys",
+                err=True,
+            )
+            sys.exit(1)
+
+        model = fallback_models(
+            *[
+                model
+                for model in DEFAULT_MODELS
+                if model in model_setup.available_models
+            ]
+        )
+
+    agent = NFactorialAgent(mode="create", model=model, client=model_setup.client)
+
     async def _run_agent() -> Any:
-        # Change working directory so the agent generates files in the correct place
         cwd = os.getcwd()
-        os.chdir(project_dir)
         try:
-            # Ensure the agent has an LLM client with available API keys
-            keys = key_storage.all_keys()
-            create_agent.client = MultiClient(
-                openai_api_key=keys.get("openai"),
-                anthropic_api_key=keys.get("anthropic"),
-                xai_api_key=keys.get("xai"),
-            )
-
-            # Build mapping of available model names → Model objects on first call
-            def _build_model_lookup() -> dict[str, Any]:
-                from factorial.llms import Model  # local import to avoid circulars
-
-                lookup: dict[str, Any] = {}
-                for attr in dir(_llms):
-                    maybe = getattr(_llms, attr)
-                    if isinstance(maybe, Model):
-                        # Index by human-friendly name and provider id (both lower-cased)
-                        lookup[maybe.name.lower()] = maybe
-                        lookup[maybe.provider_model_id.lower()] = maybe
-
-                return lookup
-
-            model_lookup = _build_model_lookup()
-
-            # Model preference: CLI flag → automatic based on keys → default
-            if model_name:
-                chosen_model = model_lookup.get(model_name.lower())
-                if not chosen_model:
-                    click.echo(
-                        "Unknown model '{0}'. Available models: {1}".format(
-                            model_name,
-                            ", ".join(sorted(set(model_lookup.keys()))),
-                        ),
-                        err=True,
-                    )
-                    sys.exit(1)
-
-                create_agent.model = chosen_model
-            else:
-                supported_models = ["gpt-4.1", "claude-4-sonnet", "grok-4"]
-                available_models = [
-                    model
-                    for model in model_lookup.values()
-                    if model.provider.value in keys.keys()
-                    and model.name.lower() in supported_models
-                ]
-                if not available_models:
-                    click.echo(
-                        "No models available with configured API keys",
-                        err=True,
-                    )
-                    sys.exit(1)
-
-                create_agent.model = fallback_models(*available_models)
-
+            os.chdir(project_dir)
             agent_ctx = CLIAgentContext(query=prompt)
-
-            completion = await create_agent.run_inline(
-                agent_ctx, event_handler=event_printer
-            )
+            completion = await agent.run_inline(agent_ctx, event_handler=event_printer)
             return completion
         finally:
             os.chdir(cwd)
@@ -212,6 +255,97 @@ def create(path: Path, description: tuple[str, ...], model_name: str | None) -> 
     (project_dir / "__init__.py").touch(exist_ok=True)
 
     click.echo(f"\nProject generated at {project_dir.resolve()}")
+
+    # Report any commands suggested by the agent (if using FinalOutput)
+    output = getattr(run_completion, "output", None)
+    try:
+        # If output is a Pydantic model (FinalOutput), convert to dict for inspection
+        if hasattr(output, "model_dump"):
+            output_dict = output.model_dump()  # type: ignore[attr-defined]
+        else:
+            output_dict = output if isinstance(output, dict) else {}
+
+        if output_dict.get("run_commands"):
+            click.echo("Suggested next commands:")
+            for cmd in output_dict["run_commands"]:
+                click.echo(f"  {cmd}")
+    except Exception:  # pragma: no cover – best-effort reporting
+        pass
+
+
+@cli.command()
+@click.argument("description", nargs=-1, required=True)
+@click.option(
+    "--model",
+    "-m",
+    "model_name",
+    default=None,
+    help="Force a particular model (e.g. 'gpt-4.1', 'claude-4-sonnet').",
+)
+def prompt(description: tuple[str, ...], model_name: str | None) -> None:
+    """Work on an existing nfactorial project.
+
+    DESCRIPTION: Description of what you want to do in the current project"""
+    prompt_text = " ".join(description).strip("'\"").strip()
+    if not prompt_text:
+        click.echo("Description cannot be empty", err=True)
+        sys.exit(1)
+
+    # Use current directory
+    project_dir = Path.cwd()
+
+    model_setup = _model_setup()
+    if not model_setup.configured_providers:
+        click.echo(
+            "No API keys configured. Please set up API keys using 'nfactorial setup add-key' command or environment variables.",
+            err=True,
+        )
+        sys.exit(1)
+
+    # Model preference: CLI flag → automatic based on keys → default
+    if model_name:
+        model = model_setup.lookup.get(model_name.lower())
+        if not model:
+            click.echo(
+                "Unknown model '{0}'. Available models: {1}".format(
+                    model_name,
+                    ", ".join([model.name for model in MODELS]),
+                ),
+                err=True,
+            )
+            sys.exit(1)
+    else:
+        if not model_setup.available_models:
+            click.echo(
+                "No models available with configured API keys",
+                err=True,
+            )
+            sys.exit(1)
+
+        model = fallback_models(
+            *[
+                model
+                for model in DEFAULT_MODELS
+                if model in model_setup.available_models
+            ]
+        )
+
+    agent = NFactorialAgent(mode="edit", model=model, client=model_setup.client)
+
+    async def _run_agent() -> Any:
+        cwd = os.getcwd()
+        try:
+            os.chdir(project_dir)
+            agent_ctx = CLIAgentContext(query=prompt_text)
+            completion = await agent.run_inline(agent_ctx, event_handler=event_printer)
+            return completion
+        finally:
+            os.chdir(cwd)
+
+    click.echo("Running nfactorial agent to work on project...\n")
+    run_completion = asyncio.run(_run_agent())
+
+    click.echo(f"\nCompleted work in {project_dir.resolve()}")
 
     # Report any commands suggested by the agent (if using FinalOutput)
     output = getattr(run_completion, "output", None)

@@ -119,8 +119,11 @@ _WHITESPACE_RE = re.compile(r"(?:\\s|\\n|\\r|\\t)+")
 def _fuzzy_pattern(old: str) -> re.Pattern[str]:
     """Return a regex that matches *old* ignoring whitespace differences."""
     escaped = re.escape(old)
-    # Replace escaped whitespace sequences (e.g. "\\ \") with "\\s+"
-    pattern_src = re.sub(r"(?:\\\\\s)+", r"\\s+", escaped)
+    # Replace any escaped whitespace characters (including \n, \r, \t, spaces) with flexible \s+
+    # This handles both sequences of escaped whitespace and individual whitespace characters
+    pattern_src = re.sub(r"\\[nrtf\s]|(?:\\\\\s)+", r"\\s+", escaped)
+    # Also handle sequences of whitespace that might not be properly escaped
+    pattern_src = re.sub(r"\s+", r"\\s+", pattern_src)
     return re.compile(pattern_src, flags=re.MULTILINE | re.DOTALL)
 
 

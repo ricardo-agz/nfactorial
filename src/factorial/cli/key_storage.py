@@ -106,9 +106,9 @@ class KeyStorage:
 
     def all_keys(self) -> dict[str, str | None]:
         """Return mapping provider→key (``None`` if not configured)."""
-        from .constants import PROVIDERS
+        from factorial import Provider
 
-        return {p: self.get_key(p) for p in PROVIDERS}
+        return {p.value: self.get_key(p.value) for p in Provider}
 
 
 key_storage = KeyStorage()

@@ -626,3 +626,25 @@ fireworks_qwen_3_coder_480b = Model(
         parser=base_tool_parser,
     ),
 )
+
+MODELS = [
+    gpt_5,
+    gpt_5_mini,
+    gpt_5_nano,
+    o3,
+    o4_mini,
+    gpt_41,
+    gpt_41_mini,
+    gpt_41_nano,
+    claude_4_opus,
+    claude_4_sonnet,
+    claude_37_sonnet,
+    claude_35_sonnet,
+    claude_35_haiku,
+    grok_4,
+    grok_3,
+    grok_3_mini,
+    fireworks_kimi_k2,
+    fireworks_qwen_3_235b,
+    fireworks_qwen_3_coder_480b,
+]

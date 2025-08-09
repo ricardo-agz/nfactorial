@@ -48,6 +48,8 @@ from factorial.llms import (
     fireworks_qwen_3_235b,
     fireworks_qwen_3_coder_480b,
     fallback_models,
+    MODELS,
+    Provider,
 )
 
 __all__ = [
@@ -99,4 +101,6 @@ __all__ = [
     "fireworks_qwen_3_235b",
     "fireworks_qwen_3_coder_480b",
     "fallback_models",
+    "MODELS",
+    "Provider",
 ]

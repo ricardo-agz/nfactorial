@@ -57,10 +57,7 @@ class ToolSpinner:
             time.sleep(0.08)  # 12.5 FPS for smooth animation
 
 
-# Global spinner instance
 _spinner = ToolSpinner()
-
-# Ensure spinner stops on program exit
 atexit.register(_spinner.stop)
 
 
@@ -90,33 +87,25 @@ def _get_tool_display_name(tool_name: str) -> str:
 
 
 async def event_printer(event) -> None:
-    """Print concise, human-friendly logs for tool executions."""
     event_type: str = getattr(event, "event_type", "")
 
     if event_type == "progress_update_completion_started":
-        # Start spinner when LLM completion begins (main thinking phase)
         _spinner.start("completion")
 
     elif event_type == "progress_update_completion_completed":
-        # Stop spinner when LLM completion finishes
         _spinner.stop()
 
     elif event_type == "progress_update_completion_chunk":
-        # Keep spinner running during streaming, but we could add visual feedback here
-        # For now, just ensure spinner is running (in case start event was missed)
         if not _spinner.running:
             _spinner.start("completion")
 
     elif event_type == "progress_update_run_turn_started":
-        # Start spinner when a new turn begins (covers both completion and tool phases)
         _spinner.start("turn")
 
     elif event_type == "progress_update_run_turn_completed":
-        # Stop spinner when turn completes
         _spinner.stop()
 
     elif event_type == "progress_update_tool_action_started":
-        # Start spinner when tool execution begins
         try:
             data = event.data or {}
             args = data.get("args", [])
@@ -134,11 +123,9 @@ async def event_printer(event) -> None:
                 if tool_name:
                     _spinner.start(tool_name)
         except Exception:
-            # Graceful degradation
             _spinner.start("working")
 
     elif event_type == "progress_update_tool_action_completed":
-        # Stop spinner and show completion message
         _spinner.stop()
         try:
             data = event.data or {}
@@ -178,7 +165,6 @@ async def event_printer(event) -> None:
                 except (json.JSONDecodeError, TypeError):
                     pass
 
-            # Extract result metadata and output content if available
             result_metadata = None
             output_content = None
             if result_data and hasattr(result_data, "output_data"):
@@ -188,7 +174,6 @@ async def event_printer(event) -> None:
                 result_metadata = result_data
                 output_content = result_data.get("output_str")
 
-            # Format output based on tool type
             message = _format_tool_message(
                 tool_name, parsed_args, result_metadata, output_content
             )
@@ -496,12 +481,3 @@ def _format_tool_message(
 
     # Default fallback
     return None
-
-
-def create_event_printer_with_spinner():
-    """Create an event printer with spinner support.
-
-    This is provided for compatibility and future extensibility.
-    Currently returns the same event_printer function.
-    """
-    return event_printer

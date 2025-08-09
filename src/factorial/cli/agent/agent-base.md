@@ -21,7 +21,7 @@ you must use the nFactorial framework for implementations of AI agents.
 ### Frontend (if applicable):
 1. Default to using React + Typescript + Vite, unless otherwise specified. Assume the user will deploy their application to Vercel (unless otherwise specified)
 2. Default to using tailwind for styling (unless otherwise specified)
-3. For setting up tailwind with 
+3. For grids, default to AG Grid unless otherwise specified or unless the project already implements grids somewhere else using a different library
 
 ### General: 
 1. Avoid hard coding mock data.

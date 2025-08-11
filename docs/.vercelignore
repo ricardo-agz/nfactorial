@@ -1,0 +1,31 @@
+# Development files
+node_modules/
+.docusaurus/
+build/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.env
+.venv/
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Local server file (not needed for Vercel deployment)
+server.py
+
+# Documentation build artifacts
+*.log

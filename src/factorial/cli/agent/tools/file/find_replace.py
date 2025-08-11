@@ -1,7 +1,7 @@
 import os
 from pathlib import Path
 
-from ..utils import run_linter, replace_block
+from ..utils import run_linter, replace_block, build_preview, build_full_file_preview
 
 
 def find_replace(
@@ -14,9 +14,11 @@ def find_replace(
 ) -> tuple[str, dict[str, int]]:
     """Replace *old_string* with *new_string* in *file_path*.
 
-    If *fuzzy* is *True*, whitespace-insensitive matching is used and minor
-    formatting changes do not prevent a hit.  When *replace_all* is *False* only
-    the first occurrence is substituted.
+    **Authoring guidelines**
+    - *old_string* **must** be copied verbatim from the source - do not add escape sequences.
+    - *new_string* is inserted **verbatim** Do not introduce additional python-style escape sequences.
+    - Set *replace_all* to *True* only when you are confident that every match should be changed - otherwise the first occurrence is safer.
+    - If *fuzzy* is *True*, whitespace-insensitive matching is used and minor formatting changes do not prevent a hit. When *replace_all* is *False* only the first occurrence is substituted.
     """
     file_path = os.path.abspath(file_path)
     if old_string == new_string:
@@ -42,12 +44,27 @@ def find_replace(
 
     lint_errors = run_linter(file_path)
 
+    # Build preview of the final content
+    final_lines = new_content.split("\n")
+    FILE_PREVIEW_LENGTH = 1000
+    if len(final_lines) > FILE_PREVIEW_LENGTH:
+        # Find first occurrence of new_string to center preview around
+        first_match_line = 1
+        for i, line in enumerate(final_lines):
+            if new_string in line:
+                first_match_line = i + 1
+                break
+        preview = build_preview(final_lines, first_match_line, padding=25)
+    else:
+        # Show full file with line numbers
+        preview = build_full_file_preview(final_lines)
+
     msg = (
         f"Successfully replaced {count} occurrence{'s' if count != 1 else ''}"
-        f" ({'fuzzy' if fuzzy else 'strict'}) in {file_path}."
+        f" ({'fuzzy' if fuzzy else 'strict'}) in {file_path}. New file contents:\n{preview}"
     )
     if lint_errors:
-        msg += f" Linter warnings:\n{lint_errors}"
+        msg += f"\nLinter warnings:\n{lint_errors}"
 
     metadata = {
         "occurrences_replaced": count,

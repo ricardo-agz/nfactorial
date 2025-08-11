@@ -9,6 +9,10 @@ def create_next_app(
 ) -> str:
     """Scaffold a **Next.js** application.
 
+    Usage:
+    This should ONLY be used to initialize a NEW frontend project. Do NOT use this if the current project already has a frontend
+    directory set up, work off of the existing frontend directory instead.
+
     Args:
         project_name: Name of the directory / project to generate.
         language: "typescript" (default) or "javascript".
@@ -16,11 +20,6 @@ def create_next_app(
             * **True** → install and configure Tailwind CSS by running ``npx tailwindcss init -p``
               and injecting Tailwind CSS directives into ``styles/globals.css``.
             * **False** → skip Tailwind CSS setup.
-
-    Returns a detailed, multi-line summary detailing the actions performed and the
-    captured logs for each shell command executed. This helps downstream agents to
-    fully understand the side-effects (e.g. Tailwind injection) without inspecting
-    the filesystem.
     """
 
     if language not in ("typescript", "javascript"):

@@ -1,7 +1,6 @@
 import os
 from typing import Callable
 import httpx
-import yaml
 from dotenv import load_dotenv
 from pydantic import BaseModel
 from factorial import (
@@ -28,27 +27,16 @@ class CLIAgentContext(AgentContext):
     pass
 
 
-DOCS_ENDPOINT = os.getenv("NFACTORIAL_DOCS_ENDPOINT", "http://localhost:8081/docs")
+PROMPT_ENDPOINT = os.getenv(
+    "NFACTORIAL_PROMPT_ENDPOINT", "http://localhost:8081/agent-prompt"
+)
 
 
-with open(os.path.join(current_dir, "agent-base.md"), "r") as fh:
-    base_prompt = fh.read()
-with open(os.path.join(current_dir, "agent-create.yaml"), "r") as fh:
-    create_variables = yaml.safe_load(fh)
-    create_prompt = base_prompt
-    for k, v in create_variables.items():
-        create_prompt = create_prompt.replace(f"{{{k.upper()}}}", v)
-with open(os.path.join(current_dir, "agent-edit.yaml"), "r") as fh:
-    edit_variables = yaml.safe_load(fh)
-    edit_prompt = base_prompt
-    for k, v in edit_variables.items():
-        edit_prompt = edit_prompt.replace(f"{{{k.upper()}}}", v)
-
-
-def _fetch_framework_docs(url: str = DOCS_ENDPOINT, timeout: float = 30.0) -> str:
-    """Retrieve the framework docs from the FastAPI docs server."""
+def _fetch_prompt(mode: str, model: str, timeout: float = 30.0) -> str:
     with httpx.Client(timeout=timeout) as client:
-        response = client.get(url)
+        response = client.get(
+            PROMPT_ENDPOINT, params={"agent_mode": mode, "model": model}
+        )
         response.raise_for_status()
         return response.text
 
@@ -65,15 +53,13 @@ class NFactorialAgent(BaseAgent[CLIAgentContext]):
         model: Callable[[CLIAgentContext], Model],
         client: MultiClient,
     ):
+        model_name = model.name if isinstance(model, Model) else "default"
         if mode == "create":
-            instructions = create_prompt
+            instructions = _fetch_prompt("create", model_name)
         elif mode == "edit":
-            instructions = edit_prompt
+            instructions = _fetch_prompt("edit", model_name)
         else:
             raise ValueError(f"Invalid mode: {mode}")
-
-        framework_docs = _fetch_framework_docs()
-        instructions = instructions.replace("{{FRAMEWORK_DOCS}}", framework_docs)
 
         super().__init__(
             context_class=CLIAgentContext,
@@ -102,4 +88,5 @@ class NFactorialAgent(BaseAgent[CLIAgentContext]):
             ),
             output_type=FinalOutput,
             client=client,
+            max_turns=60,
         )

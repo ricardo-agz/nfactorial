@@ -149,8 +149,24 @@ def remove_key(provider: str | None) -> None:
         return
     if not provider:
         provider = _prompt_provider([p.value for p in model_setup.configured_providers])
-    key_storage.remove_key(provider)
-    click.echo(f"Removed {provider} API key (if it existed).")
+    stored_key = key_storage.get_key(provider)
+    env_var = f"{provider.upper()}_API_KEY"
+    env_key = os.environ.get(env_var)
+    if stored_key:
+        key_storage.remove_key(provider)
+        click.echo(f"Removed {provider} API key from key storage.")
+    elif env_key:
+        click.echo(
+            (
+                f"{provider} API key is provided via environment variable {env_var}.\n"
+                "This CLI cannot remove environment variables from your shell.\n"
+                "To remove it:\n"
+                f"  - Temporarily (current session): 'unset {env_var}' or 'export {env_var}='\n"
+                f"  - Persistently: remove it from your shell profile (e.g., ~/.zshrc, ~/.bashrc) and restart your shell."
+            )
+        )
+    else:
+        click.echo(f"No {provider} API key found in key storage or environment.")
 
 
 @setup.command("list-keys")
@@ -158,12 +174,17 @@ def list_keys() -> None:
     """List currently configured API keys."""
     click.echo("Configured API keys:")
     click.echo("-" * 40)
-    for provider in model_setup.configured_providers:
+    for provider in PROVIDERS:
         provider_name = provider.value
         key = key_storage.get_key(provider_name)
+        env_var = f"{provider_name.upper()}_API_KEY"
+        env_key = os.environ.get(env_var)
         if key:
             masked = f"{key[:4]}...{key[-4:]}"
             click.echo(f"{provider_name:10} {masked}")
+        elif env_key:
+            masked_env = f"{env_key[:4]}...{env_key[-4:]}"
+            click.echo(f"{provider_name:10} {masked_env} (env)")
         else:
             click.echo(f"{provider_name:10} Not configured")
 
@@ -216,6 +237,16 @@ def create(path: Path, description: tuple[str, ...], model_name: str | None) -> 
                 "Unknown model '{0}'. Available models: {1}".format(
                     model_name,
                     ", ".join([model.name for model in MODELS]),
+                ),
+                err=True,
+            )
+            sys.exit(1)
+        if model.provider not in model_setup.configured_providers:
+            click.echo(
+                (
+                    f"Model '{model.name}' requires provider '{model.provider.value}', "
+                    "but no API key is configured. Add a key via 'nfactorial setup add-key' "
+                    f"or set the {model.provider.value.upper()}_API_KEY environment variable."
                 ),
                 err=True,
             )
@@ -274,7 +305,7 @@ def create(path: Path, description: tuple[str, ...], model_name: str | None) -> 
 
 
 @cli.command()
-@click.argument("description", nargs=-1, required=True)
+@click.argument("prompt", nargs=-1, required=True)
 @click.option(
     "--model",
     "-m",
@@ -282,11 +313,11 @@ def create(path: Path, description: tuple[str, ...], model_name: str | None) -> 
     default=None,
     help="Force a particular model (e.g. 'gpt-4.1', 'claude-4-sonnet').",
 )
-def prompt(description: tuple[str, ...], model_name: str | None) -> None:
+def agent(prompt: tuple[str, ...], model_name: str | None) -> None:
     """Work on an existing nfactorial project.
 
-    DESCRIPTION: Description of what you want to do in the current project"""
-    prompt_text = " ".join(description).strip("'\"").strip()
+    PROMPT: Description of what you want to do in the current project"""
+    prompt_text = " ".join(prompt).strip("'\"").strip()
     if not prompt_text:
         click.echo("Description cannot be empty", err=True)
         sys.exit(1)

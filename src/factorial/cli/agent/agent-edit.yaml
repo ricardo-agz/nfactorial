@@ -1,5 +1,0 @@
-cli_command: "nfactorial agent <prompt>"
-directive: |
-  You are working in an existing nFactorial project. Clearly understand the requirements of the prompt and determine what needs to be done, be it
-  answer a question about the code, implement a refactor, fix a bug, or implement a new feature altogether.
-additional_guidance: ""

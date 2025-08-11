@@ -23,7 +23,7 @@ def run_linter(file_path: str) -> str | None:
     # TypeScript / JavaScript – try eslint first, then tsc / node check
     if ext in {".ts", ".tsx", ".js", ".jsx"}:
         lint_cmds = [
-            ["npx", "--yes", "eslint", "--no-eslintrc", "--env", "es2021", file_path],
+            ["npx", "--yes", "eslint", file_path],
             ["npx", "--yes", "tsc", "--noEmit", "--pretty", "false", file_path],
             ["node", "--check", file_path],
         ]
@@ -32,8 +32,14 @@ def run_linter(file_path: str) -> str | None:
                 result = subprocess.run(cmd, capture_output=True, text=True)
                 if result.returncode == 0:
                     return None
-                return result.stdout or result.stderr
+                # If we have output, return it - otherwise continue to next tool
+                error_output = result.stdout or result.stderr
+                if error_output:
+                    return error_output
             except FileNotFoundError:
+                continue
+            except Exception:
+                # Log unexpected errors but continue to next tool
                 continue
         return None
 
@@ -113,16 +119,51 @@ def with_line_numbers(code: str) -> str:
     return "\n".join([f"[{i + 1}]{line}" for i, line in enumerate(code.split("\n"))])
 
 
+def build_preview(lines: list[str], start_line: int, padding: int = 25) -> str:
+    """Build a line-numbered preview around a specific line range."""
+    total_lines = len(lines)
+    if total_lines == 0:
+        return "[1] "
+
+    # Ensure start_line is within bounds (1-based)
+    start_line = max(1, min(start_line, total_lines))
+
+    # Calculate preview window
+    preview_start = max(1, start_line - padding)
+    preview_end = min(total_lines, start_line + padding)
+
+    preview_lines = []
+    for i in range(preview_start - 1, preview_end):
+        line_num = i + 1
+        content = lines[i] if i < len(lines) else ""
+        preview_lines.append(f"[{line_num}] {content}")
+
+    return "\n".join(preview_lines)
+
+
+def build_full_file_preview(lines: list[str]) -> str:
+    """Build a line-numbered preview of the entire file."""
+    return "\n".join([f"[{i + 1}] {line}" for i, line in enumerate(lines)])
+
+
 _WHITESPACE_RE = re.compile(r"(?:\\s|\\n|\\r|\\t)+")
 
 
 def _fuzzy_pattern(old: str) -> re.Pattern[str]:
     """Return a regex that matches *old* ignoring whitespace differences."""
     escaped = re.escape(old)
-    # Replace any escaped whitespace characters (including \n, \r, \t, spaces) with flexible \s+
-    # This handles both sequences of escaped whitespace and individual whitespace characters
-    pattern_src = re.sub(r"\\[nrtf\s]|(?:\\\\\s)+", r"\\s+", escaped)
-    # Also handle sequences of whitespace that might not be properly escaped
+    # Normalize whitespace so that any sequence of whitespace **or** escaped whitespace
+    # (e.g. " ", "\n", "\t", "\r", or "\s") is matched by the flexible
+    # regex token ``\s+``.  This prevents the pattern generation step from
+    # inadvertently touching other backslash-escaped characters such as escaped
+    # quotes (``\"``) that should remain untouched.
+    #
+    # First, collapse *escaped* whitespace sequences to ``\s+`` – this handles
+    # cases like ``\n`` or ``\t`` that appear after ``re.escape``.
+    pattern_src = _WHITESPACE_RE.sub(r"\\s+", escaped)
+
+    # Second, replace any remaining *literal* whitespace characters (spaces,
+    # newlines, tabs) with ``\s+`` as well.
     pattern_src = re.sub(r"\s+", r"\\s+", pattern_src)
     return re.compile(pattern_src, flags=re.MULTILINE | re.DOTALL)
 
@@ -144,7 +185,9 @@ def replace_block(
     if fuzzy:
         pattern = _fuzzy_pattern(old)
         max_count = 0 if replace_all else 1
-        new_content, n = pattern.subn(new, content, count=max_count)
+        # Use a lambda so that the *new* string is inserted **literally** and
+        # backslashes inside it are **not** interpreted by ``re.sub``.
+        new_content, n = pattern.subn(lambda _: new, content, count=max_count)
     else:
         if replace_all:
             new_content, n = content.replace(old, new), content.count(old)

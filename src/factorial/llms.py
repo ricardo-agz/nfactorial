@@ -9,6 +9,7 @@ from dotenv import load_dotenv
 import httpx
 import json
 from openai import AsyncOpenAI
+
 from openai.types.chat import (
     ChatCompletion,
     ChatCompletionChunk,
@@ -100,10 +101,14 @@ class MultiClient:
         max_keepalive_connections: int = 1000,
         timeout: float = 120.0,
     ):
+        self.openai: AsyncOpenAI | None = None
+        self.xai: AsyncOpenAI | None = None
+        self.anthropic: AsyncOpenAI | None = None
+        self.fireworks: AsyncOpenAI | None = None
+
         if http_client:
             self.http_client = http_client
         else:
-            # Configure HTTP client with proper connection pooling
             self.http_client = httpx.AsyncClient(
                 limits=httpx.Limits(
                     max_connections=max_connections,
@@ -554,14 +559,14 @@ claude_4_sonnet = Model(
 claude_37_sonnet = Model(
     name="claude-3.7-sonnet",
     provider=Provider.ANTHROPIC,
-    provider_model_id="claude-3.7-sonnet-20250219",
+    provider_model_id="claude-3-7-sonnet-20250219",
     context_window=200_000,
 )
 
 claude_35_sonnet = Model(
     name="claude-3.5-sonnet",
     provider=Provider.ANTHROPIC,
-    provider_model_id="claude-3.5-sonnet-20241022",
+    provider_model_id="claude-3-5-sonnet-20241022",
     context_window=200_000,
 )
 

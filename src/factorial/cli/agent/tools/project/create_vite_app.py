@@ -9,6 +9,10 @@ def create_vite_app(
 ) -> str:
     """Scaffold a React application using **Vite**.
 
+    Usage:
+    This should ONLY be used to initialize a NEW frontend project. Do NOT use this if the current project already has a frontend
+    directory set up, work off of the existing frontend directory instead.
+
     Args:
         project_name: Name of the directory / project to generate.
         language: "typescript" (default) or "javascript".

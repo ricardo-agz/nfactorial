@@ -1,7 +1,7 @@
 import os
 from pathlib import Path
 from pydantic import BaseModel
-from ..utils import run_linter, replace_block
+from ..utils import run_linter, replace_block, build_preview, build_full_file_preview
 
 
 def _apply_single(
@@ -33,7 +33,11 @@ def _apply_single(
 
     slice_str = "\n".join(lines[search_start - 1 : search_end])
     if old_string not in slice_str:
-        raise ValueError("old_string not found within specified range in multi_edit")
+        preview = build_preview(lines, start_line, padding=25)
+        raise ValueError(
+            f"old_string not found in lines {search_start}-{search_end} (multi_edit). "
+            f"File context:\n{preview}"
+        )
 
     new_slice, _ = replace_block(
         slice_str,
@@ -61,6 +65,17 @@ def multi_edit(
 ) -> tuple[str, dict[str, int]]:
     """
     Apply *edits* to *file_path* sequentially.
+
+    **Guidelines for crafting the *edits* list**
+    - Every *old_string* must be copied **exactly** from the source. Do not introduce additional escape sequences.
+    - *new_string* is inserted **verbatim**
+    - The *start_line* / *end_line* coordinates refer to the ORIGINAL file.
+      This function automatically adjusts subsequent edits as earlier ones
+      change line numbers.
+    - `tolerance`: number of **extra lines** that the tool is allowed to look **above _and_ below** the `[start_line, end_line]` window when searching for `old_string`.
+        * With at tolerance of 0, the start_line - end_line slice must fully encompass **every line** of `old_string`. If even one character is outside that window, the replacement fails.
+        * For a more forgiving search, increase tolerance for the tool to automatically widen the search window.
+
 
     Arguments:
     file_path: The absolute filepath to the file to edit
@@ -126,11 +141,26 @@ def multi_edit(
 
     lint_errors = run_linter(file_path)
 
-    msg = f"Successfully applied {len(edits)} edits to {file_path}." + (
-        " (file created)" if new_file else ""
+    # Build preview of the final content
+    final_lines = content.split("\n")
+    FILE_PREVIEW_LENGTH = 1000
+    if len(final_lines) > FILE_PREVIEW_LENGTH:
+        # Show preview around the middle of edited areas
+        # Calculate average line position of all edits
+        total_line_positions = sum(edit.start_line for edit in edits)
+        avg_edit_line = total_line_positions // len(edits)
+        preview = build_preview(final_lines, avg_edit_line, padding=25)
+    else:
+        # Show full file with line numbers
+        preview = build_full_file_preview(final_lines)
+
+    msg = (
+        f"Successfully applied {len(edits)} edits to {file_path}."
+        + (" (file created)" if new_file else "")
+        + f" New file contents:\n{preview}"
     )
     if lint_errors:
-        msg += f" Linter warnings:\n{lint_errors}"
+        msg += f"\nLinter warnings:\n{lint_errors}"
 
     metadata = {
         "num_edits": len(edits),

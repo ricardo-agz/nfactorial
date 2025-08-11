@@ -7,8 +7,11 @@ from ..utils import run
 def create_react_app(
     project_name: str, language: str = "typescript", with_tailwind: bool = False
 ) -> str:
-    """
-    Scaffold a React application using create-react-app. Optionally installs and configures Tailwind CSS.
+    """Scaffold a NEW React application using create-react-app.
+
+    Usage:
+    This should ONLY be used to initialize a NEW frontend project. Do NOT use this if the current project already has a frontend
+    directory set up, work off of the existing frontend directory instead.
 
     Args:
         project_name: Name of the directory / project to generate.

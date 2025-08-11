@@ -27,8 +27,8 @@ from openai.types.chat import (
     ChatCompletionMessageToolCall,
     ChatCompletionMessage,
 )
-from datetime import datetime
-
+from datetime import datetime, timezone
+import uuid
 from factorial.context import (
     AgentContext,
     ExecutionContext,
@@ -104,13 +104,69 @@ def retry(
     def _create_retry_decorator(
         the_func: Callable[..., Awaitable[T]],
     ) -> Callable[..., Awaitable[T]]:
+        # ------------------------------------------------------------------
+        # Determine which parameter (if any) represents the AgentContext so we
+        # can update its ``attempt`` field on each retry.  We do this *once* at
+        # decoration time to avoid repeated introspection.
+        # ------------------------------------------------------------------
+
+        sig = inspect.signature(the_func)
+
+        _ctx_param_name: str | None = None
+        _ctx_pos: int | None = None  # Positional index of the context parameter
+
+        for idx, param in enumerate(sig.parameters.values()):
+            ann = param.annotation
+            if (
+                ann is not inspect.Parameter.empty
+                and isinstance(ann, type)
+                and issubclass(ann, AgentContext)
+            ):
+                _ctx_param_name = param.name
+                _ctx_pos = idx - 1  # subtract 1 to account for ``self``
+                break
+
+        # Fallback to conventional name if annotation is missing.
+        if _ctx_param_name is None and "agent_ctx" in sig.parameters:
+            _ctx_param_name = "agent_ctx"
+            _ctx_pos = list(sig.parameters).index("agent_ctx") - 1
+
+        # If still None, the wrapped function doesn't take an AgentContext; we
+        # can skip all bookkeeping in that case.
+
         @wraps(the_func)
         async def wrapper(self: "BaseAgent[Any]", *args: Any, **kwargs: Any) -> T:
             if max_attempts <= 0:
                 raise ValueError("max_attempts must be greater than 0")
 
+            # --------------------------------------------------------------
+            # Resolve the AgentContext **once** per invocation so we don't
+            # repeat the same extraction logic on every retry attempt.  The
+            # reference is reused within the loop so we only update its
+            # ``attempt`` field each iteration.
+            # --------------------------------------------------------------
+            agent_ctx_obj: Any | None = None
+            if _ctx_param_name is not None:
+                # Prefer keyword argument – fastest lookup.
+                if _ctx_param_name in kwargs:
+                    agent_ctx_obj = kwargs[_ctx_param_name]
+                # Fallback to positional args tuple.
+                elif _ctx_pos is not None and _ctx_pos < len(args):
+                    agent_ctx_obj = args[_ctx_pos]
+
             last_exception: Exception | None = None
             for attempt in range(max_attempts):
+                # Best-effort: annotate the current attempt on the context so
+                # downstream helpers (e.g. model fallbacks) can react.
+                if agent_ctx_obj is not None and isinstance(
+                    agent_ctx_obj, AgentContext
+                ):
+                    try:
+                        agent_ctx_obj.attempt = attempt  # type: ignore[attr-defined]
+                    except Exception:
+                        # Never let bookkeeping failure break the retry logic.
+                        pass
+
                 try:
                     return await the_func(self, *args, **kwargs)
                 except Exception as e:
@@ -121,9 +177,7 @@ def retry(
                                 delay * (exponential_base**attempt), max_delay
                             )
                             if jitter:
-                                jitter_factor = random.uniform(0.5, 1.5)
-                                backoff_delay *= jitter_factor
-
+                                backoff_delay *= random.uniform(0.5, 1.5)
                             await asyncio.sleep(backoff_delay)
                     else:
                         raise e
@@ -1221,6 +1275,113 @@ class BaseAgent(Generic[ContextType]):
         self, agent_ctx: ContextType, execution_ctx: ExecutionContext
     ) -> None:
         pass
+
+    @final
+    async def run_inline(
+        self,
+        agent_ctx: ContextType,
+        event_handler: Callable[[AgentEvent], Awaitable[None]] | None = None,
+    ) -> RunCompletion[ContextType]:
+        """Run the agent in-line, without any queued orchestration. Useful for simple use-cases."""
+
+        # ------------------------------------------------------------------
+        # Lightweight, *local* execution helper.
+        #
+        # This mirrors the orchestrator/worker flow but **without** any Redis/
+        # queue dependencies so developers can run agents directly in an async
+        # context (e.g. notebooks, scripts, tests).
+        # ------------------------------------------------------------------
+
+        class InlineEventPublisher:  # pragma: no cover – simple stub
+            """Minimal stub that satisfies the EventPublisher interface"""
+
+            async def publish_event(self, event: Any) -> None:  # noqa: ANN401
+                if event_handler:
+                    await event_handler(event)
+
+        started_at = datetime.now(timezone.utc)
+
+        # Dummy execution context suitable for local runs.
+        execution_ctx = ExecutionContext(
+            task_id=str(uuid.uuid4()),
+            owner_id=str(uuid.uuid4()),
+            retries=0,
+            iterations=agent_ctx.turn,
+            events=InlineEventPublisher(),  # type: ignore[arg-type]
+        )
+
+        # Make the execution context available via the contextvar so all helper
+        # utilities and decorators function as expected.
+        token = execution_context.set(execution_ctx)
+
+        try:
+            # Lifecycle callback – run start
+            await self._safe_call(self.on_run_start, agent_ctx, execution_ctx)
+
+            turn_completion: TurnCompletion[ContextType]
+
+            # Main turn-processing loop ------------------------------------------------
+            while True:
+                turn_completion = await self._run_turn_with_progress(agent_ctx)
+
+                # Pending tool or child task results are not supported in local mode
+                if (
+                    turn_completion.pending_tool_call_ids
+                    or turn_completion.pending_child_task_ids
+                ):
+                    raise RuntimeError(
+                        "Pending tool/child task results are not supported when running the agent locally."
+                    )
+
+                if turn_completion.is_done:
+                    break
+
+                # Defensive guard – respect max_turns in case the LLM never
+                # reaches a final output.  `run_turn` increments `agent_ctx.turn`.
+                if self.max_turns is not None and agent_ctx.turn >= self.max_turns:
+                    logger.warning(
+                        "Reached max_turns (%s) without final output, stopping the run.",
+                        self.max_turns,
+                    )
+                    break
+
+            finished_at = datetime.now(timezone.utc)
+
+            run_completion = RunCompletion(
+                output=turn_completion.output,
+                started_at=started_at,
+                finished_at=finished_at,
+            )
+
+            # Lifecycle callback – run end (success)
+            await self._safe_call(
+                self.on_run_end,
+                agent_ctx,
+                execution_ctx,
+                run_completion,
+            )
+
+            return run_completion
+
+        except Exception as e:
+            # Lifecycle callback – run end (failure)
+            finished_at = datetime.now(timezone.utc)
+            await self._safe_call(
+                self.on_run_end,
+                agent_ctx,
+                execution_ctx,
+                RunCompletion(
+                    output=None,
+                    error=e,
+                    started_at=started_at,
+                    finished_at=finished_at,
+                ),
+            )
+            raise
+
+        finally:
+            # Always reset the execution context var to avoid leaking state.
+            execution_context.reset(token)
 
     @final
     async def execute(

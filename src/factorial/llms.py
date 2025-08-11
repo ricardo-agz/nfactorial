@@ -9,6 +9,7 @@ from dotenv import load_dotenv
 import httpx
 import json
 from openai import AsyncOpenAI
+
 from openai.types.chat import (
     ChatCompletion,
     ChatCompletionChunk,
@@ -50,6 +51,44 @@ class Model:
     custom_tool_support: ToolSupportWrapper | None = None
 
 
+# ------------------------------------------------------------
+# Helper utilities
+# ------------------------------------------------------------
+
+
+def fallback_models(*models: "Model") -> Callable[[Any], "Model"]:  # noqa: D401
+    """Return a model-selection callable cycling through *models* by retry attempt.
+
+    The callable can be passed to the ``model`` parameter of :class:`factorial.agent.BaseAgent`.
+    Inside the agent, the current retry index is exposed via ``agent_ctx.attempt`` which is
+    automatically updated by the built-in ``@retry`` decorator.  The selector will return
+    ``models[attempt]`` for the *n*-th retry, falling back to the last model once the list is
+    exhausted.
+
+    Example
+    -------
+    >>> agent = Agent(
+    ...     model=fallback_models(llms.o3, llms.o4_mini, llms.gpt_41)
+    ... )
+    """
+
+    if not models:
+        raise ValueError("At least one model must be provided to 'fallback_models'.")
+
+    model_sequence = list(models)
+
+    def _selector(agent_ctx: Any) -> "Model":  # type: ignore[name-defined]
+        # ``attempt`` is injected by the retry wrapper (defaults to 0 on first try).
+        attempt_idx = getattr(agent_ctx, "attempt", 0)
+        if attempt_idx < 0:
+            attempt_idx = 0
+        if attempt_idx >= len(model_sequence):
+            attempt_idx = attempt_idx % len(model_sequence)
+        return model_sequence[attempt_idx]
+
+    return _selector
+
+
 class MultiClient:
     def __init__(
         self,
@@ -62,10 +101,14 @@ class MultiClient:
         max_keepalive_connections: int = 1000,
         timeout: float = 120.0,
     ):
+        self.openai: AsyncOpenAI | None = None
+        self.xai: AsyncOpenAI | None = None
+        self.anthropic: AsyncOpenAI | None = None
+        self.fireworks: AsyncOpenAI | None = None
+
         if http_client:
             self.http_client = http_client
         else:
-            # Configure HTTP client with proper connection pooling
             self.http_client = httpx.AsyncClient(
                 limits=httpx.Limits(
                     max_connections=max_connections,
@@ -440,6 +483,27 @@ def base_tool_parser(response: str) -> tuple[str, list[ChatCompletionMessageTool
 
 # ---------- OPENAI MODELS ----------
 
+gpt_5 = Model(
+    name="gpt-5",
+    provider=Provider.OPENAI,
+    provider_model_id="gpt-5",
+    context_window=400_000,
+)
+
+gpt_5_mini = Model(
+    name="gpt-5-mini",
+    provider=Provider.OPENAI,
+    provider_model_id="gpt-5-mini",
+    context_window=400_000,
+)
+
+gpt_5_nano = Model(
+    name="gpt-5-nano",
+    provider=Provider.OPENAI,
+    provider_model_id="gpt-5-nano",
+    context_window=400_000,
+)
+
 o3 = Model(
     name="o3",
     provider=Provider.OPENAI,
@@ -495,14 +559,14 @@ claude_4_sonnet = Model(
 claude_37_sonnet = Model(
     name="claude-3.7-sonnet",
     provider=Provider.ANTHROPIC,
-    provider_model_id="claude-3.7-sonnet-20250219",
+    provider_model_id="claude-3-7-sonnet-20250219",
     context_window=200_000,
 )
 
 claude_35_sonnet = Model(
     name="claude-3.5-sonnet",
     provider=Provider.ANTHROPIC,
-    provider_model_id="claude-3.5-sonnet-20241022",
+    provider_model_id="claude-3-5-sonnet-20241022",
     context_window=200_000,
 )
 
@@ -567,3 +631,25 @@ fireworks_qwen_3_coder_480b = Model(
         parser=base_tool_parser,
     ),
 )
+
+MODELS = [
+    gpt_5,
+    gpt_5_mini,
+    gpt_5_nano,
+    o3,
+    o4_mini,
+    gpt_41,
+    gpt_41_mini,
+    gpt_41_nano,
+    claude_4_opus,
+    claude_4_sonnet,
+    claude_37_sonnet,
+    claude_35_sonnet,
+    claude_35_haiku,
+    grok_4,
+    grok_3,
+    grok_3_mini,
+    fireworks_kimi_k2,
+    fireworks_qwen_3_235b,
+    fireworks_qwen_3_coder_480b,
+]

@@ -28,6 +28,9 @@ from factorial.events import AgentEvent, QueueEvent, EventPublisher
 from factorial.llms import (
     Model,
     MultiClient,
+    gpt_5,
+    gpt_5_mini,
+    gpt_5_nano,
     o3,
     o4_mini,
     grok_4,
@@ -44,6 +47,9 @@ from factorial.llms import (
     fireworks_kimi_k2,
     fireworks_qwen_3_235b,
     fireworks_qwen_3_coder_480b,
+    fallback_models,
+    MODELS,
+    Provider,
 )
 
 __all__ = [
@@ -74,6 +80,9 @@ __all__ = [
     "EventPublisher",
     "Model",
     "MultiClient",
+    "gpt_5",
+    "gpt_5_mini",
+    "gpt_5_nano",
     "o3",
     "o4_mini",
     "grok_4",
@@ -91,4 +100,7 @@ __all__ = [
     "fireworks_kimi_k2",
     "fireworks_qwen_3_235b",
     "fireworks_qwen_3_coder_480b",
+    "fallback_models",
+    "MODELS",
+    "Provider",
 ]

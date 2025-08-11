@@ -159,7 +159,11 @@ def _python_type_to_json_schema(python_type: type) -> dict[str, Any]:
 
     # Handle Pydantic BaseModel classes
     if isinstance(python_type, type) and issubclass(python_type, BaseModel):
-        return python_type.model_json_schema()
+        schema = python_type.model_json_schema()
+        # Ensure additionalProperties is false for all object schemas
+        if schema.get("type") == "object":
+            schema["additionalProperties"] = False
+        return schema
 
     # Handle basic types
     if python_type is str:

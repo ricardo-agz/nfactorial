@@ -3,6 +3,9 @@ from openai import (
     InternalServerError as OpenAIInternalServerError,
     APITimeoutError as OpenAITimeoutError,
     APIConnectionError as OpenAIConnectionError,
+    BadRequestError as OpenAIBadRequestError,
+    AuthenticationError as OpenAIAuthenticationError,
+    PermissionDeniedError as OpenAIPermissionDeniedError,
 )
 
 
@@ -73,6 +76,9 @@ class FatalAgentError(Exception):
 
 
 RETRYABLE_EXCEPTIONS = (
+    OpenAIBadRequestError,
+    OpenAIAuthenticationError,
+    OpenAIPermissionDeniedError,
     OpenAIRateLimitError,
     OpenAIInternalServerError,
     OpenAIConnectionError,

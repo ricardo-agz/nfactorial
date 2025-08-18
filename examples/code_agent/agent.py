@@ -13,7 +13,7 @@ from factorial import (
     fireworks_kimi_k2,
     fireworks_qwen_3_coder_480b,
     AgentWorkerConfig,
-    deferred_result,
+    deferred_tool,
 )
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -96,7 +96,7 @@ def edit_code(
     )
 
 
-@deferred_result(timeout=300.0)  # 5-minute timeout waiting for user decision
+@deferred_tool(timeout=300.0)  # 5-minute timeout waiting for user decision
 def request_code_execution(
     response_on_reject: str, agent_ctx: AgentContext, execution_ctx: ExecutionContext
 ) -> None:
@@ -141,7 +141,7 @@ class IDEAgent(BaseAgent[IdeAgentContext]):
             context_class=IdeAgentContext,
             instructions=instructions,
             tools=[think, edit_code, request_code_execution],
-            model=fireworks_kimi_k2,
+            model=gpt_41_mini,
             model_settings=ModelSettings(
                 temperature=0.1,
             ),

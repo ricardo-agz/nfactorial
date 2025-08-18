@@ -1,6 +1,6 @@
 # Context
 
-Agents are stateless, Context is used to track the state of execution throughout each turn.
+Agents are stateless, Context is used to track the state of execution across turns.
 
 ## AgentContext
 

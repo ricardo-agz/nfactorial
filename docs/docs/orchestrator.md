@@ -1,6 +1,6 @@
 # Orchestrator
 
-The Orchestrator manages agent execution, scaling, and observability. It handles task queuing, worker management, and provides real-time monitoring.
+The Orchestrator manages agent execution, scaling, and observability. It spawns concurrent instances of each agent resgistered with a runner and handles everything from enqueing agent tasks, to retries, to streaming real-time progress events. 
 
 ## Basic Setup
 
@@ -75,15 +75,22 @@ config = MaintenanceWorkerConfig(
 
 ### Enqueue Tasks
 
+
 ```python
 import asyncio
-from factorial import AgentContext
+from factorial import Agent, AgentContext, Orchestrator
+
+agent = Agent(...)
+orchestrator = Orchestrator(...)
+orchestrator.register_runner(...)
 
 async def submit_task():
-    context = AgentContext(query="Analyze this data")
-    task = agent.create_task(owner_id="user123", payload=context)
+    task = await orchestrator.create_agent_task(
+        agent=agent,
+        owner_id="user123", 
+        payload=AgentContext(query="Analyze this data")
+    )
     
-    await orchestrator.enqueue_task(agent, task)
     return task.id
 
 task_id = asyncio.run(submit_task())
@@ -179,3 +186,113 @@ config = MetricsTimelineConfig(
     retention_multiplier=2.0,    # Keep data for 2x timeline
 )
 ```
+
+<br/>
+
+---
+
+
+## Run Agents Without the Orchestrator
+
+While there are a lot of benefits of executing agents through the orchestrator, for simpler use cases, it is possible to run an agent 'in-line', without needing an orchestrator, or its underlying Redis queue. This can be useful for local development or use cases where you simply don't want the overhead of a Redis dependency. 
+
+A practical example of such a use case is the Factorial CLI agent. You can scaffold new agents with the `nfactorial create . "<agent description>"` command, which spawns a local agent to implement the code. Given this use case only requires a single agent running locally, the orchestrator and Redis are unnecessary overhead.
+
+
+Agents expose a `run_inline` method that executes the agent locally in your process using the same lifecycle as queued runs, but without Redis or workers. You pass an `AgentContext` and optionally an `event_handler` to handle real-time progress events.
+
+```python
+import asyncio
+from factorial import Agent, AgentContext
+
+
+agent = Agent(
+    instructions="You are a helpful assistant.",
+    tools=[...],
+    max_turns=10,
+)
+
+async def main():
+    ctx = AgentContext(query="Summarize README.md")
+    # Run the agent locally (no orchestrator/Redis required)
+    completion = await agent.run_inline(ctx)
+
+    # Access final output if your agent produces one
+    print(completion.output)
+
+asyncio.run(main())
+```
+
+### Progress streaming
+
+You can provide an `event_handler` to receive structured progress events (turn start/end, tool start/end, completion chunks, failures, etc.). Here's a self-contained example that:
+- shows a simple spinner during LLM thinking
+- prints nicely formatted tool messages like "read 'path'", "created 'file'", "grep 'pattern' in 'dir'"
+
+```python
+
+def _extract_tool_data(event_data: dict) -> tuple[str | None, dict]:
+    args = (event_data.get("args") or [])
+    tool_name = None
+    arguments = {}
+    if args:
+        call = args[0]
+        func = (call.get("function") or {})
+        tool_name = func.get("name")
+        raw_args = func.get("arguments", {})
+        try:
+            if isinstance(raw_args, str):
+                arguments = json.loads(raw_args)
+            elif isinstance(raw_args, dict):
+                arguments = raw_args
+        except Exception:
+            arguments = {}
+    return tool_name, arguments
+
+
+def _format_tool_message(tool_name: str | None, args: dict, result_data: dict | None) -> str:
+    name = tool_name or "tool"
+    if name == "read":
+        return f"read '{args.get('file_path', 'unknown')}'"
+    if name == "write":
+        fp = args.get("file_path", "unknown")
+        return ("overwrote" if args.get("overwrite") else "created") + f" '{fp}'"
+    # ... more
+
+    return f"ran {name}"
+
+
+async def event_printer(event) -> None:
+    event_type: str = getattr(event, "event_type", "")
+
+    if event_type == "progress_update_completion_started":
+        print("thinking...")
+    elif event_type == "progress_update_tool_action_started":
+        tool_name, tool_args = extract_tool_data(event.data)
+        print(_format_tool_message(tool_name, tool_args))
+    elif event_type.endswith("_failed"):
+        error = getattr(event, "error", None)
+        print(f"error: {error or getattr(event, 'data', {})}")
+
+
+agent = Agent(
+    instructions="You are a helpful coding agent.",
+    tools=[read, write, edit_lines, find_replace, delete, tree, ls, grep],
+    max_turns=60,
+)
+
+async def main():
+    ctx = AgentContext(query="Add a /health route to this FastAPI service")
+    completion = await agent.run_inline(ctx, event_handler=handle_event)
+
+    print(completion.output)
+
+if __name__ == "__main__":
+    asyncio.run(main())
+
+```
+
+**Notes:**
+
+- Pending tool or child-task results are not supported in in-line mode. If you need to run a subagent, you can do so by creating a tool that calls a subagent to run in_line inside the tool execution, which effectively accomplishes the same thing.
+

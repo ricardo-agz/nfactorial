@@ -28,7 +28,7 @@ class CLIAgentContext(AgentContext):
 
 
 PROMPT_ENDPOINT = os.getenv(
-    "NFACTORIAL_PROMPT_ENDPOINT", "http://localhost:8081/agent-prompt"
+    "NFACTORIAL_PROMPT_ENDPOINT", "https://www.factorial.sh/api/agent-prompt"
 )
 
 

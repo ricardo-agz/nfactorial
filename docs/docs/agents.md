@@ -1,6 +1,19 @@
 # Agents
 
-Agents are the core building blocks of Factorial applications. They are LLMs equipped with instructions, tools, and configuration that can execute tasks autonomously. Each agent runs in a stateless manner, with context managed separately for each task execution.
+Agents are a lightweight abstraction over the Factorial queue and workers to execute an LLM completion + tool calling loop until some end condition is met. Each agent is _stateless_, meaning it takes in a _context_ object to execute a single turn, updates the context, then continues, freeing the context to be picked up by the same or a different instance of the agent.
+
+#### The mental model is:
+**Agent**:
+* Defines the tools, instructions, stop conditions, logic, etc. 
+* Takes in an _AgentContext_ object (messages, turn number, etc.) and _ExecutionContext_ object (retry attempts, owner id, task id, event publisher, etc.) and executes a single agent turn.
+
+
+**Orchestrator**: 
+* Registers each agent through `runners` which spawn concurrent agent workers to process queued tasks.
+
+
+While a big part of Factorial is the ease of orchestrating durable agents through the orchestrator and its underlying queuing system, agents can also be executed "in line" without needing an orchestrator or Redis (for simpler use cases).
+
 
 ## Quick Start
 
@@ -21,13 +34,7 @@ agent = Agent(
 
 ## Agent Parameters
 
-### Required Parameters
-
-**`description`** (str): A brief description of what the agent does. Used for logging and observability.
-
-**`instructions`** (str): The system prompt that guides the agent's behavior. This is sent to the LLM as the system message.
-
-### Optional Parameters
+**`instructions`** (str): The system prompt sent as the first message to all LLM completions. Used to guide the agent's behavior.
 
 **`tools`** (list): List of Python functions that the agent can call. See [Tools documentation](tools.md) for details.
 
@@ -37,34 +44,12 @@ def search_web(query: str) -> str:
     return f"Search results for: {query}"
 
 agent = Agent(
-    description="Research Assistant",
     instructions="You help users research topics by searching the web.",
     tools=[search_web],
 )
 ```
 
 **`model`** (Model | Callable): The LLM model to use. Can be a static model or a function that returns a model based on context.
-
-```python
-from factorial import gpt_41, gpt_41_mini
-
-# Static model
-agent = Agent(
-    description="Assistant",
-    instructions="You are helpful",
-    model=gpt_41,
-)
-
-# Dynamic model based on context
-def choose_model(agent_ctx: AgentContext) -> Model:
-    return gpt_41 if agent_ctx.turn == 0 else gpt_41_mini
-
-agent = Agent(
-    description="Assistant", 
-    instructions="You are helpful",
-    model=choose_model,
-)
-```
 
 **`model_settings`** (ModelSettings): Configuration for model parameters like temperature, tool choice, etc.
 
@@ -78,7 +63,34 @@ agent = Agent(
 
 **`request_timeout`** (float): HTTP timeout for LLM requests in seconds (default: 120.0).
 
-**`parse_tool_args`** (bool): Whether to parse tool arguments as JSON (default: True).
+**`parse_tool_args`** (bool): Whether LLM tool call arguments should be parsed as opposed to remaining a raw string. Defaults to true.
+
+## Setting the Model
+
+```python
+from factorial import gpt_5, gpt_41, gpt_41_mini, claude_4_sonnet, fallback_models
+
+# Static model
+agent = Agent(
+    instructions="You are a helpful assistant",
+    model=gpt_41,
+)
+
+# Dynamic model based on context
+def choose_model(agent_ctx: AgentContext) -> Model:
+    return gpt_41 if agent_ctx.turn == 0 else gpt_41_mini
+
+agent = Agent(
+    instructions="You are a helpful assistant",
+    model=choose_model,
+)
+
+# Fallback models (will be attempted in order, e.g. if claude_4_sonnet errors, gpt_5 will be tried next)
+agent = Agent(
+    instructions="You are a helpful assistant",
+    model=fallback_models(claude_4_sonnet, gpt_5, gpt_41),
+)
+```
 
 ## Model Settings
 

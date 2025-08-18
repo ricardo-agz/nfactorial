@@ -46,11 +46,10 @@ from factorial.events import EventPublisher, AgentEvent
 from factorial.logging import get_logger
 from factorial.exceptions import RETRYABLE_EXCEPTIONS, FatalAgentError
 from factorial.tools import (
-    FunctionTool,
-    FunctionToolActionResult,
+    AgentTool,
+    AgentToolActionResult,
     convert_tools_list,
     create_final_output_tool,
-    function_tool,
 )
 
 logger = get_logger(__name__)
@@ -408,7 +407,7 @@ class BaseAgent(Generic[ContextType]):
         name: str | None = None,
         instructions: str | Callable[..., str] | None = None,
         description: str | None = None,
-        tools: list[FunctionTool[ContextType] | Callable[..., Any]] | None = None,
+        tools: list[AgentTool[ContextType] | Callable[..., Any]] | None = None,
         model: Model | Callable[[ContextType], Model] | None = None,
         model_settings: ModelSettings[ContextType] | None = None,
         stream: bool = False,
@@ -696,7 +695,7 @@ class BaseAgent(Generic[ContextType]):
         self,
         tool_call: ChatCompletionMessageToolCall,
         agent_ctx: ContextType,
-    ) -> FunctionToolActionResult:
+    ) -> AgentToolActionResult:
         """Execute a tool action. Override to customize."""
         tool_name = tool_call.function.name
         tool_args = tool_call.function.arguments
@@ -707,7 +706,7 @@ class BaseAgent(Generic[ContextType]):
         if not action:
             raise ValueError(f"Agent {self.name} has no tool action for {tool_name}")
 
-        is_deferred_result = getattr(action, "deferred_result", False)
+        is_deferred_result = getattr(action, "deferred_tool", False)
         is_forking_tool = getattr(action, "forking_tool", False)
 
         if not self.parse_tool_args:
@@ -843,7 +842,7 @@ class BaseAgent(Generic[ContextType]):
                         f"Forking tool '{tool_call.function.name}' returned invalid task IDs: {candidate_ids}"
                     )
 
-        if isinstance(result, FunctionToolActionResult):
+        if isinstance(result, AgentToolActionResult):
             result.tool_call = tool_call
             result.pending_result = is_deferred_result
             result.pending_child_task_ids = pending_child_task_ids
@@ -864,7 +863,7 @@ class BaseAgent(Generic[ContextType]):
                 output_str = str(result)
                 output_data = result
 
-            return FunctionToolActionResult(
+            return AgentToolActionResult(
                 tool_call=tool_call,
                 output_str=output_str,
                 output_data=output_data,
@@ -875,12 +874,12 @@ class BaseAgent(Generic[ContextType]):
     def extract_tool_call_result(
         self,
         tool_call: ChatCompletionMessageToolCall,
-        result: Any | FunctionToolActionResult | Exception,
+        result: Any | AgentToolActionResult | Exception,
     ) -> tuple[str, Any | None, Exception | None]:
         if isinstance(result, Exception):
             str_result = f'<tool_call_error tool="{tool_call.id}">\nError running tool:\n{result}\n</tool_call_error>'
             return str_result, None, result
-        elif isinstance(result, FunctionToolActionResult):
+        elif isinstance(result, AgentToolActionResult):
             str_result = f'<tool_call_result tool="{tool_call.id}">\n{result.output_str}\n</tool_call_result>'
             return str_result, result.output_data, None
         else:
@@ -888,11 +887,11 @@ class BaseAgent(Generic[ContextType]):
             return str_result, result, None
 
     def format_tool_result(
-        self, tool_call_id: str, result: Any | FunctionToolActionResult | Exception
+        self, tool_call_id: str, result: Any | AgentToolActionResult | Exception
     ) -> str:
         if isinstance(result, Exception):
             return f'<tool_call_error tool="{tool_call_id}">\nError running tool:\n{result}\n</tool_call_error>'
-        elif isinstance(result, FunctionToolActionResult):
+        elif isinstance(result, AgentToolActionResult):
             return f'<tool_call_result tool="{tool_call_id}">\n{result.output_str}\n</tool_call_result>'
         else:
             return f'<tool_call_result tool="{tool_call_id}">\n{str(result)}\n</tool_call_result>'
@@ -936,13 +935,13 @@ class BaseAgent(Generic[ContextType]):
                     result
                     if isinstance(result, Exception)
                     else result.output_data
-                    if isinstance(result, FunctionToolActionResult)
+                    if isinstance(result, AgentToolActionResult)
                     else result,
                 )
             )
 
             if (
-                isinstance(result, FunctionToolActionResult)
+                isinstance(result, AgentToolActionResult)
                 and result.pending_child_task_ids
             ):
                 all_pending_child_task_ids.extend(result.pending_child_task_ids)
@@ -956,7 +955,7 @@ class BaseAgent(Generic[ContextType]):
                 new_messages.append(
                     {"role": "tool", "tool_call_id": tc.id, "content": content}
                 )
-            elif isinstance(result, FunctionToolActionResult) and result.pending_result:
+            elif isinstance(result, AgentToolActionResult) and result.pending_result:
                 pending_tool_call_ids.append(tc.id)
                 # Invoke lifecycle callback for pending tool calls
                 await self._safe_call(
@@ -1250,7 +1249,7 @@ class BaseAgent(Generic[ContextType]):
         self,
         tool_call: ChatCompletionMessageToolCall,
         agent_ctx: ContextType,
-    ) -> FunctionToolActionResult:
+    ) -> AgentToolActionResult:
         """Internal method that wraps tool_action with retry and progress publishing"""
         return await self.tool_action(tool_call, agent_ctx)
 

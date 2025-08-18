@@ -2,11 +2,12 @@ import React, { useState, useRef, useCallback } from 'react';
 import Editor, { DiffEditor } from '@monaco-editor/react';
 import type { editor as MonacoEditor } from 'monaco-editor';
 import { MessageSquare, X, Loader, Send, Check } from 'lucide-react';
-import { useWebSocket } from './hooks/useWebSocket';
+import { useAgentEvents, useEventSubscription } from './hooks/useAgentEvents';
 import { useChat } from './hooks/useChat';
 import type { Action } from './types/run';
 import { useRuns } from './context/RunContext';
-import { API_BASE } from './constants';
+import { API_BASE, WS_BASE } from './constants';
+import type { DefaultEventMap, ToolActionCompletedEvent, ToolActionFailedEvent, ToolActionStartedEvent, AgentOutputEvent } from './types/events';
 
 const STARTER_CODE = `// QuickSort
 function quickSort(arr) {
@@ -52,22 +53,159 @@ function App() {
   const MAX_SIDEBAR_WIDTH = 800;
 
   // Runs context
-  const { runs, runOrder, updateAction } = useRuns();
+  const { runs, runOrder, updateAction, addAction } = useRuns();
 
   const timelineActions = React.useMemo(() => {
     return runOrder.flatMap(id => runs[id]?.actions || []);
   }, [runOrder, runs]);
 
-  // Initialize WebSocket connection
-  useWebSocket({
-    userId: USER_ID,
-    setLoading,
-    setCurrentTaskId,
-    setCancelling,
-    setProposedCode,
+  const events = useAgentEvents<DefaultEventMap>({
+    websocketUrl: `${WS_BASE}/${USER_ID}`,
+    enabled: true,
   });
 
-  // Initialize chat functionality
+  useEventSubscription(
+    events,
+    'progress_update_tool_action_started',
+    (event: ToolActionStartedEvent) => {
+      const toolCall = event.data.args[0];
+      if (!toolCall) return;
+
+      const startAction: Action = {
+        id: toolCall.id,
+        kind: toolCall.function.name === 'request_code_execution' ? 'exec_request' : 'tool_started',
+        status: 'running',
+        timestamp: event.timestamp,
+        ...(toolCall.function.name === 'request_code_execution'
+          ? { responseOnReject: toolCall.function.arguments?.response_on_reject }
+          : {
+              toolName: toolCall.function.name,
+              arguments: toolCall.function.arguments,
+            }),
+      } as Action;
+      addAction(event.task_id, startAction);
+    }
+  );
+
+  useEventSubscription(
+    events,
+    'progress_update_tool_action_completed',
+    (event: ToolActionCompletedEvent) => {
+      const { tool_call: toolCall, output_data } = event.data.result;
+
+      // If this is an edit_code tool completion, propose the code change
+      if (toolCall.function.name === 'edit_code' && output_data && typeof output_data.new_code === 'string') {
+        setProposedCode(output_data.new_code as string);
+      }
+
+      if (toolCall.function.name === 'request_code_execution') {
+        // exec result action created after user accepts, skip for now
+      } else {
+        // mark tool completed
+        updateAction(event.task_id, toolCall.id, prev => ({
+          ...(prev ?? {
+            id: toolCall.id,
+            kind: 'tool_completed',
+            toolName: toolCall.function.name,
+            timestamp: event.timestamp,
+            status: 'done',
+          }),
+          kind: 'tool_completed',
+          status: 'done',
+          result: output_data,
+        }) as Action);
+
+        // Special handling for think tool – show thought content
+        if (toolCall.function.name === 'think' && typeof output_data === 'string') {
+          const thoughtAction: Action = {
+            id: `thought_${Date.now()}`,
+            kind: 'assistant_thought',
+            status: 'done',
+            content: output_data,
+            timestamp: event.timestamp,
+          } as Action;
+          addAction(event.task_id, thoughtAction);
+        }
+      }
+    }
+  );
+
+  useEventSubscription(
+    events,
+    'progress_update_tool_action_failed',
+    (event: ToolActionFailedEvent) => {
+      const toolCall = event.data.args[0];
+      if (!toolCall) return;
+
+      updateAction(event.task_id, toolCall.id, prev => ({
+        ...(prev ?? {
+          id: toolCall.id,
+          kind: 'tool_failed',
+          toolName: toolCall.function.name,
+          timestamp: event.timestamp,
+        }),
+        kind: 'tool_failed',
+        status: 'failed',
+        error: event.error,
+      }) as Action);
+    }
+  );
+
+  useEventSubscription(
+    events,
+    'agent_output',
+    (event: AgentOutputEvent) => {
+      const content: string = String(event.data ?? '');
+
+      const answerAction: Action = {
+        id: `answer_${Date.now()}`,
+        kind: 'final_answer',
+        status: 'done',
+        content,
+        timestamp: event.timestamp,
+      } as Action;
+      addAction(event.task_id, answerAction);
+      setLoading(false);
+      setCurrentTaskId(null);
+    }
+  );
+
+  useEventSubscription(
+    events,
+    'run_cancelled',
+    (event) => {
+      const notice: Action = {
+        id: `cancel_${Date.now()}`,
+        kind: 'system_notice',
+        status: 'done',
+        message: 'Task was cancelled.',
+        timestamp: event.timestamp,
+      } as Action;
+      addAction(event.task_id, notice);
+      setLoading(false);
+      setCancelling(false);
+      setCurrentTaskId(null);
+    }
+  );
+
+  useEventSubscription(
+    events,
+    'run_failed',
+    (event) => {
+      const notice: Action = {
+        id: `fail_${Date.now()}`,
+        kind: 'system_notice',
+        status: 'done',
+        message: 'Failed to get agent response.',
+        timestamp: event.timestamp,
+      } as Action;
+      addAction(event.task_id, notice);
+      setLoading(false);
+      setCancelling(false);
+      setCurrentTaskId(null);
+    }
+  );
+
   const { sendPrompt, cancelCurrentTask } = useChat({
     userId: USER_ID,
     input,

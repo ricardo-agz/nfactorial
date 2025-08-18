@@ -5,34 +5,33 @@ from typing import (
     TypeVar,
     Union,
     Generic,
-    Annotated,
     get_type_hints,
     get_origin,
     get_args,
     overload,
 )
 from dataclasses import dataclass
-from pydantic import BaseModel, ConfigDict, Field
+from enum import Enum
+from pydantic import BaseModel, ConfigDict
 from functools import wraps
 from openai.types.chat import ChatCompletionMessageToolCall
 import inspect
 import asyncio
-from enum import Enum  # local import to avoid unnecessary global import
 
 from factorial.context import AgentContext, ExecutionContext
 
 
 ContextT = TypeVar("ContextT", bound=AgentContext)
-FunctionToolActionReturn = Union[Any, "FunctionToolActionResult", tuple[str, Any]]
-FunctionToolAction = Union[
-    Callable[..., FunctionToolActionReturn],
-    Callable[..., Awaitable[FunctionToolActionReturn]],
+AgentToolActionReturn = Union[Any, "AgentToolActionResult", tuple[str, Any]]
+AgentToolAction = Union[
+    Callable[..., AgentToolActionReturn],
+    Callable[..., Awaitable[AgentToolActionReturn]],
 ]
 F = Callable[..., Any]
 T = TypeVar("T")
 
 
-class FunctionToolActionResult(BaseModel):
+class AgentToolActionResult(BaseModel):
     # Allow pydantic to accept Exception and other arbitrary types
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
@@ -45,7 +44,7 @@ class FunctionToolActionResult(BaseModel):
 
 
 @dataclass
-class FunctionTool(Generic[ContextT]):
+class AgentTool(Generic[ContextT]):
     """A tool that wraps a function."""
 
     name: str
@@ -57,7 +56,7 @@ class FunctionTool(Generic[ContextT]):
     params_json_schema: dict[str, Any]
     """The JSON schema for the tool's parameters."""
 
-    on_invoke_tool: FunctionToolAction
+    execute: AgentToolAction
     """The function that implements the tool."""
 
     strict_json_schema: bool = True
@@ -67,7 +66,7 @@ class FunctionTool(Generic[ContextT]):
     """Whether the tool is enabled."""
 
     def to_openai_tool_schema(self) -> dict[str, Any]:
-        """Convert this FunctionTool to OpenAI tool schema format."""
+        """Convert this AgentTool to OpenAI tool schema format."""
         return {
             "type": "function",
             "function": {
@@ -238,45 +237,45 @@ def _function_to_json_schema(func: F) -> tuple[dict[str, Any], bool]:
 
 
 @overload
-def function_tool(
+def tool(
     func: F,
-) -> FunctionTool[Any]: ...
+) -> AgentTool[Any]: ...
 
 
 @overload
-def function_tool(
+def tool(
     func: None = None,
     *,
     name: str | None = None,
     description: str | None = None,
     strict_json_schema: bool = True,
     is_enabled: bool | Callable[[ContextT], bool] = True,
-) -> Callable[[F], FunctionTool[Any]]: ...
+) -> Callable[[F], AgentTool[Any]]: ...
 
 
-def function_tool(
+def tool(
     func: F | None = None,
     *,
     name: str | None = None,
     description: str | None = None,
     strict_json_schema: bool = True,
     is_enabled: bool | Callable[[ContextT], bool] = True,
-) -> FunctionTool[ContextT] | Callable[[F], FunctionTool[ContextT]]:
-    """Convert a Python function to a FunctionTool.
+) -> AgentTool[ContextT] | Callable[[F], AgentTool[ContextT]]:
+    """Convert a Python function to an AgentTool.
 
     Can be used as a decorator with or without arguments:
 
-    @function_tool
+    @tool
     def my_tool(param: str) -> str:
         '''Tool description'''
         return f"Result: {param}"
 
-    @function_tool(name="custom_name", description="Custom description")
+    @tool(name="custom_name", description="Custom description")
     def my_tool(param: str) -> str:
         return f"Result: {param}"
     """
 
-    def _create_function_tool(the_func: F) -> FunctionTool[ContextT]:
+    def _create_agent_tool(the_func: F) -> AgentTool[ContextT]:
         tool_name = name or the_func.__name__
 
         # Extract description from docstring if not provided
@@ -297,41 +296,39 @@ def function_tool(
         # ------------------------------------------------------------------
         effective_strict_json_schema = strict_json_schema and not has_optional
 
-        return FunctionTool(
+        return AgentTool(
             name=tool_name,
             description=tool_description,
             params_json_schema=params_schema,
-            on_invoke_tool=the_func,
+            execute=the_func,
             strict_json_schema=effective_strict_json_schema,
             is_enabled=is_enabled,
         )
 
-    # If func is provided, we were used as @function_tool (no parentheses)
+    # If func is provided, we were used as @tool (no parentheses)
     if func is not None:
-        return _create_function_tool(func)
+        return _create_agent_tool(func)
 
-    # Otherwise, we were used as @function_tool(...), so return a decorator
-    return _create_function_tool
+    # Otherwise, we were used as @tool(...), so return a decorator
+    return _create_agent_tool
 
 
 def convert_tools_list(
-    tools: list[Union[FunctionTool[ContextT], F]],
-) -> tuple[list[FunctionTool[ContextT]], dict[str, FunctionToolAction]]:
-    """Convert a mixed list of FunctionTool instances and Python functions to OpenAI tool schemas and tool actions."""
-    tool_schemas: list[FunctionTool[ContextT]] = []
-    tool_actions: dict[str, FunctionToolAction] = {}
+    tools: list[Union[AgentTool[ContextT], F]],
+) -> tuple[list[AgentTool[ContextT]], dict[str, AgentToolAction]]:
+    """Convert a mixed list of AgentTool instances and Python functions to OpenAI tool schemas and tool actions."""
+    tool_schemas: list[AgentTool[ContextT]] = []
+    tool_actions: dict[str, AgentToolAction] = {}
 
-    for tool in tools:
-        if isinstance(tool, FunctionTool):
-            function_tool_instance = tool
+    for t in tools:
+        if isinstance(t, AgentTool):
+            agent_tool_instance = t
         else:
-            # Convert Python function to FunctionTool
-            function_tool_instance = function_tool(tool)
+            # Convert Python function to AgentTool
+            agent_tool_instance = tool(t)
 
-        tool_schemas.append(function_tool_instance)
-        tool_actions[function_tool_instance.name] = (
-            function_tool_instance.on_invoke_tool
-        )
+        tool_schemas.append(agent_tool_instance)
+        tool_actions[agent_tool_instance.name] = agent_tool_instance.execute
 
     return tool_schemas, tool_actions
 
@@ -348,33 +345,31 @@ def create_final_output_tool(output_type: type[BaseModel]) -> dict[str, Any]:
     return tool
 
 
-def deferred_result(
+def deferred_tool(
     timeout: float,
-) -> Callable[
-    [Callable[..., T] | Callable[..., Awaitable[T]]], Callable[..., Awaitable[T]]
-]:
-    def decorator(
-        func: Callable[..., T] | Callable[..., Awaitable[T]],
-    ) -> Callable[..., Awaitable[T]]:
-        """Wrap the tool function so it can be awaited regardless of being sync or async.
+    *,
+    name: str | None = None,
+    description: str | None = None,
+    strict_json_schema: bool = True,
+    is_enabled: bool | Callable[[ContextT], bool] = True,
+) -> Callable[[F], AgentTool[Any]]:
+    """Decorator to mark a tool as pending (deferred) and optionally configure tool metadata.
 
-        The orchestrator always awaits the result of the tool wrapper.  If the wrapped
-        function is synchronous we simply call it and return the value; if it is a
-        coroutine function we *await* it.  This prevents the "NoneType can't be used in
-        'await' expression" error when developers create synchronous deferred tools.
-        """
+    Always returns an AgentTool, preserving the original function signature for schema.
+    """
 
-        @wraps(func)
-        async def wrapper(*args: Any, **kwargs: Any) -> T:
-            if asyncio.iscoroutinefunction(func):
-                # Async tool — await normally
-                return await func(*args, **kwargs)  # type: ignore[arg-type]
-            # Sync tool — run directly
-            return func(*args, **kwargs)  # type: ignore[return-value,arg-type]
+    def decorator(func: F) -> AgentTool[Any]:
+        # Mark the original function so the agent can detect pending tools
+        setattr(func, "deferred_tool", True)
+        setattr(func, "timeout", timeout)
 
-        wrapper.deferred_result = True  # type: ignore[attr-defined]
-        wrapper.timeout = timeout  # type: ignore[attr-defined]
-        return wrapper
+        # Wrap into an AgentTool with optional metadata
+        return tool(
+            name=name,
+            description=description,
+            strict_json_schema=strict_json_schema,
+            is_enabled=is_enabled,
+        )(func)
 
     return decorator
 

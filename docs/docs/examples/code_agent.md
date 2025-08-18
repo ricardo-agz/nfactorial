@@ -38,7 +38,7 @@ from factorial import (
     AgentContext,
     ExecutionContext,
     gpt_41_mini,
-    deferred_result,
+    deferred_tool,
 )
 
 
@@ -109,7 +109,7 @@ def edit_code(
     )
 
 
-@deferred_result(timeout=300.0)  # 5-minute timeout waiting for user decision
+@deferred_tool(timeout=300.0)  # 5-minute timeout waiting for user decision
 def request_code_execution(
     response_on_reject: str, agent_ctx: AgentContext, execution_ctx: ExecutionContext
 ) -> None:

@@ -14,7 +14,7 @@ from factorial import (
     TaskTTLConfig,
     ObservabilityConfig,
     MetricsTimelineConfig,
-    function_tool,
+    tool,
 )
 from factorial.tools import forking_tool
 from factorial.context import ExecutionContext
@@ -86,8 +86,7 @@ class MainAgentContext(AgentContext):
     has_used_research: bool = False
 
 
-@function_tool(is_enabled=lambda context: not context.has_used_research)
-@forking_tool(timeout=600)
+@forking_tool(timeout=600, is_enabled=lambda context: not context.has_used_research)
 async def research(
     queries: list[str],
     agent_ctx: MainAgentContext,

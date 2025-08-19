@@ -188,6 +188,19 @@ def replace_block(
         # Use a lambda so that the *new* string is inserted **literally** and
         # backslashes inside it are **not** interpreted by ``re.sub``.
         new_content, n = pattern.subn(lambda _: new, content, count=max_count)
+
+        # Fallback: if fuzzy matching fails, retry with exact replacement so
+        # this function remains a superset of the literal behavior.
+        if n == 0:
+            if replace_all:
+                new_content, n = content.replace(old, new), content.count(old)
+            else:
+                if old not in content:
+                    n = 0
+                    new_content = content
+                else:
+                    new_content = content.replace(old, new, 1)
+                    n = 1
     else:
         if replace_all:
             new_content, n = content.replace(old, new), content.count(old)

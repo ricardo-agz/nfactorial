@@ -1,6 +1,8 @@
 <example>
 # EXAMPLE: useAgentEvents (frontend)
-A custom hook that makes it easy to subscribe to websocket agent events and add handlers for different events.
+A custom hook that makes it easy to subscribe to websocket agent events and add handlers for different events. Unless the user has
+specifically requested an alternative way to subscribe to the realtime agent events, you should implement this hook to subscribe 
+to the agent realtime websocket events. Unless you have a reason to deviate from it, it is best to copy this file line by line.
 
 e.g. /ui/hooks/useAgentEvents.tsx
 ```typescript

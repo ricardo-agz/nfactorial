@@ -241,7 +241,8 @@ class EnqueueRequest(BaseModel):
 
 @app.post("/api/enqueue")
 async def enqueue(request: EnqueueRequest):
-    task = ide_agent.create_task(
+    task = await orchestrator.enqueue_task(
+        agent=ide_agent,
         owner_id=request.user_id,
         payload=IdeAgentContext(
             messages=request.message_history,
@@ -251,7 +252,6 @@ async def enqueue(request: EnqueueRequest):
         ),
     )
 
-    await orchestrator.enqueue_task(agent=ide_agent, task=task)
     return {"task_id": task.id}
 
 

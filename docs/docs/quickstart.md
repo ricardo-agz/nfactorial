@@ -73,12 +73,13 @@ import asyncio
 from factorial import AgentContext
 
 async def main():
-    # Create task
-    context = AgentContext(query="What's the weather in San Francisco?")
-    task = agent.create_task(owner_id="user123", payload=context)
-    
-    # Submit to orchestrator
-    await orchestrator.enqueue_task(agent, task)
+    # Create and enqueue task
+    task = await orchestrator.enqueue_task(
+        agent=agent,
+        owner_id="user123",
+        payload=AgentContext(query="What's the weather in San Francisco?"),
+    )
+    print("Enqueued task:", task.id)
     
     # Check status
     status = await orchestrator.get_task_status(task.id)

@@ -10,6 +10,8 @@ from factorial.queue.task import (
 )
 from factorial.queue.operations import (
     enqueue_task,
+    enqueue_batch,
+    cancel_batch,
     cancel_task,
     steer_task,
     complete_deferred_tool,
@@ -21,6 +23,8 @@ __all__ = [
     "Task",
     "TaskStatus",
     "enqueue_task",
+    "enqueue_batch",
+    "cancel_batch",
     "cancel_task",
     "steer_task",
     "complete_deferred_tool",

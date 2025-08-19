@@ -24,9 +24,8 @@ def write(
     file_exists = os.path.exists(file_path)
 
     if file_exists and not overwrite:
-        return (
-            f"Error: File {file_path} already exists. If you meant to edit the file use one of the available edit tools, if this was intentional, set the overwrite flag to True.",
-            {},
+        raise FileExistsError(
+            f"File {file_path} already exists. If you meant to edit the file use one of the available edit tools, if this was intentional, set the overwrite flag to True."
         )
 
     parent_dir = os.path.dirname(file_path)

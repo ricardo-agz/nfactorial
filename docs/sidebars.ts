@@ -26,6 +26,7 @@ const sidebars: SidebarsConfig = {
         'context',
         'events',
         'subagents',
+        'batching',
       ],
     },
     {

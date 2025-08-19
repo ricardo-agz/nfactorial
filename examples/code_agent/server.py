@@ -57,7 +57,7 @@ async def enqueue(request: EnqueueRequest):
         code=request.code,
     )
 
-    task = await orchestrator.create_agent_task(
+    task = await orchestrator.enqueue_task(
         agent=ide_agent,
         owner_id=request.user_id,
         payload=payload,

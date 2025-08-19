@@ -110,9 +110,9 @@ async def research(
     payloads = [AgentContext(query=q) for q in queries]
     
     # Spawn child tasks and get their IDs
-    child_ids = await execution_ctx.spawn_child_tasks(search_agent, payloads)
+    batch = await execution_ctx.spawn_child_tasks(search_agent, payloads)
     
-    return child_ids
+    return batch.task_ids
 ```
 
 **Key points:**
@@ -162,7 +162,8 @@ class EnqueueRequest(BaseModel):
 
 @app.post("/api/enqueue")
 async def enqueue(request: EnqueueRequest):
-    task = basic_agent.create_task(
+    task = await orchestrator.enqueue_task(
+        agent=basic_agent,
         owner_id=request.user_id,
         payload=AgentContext(
             messages=request.message_history,
@@ -170,7 +171,6 @@ async def enqueue(request: EnqueueRequest):
         ),
     )
 
-    await orchestrator.enqueue_task(agent=basic_agent, task=task)
     return {"task_id": task.id}
 
 

@@ -85,7 +85,7 @@ orchestrator = Orchestrator(...)
 orchestrator.register_runner(...)
 
 async def submit_task():
-    task = await orchestrator.create_agent_task(
+    task = await orchestrator.enqueue_task(
         agent=agent,
         owner_id="user123", 
         payload=AgentContext(query="Analyze this data")

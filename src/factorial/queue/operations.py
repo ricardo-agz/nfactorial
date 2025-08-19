@@ -261,6 +261,28 @@ async def create_batch_and_enqueue(
     )
 
 
+async def enqueue_batch(
+    redis_client: redis.Redis,
+    namespace: str,
+    agent: BaseAgent[Any],
+    payloads: list[ContextType],
+    owner_id: str,
+    parent_id: str | None = None,
+) -> Batch:
+    """Public wrapper that mirrors ``enqueue_task`` naming.
+
+    Creates a batch and enqueues all tasks atomically.
+    """
+    return await create_batch_and_enqueue(
+        redis_client=redis_client,
+        namespace=namespace,
+        agent=agent,
+        payloads=payloads,
+        owner_id=owner_id,
+        parent_id=parent_id,
+    )
+
+
 async def cancel_batch(
     redis_client: redis.Redis,
     namespace: str,

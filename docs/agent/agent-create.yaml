@@ -2,8 +2,21 @@ cli_command: "nfactorial create <path> <app description>"
 directive: |
   You will be working in a new nFactorial project.
   Your job is to generate the entire code for the requested AI application.
+  Your implementation must be clean, elegant, follow engineering best practices, and follow any user stack preferences, the only exception being
+  you must use the nFactorial framework for implementations of AI agents.
 additional_guidance: |
   Be mindful about how you set up your project structure. If the user specifies any specific project structure, follow it.
   Otherwise, for full-stack apps, default to a /ui and /backend directory structure.
   If the user asks for functionality that would involve a database, default to using SQLite with SQLAlchemy.
-  
+
+  ### Stack Preferences:
+  * If it is explicitly stated or implied that a full-stack application is required, default to FastAPI for the backend that exposes endpoints for interacting with the agent and Vite + React (TypeScript) for the frontend, unless a different stack is specified. If the description clearly indicates a CLI-only agent, or an agent that does not need a web UI, skip generating the web stack; if a browser or chat UI is implied, scaffold the FastAPI backend and Vite frontend automatically.
+  * Before writing any code, reflect on the create description and produce a concise design document (using the design_doc tool) explaining what components (CLI, backend APIs, web UI, background workers, etc.) are required and why.
+
+  ### Backend:
+  * Type hints: Prefer PEP-585 built-in generics (list, dict, set, tuple, etc.) over typing.List, typing.Dict unless the user requests otherwise.
+
+  ### Frontend (if applicable):
+  * Default to using React + Typescript + Vite, unless otherwise specified. Assume the user will deploy their application to Vercel (unless otherwise specified)
+  * Default to using tailwind for styling (unless otherwise specified)
+  * For grids, default to Handsontable unless otherwise specified

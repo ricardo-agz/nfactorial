@@ -1,8 +1,21 @@
 cli_command: "nfactorial agent <prompt>"
 directive: |
-  You are working in an existing nFactorial project. Clearly understand the requirements of the prompt and determine what needs to be done, be it
-  answer a question about the code, implement a refactor, fix a bug, or implement a new feature altogether.
+  You are working in an existing repo which may or may not already implement the nFactorial framework. Deeply analyze the ask and the
+  existing state of the codebase and determine what needs to be done, be it answer a question about the code, implement a refactor, 
+  fix a bug, or implement a new feature altogether.
 additional_guidance: |
+  ### Backend:
+  If the project already implements a backend and the user ask involves backend work, you must follow the styles and conventions already established.
+  If the project does not yet implement a backend and you are being asked to implement a backend:
+    * Type hints: Prefer PEP-585 built-in generics (list, dict, set, tuple, etc.) over typing.List, typing.Dict unless the current project explicitly uses the older style or the user requests otherwise.
+
+  ### Frontend (if applicable):
+  If the project already implements a frontend and the user ask involves frontend work, you must follow the styles and conventions already established.
+  If the project does not yet implement a frontend and you are being asked to implement a frontend:
+    1. Default to using React + Typescript + Vite, unless otherwise specified. Assume the user will deploy their application to Vercel (unless otherwise specified)
+    2. Default to using tailwind for styling (unless otherwise specified)
+    3. For grids, default to Handsontable unless otherwise specified or unless the project already implements grids somewhere else using a different library
+
   Before writing any code, make sure you understand the codebase and the right files that the user wants or needs you to edit, be it because
   they mentioned them specifically, or because they contain the logic for the feature or bug that needs to be fixed.
 

@@ -10,6 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 
 from factorial.queue import worker_loop, maintenance_loop, Task
+from factorial.queue.task import Batch
 from factorial.queue.keys import RedisKeys
 from factorial.context import ContextType
 from factorial.agent import BaseAgent
@@ -436,32 +437,49 @@ class Orchestrator:
         """Get a Redis client from the pool"""
         return redis.Redis(connection_pool=self.redis_pool, decode_responses=True)
 
-    async def create_agent_task(
+    async def enqueue_task(
         self,
         agent: BaseAgent[Any],
         payload: ContextType,
         owner_id: str,
     ) -> Task[ContextType]:
-        """Create a task with the correct context type for this agent"""
-        task = Task.create(owner_id=owner_id, agent=agent.name, payload=payload)
-        await self.enqueue_task(agent, task)
-        return task
-
-    async def enqueue_task(
-        self,
-        agent: BaseAgent[Any],
-        task: Task[ContextType],
-    ) -> None:
         """Enqueue a task using the control plane's configuration"""
         from factorial.queue import enqueue_task as q_enqueue_task
 
         redis_client = await self.get_redis_client()
+        task = Task.create(owner_id=owner_id, agent=agent.name, payload=payload)
         try:
             await q_enqueue_task(
                 redis_client=redis_client,
                 namespace=self.namespace,
                 agent=agent,
                 task=task,
+            )
+        finally:
+            await redis_client.close()
+
+        return task
+
+    async def enqueue_batch(
+        self,
+        agent: BaseAgent[Any],
+        payloads: list[ContextType],
+        owner_id: str,
+    ) -> Batch:
+        """Enqueue a batch of payloads using the control plane's configuration.
+
+        Returns the created ``Batch`` with metadata and task IDs.
+        """
+        from factorial.queue import enqueue_batch as q_enqueue_batch
+
+        redis_client = await self.get_redis_client()
+        try:
+            return await q_enqueue_batch(
+                redis_client=redis_client,
+                namespace=self.namespace,
+                agent=agent,
+                payloads=payloads,
+                owner_id=owner_id,
             )
         finally:
             await redis_client.close()
@@ -479,6 +497,26 @@ class Orchestrator:
                 redis_client=redis_client,
                 namespace=self.namespace,
                 task_id=task_id,
+                agents_by_name=self.agents_by_name,
+                metrics_bucket_duration=self.metrics_config.bucket_duration,
+                metrics_retention_duration=self.metrics_config.retention_duration,
+            )
+        finally:
+            await redis_client.close()
+
+    async def cancel_batch(
+        self,
+        batch_id: str,
+    ) -> Batch:
+        """Cancel all tasks in a batch and return the updated Batch."""
+        from factorial.queue import cancel_batch as q_cancel_batch
+
+        redis_client = await self.get_redis_client()
+        try:
+            return await q_cancel_batch(
+                redis_client=redis_client,
+                namespace=self.namespace,
+                batch_id=batch_id,
                 agents_by_name=self.agents_by_name,
                 metrics_bucket_duration=self.metrics_config.bucket_duration,
                 metrics_retention_duration=self.metrics_config.retention_duration,

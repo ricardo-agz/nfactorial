@@ -161,15 +161,14 @@ Agents don't run directly - they process tasks through an orchestrator:
 ```python
 from factorial import AgentContext
 
-task = agent.create_task(
+# Create and enqueue the task (see the orchestrator section on how to set up the orchestrator)
+task = await orchestrator.enqueue_task(
+    agent=agent,
     owner_id="user123", 
     payload=AgentContext(
         query="What's the weather like in San Francisco?"
     )
 )
-
-# Enqueue the task (see the orchestrator section on how to set up the orchestrator)
-await orchestrator.enqueue_task(agent=agent, task=task)
 ```
 
 ## Custom Agent Classes
@@ -262,7 +261,11 @@ research_context = ResearchContext(
     turn=0,
 )
 
-task = research_agent.create_task(
+# set up orchestrator and register runners...
+orchestrator = ...
+
+task = await orchestrator.enqueue_task(
+    agent=research_agent,
     owner_id="researcher123",
     payload=research_context
 )

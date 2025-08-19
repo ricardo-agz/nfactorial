@@ -9,7 +9,11 @@ from typing import Any
 import click
 
 from .key_storage import key_storage
-from .agent import NFactorialAgent, CLIAgentContext
+from .agent import (
+    NFactorialAgent,
+    CLIAgentContext,
+)
+from .agent.agent import build_user_prompt
 from .event_printer import event_printer
 
 from factorial import fallback_models
@@ -273,7 +277,16 @@ def create(path: Path, description: tuple[str, ...], model_name: str | None) -> 
         cwd = os.getcwd()
         try:
             os.chdir(project_dir)
-            agent_ctx = CLIAgentContext(query=prompt)
+            full_prompt, relevant_files = await build_user_prompt(
+                model_setup.client, Path.cwd(), prompt
+            )
+            if relevant_files:
+                for f in relevant_files:
+                    click.echo(
+                        click.style("[agent] ", fg="blue")
+                        + click.style(f"read '{f}'", fg="cyan")
+                    )
+            agent_ctx = CLIAgentContext(query=full_prompt)
             completion = await agent.run_inline(agent_ctx, event_handler=event_printer)
             return completion
         finally:
@@ -367,7 +380,16 @@ def agent(prompt: tuple[str, ...], model_name: str | None) -> None:
         cwd = os.getcwd()
         try:
             os.chdir(project_dir)
-            agent_ctx = CLIAgentContext(query=prompt_text)
+            full_prompt, relevant_files = await build_user_prompt(
+                model_setup.client, Path.cwd(), prompt_text
+            )
+            if relevant_files:
+                for f in relevant_files:
+                    click.echo(
+                        click.style("[agent] ", fg="blue")
+                        + click.style(f"read '{f}'", fg="cyan")
+                    )
+            agent_ctx = CLIAgentContext(query=full_prompt)
             completion = await agent.run_inline(agent_ctx, event_handler=event_printer)
             return completion
         finally:

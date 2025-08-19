@@ -70,6 +70,7 @@ def _get_tool_display_name(tool_name: str) -> str:
         "plan": "planning",
         "design_doc": "designing",
         "read": "reading",
+        "multi_read": "reading",
         "write": "writing",
         "edit_lines": "editing",
         "multi_edit": "editing",
@@ -307,6 +308,36 @@ def _format_tool_message(
     if tool_name == "read":
         file_path = args.get("file_path", "unknown")
         return style("[agent] ", fg="blue") + style(f"read '{file_path}'", fg="cyan")
+
+    elif tool_name == "multi_read":
+        file_paths = args.get("file_paths", [])
+        num_files = len(file_paths) if isinstance(file_paths, list) else 0
+
+        diag_count = 0
+        error_count = 0
+        if result_metadata and isinstance(result_metadata, dict):
+            files_meta = result_metadata.get("files", [])
+            if isinstance(files_meta, list):
+                for fm in files_meta:
+                    if isinstance(fm, dict):
+                        if fm.get("has_diagnostics"):
+                            diag_count += 1
+                        if fm.get("error"):
+                            error_count += 1
+
+        extras = []
+        if diag_count:
+            extras.append(f"{diag_count} with diagnostics")
+        if error_count:
+            extras.append(f"{error_count} error" + ("s" if error_count != 1 else ""))
+        extra_msg = (
+            style(" (" + ", ".join(extras) + ")", fg="bright_black") if extras else ""
+        )
+
+        action_msg = style(
+            f"read {num_files} file" + ("s" if num_files != 1 else ""), fg="cyan"
+        )
+        return style("[agent] ", fg="blue") + action_msg + extra_msg
 
     elif tool_name == "write":
         file_path = args.get("file_path", "unknown")

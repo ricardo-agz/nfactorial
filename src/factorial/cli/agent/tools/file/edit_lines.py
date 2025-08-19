@@ -48,6 +48,23 @@ def edit_lines(
     """
 
     file_path = os.path.abspath(file_path)
+
+    try:
+        start_line = int(start_line)
+    except Exception as exc:
+        raise TypeError("start_line must be an integer") from exc
+
+    if end_line is not None:
+        try:
+            end_line = int(end_line)
+        except Exception as exc:
+            raise TypeError("end_line must be an integer when provided") from exc
+
+    try:
+        tolerance = int(tolerance)
+    except Exception as exc:
+        raise TypeError("tolerance must be an integer") from exc
+
     if start_line < 1:
         raise ValueError("start_line must be >= 1")
     if end_line is not None and end_line < start_line:

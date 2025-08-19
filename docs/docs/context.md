@@ -43,11 +43,13 @@ class ABTestableAgent(BaseAgent[DualAgentContext]): # For the type checker
             context_class=DualAgentContext,  # For task serialization
         )
 
+agent = ABTestableAgent()
+
 # Create tasks with custom context
 context = DualAgentContext(
     query="Research AI developments",
 )
-task = agent.create_task(owner_id="user123", payload=context)
+task = await orchestrator.enqueue_task(agent=agent, owner_id="user123", payload=context)
 ```
 
 ## Execution Context

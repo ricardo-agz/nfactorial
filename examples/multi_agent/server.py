@@ -108,7 +108,7 @@ async def enqueue(request: EnqueueRequest):
         query=request.query,
         turn=0,
     )
-    task = await orchestrator.create_agent_task(
+    task = await orchestrator.enqueue_task(
         agent=basic_agent,
         owner_id=request.user_id,
         payload=payload,
@@ -153,7 +153,10 @@ async def cancel_task_endpoint(request: CancelRequest) -> dict[str, Any]:
         }
     except Exception as e:
         import traceback
-        print(f"Error cancelling task {request.task_id}: {str(e)}", traceback.format_exc())
+
+        print(
+            f"Error cancelling task {request.task_id}: {str(e)}", traceback.format_exc()
+        )
         raise HTTPException(
             status_code=500,
             detail=f"Failed to cancel task {request.task_id}: {str(e)}",

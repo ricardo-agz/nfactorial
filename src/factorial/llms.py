@@ -6,7 +6,7 @@ import string
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, cast
+from typing import Any
 
 import httpx
 from dotenv import load_dotenv
@@ -17,11 +17,23 @@ from openai.types.chat import (
     ChatCompletionChunk,
     ChatCompletionMessageToolCall,
 )
+from openai.types.chat.chat_completion_message_custom_tool_call import (
+    ChatCompletionMessageCustomToolCall,
+)
+from openai.types.chat.chat_completion_message_function_tool_call import (
+    ChatCompletionMessageFunctionToolCall,
+)
 from openai.types.chat.chat_completion_message_tool_call import Function
 from openai.types.chat.completion_create_params import ResponseFormat
 from pydantic import BaseModel
 
 load_dotenv()
+
+
+# Type alias for tool calls that matches what the SDK expects
+ToolCallList = list[
+    ChatCompletionMessageFunctionToolCall | ChatCompletionMessageCustomToolCall
+]
 
 
 class ToolSupportWrapper:
@@ -30,7 +42,7 @@ class ToolSupportWrapper:
         instructions: Callable[
             [list[dict[str, Any]], dict[str, Any] | str | None, bool], str
         ],
-        parser: Callable[[str], tuple[str, list[ChatCompletionMessageToolCall]]],
+        parser: Callable[[str], tuple[str, ToolCallList]],
     ):
         self.instructions = instructions
         self.parser = parser
@@ -180,31 +192,28 @@ class MultiClient:
                 http_client=self.http_client,
             )
 
-    async def _client_completion(
-        self,
-        model_obj: Model,
-        **kwargs: Any,
-    ) -> ChatCompletion | AsyncStream[ChatCompletionChunk]:
+    def _get_client(self, model_obj: Model) -> AsyncOpenAI:
+        """Get the appropriate OpenAI-compatible client for the model's provider."""
         if model_obj.provider == Provider.OPENAI:
             if not self.openai:
                 raise ValueError("OpenAI client not initialized")
-            return await self.openai.chat.completions.create(**kwargs)
+            return self.openai
         if model_obj.provider == Provider.XAI:
             if not self.xai:
                 raise ValueError("XAI client not initialized")
-            return await self.xai.chat.completions.create(**kwargs)
+            return self.xai
         if model_obj.provider == Provider.ANTHROPIC:
             if not self.anthropic:
                 raise ValueError("Anthropic client not initialized")
-            return await self.anthropic.chat.completions.create(**kwargs)
+            return self.anthropic
         if model_obj.provider == Provider.FIREWORKS:
             if not self.fireworks:
                 raise ValueError("Fireworks client not initialized")
-            return await self.fireworks.chat.completions.create(**kwargs)
+            return self.fireworks
         if model_obj.provider == Provider.AI_GATEWAY:
             if not self.ai_gateway:
                 raise ValueError("AI Gateway client not initialized")
-            return await self.ai_gateway.chat.completions.create(**kwargs)
+            return self.ai_gateway
 
         raise ValueError(f"Unsupported provider: {model_obj.provider}")
 
@@ -221,29 +230,14 @@ class MultiClient:
         response_format: ResponseFormat | type[BaseModel] | None = None,
         **kwargs: Any,
     ) -> ChatCompletion | AsyncStream[ChatCompletionChunk]:
-        kwargs["model"] = model.provider_model_id
-        kwargs["messages"] = messages
-        kwargs["stream"] = stream
-
-        if max_completion_tokens:
-            kwargs["max_completion_tokens"] = max_completion_tokens
-        if temperature:
-            kwargs["temperature"] = temperature
-        if tools and not model.custom_tool_support:
-            kwargs["tools"] = tools
-        if tool_choice and not model.custom_tool_support:
-            kwargs["tool_choice"] = tool_choice
-        if parallel_tool_calls is not None and not model.custom_tool_support:
-            kwargs["parallel_tool_calls"] = parallel_tool_calls
-        if response_format:
-            kwargs["response_format"] = response_format
-
         if stream and model.custom_tool_support:
             raise ValueError(
                 "Streaming is not supported for this model "
                 "when custom tool support is provided"
             )
 
+        # Prepare messages (potentially with custom tool instructions)
+        final_messages = messages
         if model.custom_tool_support and tools:
             custom_system_message = [
                 {
@@ -255,11 +249,40 @@ class MultiClient:
                     ),
                 }
             ]
-            kwargs["messages"] = custom_system_message + messages
+            final_messages = custom_system_message + messages
 
-        response = await self._client_completion(model, **kwargs)
+        client = self._get_client(model)
+
+        # Build request parameters - start with any extra kwargs passed through
+        request_params: dict[str, Any] = {**kwargs}
+
+        # Set core required parameters
+        request_params["model"] = model.provider_model_id
+        request_params["messages"] = final_messages
+        request_params["stream"] = stream
+
+        # Add optional parameters only if provided
+        if max_completion_tokens is not None:
+            request_params["max_completion_tokens"] = max_completion_tokens
+        if temperature is not None:
+            request_params["temperature"] = temperature
+        if tools and not model.custom_tool_support:
+            request_params["tools"] = tools
+        if tool_choice and not model.custom_tool_support:
+            request_params["tool_choice"] = tool_choice
+        if parallel_tool_calls is not None and not model.custom_tool_support:
+            request_params["parallel_tool_calls"] = parallel_tool_calls
+        if response_format is not None:
+            request_params["response_format"] = response_format
+
+        response: ChatCompletion | AsyncStream[ChatCompletionChunk] = (
+            await client.chat.completions.create(**request_params)
+        )
+
+        # Post-process for custom tool support
         if model.custom_tool_support:
-            response = cast(ChatCompletion, response)
+            # Custom tool support only works with non-streaming responses
+            assert isinstance(response, ChatCompletion)
             for choice in response.choices:
                 raw_content = choice.message.content or ""
                 content, tool_calls = model.custom_tool_support.parser(raw_content)
@@ -268,7 +291,7 @@ class MultiClient:
 
         return response
 
-    async def close(self):
+    async def close(self) -> None:
         """Close HTTP clients to clean up connections"""
         if hasattr(self, "openai") and self.openai and self.openai._client:
             await self.openai._client.aclose()
@@ -367,7 +390,7 @@ def base_tool_instructions(
     )
 
 
-def base_tool_parser(response: str) -> tuple[str, list[ChatCompletionMessageToolCall]]:
+def base_tool_parser(response: str) -> tuple[str, ToolCallList]:
     # pattern for qwen models
     pattern_a = re.compile(
         r"<tool_call>(?P<json>.*?)</tool_call>", re.DOTALL | re.IGNORECASE
@@ -528,7 +551,7 @@ def base_tool_parser(response: str) -> tuple[str, list[ChatCompletionMessageTool
             random.choices(string.ascii_letters + string.digits, k=8)
         )
 
-    parsed_tool_calls: list[ChatCompletionMessageToolCall] = []
+    parsed_tool_calls: ToolCallList = []
     for tool in tool_dicts:
         try:
             parsed_tool_calls.append(

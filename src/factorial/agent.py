@@ -12,6 +12,7 @@ from functools import wraps
 from typing import (
     Any,
     Generic,
+    Literal,
     TypeVar,
     cast,
     final,
@@ -29,6 +30,13 @@ from openai.types.chat import (
     ChatCompletionMessageToolCall,
 )
 from openai.types.chat.chat_completion import Choice
+from openai.types.chat.chat_completion_message_custom_tool_call import (
+    ChatCompletionMessageCustomToolCall,
+)
+from openai.types.chat.chat_completion_message_function_tool_call import (
+    ChatCompletionMessageFunctionToolCall,
+    Function as ToolCallFunction,
+)
 from pydantic import BaseModel
 
 from factorial.context import (
@@ -572,7 +580,9 @@ class BaseAgent(Generic[ContextType]):
 
             res_id: str = ""
             created_ts: int | None = None
-            finish_reason: str | None = None
+            finish_reason: Literal[
+                "stop", "length", "tool_calls", "content_filter", "function_call"
+            ] | None = None
             usage: Any | None = None  # ``usage`` is populated in the last chunk
 
             res = cast(
@@ -652,7 +662,13 @@ class BaseAgent(Generic[ContextType]):
                     )
 
             # Convert accumulated tool call data into the structured OpenAI type
-            formatted_tool_calls: list[ChatCompletionMessageToolCall] | None = None
+            formatted_tool_calls: (
+                list[
+                    ChatCompletionMessageFunctionToolCall
+                    | ChatCompletionMessageCustomToolCall
+                ]
+                | None
+            ) = None
             if tool_call_acc:
                 formatted_tool_calls = []
                 for idx in sorted(tool_call_acc.keys()):
@@ -668,10 +684,10 @@ class BaseAgent(Generic[ContextType]):
                         ChatCompletionMessageToolCall(
                             id=acc["id"] or f"call_{idx}",
                             type=acc["type"] or "function",
-                            function={  # type: ignore[arg-type]
-                                "name": acc["name"],
-                                "arguments": acc["arguments"],
-                            },
+                            function=ToolCallFunction(
+                                name=acc["name"],
+                                arguments=acc["arguments"],
+                            ),
                         )
                     )
 
@@ -1065,8 +1081,14 @@ class BaseAgent(Generic[ContextType]):
         pending_tool_call_ids: list[str] = []
         pending_child_task_ids: list[str] = []
         if response.choices[0].message.tool_calls:
+            # Filter to only function tool calls (the only type we support)
+            function_tool_calls = [
+                tc
+                for tc in response.choices[0].message.tool_calls
+                if isinstance(tc, ChatCompletionMessageFunctionToolCall)
+            ]
             results = await self.execute_tools(
-                response.choices[0].message.tool_calls,
+                function_tool_calls,
                 agent_ctx,
             )
             messages += results.new_messages
@@ -1191,7 +1213,9 @@ class BaseAgent(Generic[ContextType]):
         tool_calls = response.choices[0].message.tool_calls
 
         return (not tool_calls and self.output_type is None) or any(
-            tc.function.name == "final_output" for tc in tool_calls or []
+            isinstance(tc, ChatCompletionMessageFunctionToolCall)
+            and tc.function.name == "final_output"
+            for tc in tool_calls or []
         )
 
     def _prepare_instructions(self, agent_ctx: ContextType) -> str:
@@ -1246,9 +1270,15 @@ class BaseAgent(Generic[ContextType]):
 
         if tool_calls:
             for tool_call in tool_calls:
-                if tool_call.function.name == "final_output":
+                if (
+                    isinstance(tool_call, ChatCompletionMessageFunctionToolCall)
+                    and tool_call.function.name == "final_output"
+                ):
                     if self.parse_tool_args:
-                        return json.loads(tool_call.function.arguments)
+                        parsed: dict[str, Any] = json.loads(
+                            tool_call.function.arguments
+                        )
+                        return parsed
                     else:
                         return tool_call.function.arguments
 
@@ -1376,7 +1406,7 @@ class BaseAgent(Generic[ContextType]):
 
             finished_at = datetime.now(timezone.utc)
 
-            run_completion = RunCompletion(
+            run_completion: RunCompletion = RunCompletion(
                 output=turn_completion.output,
                 started_at=started_at,
                 finished_at=finished_at,

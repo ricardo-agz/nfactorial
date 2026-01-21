@@ -498,7 +498,7 @@ async def run_agent_cancellation(
         return
 
     try:
-        task = Task.from_dict(task_data, context_class=agent.context_class)
+        task: Task[Any] = Task.from_dict(task_data, context_class=agent.context_class)
     except Exception as e:
         logger.error(
             f"Failed to process task {task_id}: Task data is invalid", exc_info=e

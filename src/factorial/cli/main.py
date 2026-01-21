@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import os
 import sys
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -32,6 +33,8 @@ except ModuleNotFoundError:  # pragma: no cover
 
 
 from typing import NamedTuple
+
+from pydantic import BaseModel
 
 PROVIDERS: list[Provider] = list(Provider)
 
@@ -78,7 +81,13 @@ def _model_setup() -> ModelSetup:
     ]
 
     return ModelSetup(
-        client=MultiClient(**client_kwargs),
+        client=MultiClient(
+            openai_api_key=client_kwargs.get("openai_api_key"),
+            xai_api_key=client_kwargs.get("xai_api_key"),
+            anthropic_api_key=client_kwargs.get("anthropic_api_key"),
+            fireworks_api_key=client_kwargs.get("fireworks_api_key"),
+            ai_gateway_api_key=client_kwargs.get("ai_gateway_api_key"),
+        ),
         lookup=lookup,
         available_models=available_models,
         configured_providers=list(configured_providers),
@@ -89,25 +98,26 @@ model_setup = _model_setup()
 
 
 def _prompt_provider(providers: list[str] | None = None) -> str:
+    provider_list = providers or []
     if inquirer:
         questions = [
             inquirer.List(
                 "provider",
                 message="Select API provider",
-                choices=providers,
+                choices=provider_list,
             )
         ]
         answers = inquirer.prompt(questions)
         if not answers:
             click.echo("\nAborted!", err=True)
             sys.exit(1)
-        return answers["provider"]
+        return str(answers["provider"])
 
     click.echo("Select API provider:")
-    for idx, p in enumerate(providers, 1):
+    for idx, p in enumerate(provider_list, 1):
         click.echo(f"{idx}) {p}")
-    choice = click.prompt("Provider", type=click.IntRange(1, len(providers)))
-    return providers[choice - 1]
+    choice = click.prompt("Provider", type=click.IntRange(1, len(provider_list)))
+    return str(provider_list[choice - 1])
 
 
 @click.group(context_settings={"help_option_names": ["-h", "--help"]})
@@ -231,26 +241,28 @@ def create(path: Path, description: tuple[str, ...], model_name: str | None) -> 
         sys.exit(1)
 
     # Model preference: CLI flag → automatic based on keys → default
+    model: Model | Callable[[CLIAgentContext], Model]
     if model_name:
-        model = model_setup.lookup.get(model_name.lower())
-        if not model:
+        selected_model = model_setup.lookup.get(model_name.lower())
+        if not selected_model:
             available = ", ".join([m.name for m in MODELS])
             click.echo(
                 f"Unknown model '{model_name}'. Available models: {available}",
                 err=True,
             )
             sys.exit(1)
-        if model.provider not in model_setup.configured_providers:
-            provider_val = model.provider.value
+        if selected_model.provider not in model_setup.configured_providers:
+            provider_val = selected_model.provider.value
             env_var = f"{provider_val.upper()}_API_KEY"
             click.echo(
-                f"Model '{model.name}' requires provider '{provider_val}', "
+                f"Model '{selected_model.name}' requires provider '{provider_val}', "
                 "but no API key is configured. Add a key via "
                 f"'nfactorial setup add-key' or set the {env_var} "
                 "environment variable.",
                 err=True,
             )
             sys.exit(1)
+        model = selected_model
     else:
         if not model_setup.available_models:
             click.echo(
@@ -261,9 +273,9 @@ def create(path: Path, description: tuple[str, ...], model_name: str | None) -> 
 
         model = fallback_models(
             *[
-                model
-                for model in DEFAULT_MODELS
-                if model in model_setup.available_models
+                m
+                for m in DEFAULT_MODELS
+                if m in model_setup.available_models
             ]
         )
 
@@ -291,10 +303,12 @@ def create(path: Path, description: tuple[str, ...], model_name: str | None) -> 
     output = getattr(run_completion, "output", None)
     try:
         # If output is a Pydantic model (FinalOutput), convert to dict for inspection
-        if hasattr(output, "model_dump"):
-            output_dict = output.model_dump()  # type: ignore[attr-defined]
+        if isinstance(output, BaseModel):
+            output_dict = output.model_dump()
+        elif isinstance(output, dict):
+            output_dict = output
         else:
-            output_dict = output if isinstance(output, dict) else {}
+            output_dict = {}
 
         if output_dict.get("run_commands"):
             click.echo("Suggested next commands:")
@@ -335,15 +349,17 @@ def agent(prompt: tuple[str, ...], model_name: str | None) -> None:
         sys.exit(1)
 
     # Model preference: CLI flag → automatic based on keys → default
+    agent_model: Model | Callable[[CLIAgentContext], Model]
     if model_name:
-        model = model_setup.lookup.get(model_name.lower())
-        if not model:
+        selected_model = model_setup.lookup.get(model_name.lower())
+        if not selected_model:
             available = ", ".join([m.name for m in MODELS])
             click.echo(
                 f"Unknown model '{model_name}'. Available models: {available}",
                 err=True,
             )
             sys.exit(1)
+        agent_model = selected_model
     else:
         if not model_setup.available_models:
             click.echo(
@@ -352,15 +368,15 @@ def agent(prompt: tuple[str, ...], model_name: str | None) -> None:
             )
             sys.exit(1)
 
-        model = fallback_models(
+        agent_model = fallback_models(
             *[
-                model
-                for model in DEFAULT_MODELS
-                if model in model_setup.available_models
+                m
+                for m in DEFAULT_MODELS
+                if m in model_setup.available_models
             ]
         )
 
-    agent = NFactorialAgent(mode="edit", model=model, client=model_setup.client)
+    agent = NFactorialAgent(mode="edit", model=agent_model, client=model_setup.client)
 
     async def _run_agent() -> Any:
         cwd = os.getcwd()
@@ -381,10 +397,12 @@ def agent(prompt: tuple[str, ...], model_name: str | None) -> None:
     output = getattr(run_completion, "output", None)
     try:
         # If output is a Pydantic model (FinalOutput), convert to dict for inspection
-        if hasattr(output, "model_dump"):
-            output_dict = output.model_dump()  # type: ignore[attr-defined]
+        if isinstance(output, BaseModel):
+            output_dict = output.model_dump()
+        elif isinstance(output, dict):
+            output_dict = output
         else:
-            output_dict = output if isinstance(output, dict) else {}
+            output_dict = {}
 
         if output_dict.get("run_commands"):
             click.echo("Suggested next commands:")

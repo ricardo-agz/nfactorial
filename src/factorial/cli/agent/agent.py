@@ -52,7 +52,7 @@ class NFactorialAgent(BaseAgent[CLIAgentContext]):
     def __init__(
         self,
         mode: str,
-        model: Callable[[CLIAgentContext], Model],
+        model: Model | Callable[[CLIAgentContext], Model],
         client: MultiClient,
     ):
         model_name = model.name if isinstance(model, Model) else "default"

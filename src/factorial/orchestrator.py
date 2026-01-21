@@ -1,7 +1,7 @@
 import asyncio
 import os
 import signal
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Any, Literal
@@ -55,7 +55,7 @@ class MetricsTimelineConfig:
     # Retention multiplier - how long to keep metrics data relative to timeline
     retention_multiplier: float = 2.0  # Keep data for 2x the timeline duration
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         """Calculate bucket size if not provided"""
         # Validate that timeline duration provides enough buckets
         min_buckets = 50
@@ -160,7 +160,7 @@ class Runner:
         self.maintenance_worker_config = maintenance_worker_config
         self.namespace = namespace
 
-    def set_shutdown_event(self, shutdown_event: asyncio.Event):
+    def set_shutdown_event(self, shutdown_event: asyncio.Event) -> None:
         self.shutdown_event = shutdown_event
 
     def create_worker_tasks(
@@ -264,7 +264,7 @@ class Orchestrator:
         return self._namespace
 
     @namespace.setter
-    def namespace(self, value: str):
+    def namespace(self, value: str) -> None:
         self._namespace = value
 
     @property
@@ -272,7 +272,7 @@ class Orchestrator:
         return list(self.agents_by_name.values())
 
     @agents.setter
-    def agents(self, value: list[BaseAgent[Any]]):
+    def agents(self, value: list[BaseAgent[Any]]) -> None:
         self.agents_by_name = {agent.name: agent for agent in value}
 
     def get_updates_channel(self, owner_id: str) -> str:
@@ -281,7 +281,9 @@ class Orchestrator:
         ).updates_channel
 
     @asynccontextmanager
-    async def _pubsub_context(self, owner_id: str):
+    async def _pubsub_context(
+        self, owner_id: str
+    ) -> AsyncIterator[tuple[redis.Redis, Any, str]]:
         """Context manager for Redis pubsub with proper cleanup"""
         redis_client = await self.get_redis_client()
         pubsub = redis_client.pubsub()
@@ -415,7 +417,7 @@ class Orchestrator:
         agent: BaseAgent[Any],
         agent_worker_config: AgentWorkerConfig | None = None,
         maintenance_worker_config: MaintenanceWorkerConfig | None = None,
-    ):
+    ) -> None:
         if agent_worker_config is None:
             agent_worker_config = AgentWorkerConfig()
         if maintenance_worker_config is None:
@@ -423,14 +425,18 @@ class Orchestrator:
         num_connections = agent_worker_config.workers * agent_worker_config.batch_size
         http_client = httpx.AsyncClient(
             limits=httpx.Limits(
-                max_connections=num_connections * 1.25,
+                max_connections=int(num_connections * 1.25),
                 max_keepalive_connections=num_connections,
             ),
             timeout=httpx.Timeout(agent.request_timeout),
         )
         llm_client = MultiClient(
             http_client=http_client,
-            **self.api_keys,
+            openai_api_key=self.api_keys.get("openai_api_key"),
+            xai_api_key=self.api_keys.get("xai_api_key"),
+            anthropic_api_key=self.api_keys.get("anthropic_api_key"),
+            fireworks_api_key=self.api_keys.get("fireworks_api_key"),
+            ai_gateway_api_key=self.api_keys.get("ai_gateway_api_key"),
         )
 
         runner = Runner(
@@ -641,7 +647,7 @@ class Orchestrator:
         )
 
         @app.get("/")
-        async def root():
+        async def root() -> dict[str, Any]:
             return {
                 "message": "Observability dashboard",
                 "dashboard": "/observability",
@@ -741,7 +747,7 @@ class Orchestrator:
             await self.redis_pool.disconnect()
             logger.info("Redis connection pool closed")
 
-    def run(self, run_observability_server: bool = True):
+    def run(self, run_observability_server: bool = True) -> None:
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
 

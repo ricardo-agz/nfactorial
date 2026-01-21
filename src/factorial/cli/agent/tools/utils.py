@@ -2,6 +2,7 @@ import json
 import os
 import re
 import subprocess
+from typing import Any
 
 
 def run_linter(file_path: str) -> str | None:
@@ -208,7 +209,7 @@ def count_occurrences(content: str, substring: str) -> int:
     return content.count(substring)
 
 
-def run(cmd: list[str], **kwargs) -> str:
+def run(cmd: list[str], **kwargs: Any) -> str:
     """Wrapper around subprocess.run that captures stdout/stderr."""
     completed = subprocess.run(
         cmd, capture_output=True, text=True, check=True, **kwargs

@@ -2,6 +2,9 @@ import asyncio
 import fnmatch
 import os
 import re
+from typing import cast
+
+from openai.types.chat import ChatCompletion
 
 from factorial.llms import MultiClient, gpt_41_nano
 from factorial.logging import get_logger
@@ -85,7 +88,9 @@ async def _llm_description_from_snippet(snippet: str) -> str | None:
             ],
             max_completion_tokens=100,
         )
-        return resp.choices[0].message.content.strip()
+        resp_typed = cast(ChatCompletion, resp)
+        content = resp_typed.choices[0].message.content
+        return content.strip() if content else None
     except Exception:
         return None
     finally:

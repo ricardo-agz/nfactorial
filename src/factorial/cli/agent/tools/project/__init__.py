@@ -8,4 +8,4 @@ project_tools = [
     create_next_app,
 ]
 
-__all__ = [project_tools, create_react_app, create_vite_app, create_next_app]
+__all__ = ["project_tools", "create_react_app", "create_vite_app", "create_next_app"]

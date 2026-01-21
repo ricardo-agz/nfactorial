@@ -366,9 +366,9 @@ def deferred_result(
         async def wrapper(*args: Any, **kwargs: Any) -> T:
             if asyncio.iscoroutinefunction(func):
                 # Async tool — await normally
-                return await func(*args, **kwargs)  # type: ignore[arg-type]
+                return await func(*args, **kwargs)  # type: ignore[arg-type,no-any-return]
             # Sync tool — run directly
-            return func(*args, **kwargs)  # type: ignore[return-value,arg-type]
+            return func(*args, **kwargs)  # type: ignore[return-value,arg-type,no-any-return]
 
         wrapper.deferred_result = True  # type: ignore[attr-defined]
         wrapper.timeout = timeout  # type: ignore[attr-defined]
@@ -397,9 +397,9 @@ def forking_tool(
         async def wrapper(*args: Any, **kwargs: Any) -> T:
             if asyncio.iscoroutinefunction(func):
                 # Async tool — await normally
-                return await func(*args, **kwargs)  # type: ignore[arg-type]
+                return await func(*args, **kwargs)  # type: ignore[arg-type,no-any-return]
             # Sync tool — run directly
-            return func(*args, **kwargs)  # type: ignore[return-value,arg-type]
+            return func(*args, **kwargs)  # type: ignore[return-value,arg-type,no-any-return]
 
         wrapper.forking_tool = True  # type: ignore[attr-defined]
         wrapper.timeout = timeout  # type: ignore[attr-defined]

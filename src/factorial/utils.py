@@ -30,7 +30,7 @@ def serialize_data(data: Any) -> Any:
     elif isinstance(data, (bytes, bytearray, memoryview)):
         # Attempt UTF-8 decode first; fall back to base64 for binary safety
         try:
-            return data.decode("utf-8")  # type: ignore[call-arg]
+            return bytes(data).decode("utf-8")
         except UnicodeDecodeError:
             return base64.b64encode(bytes(data)).decode("ascii")
     elif isinstance(data, (datetime, date, time)):

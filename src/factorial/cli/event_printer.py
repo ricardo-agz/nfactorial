@@ -12,14 +12,14 @@ from click import style
 class ToolSpinner:
     """A simple spinner that shows while tools are executing."""
 
-    def __init__(self):
+    def __init__(self) -> None:
         self.spinner_chars = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"  # Braille patterns for smooth animation
         self.idx = 0
         self.running = False
-        self.thread = None
-        self.current_tool = None
+        self.thread: Thread | None = None
+        self.current_tool: str | None = None
 
-    def start(self, tool_name: str):
+    def start(self, tool_name: str) -> None:
         """Start the spinner with a tool name."""
         if self.running:
             self.stop()  # Stop any existing spinner
@@ -30,7 +30,7 @@ class ToolSpinner:
         self.thread = Thread(target=self._spin, daemon=True)
         self.thread.start()
 
-    def stop(self):
+    def stop(self) -> None:
         """Stop the spinner and clear the line."""
         if self.running:
             self.running = False
@@ -40,7 +40,7 @@ class ToolSpinner:
             sys.stdout.write("\r" + " " * 80 + "\r")
             sys.stdout.flush()
 
-    def _spin(self):
+    def _spin(self) -> None:
         """Internal method to animate the spinner."""
         while self.running:
             char = self.spinner_chars[self.idx % len(self.spinner_chars)]
@@ -87,7 +87,7 @@ def _get_tool_display_name(tool_name: str) -> str:
     return display_names.get(tool_name, f"running {tool_name}")
 
 
-async def event_printer(event) -> None:
+async def event_printer(event: Any) -> None:
     event_type: str = getattr(event, "event_type", "")
 
     if event_type == "progress_update_completion_started":
@@ -194,7 +194,7 @@ async def event_printer(event) -> None:
         click.echo(error_msg)
 
 
-def _format_error_message(event_type: str, event) -> str:
+def _format_error_message(event_type: str, event: Any) -> str:
     """Format a detailed error message from a failed event."""
 
     # Extract error details from the event

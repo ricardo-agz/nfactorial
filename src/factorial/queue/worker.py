@@ -2,6 +2,7 @@ import asyncio
 import json
 import random
 import time
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
 from dataclasses import replace
 from datetime import datetime, timezone
@@ -100,7 +101,7 @@ async def heartbeat_context(
     task_id: str,
     agent: BaseAgent[Any],
     interval: int,
-):
+) -> AsyncIterator[None]:
     """Run ``heartbeat_loop`` in the background for the ``with`` block."""
 
     stop_event: asyncio.Event = asyncio.Event()
@@ -296,7 +297,7 @@ async def process_task(
         pending_tool_call_ids: list[str] | None,
         pending_child_task_ids: list[str] | None,
         final_output: dict[str, Any] | str | None,
-    ):
+    ) -> bool:
         try:
             result = await completion_script.execute(
                 queue_main_key=keys.queue_main,

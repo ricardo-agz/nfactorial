@@ -49,7 +49,7 @@ class TaskMetadata:
         }
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]):
+    def from_dict(cls, data: dict[str, Any]) -> "TaskMetadata":
         data["created_at"] = datetime.fromtimestamp(
             float(data["created_at"]), tz=timezone.utc
         )
@@ -59,7 +59,7 @@ class TaskMetadata:
         return json.dumps(self.to_dict())
 
     @classmethod
-    def from_json(cls, json_str: str | bytes):
+    def from_json(cls, json_str: str | bytes) -> "TaskMetadata":
         return cls.from_dict(json.loads(decode(json_str)))
 
 
@@ -116,14 +116,17 @@ class Task(Generic[ContextType]):
         status = TaskStatus(data["status"])
         metadata = TaskMetadata.from_dict(data["metadata"])
 
+        payload: ContextType
         if data["payload"]:
             if isinstance(data["payload"], dict):
-                payload = context_class.from_dict(cast(dict[str, Any], data["payload"]))
+                payload_dict = cast(dict[str, Any], data["payload"])
+                payload = cast(ContextType, context_class.from_dict(payload_dict))
             else:
                 payload_str = decode(data["payload"])
-                payload = context_class.from_dict(json.loads(payload_str))
+                payload_dict = json.loads(payload_str)
+                payload = cast(ContextType, context_class.from_dict(payload_dict))
         else:
-            payload = context_class.from_dict({})
+            payload = cast(ContextType, context_class.from_dict({}))
 
         return cls(
             id=data["id"],

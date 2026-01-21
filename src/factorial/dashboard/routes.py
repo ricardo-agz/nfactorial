@@ -54,8 +54,8 @@ class MetricsCollector:
     async def _check_redis(self) -> bool:
         """Check Redis connectivity"""
         try:
-            await self._r.ping()
-            return True
+            result = await self._r.ping()  # type: ignore[misc]
+            return bool(result)
         except Exception:
             return False
 
@@ -613,7 +613,7 @@ def add_observability_routes(
     )
 
     @app.get("/observability", response_class=HTMLResponse)
-    async def dashboard():
+    async def dashboard() -> str:
         """Serve the dashboard HTML"""
         dashboard_path = os.path.join(os.path.dirname(__file__), "dashboard.html")
         try:
@@ -629,12 +629,12 @@ def add_observability_routes(
         window: str | None = Query(
             default=None, description="Metrics window: 1h, 24h, or 7d"
         )
-    ):
+    ) -> dict[str, Any]:
         """Get dashboard metrics from rolling bucket rings (fixed memory)."""
         return await collector.get_all_metrics(agents, window=window)
 
     @app.get("/observability/api/health", response_class=JSONResponse)
-    async def health():
+    async def health() -> dict[str, Any]:
         """Simple health check"""
         redis_ok = await collector._check_redis()
         return {
@@ -644,7 +644,7 @@ def add_observability_routes(
         }
 
     @app.post("/observability/api/cache/invalidate", response_class=JSONResponse)
-    async def invalidate_cache():
+    async def invalidate_cache() -> dict[str, Any]:
         """Manually invalidate metrics cache"""
         await collector.invalidate_cache()
         return {

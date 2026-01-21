@@ -36,9 +36,8 @@ dev = [
     "mypy",
     "pytest",
     "pytest-asyncio",
-    "black",
-    "isort>=5.12.0",
-    "flake8>=6.0.0",
+    "ruff>=0.4.0",
+    "build",
 ]
 cli = [
     "inquirer>=3.2.4",

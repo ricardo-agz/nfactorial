@@ -91,3 +91,5 @@ docs/yarn.lock
 
 example_agents/
 scratchpad/
+
+uv.lock

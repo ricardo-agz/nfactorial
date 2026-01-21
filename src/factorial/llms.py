@@ -735,5 +735,4 @@ MODELS = [
     fireworks_kimi_k2,
     fireworks_qwen_3_235b,
     fireworks_qwen_3_coder_480b,
-    # NOTE: AI Gateway-only model presets removed (not shipped in this repo).
 ]

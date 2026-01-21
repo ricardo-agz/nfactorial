@@ -706,6 +706,7 @@ fireworks_qwen_3_coder_480b = Model(
     ),
 )
 
+
 MODELS = [
     # OpenAI (direct)
     gpt_52,

@@ -44,6 +44,7 @@ const state = {
   refreshTimer: null,
   lastData: null,
   autoRefresh: true,
+  window: '1h',
   charts: {},
   refreshInterval: CONFIG.DEFAULT_REFRESH_INTERVAL,
   lastRefreshTime: null,
@@ -63,6 +64,9 @@ const elements = {
   manualRefreshBtn: document.getElementById('manual-refresh-btn'),
   refreshRateBtn: document.getElementById('refresh-rate-btn'),
   refreshDropdown: document.getElementById('refresh-dropdown'),
+  windowBtn: document.getElementById('window-btn'),
+  windowDropdown: document.getElementById('window-dropdown'),
+  windowDisplay: document.getElementById('window-display'),
   autoToggle: document.getElementById('auto-toggle'),
   mainContent: document.getElementById('main-content'),
   footer: document.querySelector('footer'),
@@ -150,7 +154,12 @@ function formatDuration(seconds) {
   }
   
   const hours = seconds / 3600;
-  return hours % 1 === 0 ? `${hours}h` : `${hours.toFixed(1)}h`;
+  if (seconds < 86400) {
+    return hours % 1 === 0 ? `${hours}h` : `${hours.toFixed(1)}h`;
+  }
+
+  const days = seconds / 86400;
+  return days % 1 === 0 ? `${days}d` : `${days.toFixed(1)}d`;
 }
 
 // ============================================================================
@@ -718,6 +727,16 @@ function updateRefreshRateDisplay() {
 }
 
 /**
+ * Updates the metrics window display in the UI
+ * @returns {void}
+ */
+function updateWindowDisplay() {
+  if (elements.windowDisplay) {
+    elements.windowDisplay.textContent = state.window || '1h';
+  }
+}
+
+/**
  * Updates the system status badge based on current system health
  * @param {Object} data - Dashboard data
  * @param {Object} data.system - System information
@@ -1262,11 +1281,18 @@ async function fetchMetrics() {
   elements.manualRefreshBtn.querySelector('.w-4').classList.add('spin');
   
   try {
-    const response = await fetch('/observability/api/metrics');
+    const windowParam = encodeURIComponent(state.window || '1h');
+    const response = await fetch(`/observability/api/metrics?window=${windowParam}`);
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     
     const data = await response.json();
     renderDashboard(data);
+
+    // Sync window (server may normalize)
+    if (data?.system?.window) {
+      state.window = data.system.window;
+      updateWindowDisplay();
+    }
     
     // Update last refresh time
     state.lastRefreshTime = new Date();
@@ -1365,6 +1391,27 @@ function setupEventListeners() {
   // Manual refresh button
   elements.manualRefreshBtn.addEventListener('click', fetchMetrics);
 
+  // Metrics window dropdown
+  if (elements.windowBtn && elements.windowDropdown) {
+    elements.windowBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      elements.windowDropdown.classList.toggle('hidden');
+    });
+  }
+
+  document.querySelectorAll('.window-option').forEach(option => {
+    option.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const newWindow = e.currentTarget?.dataset?.window;
+      if (newWindow) {
+        state.window = newWindow;
+        updateWindowDisplay();
+        elements.windowDropdown?.classList.add('hidden');
+        fetchMetrics();
+      }
+    });
+  });
+
   // Refresh rate dropdown
   elements.refreshRateBtn.addEventListener('click', (e) => {
     e.stopPropagation();
@@ -1382,8 +1429,11 @@ function setupEventListeners() {
 
   // Close dropdown when clicking outside
   document.addEventListener('click', (e) => {
-    if (!elements.refreshDropdown.contains(e.target) && !elements.refreshRateBtn.contains(e.target)) {
+    if (elements.refreshDropdown && elements.refreshRateBtn && !elements.refreshDropdown.contains(e.target) && !elements.refreshRateBtn.contains(e.target)) {
       elements.refreshDropdown.classList.add('hidden');
+    }
+    if (elements.windowDropdown && elements.windowBtn && !elements.windowDropdown.contains(e.target) && !elements.windowBtn.contains(e.target)) {
+      elements.windowDropdown.classList.add('hidden');
     }
   });
 
@@ -1402,6 +1452,7 @@ function setupEventListeners() {
 function initialize() {
   safeCreateIcons();
   updateRefreshRateDisplay();
+  updateWindowDisplay();
   setupEventListeners();
   
   // Show dashboard skeleton immediately for better perceived performance

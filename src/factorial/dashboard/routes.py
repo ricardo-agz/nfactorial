@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 import redis.asyncio as redis
-from fastapi import FastAPI
+from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -34,24 +34,20 @@ class MetricsCollector:
     def __init__(
         self,
         redis_client: redis.Redis,
-        timeline_duration: int,
-        bucket_duration: int,
-        retention_duration: int,
         namespace: str,
         total_configured_workers: int,
+        default_window: str = "1h",
         cache_ttl: float = 15.0,
     ):
         self._r = redis_client
         self._start_ts = time.time()
-        self._timeline_duration = timeline_duration
-        self._bucket_duration = bucket_duration
-        self._retention_duration = retention_duration
         self._namespace = namespace
         self._total_configured_workers = total_configured_workers
+        self._default_window = default_window
         self._cache_ttl = cache_ttl
 
         # Simple in-memory cache
-        self._cache: CachedMetrics | None = None
+        self._cache: dict[str, CachedMetrics] = {}
         self._cache_lock = asyncio.Lock()
 
     async def _check_redis(self) -> bool:
@@ -62,49 +58,100 @@ class MetricsCollector:
         except Exception:
             return False
 
-    async def get_all_metrics(self, agents: list[BaseAgent[Any]]) -> dict[str, Any]:
-        """Get all metrics using Redis pipelines and transactions"""
+    async def get_all_metrics(
+        self,
+        agents: list[BaseAgent[Any]],
+        *,
+        window: str | None = None,
+    ) -> dict[str, Any]:
+        """Get all metrics from fixed-memory rolling bucket rings.
 
-        # Check cache first
+        Supported windows:
+        - 1h  : minute-level bars (60)
+        - 24h : 60 bars, each bar aggregates 24 minutes
+        - 7d  : 60 bars, each bar aggregates 168 minutes (2h48m) using 6-minute buckets
+        """
+
+        window = (window or self._default_window or "1h").strip()
+        if window not in {"1h", "24h", "7d"}:
+            window = self._default_window
+
+        # Check cache first (per-window)
         async with self._cache_lock:
-            if self._cache and not self._cache.is_expired():
+            cached = self._cache.get(window)
+            if cached and not cached.is_expired():
                 logger.debug("Returning cached metrics")
-                return self._cache.data
+                return cached.data
 
         try:
-            # Get agent names
             agent_names = [agent.name for agent in agents]
 
-            # Calculate bucket timestamps
-            current_time = time.time()
-            start_time = current_time - self._timeline_duration
-            start_bucket = (
-                int(start_time / self._bucket_duration) * self._bucket_duration
-            )
-            end_bucket = (
-                int(current_time / self._bucket_duration) * self._bucket_duration
-            )
-            bucket_timestamps = list(
-                range(
-                    start_bucket,
-                    end_bucket + self._bucket_duration,
-                    self._bucket_duration,
-                )
-            )
+            # ---------------------------
+            # Window / ring configuration
+            # ---------------------------
+            chart_bars = 60
+            metric_types = ["completed", "failed", "cancelled", "retried"]
+            # UI only renders these, but we keep `retried` for distribution + completeness
+            chart_metric_types = ["completed", "failed", "cancelled"]
 
-            # Initialize result structure
+            window_cfg: dict[str, Any] = {
+                "1h": {
+                    "window_seconds": 3600,
+                    "ring_prefix": "m1",
+                    "bucket_seconds": 60,
+                    "ring_size": 1440,  # 24h of 1-minute slots
+                },
+                "24h": {
+                    "window_seconds": 86400,
+                    "ring_prefix": "m1",
+                    "bucket_seconds": 60,
+                    "ring_size": 1440,
+                },
+                "7d": {
+                    "window_seconds": 7 * 86400,
+                    "ring_prefix": "m6",
+                    "bucket_seconds": 360,  # 6-minute slots
+                    "ring_size": 1680,  # 7d / 6m
+                },
+            }[window]
+
+            window_seconds = int(window_cfg["window_seconds"])
+            ring_prefix = str(window_cfg["ring_prefix"])
+            bucket_seconds = int(window_cfg["bucket_seconds"])
+            ring_size = int(window_cfg["ring_size"])
+
+            num_buckets = window_seconds // bucket_seconds
+            if num_buckets <= 0:
+                num_buckets = 1
+
+            if num_buckets % chart_bars != 0:
+                # Should not happen with our fixed configs; fall back to showing raw buckets.
+                chart_bars = min(chart_bars, num_buckets)
+
+            group_size = max(1, num_buckets // chart_bars)
+            bar_seconds = group_size * bucket_seconds
+
+            # Align to bucket boundaries
+            now = time.time()
+            end_bucket_ts = int(now // bucket_seconds) * bucket_seconds
+            start_bucket_ts = end_bucket_ts - (num_buckets - 1) * bucket_seconds
+            bucket_timestamps = [
+                start_bucket_ts + i * bucket_seconds for i in range(num_buckets)
+            ]
+            slots = [
+                (ts // bucket_seconds) % ring_size for ts in bucket_timestamps
+            ]
+            bar_timestamps = [
+                bucket_timestamps[i * group_size] for i in range(chart_bars)
+            ]
+
+            # ---------------------------
+            # Step 1: Queue state (fast)
+            # ---------------------------
             system_totals = {"queued": 0, "processing": 0, "pending": 0, "backoff": 0}
-            activity_timeline = {
-                metric_type: {"buckets": [], "total_tasks": 0, "total_duration": 0}
-                for metric_type in ["completed", "failed", "cancelled", "retried"]
-            }
-            agent_metrics = {}
-            agent_activity_timelines = {}
 
-            # Step 1: Collect current queue states using pipeline
             pipe = self._r.pipeline(transaction=False)
             for agent_name in agent_names:
-                # Use exact Redis key patterns from queue.py
                 queue_main_key = f"{self._namespace}:queue:{agent_name}:main"
                 processing_heartbeats_key = (
                     f"{self._namespace}:processing:{agent_name}:heartbeats"
@@ -112,17 +159,15 @@ class MetricsCollector:
                 queue_backoff_key = f"{self._namespace}:queue:{agent_name}:backoff"
                 queue_pending_key = f"{self._namespace}:queue:{agent_name}:pending"
 
-                pipe.llen(queue_main_key)  # Get main queue length
-                pipe.zcard(processing_heartbeats_key)  # Get processing count
-                pipe.zcard(queue_backoff_key)  # Get backoff count
-                pipe.zcard(queue_pending_key)  # Get pending count
-                pipe.zrange(
-                    processing_heartbeats_key, -1, -1, withscores=True
-                )  # Get last heartbeat
+                pipe.llen(queue_main_key)
+                pipe.zcard(processing_heartbeats_key)
+                pipe.zcard(queue_backoff_key)
+                pipe.zcard(queue_pending_key)
+                pipe.zrange(processing_heartbeats_key, -1, -1, withscores=True)
 
             queue_results = await pipe.execute()
 
-            # Process queue state results
+            agent_metrics: dict[str, dict[str, Any]] = {}
             for i, agent_name in enumerate(agent_names):
                 base_idx = i * 5
                 queued = int(queue_results[base_idx] or 0)
@@ -142,12 +187,8 @@ class MetricsCollector:
                     "last_heartbeat": last_heartbeat,
                     "completed": 0,
                     "failed": 0,
-                    "total_duration": 0,
-                }
-
-                agent_activity_timelines[agent_name] = {
-                    metric_type: {"buckets": [], "total_tasks": 0, "total_duration": 0}
-                    for metric_type in ["completed", "failed", "cancelled", "retried"]
+                    "total_duration": 0.0,  # completed duration sum
+                    "last_bucket_activity": None,  # seconds
                 }
 
                 system_totals["queued"] += queued
@@ -155,257 +196,282 @@ class MetricsCollector:
                 system_totals["backoff"] += backoff
                 system_totals["pending"] += pending
 
-            # Step 2: Collect metrics for each bucket using pipeline
-            # Build a single pipeline for all buckets to minimize network round-trips
-            metric_types = ["completed", "failed", "cancelled", "retried"]
+            # ---------------------------
+            # Step 2: Rolling metrics rings (bounded)
+            # ---------------------------
+            global_metrics_key = f"{self._namespace}:metrics:__all__"
+
+            def build_fields(prefix: str, slot_list: list[int]) -> list[str]:
+                fields: list[str] = []
+                for slot in slot_list:
+                    fields.append(f"{prefix}:ts:{slot}")
+                    fields.append(f"{prefix}:completed_count:{slot}")
+                    fields.append(f"{prefix}:completed_total_duration:{slot}")
+                    fields.append(f"{prefix}:failed_count:{slot}")
+                    fields.append(f"{prefix}:cancelled_count:{slot}")
+                    fields.append(f"{prefix}:retried_count:{slot}")
+                return fields
+
+            fields = build_fields(ring_prefix, slots)
 
             pipe = self._r.pipeline(transaction=False)
+            pipe.hmget(global_metrics_key, fields)
+            for agent_name in agent_names:
+                pipe.hmget(f"{self._namespace}:metrics:{agent_name}", fields)
+            ring_results = await pipe.execute()
 
-            # Queue HMGETs for every bucket (global + per-agent) in one pipeline
-            for bucket_timestamp in bucket_timestamps:
-                # Global metrics
-                global_metrics_key = (
-                    f"{self._namespace}:metrics:__all__:{bucket_timestamp}"
+            def parse_ring(values: list[Any]) -> tuple[
+                dict[str, list[int]],
+                list[float],
+                dict[str, int],
+                float,
+                int | None,
+            ]:
+                # Per-bar aggregation
+                bar_counts = {m: [0] * chart_bars for m in metric_types}
+                bar_completed_duration = [0.0] * chart_bars
+
+                totals = {m: 0 for m in metric_types}
+                total_completed_duration = 0.0
+                last_bucket_activity: int | None = None
+
+                # Values are [ts, completed_count, completed_dur, failed_count, cancelled_count, retried_count] per bucket
+                for i, expected_ts in enumerate(bucket_timestamps):
+                    off = i * 6
+                    ts_raw = values[off]
+                    ts = int(ts_raw) if ts_raw else 0
+                    if ts != expected_ts:
+                        continue
+
+                    completed = int(values[off + 1] or 0)
+                    completed_dur = float(values[off + 2] or 0.0)
+                    failed = int(values[off + 3] or 0)
+                    cancelled = int(values[off + 4] or 0)
+                    retried = int(values[off + 5] or 0)
+
+                    if completed or failed or cancelled or retried:
+                        last_bucket_activity = expected_ts
+
+                    bar_idx = i // group_size
+                    if bar_idx >= chart_bars:
+                        bar_idx = chart_bars - 1
+
+                    bar_counts["completed"][bar_idx] += completed
+                    bar_counts["failed"][bar_idx] += failed
+                    bar_counts["cancelled"][bar_idx] += cancelled
+                    bar_counts["retried"][bar_idx] += retried
+                    bar_completed_duration[bar_idx] += completed_dur
+
+                    totals["completed"] += completed
+                    totals["failed"] += failed
+                    totals["cancelled"] += cancelled
+                    totals["retried"] += retried
+                    total_completed_duration += completed_dur
+
+                return (
+                    bar_counts,
+                    bar_completed_duration,
+                    totals,
+                    total_completed_duration,
+                    last_bucket_activity,
                 )
-                pipe.hmget(
-                    global_metrics_key,
-                    "completed_count",
-                    "completed_total_duration",
-                    "completed_total_turns",
-                    "completed_total_retries",
-                    "failed_count",
-                    "failed_total_duration",
-                    "failed_total_turns",
-                    "failed_total_retries",
-                    "cancelled_count",
-                    "cancelled_total_duration",
-                    "cancelled_total_turns",
-                    "cancelled_total_retries",
-                    "retried_count",
-                    "retried_total_duration",
-                    "retried_total_turns",
-                    "retried_total_retries",
-                )
 
-                # Per-agent metrics for this bucket
-                for agent_name in agent_names:
-                    agent_metrics_key = (
-                        f"{self._namespace}:metrics:{agent_name}:{bucket_timestamp}"
-                    )
-                    pipe.hmget(
-                        agent_metrics_key,
-                        "completed_count",
-                        "completed_total_duration",
-                        "completed_total_turns",
-                        "completed_total_retries",
-                        "failed_count",
-                        "failed_total_duration",
-                        "failed_total_turns",
-                        "failed_total_retries",
-                        "cancelled_count",
-                        "cancelled_total_duration",
-                        "cancelled_total_turns",
-                        "cancelled_total_retries",
-                        "retried_count",
-                        "retried_total_duration",
-                        "retried_total_turns",
-                        "retried_total_retries",
-                    )
+            # Global first, then per-agent in the same order we queued them
+            global_bar_counts, global_bar_completed_dur, global_totals, global_completed_dur_sum, _ = parse_ring(
+                ring_results[0]
+            )
 
-            # Execute the pipeline once (single network round-trip)
-            results = await pipe.execute()
+            # Fill per-agent timelines + totals
+            agent_activity_charts: dict[str, dict[str, Any]] = {}
+            for idx, agent_name in enumerate(agent_names):
+                (
+                    bar_counts,
+                    bar_completed_dur,
+                    totals,
+                    completed_dur_sum,
+                    last_bucket_activity,
+                ) = parse_ring(ring_results[idx + 1])
 
-            num_keys_per_bucket = 1 + len(agent_names)
+                agent_metrics[agent_name]["completed"] = totals["completed"]
+                agent_metrics[agent_name]["failed"] = totals["failed"]
+                agent_metrics[agent_name]["total_duration"] = completed_dur_sum
+                agent_metrics[agent_name]["last_bucket_activity"] = last_bucket_activity
 
-            for bucket_idx, bucket_timestamp in enumerate(bucket_timestamps):
-                base_result_idx = bucket_idx * num_keys_per_bucket
-
-                # -------- Global metrics --------
-                global_metrics = results[base_result_idx]
-                for i, metric_type in enumerate(metric_types):
-                    m_base = i * 4
-                    count = int(global_metrics[m_base] or 0)
-                    total_duration = float(global_metrics[m_base + 1] or 0)
-                    total_turns = int(global_metrics[m_base + 2] or 0)
-                    total_retries = int(global_metrics[m_base + 3] or 0)
-
-                    activity_timeline[metric_type]["buckets"].append(
+                # Build agent charts (60 bars) for UI toggles
+                agent_activity_charts[agent_name] = {}
+                for metric_type in chart_metric_types:
+                    total_tasks = totals[metric_type]
+                    total_duration = completed_dur_sum if metric_type == "completed" else 0.0
+                    buckets = [
                         {
-                            "timestamp": bucket_timestamp,
-                            "count": count,
-                            "total_duration": total_duration,
-                            "total_turns": total_turns,
-                            "total_retries": total_retries,
+                            "timestamp": bar_timestamps[i],
+                            "count": bar_counts[metric_type][i],
+                            "total_duration": (
+                                bar_completed_dur[i] if metric_type == "completed" else 0.0
+                            ),
+                            "total_turns": 0,
+                            "total_retries": 0,
                         }
-                    )
-                    activity_timeline[metric_type]["total_tasks"] += count
-                    activity_timeline[metric_type]["total_duration"] += total_duration
+                        for i in range(chart_bars)
+                    ]
+                    agent_activity_charts[agent_name][metric_type] = {
+                        "buckets": buckets,
+                        "total_tasks": total_tasks,
+                        "avg_duration": (
+                            (total_duration / total_tasks) if total_tasks > 0 else 0.0
+                        ),
+                        "ttl_seconds": window_seconds,
+                        "task_timestamps": [
+                            bar_timestamps[i]
+                            for i in range(chart_bars)
+                            if bar_counts[metric_type][i] > 0
+                        ],
+                    }
 
-                # -------- Per-agent metrics --------
-                for agent_idx, agent_name in enumerate(agent_names):
-                    agent_metrics_result = results[base_result_idx + 1 + agent_idx]
-                    for i, metric_type in enumerate(metric_types):
-                        m_base = i * 4
-                        count = int(agent_metrics_result[m_base] or 0)
-                        total_duration = float(agent_metrics_result[m_base + 1] or 0)
-                        total_turns = int(agent_metrics_result[m_base + 2] or 0)
-                        total_retries = int(agent_metrics_result[m_base + 3] or 0)
-
-                        agent_activity_timelines[agent_name][metric_type][
-                            "buckets"
-                        ].append(
-                            {
-                                "timestamp": bucket_timestamp,
-                                "count": count,
-                                "total_duration": total_duration,
-                                "total_turns": total_turns,
-                                "total_retries": total_retries,
-                            }
-                        )
-                        agent_activity_timelines[agent_name][metric_type][
-                            "total_tasks"
-                        ] += count
-                        agent_activity_timelines[agent_name][metric_type][
-                            "total_duration"
-                        ] += total_duration
-
-                        if metric_type == "completed":
-                            agent_metrics[agent_name]["completed"] += count
-                            agent_metrics[agent_name]["total_duration"] += (
-                                total_duration
-                            )
-                        elif metric_type == "failed":
-                            agent_metrics[agent_name]["failed"] += count
-
-            # Calculate derived metrics using full timeline for success rate
-            total_completed = activity_timeline["completed"]["total_tasks"]
-            total_failed = activity_timeline["failed"]["total_tasks"]
+            # Global success rate for the selected window
+            total_completed = global_totals["completed"]
+            total_failed = global_totals["failed"]
             total_attempts = total_completed + total_failed
             system_success_rate = (
                 (total_completed / total_attempts * 100) if total_attempts > 0 else 0.0
             )
 
-            # Calculate current throughput using recent activity (last 2 minutes)
-            # Use the most recent buckets for more current throughput
-            recent_window_seconds = self._bucket_duration * 2  # Last 2 buckets
-            current_time = time.time()
-            recent_cutoff = current_time - recent_window_seconds
+            # Build global charts (60 bars)
+            activity_charts: dict[str, Any] = {}
+            for metric_type in chart_metric_types:
+                total_tasks = global_totals[metric_type]
+                total_duration = (
+                    global_completed_dur_sum if metric_type == "completed" else 0.0
+                )
+                buckets = [
+                    {
+                        "timestamp": bar_timestamps[i],
+                        "count": global_bar_counts[metric_type][i],
+                        "total_duration": (
+                            global_bar_completed_dur[i] if metric_type == "completed" else 0.0
+                        ),
+                        "total_turns": 0,
+                        "total_retries": 0,
+                    }
+                    for i in range(chart_bars)
+                ]
+                activity_charts[metric_type] = {
+                    "buckets": buckets,
+                    "total_tasks": total_tasks,
+                    "avg_duration": (
+                        (total_duration / total_tasks) if total_tasks > 0 else 0.0
+                    ),
+                    "success_rate": (
+                        system_success_rate if metric_type == "completed" else 0.0
+                    ),
+                    "ttl_seconds": window_seconds,
+                    "task_timestamps": [
+                        bar_timestamps[i]
+                        for i in range(chart_bars)
+                        if global_bar_counts[metric_type][i] > 0
+                    ],
+                }
 
-            # Count recent tasks from buckets
-            recent_completed = 0
-            recent_failed = 0
+            # ---------------------------
+            # Throughput: always "recent" (last 2 minutes) from m1 ring
+            # ---------------------------
+            recent_bucket_seconds = 60
+            recent_ring_prefix = "m1"
+            recent_ring_size = 1440
+            recent_end_ts = int(now // recent_bucket_seconds) * recent_bucket_seconds
+            recent_bucket_timestamps = [recent_end_ts - 60, recent_end_ts]
+            recent_slots = [
+                (ts // recent_bucket_seconds) % recent_ring_size
+                for ts in recent_bucket_timestamps
+            ]
 
-            for bucket in activity_timeline["completed"]["buckets"]:
-                if bucket["timestamp"] >= recent_cutoff:
-                    recent_completed += bucket["count"]
+            def build_recent_fields(prefix: str, slot_list: list[int]) -> list[str]:
+                f: list[str] = []
+                for slot in slot_list:
+                    f.append(f"{prefix}:ts:{slot}")
+                    f.append(f"{prefix}:completed_count:{slot}")
+                return f
 
-            for bucket in activity_timeline["failed"]["buckets"]:
-                if bucket["timestamp"] >= recent_cutoff:
-                    recent_failed += bucket["count"]
+            recent_fields = build_recent_fields(recent_ring_prefix, recent_slots)
+            pipe = self._r.pipeline(transaction=False)
+            pipe.hmget(global_metrics_key, recent_fields)
+            for agent_name in agent_names:
+                pipe.hmget(f"{self._namespace}:metrics:{agent_name}", recent_fields)
+            recent_results = await pipe.execute()
 
-            recent_total = recent_completed + recent_failed
-            recent_minutes = recent_window_seconds / 60.0
+            def parse_recent_completed(values: list[Any]) -> int:
+                completed_sum = 0
+                for i, expected_ts in enumerate(recent_bucket_timestamps):
+                    off = i * 2
+                    ts_raw = values[off]
+                    ts = int(ts_raw) if ts_raw else 0
+                    if ts != expected_ts:
+                        continue
+                    completed_sum += int(values[off + 1] or 0)
+                return completed_sum
 
-            # Calculate system throughput based on actual completion rate
-            # Throughput = tasks completed per minute
+            recent_completed_global = parse_recent_completed(recent_results[0])
+            recent_minutes = 2.0
             system_throughput = (
-                recent_completed / recent_minutes if recent_minutes > 0 else 0.0
+                recent_completed_global / recent_minutes if recent_minutes > 0 else 0.0
             )
 
-            # Get display name for activity window
-            if self._timeline_duration < 3600:
-                minutes = self._timeline_duration // 60
-                activity_window_display = f"last {minutes}m"
-            elif self._timeline_duration < 86400:
-                hours = self._timeline_duration // 3600
-                activity_window_display = f"last {hours}h"
+            recent_completed_by_agent: dict[str, int] = {}
+            for idx, agent_name in enumerate(agent_names):
+                recent_completed_by_agent[agent_name] = parse_recent_completed(
+                    recent_results[idx + 1]
+                )
+
+            # Display name for activity window (UI)
+            if window_seconds < 3600:
+                activity_window_display = f"last {window_seconds // 60}m"
+            elif window_seconds < 86400:
+                activity_window_display = f"last {window_seconds // 3600}h"
             else:
-                days = self._timeline_duration // 86400
-                activity_window_display = f"last {days}d"
+                activity_window_display = f"last {window_seconds // 86400}d"
 
-            # Helper function to calculate true last activity time
+            # Last activity helper
             def calculate_last_activity(agent_name: str, metrics: dict) -> float | None:
-                """Calculate the latest activity time from heartbeats and task completions"""
-                timestamps = []
-
-                # Add last heartbeat if available
+                timestamps: list[float] = []
                 if metrics.get("last_heartbeat") is not None:
                     timestamps.append(float(metrics["last_heartbeat"]))
-
-                # Add latest activity from timeline buckets
-                if agent_name in agent_activity_timelines:
-                    agent_timeline = agent_activity_timelines[agent_name]
-                    for metric_type in ["completed", "failed", "cancelled", "retried"]:
-                        if metric_type in agent_timeline:
-                            for bucket in agent_timeline[metric_type]["buckets"]:
-                                if bucket["count"] > 0:
-                                    timestamps.append(float(bucket["timestamp"]))
-
+                if metrics.get("last_bucket_activity") is not None:
+                    timestamps.append(float(metrics["last_bucket_activity"]))
                 return max(timestamps) if timestamps else None
 
-            # Calculate performance data with proper last activity calculation
             performance_data = []
             for agent_name, metrics in agent_metrics.items():
                 last_activity = calculate_last_activity(agent_name, metrics)
-
-                # Calculate agent throughput using same recent window as system throughput
-                agent_recent_completed = 0
-                agent_recent_failed = 0
-
-                if agent_name in agent_activity_timelines:
-                    agent_timeline = agent_activity_timelines[agent_name]
-
-                    # Count recent completed tasks
-                    if "completed" in agent_timeline:
-                        for bucket in agent_timeline["completed"]["buckets"]:
-                            if bucket["timestamp"] >= recent_cutoff:
-                                agent_recent_completed += bucket["count"]
-
-                    # Count recent failed tasks
-                    if "failed" in agent_timeline:
-                        for bucket in agent_timeline["failed"]["buckets"]:
-                            if bucket["timestamp"] >= recent_cutoff:
-                                agent_recent_failed += bucket["count"]
-
-                agent_recent_total = agent_recent_completed + agent_recent_failed
-
-                # Calculate agent throughput based on actual completion rate
-                # Throughput = tasks completed per minute
+                agent_recent_completed = recent_completed_by_agent.get(agent_name, 0)
                 agent_throughput = (
                     agent_recent_completed / recent_minutes
                     if recent_minutes > 0
                     else 0.0
                 )
 
+                completed = int(metrics.get("completed", 0) or 0)
+                failed = int(metrics.get("failed", 0) or 0)
+                attempts = completed + failed
+                success_rate_percent = (
+                    (completed / attempts * 100) if attempts > 0 else 0.0
+                )
+
+                total_duration = float(metrics.get("total_duration", 0.0) or 0.0)
+                avg_processing_time_seconds = (
+                    (total_duration / completed) if completed > 0 else 0.0
+                )
+
                 performance_data.append(
                     {
                         "current_throughput": agent_throughput,
-                        "success_rate_percent": (
-                            (
-                                metrics.get("completed", 0)
-                                / (
-                                    metrics.get("completed", 0)
-                                    + metrics.get("failed", 0)
-                                )
-                                * 100
-                            )
-                            if (metrics.get("completed", 0) + metrics.get("failed", 0))
-                            > 0
-                            else 0.0
-                        ),
-                        "avg_processing_time_seconds": (
-                            metrics.get("total_duration", 0)
-                            / metrics.get("completed", 1)
-                            if metrics.get("completed", 0) > 0
-                            else 0.0
-                        ),
+                        "success_rate_percent": success_rate_percent,
+                        "avg_processing_time_seconds": avg_processing_time_seconds,
                         "last_activity": (
                             last_activity * 1000 if last_activity is not None else None
                         ),
                     }
                 )
 
-            # Build response
             metrics_data = {
                 "system": {
                     "total_agents": len(agents),
@@ -417,15 +483,16 @@ class MetricsCollector:
                     "overall_success_rate_percent": system_success_rate,
                     "system_throughput_per_minute": system_throughput,
                     "activity_window_display": activity_window_display,
+                    "window": window,
                 },
                 "task_distribution": {
                     "queued": system_totals["queued"],
                     "processing": system_totals["processing"],
                     "backoff": system_totals["backoff"],
-                    "completed": activity_timeline["completed"]["total_tasks"],
-                    "failed": activity_timeline["failed"]["total_tasks"],
-                    "cancelled": activity_timeline["cancelled"]["total_tasks"],
-                    "retried": activity_timeline["retried"]["total_tasks"],
+                    "completed": global_totals["completed"],
+                    "failed": global_totals["failed"],
+                    "cancelled": global_totals["cancelled"],
+                    "retried": global_totals["retried"],
                     "pending": system_totals["pending"],
                     "pending_tool_results": 0,
                 },
@@ -443,68 +510,33 @@ class MetricsCollector:
                     for agent_name, metrics in agent_metrics.items()
                 ],
                 "performance": performance_data,
-                "activity_charts": {
-                    metric_type: {
-                        "buckets": data["buckets"],
-                        "total_tasks": data["total_tasks"],
-                        "avg_duration": (
-                            data["total_duration"] / data["total_tasks"]
-                            if data["total_tasks"] > 0
-                            else 0.0
-                        ),
-                        "success_rate": (
-                            system_success_rate if metric_type == "completed" else 0.0
-                        ),
-                        "ttl_seconds": self._timeline_duration,
-                        "task_timestamps": [
-                            b["timestamp"] for b in data["buckets"] if b["count"] > 0
-                        ],
-                    }
-                    for metric_type, data in activity_timeline.items()
-                },
-                "agent_activity_charts": {
-                    agent_name: {
-                        metric_type: {
-                            "buckets": data["buckets"],
-                            "total_tasks": data["total_tasks"],
-                            "avg_duration": (
-                                data["total_duration"] / data["total_tasks"]
-                                if data["total_tasks"] > 0
-                                else 0.0
-                            ),
-                            "ttl_seconds": self._timeline_duration,
-                            "task_timestamps": [
-                                b["timestamp"]
-                                for b in data["buckets"]
-                                if b["count"] > 0
-                            ],
-                        }
-                        for metric_type, data in agent_timeline.items()
-                    }
-                    for agent_name, agent_timeline in agent_activity_timelines.items()
-                },
+                "activity_charts": activity_charts,
+                "agent_activity_charts": agent_activity_charts,
                 "ttl_info": {
-                    "timeline_duration": self._timeline_duration,
-                    "bucket_duration": self._bucket_duration,
-                    "retention_duration": self._retention_duration,
+                    "window": window,
+                    "window_seconds": window_seconds,
+                    "ring_prefix": ring_prefix,
+                    "bucket_seconds": bucket_seconds,
+                    "ring_size": ring_size,
+                    "chart_bars": chart_bars,
+                    "bar_seconds": bar_seconds,
                 },
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             }
 
             # Cache the result
             async with self._cache_lock:
-                self._cache = CachedMetrics(
+                self._cache[window] = CachedMetrics(
                     data=metrics_data,
                     timestamp=time.time(),
                     ttl=self._cache_ttl,
                 )
 
-            logger.debug("Collected metrics using Redis pipelines and transactions")
+            logger.debug("Collected metrics using rolling rings")
             return metrics_data
 
         except Exception as e:
             logger.error(f"Metrics collection failed: {e}")
-            # Fallback to basic system info
             redis_ok = await self._check_redis()
             return {
                 "error": "Failed to collect metrics",
@@ -518,7 +550,7 @@ class MetricsCollector:
     async def invalidate_cache(self) -> None:
         """Manually invalidate the cache"""
         async with self._cache_lock:
-            self._cache = None
+            self._cache = {}
 
 
 def add_observability_routes(
@@ -540,14 +572,22 @@ def add_observability_routes(
         maintenance_workers = runner.maintenance_worker_config.workers
         total_configured_workers += agent_workers + maintenance_workers
 
-    # Create metrics collector with namespace
+    # Pick a sensible default window from config (if provided)
+    default_window = "1h"
+    try:
+        timeline_duration = int(getattr(metrics_config, "timeline_duration", 0) or 0)
+        if timeline_duration >= 7 * 86400:
+            default_window = "7d"
+        elif timeline_duration >= 24 * 3600:
+            default_window = "24h"
+    except Exception:
+        default_window = "1h"
+
     collector = MetricsCollector(
         redis_client=redis_client,
-        timeline_duration=metrics_config.timeline_duration,
-        bucket_duration=metrics_config.bucket_duration,
-        retention_duration=metrics_config.retention_duration,
         namespace=namespace,
         total_configured_workers=total_configured_workers,
+        default_window=default_window,
     )
 
     # Mount static files
@@ -573,9 +613,13 @@ def add_observability_routes(
             return "<html><body><h1>Dashboard not found</h1></body></html>"
 
     @app.get("/observability/api/metrics", response_class=JSONResponse)
-    async def metrics():
-        """Get all metrics efficiently using single Lua script call + caching"""
-        return await collector.get_all_metrics(agents)
+    async def metrics(
+        window: str | None = Query(
+            default=None, description="Metrics window: 1h, 24h, or 7d"
+        )
+    ):
+        """Get dashboard metrics from rolling bucket rings (fixed memory)."""
+        return await collector.get_all_metrics(agents, window=window)
 
     @app.get("/observability/api/health", response_class=JSONResponse)
     async def health():

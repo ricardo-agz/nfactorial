@@ -7,7 +7,7 @@ name = "nfactorial"
 version = "0.1.31"
 description = "A distributed task queue for building reliable multi-agent systems."
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 classifiers = [
     "Typing :: Typed",
     "Development Status :: 3 - Alpha",
@@ -15,7 +15,6 @@ classifiers = [
     "Topic :: Software Development :: Libraries :: Python Modules",
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
@@ -37,9 +36,8 @@ dev = [
     "mypy",
     "pytest",
     "pytest-asyncio",
-    "black",
-    "isort>=5.12.0",
-    "flake8>=6.0.0",
+    "ruff>=0.4.0",
+    "build",
 ]
 cli = [
     "inquirer>=3.2.4",
@@ -70,14 +68,33 @@ factorial = [
 
 [tool.black]
 line-length = 88
-target-version = ['py38']
+target-version = ["py310"]
 
 [tool.isort]
 profile = "black"
 line_length = 88
+known_first_party = ["factorial"]
+src_paths = ["src"]
 
 [tool.mypy]
-python_version = "3.8"
+python_version = "3.10"
 warn_return_any = true
 warn_unused_configs = true
-disallow_untyped_defs = true 
+disallow_untyped_defs = true
+
+[tool.ruff]
+line-length = 88
+target-version = "py310"
+src = ["src"]
+
+[tool.ruff.lint]
+select = [
+    "E",  # pycodestyle errors
+    "W",  # pycodestyle warnings
+    "F",  # pyflakes
+    "I",  # isort
+    "B",  # flake8-bugbear
+    "C4", # flake8-comprehensions
+    "UP", # pyupgrade
+]
+isort = { combine-as-imports = true, known-first-party = ["factorial"] }

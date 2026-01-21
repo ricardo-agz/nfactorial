@@ -175,7 +175,7 @@ if action == "complete" then
     -- Update timeline metrics
     inc_metrics(
         { agent_metrics_bucket_key, global_metrics_bucket_key },
-        { 'completed', pickups, retries, meta_json, metrics_ttl }
+        { 'completed', meta_json, metrics_ttl }
     )
 
     -- If the task is a child task, update the parent task's pending child task results
@@ -215,7 +215,7 @@ elseif action == "retry" then
     -- Update timeline metrics for retry
     inc_metrics(
         { agent_metrics_bucket_key, global_metrics_bucket_key },
-        { 'retried', pickups, retries, meta_json, metrics_ttl }
+        { 'retried', meta_json, metrics_ttl }
     )
 
     return { true, false }
@@ -246,7 +246,7 @@ elseif action == "fail" then
     -- Update timeline metrics
     inc_metrics(
         { agent_metrics_bucket_key, global_metrics_bucket_key },
-        { 'failed', pickups, retries, meta_json, metrics_ttl }
+        { 'failed', meta_json, metrics_ttl }
     )
 
     -- If the task is a child task, update the parent task's pending child task results

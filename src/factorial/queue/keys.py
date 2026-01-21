@@ -57,10 +57,14 @@ PENDING_CHILD_TASK_RESULTS = "{namespace}:pending:{task_id}:children"
 UPDATES_CHANNEL = "{namespace}:updates:{owner_id}"
 
 # ===== METRICS =====
-# HASH: {completed, failed, ..., completed_duration, failed_duration, ...} (bucket is a timestamp of a time bucket)
-# completed, failed, cancelled, retried
-AGENT_ACTIVITY_METRICS = "{namespace}:metrics:{agent}:{bucket}"
-GLOBAL_ACTIVITY_METRICS = "{namespace}:metrics:__all__:{bucket}"
+# Rolling (fixed-memory) metrics ring buffers.
+# We store bucketed counters inside a single Redis HASH per agent + one global HASH.
+# The Lua `inc_metrics()` helper maintains a rolling window by overwriting slots in-place.
+#
+# NOTE: These keys intentionally do NOT include a `{bucket}` timestamp. Bucket timestamps live
+# inside hash fields so memory stays bounded.
+AGENT_ACTIVITY_METRICS = "{namespace}:metrics:{agent}"
+GLOBAL_ACTIVITY_METRICS = "{namespace}:metrics:__all__"
 
 # ===== BATCH MANAGEMENT =====
 # HASH: batch_id -> {owner_id, created_at, total_tasks, max_progress, status: 'active'|'cancelled'|'completed'}
@@ -105,7 +109,7 @@ class RedisKeys:
     _queue_cancelled: str | None = None
     _processing_heartbeats: str | None = None
 
-    # Metrics keys (present when agent + metrics_bucket_duration provided)
+    # Metrics keys (rolling ring buffers; agent-scoped present when agent provided)
     _agent_metrics_bucket: str | None = None
     _global_metrics_bucket: str | None = None
 
@@ -251,19 +255,19 @@ class RedisKeys:
 
     @property
     def agent_metrics_bucket(self) -> str:
-        """{namespace}:metrics:{agent}:{bucket}"""
+        """{namespace}:metrics:{agent}"""
         if self._agent_metrics_bucket is None:
             raise ValueError(
-                "agent_metrics_bucket is not available - agent and metrics_bucket_duration were not provided during RedisKeys.format()"
+                "agent_metrics_bucket is not available - agent was not provided during RedisKeys.format()"
             )
         return self._agent_metrics_bucket
 
     @property
     def global_metrics_bucket(self) -> str:
-        """{namespace}:metrics:__all__:{bucket}"""
+        """{namespace}:metrics:__all__"""
         if self._global_metrics_bucket is None:
             raise ValueError(
-                "global_metrics_bucket is not available - metrics_bucket_duration was not provided during RedisKeys.format()"
+                "global_metrics_bucket is not available - namespace was not provided during RedisKeys.format()"
             )
         return self._global_metrics_bucket
 
@@ -324,6 +328,8 @@ class RedisKeys:
         owner_id: str | None = None,
         metrics_bucket_duration: int | None = None,
     ) -> "RedisKeys":
+        # NOTE: metrics_bucket_duration is kept for backwards compatibility with callers,
+        # but rolling metrics keys no longer depend on bucket timestamps.
         bucket_id = (
             (int(time.time() / metrics_bucket_duration) * metrics_bucket_duration)
             if metrics_bucket_duration
@@ -368,17 +374,15 @@ class RedisKeys:
             )
             if agent
             else None,
-            # Metrics keys (require bucket calculation)
+            # Metrics keys (rolling ring buffers)
             _agent_metrics_bucket=AGENT_ACTIVITY_METRICS.format(
                 namespace=namespace, agent=agent, bucket=bucket_id
             )
-            if agent and metrics_bucket_duration
+            if agent
             else None,
             _global_metrics_bucket=GLOBAL_ACTIVITY_METRICS.format(
                 namespace=namespace, bucket=bucket_id
-            )
-            if metrics_bucket_duration
-            else None,
+            ),
             # Batch-scoped keys
             _batch_meta=BATCH_META.format(namespace=namespace),
             _batch_tasks=BATCH_TASKS.format(namespace=namespace),

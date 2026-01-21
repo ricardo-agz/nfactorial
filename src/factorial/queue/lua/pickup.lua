@@ -53,7 +53,7 @@ for i = 1, attempts do
 
             inc_metrics(
                 { agent_metrics_bucket_key, global_metrics_bucket_key },
-                { 'cancelled', pickups, retries, meta_json, metrics_ttl }
+                { 'cancelled', meta_json, metrics_ttl }
             )
 
             table.insert(tasks_to_cancel_ids, task_id)

@@ -70,7 +70,7 @@ if status == "pending_tool_results" or status == "pending_child_tasks" then
     -- Update timeline metrics
     inc_metrics(
         { agent_metrics_bucket_key, global_metrics_bucket_key },
-        { 'cancelled', pickups, retries, meta_json, metrics_ttl }
+        { 'cancelled', meta_json, metrics_ttl }
     )
 
     return { true, status, "Task cancelled", owner_id or "" }
@@ -82,7 +82,7 @@ elseif status == "backoff" then
     -- Update timeline metrics
     inc_metrics(
         { agent_metrics_bucket_key, global_metrics_bucket_key },
-        { 'cancelled', pickups, retries, meta_json, metrics_ttl }
+        { 'cancelled', meta_json, metrics_ttl }
     )
 
     return { true, status, "Task cancelled", owner_id or "" }

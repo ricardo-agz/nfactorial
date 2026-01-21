@@ -158,6 +158,22 @@
               </div>
             </div>
 
+            <!-- Metrics Window Display with Dropdown -->
+            <div class="relative">
+              <button id="window-btn" class="flex items-center gap-2 text-sm text-gray-500 hover:text-gray-700 transition-colors cursor-pointer">
+                <span>Window: </span>
+                <span id="window-display">1h</span>
+                <i data-lucide="chevron-down" class="w-3 h-3"></i>
+              </button>
+              <div id="window-dropdown" class="absolute right-0 top-full mt-1 w-48 bg-white border border-gray-100 rounded-lg shadow-lg z-50 hidden">
+                <div class="p-2">
+                  <button class="window-option w-full text-left px-3 py-2 text-sm text-gray-700 hover:bg-gray-50 rounded" data-window="1h">Last 1 hour</button>
+                  <button class="window-option w-full text-left px-3 py-2 text-sm text-gray-700 hover:bg-gray-50 rounded" data-window="24h">Last 24 hours</button>
+                  <button class="window-option w-full text-left px-3 py-2 text-sm text-gray-700 hover:bg-gray-50 rounded" data-window="7d">Last 7 days</button>
+                </div>
+              </div>
+            </div>
+
             <!-- Refresh Rate Display with Dropdown -->
             <div class="relative">
               <button id="refresh-rate-btn" class="flex items-center gap-2 text-sm text-gray-500 hover:text-gray-700 transition-colors cursor-pointer">

@@ -59,7 +59,7 @@ for i = 1, #stale_task_ids do
                 -- Update timeline metrics for recovery
                 inc_metrics(
                     { agent_metrics_bucket_key, global_metrics_bucket_key },
-                    { 'recovery', pickups, retries, meta_json, metrics_ttl }
+                    { 'recovery', meta_json, metrics_ttl }
                 )
             else
                 -- Max retries exceeded, send to failed queue and set status to failed
@@ -71,7 +71,7 @@ for i = 1, #stale_task_ids do
                 -- Update timeline metrics
                 inc_metrics(
                     { agent_metrics_bucket_key, global_metrics_bucket_key },
-                    { 'failed', pickups, retries, meta_json, metrics_ttl }
+                    { 'failed', meta_json, metrics_ttl }
                 )
             end
         end

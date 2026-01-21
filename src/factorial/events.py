@@ -1,7 +1,8 @@
-from dataclasses import dataclass, asdict
+import json
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from typing import Any
-import json
+
 from redis.asyncio import Redis
 
 from factorial.logging import get_logger

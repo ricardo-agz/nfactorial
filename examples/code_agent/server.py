@@ -1,13 +1,12 @@
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.exceptions import HTTPException
-from pydantic import BaseModel
 import json
 from typing import Any
+
+from agent import IdeAgentContext, ide_agent, orchestrator
+from fastapi import FastAPI
+from fastapi.exceptions import HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 from starlette.websockets import WebSocket, WebSocketDisconnect
-
-from agent import ide_agent, orchestrator, IdeAgentContext
-
 
 app = FastAPI()
 
@@ -82,7 +81,7 @@ async def cancel_task_endpoint(request: CancelRequest) -> dict[str, Any]:
         raise HTTPException(
             status_code=500,
             detail=f"Failed to cancel task {request.task_id}: {str(e)}",
-        )
+        ) from e
 
 
 class CompleteToolRequest(BaseModel):
@@ -107,7 +106,7 @@ async def complete_deferred_tool_endpoint(request: CompleteToolRequest):
         raise HTTPException(status_code=500, detail="Unable to complete deferred tool.")
     except Exception as e:
         print(f"Failed to complete deferred tool call {request.tool_call_id}: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=str(e)) from e
 
 
 if __name__ == "__main__":

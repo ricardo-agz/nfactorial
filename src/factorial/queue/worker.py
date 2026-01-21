@@ -1,17 +1,36 @@
-import random
-from typing import Any
-from enum import Enum
-import redis.asyncio as redis
-import time
-import json
 import asyncio
-from dataclasses import replace
+import json
+import random
+import time
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
+from dataclasses import replace
+from datetime import datetime, timezone
+from enum import Enum
+from typing import Any
+
+import redis.asyncio as redis
+
 from factorial.agent import BaseAgent, ExecutionContext, RunCompletion, serialize_data
 from factorial.context import ContextType
-from factorial.events import QueueEvent, AgentEvent, EventPublisher, BatchEvent
-from factorial.logging import get_logger, colored
+from factorial.events import AgentEvent, BatchEvent, EventPublisher, QueueEvent
 from factorial.exceptions import RETRYABLE_EXCEPTIONS, FatalAgentError
+from factorial.logging import colored, get_logger
+from factorial.queue.keys import PENDING_SENTINEL, RedisKeys
+from factorial.queue.lua import (
+    TaskCompletionScript,
+    TaskSteeringScript,
+    create_batch_pickup_script,
+    create_task_completion_script,
+    create_task_steering_script,
+)
+from factorial.queue.operations import (
+    create_batch_and_enqueue,
+    enqueue_task,
+    get_task_batch,
+    process_cancelled_tasks,
+    resume_if_no_remaining_child_tasks,
+)
 from factorial.queue.task import (
     Batch,
     Task,
@@ -19,23 +38,6 @@ from factorial.queue.task import (
     get_task_data,
     get_task_steering_messages,
 )
-from factorial.queue.lua import (
-    TaskSteeringScript,
-    TaskCompletionScript,
-    create_batch_pickup_script,
-    create_task_steering_script,
-    create_task_completion_script,
-)
-from factorial.queue.operations import (
-    create_batch_and_enqueue,
-    resume_if_no_remaining_child_tasks,
-    process_cancelled_tasks,
-    get_task_batch,
-    enqueue_task,
-)
-from factorial.queue.keys import RedisKeys, PENDING_SENTINEL
-from datetime import datetime, timezone
-
 
 logger = get_logger("factorial.queue")
 
@@ -99,8 +101,8 @@ async def heartbeat_context(
     task_id: str,
     agent: BaseAgent[Any],
     interval: int,
-):
-    """Run ``heartbeat_loop`` in the background for the lifetime of the ``with`` block."""
+) -> AsyncIterator[None]:
+    """Run ``heartbeat_loop`` in the background for the ``with`` block."""
 
     stop_event: asyncio.Event = asyncio.Event()
     hb_task = asyncio.create_task(
@@ -253,7 +255,6 @@ async def process_task(
     max_retries: int,
     heartbeat_interval: int,
     task_timeout: int,
-    metrics_bucket_duration: int,
     metrics_retention_duration: int,
 ) -> None:
     """Process a single task"""
@@ -273,7 +274,6 @@ async def process_task(
             agent=agent.name,
             task_id=task_id,
             owner_id=task.metadata.owner_id,
-            metrics_bucket_duration=metrics_bucket_duration,
         )
         parent_task_id = task.metadata.parent_id
         parent_keys = (
@@ -297,7 +297,7 @@ async def process_task(
         pending_tool_call_ids: list[str] | None,
         pending_child_task_ids: list[str] | None,
         final_output: dict[str, Any] | str | None,
-    ):
+    ) -> bool:
         try:
             result = await completion_script.execute(
                 queue_main_key=keys.queue_main,
@@ -503,7 +503,8 @@ async def process_task(
                 )
 
                 logger.info(
-                    f"⏳ Task awaiting child task results {colored(f'[{task.id}]', 'dim')}"
+                    f"⏳ Task awaiting child task results "
+                    f"{colored(f'[{task.id}]', 'dim')}"
                 )
                 await event_publisher.publish_event(
                     AgentEvent(
@@ -572,7 +573,7 @@ async def process_task(
                     final_output=None,
                 )
 
-                # granular batch progress updates are only supported for batches with max_turns set
+                # granular batch progress updates only for batches with max_turns
                 if task.metadata.batch_id and agent.max_turns:
                     await _publish_batch_progress(task.metadata.batch_id)
 
@@ -628,7 +629,7 @@ async def process_task(
         finally:
             # Only emit retry/failure events if the task actually failed
             if task_failed:
-                # If the task was marked as a permanent failure, don't treat it as a retry.
+                # If marked as permanent failure, don't treat it as a retry.
                 if final_action is CompletionAction.FAIL or task.retries >= max_retries:
                     logger.error(
                         f"❌ Task failed permanently {colored(f'[{task.id}]', 'dim')}"
@@ -639,7 +640,10 @@ async def process_task(
                             task_id=task.id,
                             owner_id=task.metadata.owner_id,
                             agent_name=agent.name,
-                            error=f"Agent {agent.name} failed to complete task {task.id} due to max retries ({max_retries})",
+                            error=(
+                                f"Agent {agent.name} failed to complete "
+                                f"task {task.id} (max retries: {max_retries})"
+                            ),
                         )
                     )
 
@@ -670,7 +674,6 @@ async def worker_loop(
     max_retries: int,
     heartbeat_interval: int,
     task_timeout: int,
-    metrics_bucket_duration: int,
     metrics_retention_duration: int,
 ) -> None:
     """Main worker loop"""
@@ -688,7 +691,6 @@ async def worker_loop(
                 batch_script=batch_script,
                 agent=agent,
                 batch_size=batch_size,
-                metrics_bucket_duration=metrics_bucket_duration,
                 metrics_ttl=metrics_retention_duration,
                 namespace=namespace,
             )
@@ -697,7 +699,8 @@ async def worker_loop(
 
             if tasks_to_process_ids:
                 logger.info(
-                    f"Worker {worker_id} got {len(tasks_to_process_ids)} tasks to process"
+                    f"Worker {worker_id} got "
+                    f"{len(tasks_to_process_ids)} tasks to process"
                 )
 
                 cancellation_task = (
@@ -726,7 +729,6 @@ async def worker_loop(
                             max_retries=max_retries,
                             heartbeat_interval=heartbeat_interval,
                             task_timeout=task_timeout,
-                            metrics_bucket_duration=metrics_bucket_duration,
                             metrics_retention_duration=metrics_retention_duration,
                         )
                     )

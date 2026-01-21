@@ -1,56 +1,65 @@
 from __future__ import annotations
-import random
-from typing import (
-    Any,
-    Callable,
-    Awaitable,
-    cast,
-    final,
-    Generic,
-    overload,
-    TypeVar,
-    get_origin,
-    get_args,
-)
-from functools import wraps
-from dataclasses import dataclass, field
-from openai import AsyncStream
-from openai.types.chat.chat_completion import Choice
-from pydantic import BaseModel
-import json
+
 import asyncio
 import inspect
+import json
+import random
+import uuid
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from functools import wraps
+from typing import (
+    Any,
+    Generic,
+    Literal,
+    TypeVar,
+    cast,
+    final,
+    get_args,
+    get_origin,
+    overload,
+)
+
 import httpx
+from openai import AsyncStream
 from openai.types.chat import (
     ChatCompletion,
     ChatCompletionChunk,
-    ChatCompletionMessageToolCall,
     ChatCompletionMessage,
+    ChatCompletionMessageToolCall,
 )
-from datetime import datetime, timezone
-import uuid
+from openai.types.chat.chat_completion import Choice
+from openai.types.chat.chat_completion_message_custom_tool_call import (
+    ChatCompletionMessageCustomToolCall,
+)
+from openai.types.chat.chat_completion_message_function_tool_call import (
+    ChatCompletionMessageFunctionToolCall,
+    Function as ToolCallFunction,
+)
+from pydantic import BaseModel
+
 from factorial.context import (
     AgentContext,
+    ContextType,
     ExecutionContext,
     execution_context,
-    ContextType,
 )
-from factorial.llms import Model, MultiClient
-from factorial.utils import (
-    serialize_data,
-    to_snake_case,
-    is_valid_task_id,
-    validate_callback_signature as _vcs,
-)
-from factorial.events import EventPublisher, AgentEvent
-from factorial.logging import get_logger
+from factorial.events import AgentEvent, EventPublisher
 from factorial.exceptions import RETRYABLE_EXCEPTIONS, FatalAgentError
+from factorial.llms import Model, MultiClient
+from factorial.logging import get_logger
 from factorial.tools import (
     FunctionTool,
     FunctionToolActionResult,
     convert_tools_list,
     create_final_output_tool,
-    function_tool,
+)
+from factorial.utils import (
+    is_valid_task_id,
+    serialize_data,
+    to_snake_case,
+    validate_callback_signature as _vcs,
 )
 
 logger = get_logger(__name__)
@@ -241,7 +250,7 @@ def publish_progress(
         actual_func_name = func_name or the_func.__name__
 
         @wraps(the_func)
-        async def wrapper(self: "BaseAgent[Any]", *args: Any, **kwargs: Any) -> T:
+        async def wrapper(self: BaseAgent[Any], *args: Any, **kwargs: Any) -> T:
             async def publish(
                 event_suffix: str,
                 data: dict[str, Any] | None = None,
@@ -369,7 +378,7 @@ class ModelSettings(Generic[ContextType]):
     parallel_tool_calls: bool | Callable[[ContextType], bool] | None = None
     max_completion_tokens: int | Callable[[ContextType], int] | None = None
 
-    def resolve(self, agent_ctx: ContextType) -> "ResolvedModelSettings":
+    def resolve(self, agent_ctx: ContextType) -> ResolvedModelSettings:
         return ResolvedModelSettings(
             temperature=self.temperature(agent_ctx)
             if callable(self.temperature)
@@ -479,7 +488,7 @@ class BaseAgent(Generic[ContextType]):
         self.on_pending_tool_results = on_pending_tool_results
         self.on_run_cancelled = on_run_cancelled
 
-        # --- Validate lifecycle callback signatures ---------------------------------- #
+        # --- Validate lifecycle callback signatures --- #
         _vcs("on_run_start", self.on_run_start, (AgentContext, ExecutionContext))
         _vcs("on_turn_start", self.on_turn_start, (AgentContext, ExecutionContext))
         _vcs(
@@ -515,7 +524,10 @@ class BaseAgent(Generic[ContextType]):
         agent_ctx: ContextType,
         response: ChatCompletion,
     ) -> None:
-        """Validate the completion response. Raise an InvalidLLMResponseError if the response is invalid."""
+        """Validate the completion response.
+
+        Raise an InvalidLLMResponseError if the response is invalid.
+        """
         pass
 
     async def completion(
@@ -530,7 +542,7 @@ class BaseAgent(Generic[ContextType]):
 
         execution_ctx = ExecutionContext.current()
 
-        # If ``max_turns`` is set we need to *force* the agent to finish on the final allowed turn.
+        # If max_turns is set, force the agent to finish on the final turn.
         is_last_turn = (
             self.max_turns is not None and agent_ctx.turn >= self.max_turns - 1
         )
@@ -568,7 +580,9 @@ class BaseAgent(Generic[ContextType]):
 
             res_id: str = ""
             created_ts: int | None = None
-            finish_reason: str | None = None
+            finish_reason: Literal[
+                "stop", "length", "tool_calls", "content_filter", "function_call"
+            ] | None = None
             usage: Any | None = None  # ``usage`` is populated in the last chunk
 
             res = cast(
@@ -608,7 +622,7 @@ class BaseAgent(Generic[ContextType]):
                             },
                         )
 
-                        # Static fields can arrive at any time – keep the first non-None.
+                        # Static fields can arrive anytime – keep first non-None.
                         if delta_tool.id is not None:
                             acc["id"] = delta_tool.id
                         if delta_tool.type is not None:
@@ -648,7 +662,13 @@ class BaseAgent(Generic[ContextType]):
                     )
 
             # Convert accumulated tool call data into the structured OpenAI type
-            formatted_tool_calls: list[ChatCompletionMessageToolCall] | None = None
+            formatted_tool_calls: (
+                list[
+                    ChatCompletionMessageFunctionToolCall
+                    | ChatCompletionMessageCustomToolCall
+                ]
+                | None
+            ) = None
             if tool_call_acc:
                 formatted_tool_calls = []
                 for idx in sorted(tool_call_acc.keys()):
@@ -664,10 +684,10 @@ class BaseAgent(Generic[ContextType]):
                         ChatCompletionMessageToolCall(
                             id=acc["id"] or f"call_{idx}",
                             type=acc["type"] or "function",
-                            function={  # type: ignore[arg-type]
-                                "name": acc["name"],
-                                "arguments": acc["arguments"],
-                            },
+                            function=ToolCallFunction(
+                                name=acc["name"],
+                                arguments=acc["arguments"],
+                            ),
                         )
                     )
 
@@ -840,7 +860,8 @@ class BaseAgent(Generic[ContextType]):
                     pending_child_task_ids = list(candidate_ids)
                 else:
                     raise ValueError(
-                        f"Forking tool '{tool_call.function.name}' returned invalid task IDs: {candidate_ids}"
+                        f"Forking tool '{tool_call.function.name}' "
+                        f"returned invalid task IDs: {candidate_ids}"
                     )
 
         if isinstance(result, FunctionToolActionResult):
@@ -878,32 +899,56 @@ class BaseAgent(Generic[ContextType]):
         result: Any | FunctionToolActionResult | Exception,
     ) -> tuple[str, Any | None, Exception | None]:
         if isinstance(result, Exception):
-            str_result = f'<tool_call_error tool="{tool_call.id}">\nError running tool:\n{result}\n</tool_call_error>'
+            str_result = (
+                f'<tool_call_error tool="{tool_call.id}">\n'
+                f"Error running tool:\n{result}\n</tool_call_error>"
+            )
             return str_result, None, result
         elif isinstance(result, FunctionToolActionResult):
-            str_result = f'<tool_call_result tool="{tool_call.id}">\n{result.output_str}\n</tool_call_result>'
+            str_result = (
+                f'<tool_call_result tool="{tool_call.id}">\n'
+                f"{result.output_str}\n</tool_call_result>"
+            )
             return str_result, result.output_data, None
         else:
-            str_result = f'<tool_call_result tool="{tool_call.id}">\n{str(result)}\n</tool_call_result>'
+            str_result = (
+                f'<tool_call_result tool="{tool_call.id}">\n'
+                f"{str(result)}\n</tool_call_result>"
+            )
             return str_result, result, None
 
     def format_tool_result(
         self, tool_call_id: str, result: Any | FunctionToolActionResult | Exception
     ) -> str:
         if isinstance(result, Exception):
-            return f'<tool_call_error tool="{tool_call_id}">\nError running tool:\n{result}\n</tool_call_error>'
+            return (
+                f'<tool_call_error tool="{tool_call_id}">\n'
+                f"Error running tool:\n{result}\n</tool_call_error>"
+            )
         elif isinstance(result, FunctionToolActionResult):
-            return f'<tool_call_result tool="{tool_call_id}">\n{result.output_str}\n</tool_call_result>'
+            return (
+                f'<tool_call_result tool="{tool_call_id}">\n'
+                f"{result.output_str}\n</tool_call_result>"
+            )
         else:
-            return f'<tool_call_result tool="{tool_call_id}">\n{str(result)}\n</tool_call_result>'
+            return (
+                f'<tool_call_result tool="{tool_call_id}">\n'
+                f"{str(result)}\n</tool_call_result>"
+            )
 
     def format_child_task_result(
         self, child_task_id: str, result: Any | Exception
     ) -> str:
         if isinstance(result, Exception):
-            return f'<sub_task_error sub_task_id="{child_task_id}">\nError running sub task:\n{result}\n</sub_task_error>'
+            return (
+                f'<sub_task_error sub_task_id="{child_task_id}">\n'
+                f"Error running sub task:\n{result}\n</sub_task_error>"
+            )
         else:
-            return f'<sub_task_result sub_task_id="{child_task_id}">\n{str(result)}\n</sub_task_result>'
+            return (
+                f'<sub_task_result sub_task_id="{child_task_id}">\n'
+                f"{str(result)}\n</sub_task_result>"
+            )
 
     async def execute_tools(
         self,
@@ -929,7 +974,7 @@ class BaseAgent(Generic[ContextType]):
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
         # Add results to messages
-        for tc, result in zip(tool_calls, results):
+        for tc, result in zip(tool_calls, results, strict=True):
             tool_call_results.append(
                 (
                     tc,
@@ -951,7 +996,7 @@ class BaseAgent(Generic[ContextType]):
                 logger.error(
                     f"Tool {tc.function.name} failed: {result}", exc_info=result
                 )
-                # Still need to add a tool response message to maintain conversation format
+                # Still need to add tool response to maintain conversation format
                 content = self.format_tool_result(tc.id, result)
                 new_messages.append(
                     {"role": "tool", "tool_call_id": tc.id, "content": content}
@@ -971,7 +1016,7 @@ class BaseAgent(Generic[ContextType]):
                     {"role": "tool", "tool_call_id": tc.id, "content": content}
                 )
 
-            # Propagate unrecoverable errors immediately so the worker can fail the task.
+            # Propagate unrecoverable errors so the worker can fail the task.
             if isinstance(result, FatalAgentError):
                 raise result
 
@@ -1036,8 +1081,14 @@ class BaseAgent(Generic[ContextType]):
         pending_tool_call_ids: list[str] = []
         pending_child_task_ids: list[str] = []
         if response.choices[0].message.tool_calls:
+            # Filter to only function tool calls (the only type we support)
+            function_tool_calls = [
+                tc
+                for tc in response.choices[0].message.tool_calls
+                if isinstance(tc, ChatCompletionMessageFunctionToolCall)
+            ]
             results = await self.execute_tools(
-                response.choices[0].message.tool_calls,
+                function_tool_calls,
                 agent_ctx,
             )
             messages += results.new_messages
@@ -1096,12 +1147,8 @@ class BaseAgent(Generic[ContextType]):
 
         if formatted_child_task_results:
             joined_results = "\n\n".join(formatted_child_task_results)
-            updated_messages.append(
-                {
-                    "role": "assistant",
-                    "content": f"<sub_task_results>\n{joined_results}\n</sub_task_results>",
-                }
-            )
+            content = f"<sub_task_results>\n{joined_results}\n</sub_task_results>"
+            updated_messages.append({"role": "assistant", "content": content})
 
         agent_ctx.messages = updated_messages
 
@@ -1166,16 +1213,21 @@ class BaseAgent(Generic[ContextType]):
         tool_calls = response.choices[0].message.tool_calls
 
         return (not tool_calls and self.output_type is None) or any(
-            tc.function.name == "final_output" for tc in tool_calls or []
+            isinstance(tc, ChatCompletionMessageFunctionToolCall)
+            and tc.function.name == "final_output"
+            for tc in tool_calls or []
         )
 
     def _prepare_instructions(self, agent_ctx: ContextType) -> str:
-        """Prepare instructions for LLM request. Override to customize instructions preparation."""
+        """Prepare instructions for LLM request. Override to customize."""
 
         instructions = self.resolve_instructions(agent_ctx)
 
         if self.max_turns:
-            instructions += f"\n\nYou must reach a final response in {self.max_turns} turns or less."
+            instructions += (
+                f"\n\nYou must reach a final response "
+                f"in {self.max_turns} turns or less."
+            )
         if (
             self.output_type
             and isinstance(self.output_type, type)
@@ -1188,7 +1240,7 @@ class BaseAgent(Generic[ContextType]):
         return instructions
 
     def prepare_messages(self, agent_ctx: ContextType) -> list[dict[str, Any]]:
-        """Prepare messages for LLM request. Override to customize message preparation."""
+        """Prepare messages for LLM request. Override to customize."""
         if agent_ctx.turn == 0:
             messages = (
                 [{"role": "system", "content": self._prepare_instructions(agent_ctx)}]
@@ -1218,9 +1270,15 @@ class BaseAgent(Generic[ContextType]):
 
         if tool_calls:
             for tool_call in tool_calls:
-                if tool_call.function.name == "final_output":
+                if (
+                    isinstance(tool_call, ChatCompletionMessageFunctionToolCall)
+                    and tool_call.function.name == "final_output"
+                ):
                     if self.parse_tool_args:
-                        return json.loads(tool_call.function.arguments)
+                        parsed: dict[str, Any] = json.loads(
+                            tool_call.function.arguments
+                        )
+                        return parsed
                     else:
                         return tool_call.function.arguments
 
@@ -1282,7 +1340,7 @@ class BaseAgent(Generic[ContextType]):
         agent_ctx: ContextType,
         event_handler: Callable[[AgentEvent], Awaitable[None]] | None = None,
     ) -> RunCompletion[ContextType]:
-        """Run the agent in-line, without any queued orchestration. Useful for simple use-cases."""
+        """Run the agent in-line, without orchestration. For simple use-cases."""
 
         # ------------------------------------------------------------------
         # Lightweight, *local* execution helper.
@@ -1330,7 +1388,8 @@ class BaseAgent(Generic[ContextType]):
                     or turn_completion.pending_child_task_ids
                 ):
                     raise RuntimeError(
-                        "Pending tool/child task results are not supported when running the agent locally."
+                        "Pending tool/child task results are not "
+                        "supported when running the agent locally."
                     )
 
                 if turn_completion.is_done:
@@ -1340,14 +1399,14 @@ class BaseAgent(Generic[ContextType]):
                 # reaches a final output.  `run_turn` increments `agent_ctx.turn`.
                 if self.max_turns is not None and agent_ctx.turn >= self.max_turns:
                     logger.warning(
-                        "Reached max_turns (%s) without final output, stopping the run.",
+                        "Reached max_turns (%s) without final output, stopping.",
                         self.max_turns,
                     )
                     break
 
             finished_at = datetime.now(timezone.utc)
 
-            run_completion = RunCompletion(
+            run_completion: RunCompletion = RunCompletion(
                 output=turn_completion.output,
                 started_at=started_at,
                 finished_at=finished_at,
@@ -1442,6 +1501,6 @@ class BaseAgent(Generic[ContextType]):
 
 
 class Agent(BaseAgent[AgentContext]):
-    """Base agent class that uses AgentContext by default. Use this for simple agents."""
+    """Base agent class using AgentContext by default. For simple agents."""
 
     pass

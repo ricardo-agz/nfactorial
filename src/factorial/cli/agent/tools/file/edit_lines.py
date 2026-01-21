@@ -1,7 +1,7 @@
 import os
 from pathlib import Path
 
-from ..utils import run_linter, replace_block, build_preview, build_full_file_preview
+from ..utils import build_full_file_preview, build_preview, replace_block, run_linter
 
 __all__ = ["edit_lines"]
 
@@ -20,11 +20,18 @@ def edit_lines(
     **Important authoring guidelines**
     1. *old_string* **must match the text in the target file exactly** - copy it
        verbatim from the source (including indentation).
-    2. *new_string* is inserted **verbatim** Do not introduce additional python-style escape sequences.
-    3. Keep replacements minimal: only the changed lines should differ between *old_string* and *new_string*.
-    4. `tolerance`: number of **extra lines** that the tool is allowed to look **above _and_ below** the `[start_line, end_line]` window when searching for `old_string`.
-        * With at tolerance of 0, the start_line - end_line slice must fully encompass **every line** of `old_string`. If even one character is outside that window, the replacement fails.
-        * For a more forgiving search, increase tolerance for the tool to automatically widen the search window.
+    2. *new_string* is inserted **verbatim** Do not introduce additional
+       python-style escape sequences.
+    3. Keep replacements minimal: only the changed lines should differ between
+       *old_string* and *new_string*.
+    4. `tolerance`: number of **extra lines** that the tool is allowed to look
+       **above _and_ below** the `[start_line, end_line]` window when searching
+       for `old_string`.
+        * With at tolerance of 0, the start_line - end_line slice must fully
+          encompass **every line** of `old_string`. If even one character is
+          outside that window, the replacement fails.
+        * For a more forgiving search, increase tolerance for the tool to
+          automatically widen the search window.
         * The default tolerance is 1.
     5. The *start_line* / *end_line* coordinates refer to the ORIGINAL file.
        This function automatically adjusts subsequent edits as earlier ones

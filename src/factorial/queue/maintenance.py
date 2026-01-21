@@ -1,22 +1,22 @@
-import random
-from typing import Any
-import redis.asyncio as redis
-import time
 import asyncio
+import random
+import time
+from typing import Any
+
+import redis.asyncio as redis
 
 from factorial.agent import BaseAgent
-from factorial.logging import get_logger, colored
+from factorial.logging import colored, get_logger
+from factorial.queue.keys import RedisKeys
 from factorial.queue.lua import (
     StaleRecoveryScript,
+    StaleRecoveryScriptResult,
     TaskExpirationScript,
+    TaskExpirationScriptResult,
+    create_backoff_recovery_script,
     create_stale_recovery_script,
     create_task_expiration_script,
-    create_backoff_recovery_script,
-    StaleRecoveryScriptResult,
-    TaskExpirationScriptResult,
 )
-from factorial.queue.keys import RedisKeys
-
 
 logger = get_logger(__name__)
 
@@ -28,7 +28,6 @@ async def recover_stale_tasks(
     heartbeat_timeout: int,
     max_retries: int,
     batch_size: int,
-    metrics_bucket_duration: int,
     metrics_retention_duration: int,
 ) -> int:
     """Atomically move stale tasks back to main queue"""
@@ -37,7 +36,6 @@ async def recover_stale_tasks(
     keys = RedisKeys.format(
         namespace=namespace,
         agent=agent.name,
-        metrics_bucket_duration=metrics_bucket_duration,
     )
 
     try:
@@ -63,8 +61,10 @@ async def recover_stale_tasks(
         failed_count = result.failed_count
         stale_task_actions = result.stale_task_actions
         if recovered_count > 0:
+            total_stale = recovered_count + failed_count
             logger.warning(
-                f"⚠️ Found {recovered_count + failed_count} tasks with stale heartbeats (>{heartbeat_timeout}s)"
+                f"⚠️ Found {total_stale} tasks with stale "
+                f"heartbeats (>{heartbeat_timeout}s)"
             )
             if recovered_count > 0:
                 logger.info(
@@ -72,7 +72,8 @@ async def recover_stale_tasks(
                 )
             if failed_count > 0:
                 logger.error(
-                    f"❌ Moved {failed_count} tasks to failed queue (max retries exceeded)"
+                    f"❌ Moved {failed_count} tasks to failed queue "
+                    "(max retries exceeded)"
                 )
 
             for task_id, action in stale_task_actions:
@@ -94,7 +95,7 @@ async def recover_backoff_tasks(
     agent: BaseAgent[Any],
     batch_size: int,
 ) -> int:
-    """Move tasks from backoff queue back to main queue when their backoff time has expired"""
+    """Move tasks from backoff queue back to main queue when backoff expires."""
     keys = RedisKeys.format(namespace=namespace, agent=agent.name)
 
     try:
@@ -198,7 +199,8 @@ async def cleanup_finished_batches(
     """Remove batch bookkeeping data after *completed_ttl* seconds.
 
     The function deletes:
-      • hash entries in *batch_meta*, *batch_tasks*, *batch_remaining_tasks*, *batch_progress*
+      • hash entries in *batch_meta*, *batch_tasks*, *batch_remaining_tasks*,
+        *batch_progress*
       • the ZSET entry in *batch_completed*
 
     Returns the number of batches cleaned.
@@ -246,16 +248,16 @@ async def maintenance_loop(
     interval: int,
     task_ttl_config: Any,  # Will be TaskTTLConfig from manager.py
     max_cleanup_batch: int,
-    metrics_bucket_duration: int,
     metrics_retention_duration: int,
 ) -> None:
-    """Background maintenance worker to periodically recover stale tasks and clean up expired tasks"""
+    """Background maintenance worker to recover stale tasks and clean up."""
     redis_client = redis.Redis(connection_pool=redis_pool, decode_responses=True)
     recovery_script = await create_stale_recovery_script(redis_client)
     task_expiration_script = await create_task_expiration_script(redis_client)
 
     logger.info(
-        f"Maintenance worker started (checking every {interval}s for stale tasks >{heartbeat_timeout}s old and cleaning expired tasks)"
+        f"Maintenance worker started (checking every {interval}s for "
+        f"stale tasks >{heartbeat_timeout}s old and cleaning expired tasks)"
     )
 
     try:
@@ -267,7 +269,6 @@ async def maintenance_loop(
                     heartbeat_timeout=heartbeat_timeout,
                     max_retries=max_retries,
                     batch_size=batch_size,
-                    metrics_bucket_duration=metrics_bucket_duration,
                     metrics_retention_duration=metrics_retention_duration,
                     namespace=namespace,
                 )

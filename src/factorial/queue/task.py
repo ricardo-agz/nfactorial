@@ -1,21 +1,21 @@
-from enum import Enum
+import json
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-import uuid
-import json
-from typing import Generic, Type, Any, cast
+from enum import Enum
+from typing import Any, Generic, cast
+
 import redis.asyncio as redis
 
-from factorial.utils import decode
 from factorial.context import ContextType
 from factorial.exceptions import (
-    TaskNotFoundError,
-    InvalidTaskIdError,
-    CorruptedTaskDataError,
     BatchNotFoundError,
+    CorruptedTaskDataError,
+    InvalidTaskIdError,
+    TaskNotFoundError,
 )
 from factorial.queue.keys import RedisKeys
-from factorial.utils import is_valid_task_id
+from factorial.utils import decode, is_valid_task_id
 
 
 class TaskStatus(str, Enum):
@@ -49,7 +49,7 @@ class TaskMetadata:
         }
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]):
+    def from_dict(cls, data: dict[str, Any]) -> "TaskMetadata":
         data["created_at"] = datetime.fromtimestamp(
             float(data["created_at"]), tz=timezone.utc
         )
@@ -59,7 +59,7 @@ class TaskMetadata:
         return json.dumps(self.to_dict())
 
     @classmethod
-    def from_json(cls, json_str: str | bytes):
+    def from_json(cls, json_str: str | bytes) -> "TaskMetadata":
         return cls.from_dict(json.loads(decode(json_str)))
 
 
@@ -111,19 +111,22 @@ class Task(Generic[ContextType]):
     def from_dict(
         cls,
         data: dict[str, Any],
-        context_class: Type[ContextType],
+        context_class: type[ContextType],
     ) -> "Task[ContextType]":
         status = TaskStatus(data["status"])
         metadata = TaskMetadata.from_dict(data["metadata"])
 
+        payload: ContextType
         if data["payload"]:
             if isinstance(data["payload"], dict):
-                payload = context_class.from_dict(cast(dict[str, Any], data["payload"]))
+                payload_dict = cast(dict[str, Any], data["payload"])
+                payload = cast(ContextType, context_class.from_dict(payload_dict))
             else:
                 payload_str = decode(data["payload"])
-                payload = context_class.from_dict(json.loads(payload_str))
+                payload_dict = json.loads(payload_str)
+                payload = cast(ContextType, context_class.from_dict(payload_dict))
         else:
-            payload = context_class.from_dict({})
+            payload = cast(ContextType, context_class.from_dict({}))
 
         return cls(
             id=data["id"],
@@ -137,7 +140,7 @@ class Task(Generic[ContextType]):
 
     @classmethod
     def from_json(
-        cls, json_str: str | bytes, context_class: Type[ContextType]
+        cls, json_str: str | bytes, context_class: type[ContextType]
     ) -> "Task[ContextType]":
         data = json.loads(decode(json_str))
         return cls.from_dict(data, context_class)

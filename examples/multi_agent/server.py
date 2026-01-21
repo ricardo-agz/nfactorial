@@ -1,15 +1,15 @@
+from contextlib import asynccontextmanager
+from typing import Any
+
+import redis.asyncio as redis
+from agent import basic_agent, orchestrator
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-import redis.asyncio as redis
-from redis.asyncio.client import Redis as RedisType, PubSub
 from pydantic import BaseModel
-from typing import Any
-from contextlib import asynccontextmanager
+from redis.asyncio.client import PubSub, Redis as RedisType
 from starlette.websockets import WebSocket, WebSocketDisconnect
+
 from factorial import AgentContext
-
-from agent import basic_agent, orchestrator
-
 
 WS_REDIS_SUB_TIMEOUT = 5.0  # seconds
 
@@ -54,7 +54,8 @@ async def websocket_updates(websocket: WebSocket, user_id: str):
     pubsub: PubSub = redis_client.pubsub()  # type: ignore
     channel = orchestrator.get_updates_channel(owner_id=user_id)
     print(
-        f"WebSocket connection established for user_id={user_id}, subscribing to channel={channel}"
+        f"WebSocket connection established for user_id={user_id}, "
+        f"subscribing to channel={channel}"
     )
     await pubsub.subscribe(channel)  # type: ignore
 
@@ -75,7 +76,8 @@ async def websocket_updates(websocket: WebSocket, user_id: str):
         await pubsub.unsubscribe(channel)  # type: ignore
         await pubsub.aclose()
         print(
-            f"WebSocket cleanup completed for user_id={user_id}, unsubscribed from channel={channel}"
+            f"WebSocket cleanup completed for user_id={user_id}, "
+            f"unsubscribed from channel={channel}"
         )
 
 
@@ -126,7 +128,8 @@ async def steer_task_endpoint(request: SteerRequest) -> dict[str, Any]:
         )
 
         print(
-            f"Steering messages sent for task {request.task_id} by user {request.user_id}"
+            f"Steering messages sent for task {request.task_id} "
+            f"by user {request.user_id}"
         )
         return {
             "success": True,
@@ -136,7 +139,7 @@ async def steer_task_endpoint(request: SteerRequest) -> dict[str, Any]:
         raise HTTPException(
             status_code=500,
             detail=f"Failed to steer task {request.task_id}: {str(e)}",
-        )
+        ) from e
 
 
 @app.post("/api/cancel")
@@ -153,11 +156,14 @@ async def cancel_task_endpoint(request: CancelRequest) -> dict[str, Any]:
         }
     except Exception as e:
         import traceback
-        print(f"Error cancelling task {request.task_id}: {str(e)}", traceback.format_exc())
+        print(
+            f"Error cancelling task {request.task_id}: {str(e)}",
+            traceback.format_exc(),
+        )
         raise HTTPException(
             status_code=500,
             detail=f"Failed to cancel task {request.task_id}: {str(e)}",
-        )
+        ) from e
 
 
 if __name__ == "__main__":

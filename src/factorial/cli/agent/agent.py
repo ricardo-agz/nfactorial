@@ -1,20 +1,22 @@
 import os
-from typing import Callable
+from collections.abc import Callable
+
 import httpx
 from dotenv import load_dotenv
 from pydantic import BaseModel
+
 from factorial import (
-    BaseAgent,
     AgentContext,
-    ModelSettings,
+    BaseAgent,
     Model,
+    ModelSettings,
     MultiClient,
 )
 
 from .tools.file import file_tools
 from .tools.project import project_tools
 from .tools.search import search_tools
-from .tools.thinking import think, plan, design_doc
+from .tools.thinking import design_doc, plan, think
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
 env_path = os.path.join(current_dir, ".env")
@@ -50,7 +52,7 @@ class NFactorialAgent(BaseAgent[CLIAgentContext]):
     def __init__(
         self,
         mode: str,
-        model: Callable[[CLIAgentContext], Model],
+        model: Model | Callable[[CLIAgentContext], Model],
         client: MultiClient,
     ):
         model_name = model.name if isinstance(model, Model) else "default"

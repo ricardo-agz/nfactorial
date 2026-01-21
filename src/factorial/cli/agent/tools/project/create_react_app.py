@@ -10,14 +10,17 @@ def create_react_app(
     """Scaffold a NEW React application using create-react-app.
 
     Usage:
-    This should ONLY be used to initialize a NEW frontend project. Do NOT use this if the current project already has a frontend
-    directory set up, work off of the existing frontend directory instead.
+    This should ONLY be used to initialize a NEW frontend project. Do NOT use
+    this if the current project already has a frontend directory set up, work
+    off of the existing frontend directory instead.
 
     Args:
         project_name: Name of the directory / project to generate.
         language: "typescript" (default) or "javascript".
         with_tailwind:
-        * **True** → install and configure Tailwind CSS by running `npx tailwindcss init -p` and injecting Tailwind CSS directives into `src/index.css`
+        * **True** → install and configure Tailwind CSS by running
+          `npx tailwindcss init -p` and injecting Tailwind CSS directives
+          into `src/index.css`
         * **False** → skip
     """
     if language not in ("typescript", "javascript"):
@@ -43,10 +46,10 @@ def create_react_app(
                     cwd=project_name,
                 )
             )
-            # 3. Initialise Tailwind configuration (generates tailwind.config.js & postcss.config.js)
+            # 3. Initialise Tailwind config (tailwind.config.js & postcss.config.js)
             logs.append(run(["npx", "tailwindcss", "init", "-p"], cwd=project_name))
 
-            # 4. Replace the main CSS file with Tailwind directives so the framework is active immediately
+            # 4. Replace the main CSS file with Tailwind directives
             index_css = os.path.join(project_name, "src", "index.css")
             with open(index_css, "w") as fh:
                 fh.write(
@@ -62,10 +65,11 @@ def create_react_app(
         ]
         if with_tailwind:
             summary_lines.append(
-                "Tailwind CSS was installed and configured (tailwind.config.js, postcss.config.js, and src/index.css updated)."
+                "Tailwind CSS was installed and configured "
+                "(tailwind.config.js, postcss.config.js, and src/index.css updated)."
             )
 
-        # Join logs, truncate if excessively long (>4000 chars) to avoid flooding the caller
+        # Join logs, truncate if excessively long (>4000 chars)
         logs_text = "\n\n".join(logs)
         max_len = 4000
         if len(logs_text) > max_len:
@@ -75,6 +79,9 @@ def create_react_app(
         return "\n".join(summary_lines)
 
     except subprocess.CalledProcessError as exc:
-        # We already captured the failing command's output in `logs`, so surface that too
+        # Surface the failing command's output
         error_logs = "\n\n".join(logs)
-        return f"Error during create-react-app execution: {exc}\n\n--- Partial Logs ---\n{error_logs}"
+        return (
+            f"Error during create-react-app execution: {exc}\n\n"
+            f"--- Partial Logs ---\n{error_logs}"
+        )

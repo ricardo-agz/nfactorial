@@ -21,7 +21,7 @@ classifiers = [
 ]
 dependencies = [
     "python-dotenv>=1.0.0",
-    "openai>=1.81.0",
+    "openai>=2.0.0",
     "pydantic>=2.10,<3",
     "redis>=6.1.0",
     "fastapi>=0.110.0,<1",

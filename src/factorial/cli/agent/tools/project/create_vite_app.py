@@ -10,16 +10,19 @@ def create_vite_app(
     """Scaffold a React application using **Vite**.
 
     Usage:
-    This should ONLY be used to initialize a NEW frontend project. Do NOT use this if the current project already has a frontend
-    directory set up, work off of the existing frontend directory instead.
+    This should ONLY be used to initialize a NEW frontend project. Do NOT use
+    this if the current project already has a frontend directory set up, work
+    off of the existing frontend directory instead.
 
     Args:
         project_name: Name of the directory / project to generate.
         language: "typescript" (default) or "javascript".
         with_tailwind:
-            * **True** → install and configure Tailwind CSS v4+ with ``@tailwindcss/postcss`` plugin,
-              create proper PostCSS configuration, and inject Tailwind CSS directives into ``src/index.css``.
-              Note: Tailwind v4+ doesn't require a tailwind.config.js file for basic setup.
+            * **True** → install and configure Tailwind CSS v4+ with
+              ``@tailwindcss/postcss`` plugin, create proper PostCSS config,
+              and inject Tailwind CSS directives into ``src/index.css``.
+              Note: Tailwind v4+ doesn't require a tailwind.config.js for
+              basic setup.
             * **False** → skip Tailwind CSS setup.
     """
 
@@ -94,24 +97,23 @@ export default {
   plugins: [],
 }
 """)
-            logs.append(
-                f"# Created Tailwind configuration at {os.path.relpath(tailwind_config)}"
-            )
+            relative_config = os.path.relpath(tailwind_config)
+            logs.append(f"# Created Tailwind configuration at {relative_config}")
 
             # 5. Inject Tailwind directives into the main CSS entry point
             index_css = os.path.join(project_name, "src", "index.css")
             if os.path.isfile(index_css):
                 with open(index_css, "w", encoding="utf-8") as fh:
                     fh.write('@import "tailwindcss";\n')
-                logs.append(
-                    f"# Injected Tailwind CSS directives into {os.path.relpath(index_css)}"
-                )
+                relative_css = os.path.relpath(index_css)
+                logs.append(f"# Injected Tailwind CSS directives into {relative_css}")
 
         # Compose human-readable summary
         summary_lines = [f"Vite app '{project_name}' created successfully."]
         if with_tailwind:
             summary_lines.append(
-                "Tailwind CSS v4+ was installed and fully configured (postcss.config.js and src/index.css updated)."
+                "Tailwind CSS v4+ was installed and fully configured "
+                "(postcss.config.js and src/index.css updated)."
             )
 
         # Concatenate logs and truncate if too long
@@ -126,4 +128,7 @@ export default {
 
     except subprocess.CalledProcessError as exc:
         error_logs = "\n\n".join(logs)
-        return f"Error during Vite app creation: {exc}\n\n--- Partial Logs ---\n{error_logs}"
+        return (
+            f"Error during Vite app creation: {exc}\n\n"
+            f"--- Partial Logs ---\n{error_logs}"
+        )

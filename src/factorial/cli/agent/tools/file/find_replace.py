@@ -1,7 +1,7 @@
 import os
 from pathlib import Path
 
-from ..utils import run_linter, replace_block, build_preview, build_full_file_preview
+from ..utils import build_full_file_preview, build_preview, replace_block, run_linter
 
 
 def find_replace(
@@ -15,10 +15,15 @@ def find_replace(
     """Replace *old_string* with *new_string* in *file_path*.
 
     **Authoring guidelines**
-    - *old_string* **must** be copied verbatim from the source - do not add escape sequences.
-    - *new_string* is inserted **verbatim** Do not introduce additional python-style escape sequences.
-    - Set *replace_all* to *True* only when you are confident that every match should be changed - otherwise the first occurrence is safer.
-    - If *fuzzy* is *True*, whitespace-insensitive matching is used and minor formatting changes do not prevent a hit. When *replace_all* is *False* only the first occurrence is substituted.
+    - *old_string* **must** be copied verbatim from the source - do not add
+      escape sequences.
+    - *new_string* is inserted **verbatim** Do not introduce additional
+      python-style escape sequences.
+    - Set *replace_all* to *True* only when you are confident that every match
+      should be changed - otherwise the first occurrence is safer.
+    - If *fuzzy* is *True*, whitespace-insensitive matching is used and minor
+      formatting changes do not prevent a hit. When *replace_all* is *False*
+      only the first occurrence is substituted.
     """
     file_path = os.path.abspath(file_path)
     if old_string == new_string:
@@ -59,9 +64,10 @@ def find_replace(
         # Show full file with line numbers
         preview = build_full_file_preview(final_lines)
 
+    mode = "fuzzy" if fuzzy else "strict"
     msg = (
         f"Successfully replaced {count} occurrence{'s' if count != 1 else ''}"
-        f" ({'fuzzy' if fuzzy else 'strict'}) in {file_path}. New file contents:\n{preview}"
+        f" ({mode}) in {file_path}. New file contents:\n{preview}"
     )
     if lint_errors:
         msg += f"\nLinter warnings:\n{lint_errors}"

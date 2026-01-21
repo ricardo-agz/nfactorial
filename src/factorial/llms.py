@@ -1,26 +1,39 @@
+import json
+import os
+import random
+import re
+import string
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
-import os
-import re
-import random
-import string
-from typing import Any, Callable, cast
-from dotenv import load_dotenv
-import httpx
-import json
-from openai import AsyncOpenAI
+from typing import Any
 
+import httpx
+from dotenv import load_dotenv
+from openai import AsyncOpenAI
+from openai._streaming import AsyncStream
 from openai.types.chat import (
     ChatCompletion,
     ChatCompletionChunk,
     ChatCompletionMessageToolCall,
 )
+from openai.types.chat.chat_completion_message_custom_tool_call import (
+    ChatCompletionMessageCustomToolCall,
+)
+from openai.types.chat.chat_completion_message_function_tool_call import (
+    ChatCompletionMessageFunctionToolCall,
+)
 from openai.types.chat.chat_completion_message_tool_call import Function
 from openai.types.chat.completion_create_params import ResponseFormat
-from openai._streaming import AsyncStream
 from pydantic import BaseModel
 
 load_dotenv()
+
+
+# Type alias for tool calls that matches what the SDK expects
+ToolCallList = list[
+    ChatCompletionMessageFunctionToolCall | ChatCompletionMessageCustomToolCall
+]
 
 
 class ToolSupportWrapper:
@@ -29,7 +42,7 @@ class ToolSupportWrapper:
         instructions: Callable[
             [list[dict[str, Any]], dict[str, Any] | str | None, bool], str
         ],
-        parser: Callable[[str], tuple[str, list[ChatCompletionMessageToolCall]]],
+        parser: Callable[[str], tuple[str, ToolCallList]],
     ):
         self.instructions = instructions
         self.parser = parser
@@ -60,11 +73,12 @@ class Model:
 def fallback_models(*models: "Model") -> Callable[[Any], "Model"]:  # noqa: D401
     """Return a model-selection callable cycling through *models* by retry attempt.
 
-    The callable can be passed to the ``model`` parameter of :class:`factorial.agent.BaseAgent`.
-    Inside the agent, the current retry index is exposed via ``agent_ctx.attempt`` which is
-    automatically updated by the built-in ``@retry`` decorator.  The selector will return
-    ``models[attempt]`` for the *n*-th retry, falling back to the last model once the list is
-    exhausted.
+    The callable can be passed to the ``model`` parameter of
+    :class:`factorial.agent.BaseAgent`. Inside the agent, the current retry
+    index is exposed via ``agent_ctx.attempt`` which is automatically updated
+    by the built-in ``@retry`` decorator. The selector will return
+    ``models[attempt]`` for the *n*-th retry, falling back to the last model
+    once the list is exhausted.
 
     Example
     -------
@@ -178,31 +192,28 @@ class MultiClient:
                 http_client=self.http_client,
             )
 
-    async def _client_completion(
-        self,
-        model_obj: Model,
-        **kwargs: Any,
-    ) -> ChatCompletion | AsyncStream[ChatCompletionChunk]:
+    def _get_client(self, model_obj: Model) -> AsyncOpenAI:
+        """Get the appropriate OpenAI-compatible client for the model's provider."""
         if model_obj.provider == Provider.OPENAI:
             if not self.openai:
                 raise ValueError("OpenAI client not initialized")
-            return await self.openai.chat.completions.create(**kwargs)
+            return self.openai
         if model_obj.provider == Provider.XAI:
             if not self.xai:
                 raise ValueError("XAI client not initialized")
-            return await self.xai.chat.completions.create(**kwargs)
+            return self.xai
         if model_obj.provider == Provider.ANTHROPIC:
             if not self.anthropic:
                 raise ValueError("Anthropic client not initialized")
-            return await self.anthropic.chat.completions.create(**kwargs)
+            return self.anthropic
         if model_obj.provider == Provider.FIREWORKS:
             if not self.fireworks:
                 raise ValueError("Fireworks client not initialized")
-            return await self.fireworks.chat.completions.create(**kwargs)
+            return self.fireworks
         if model_obj.provider == Provider.AI_GATEWAY:
             if not self.ai_gateway:
                 raise ValueError("AI Gateway client not initialized")
-            return await self.ai_gateway.chat.completions.create(**kwargs)
+            return self.ai_gateway
 
         raise ValueError(f"Unsupported provider: {model_obj.provider}")
 
@@ -219,28 +230,14 @@ class MultiClient:
         response_format: ResponseFormat | type[BaseModel] | None = None,
         **kwargs: Any,
     ) -> ChatCompletion | AsyncStream[ChatCompletionChunk]:
-        kwargs["model"] = model.provider_model_id
-        kwargs["messages"] = messages
-        kwargs["stream"] = stream
-
-        if max_completion_tokens:
-            kwargs["max_completion_tokens"] = max_completion_tokens
-        if temperature:
-            kwargs["temperature"] = temperature
-        if tools and not model.custom_tool_support:
-            kwargs["tools"] = tools
-        if tool_choice and not model.custom_tool_support:
-            kwargs["tool_choice"] = tool_choice
-        if parallel_tool_calls is not None and not model.custom_tool_support:
-            kwargs["parallel_tool_calls"] = parallel_tool_calls
-        if response_format:
-            kwargs["response_format"] = response_format
-
         if stream and model.custom_tool_support:
             raise ValueError(
-                "Streaming is not supported for this model when custom tool support is provided"
+                "Streaming is not supported for this model "
+                "when custom tool support is provided"
             )
 
+        # Prepare messages (potentially with custom tool instructions)
+        final_messages = messages
         if model.custom_tool_support and tools:
             custom_system_message = [
                 {
@@ -252,11 +249,40 @@ class MultiClient:
                     ),
                 }
             ]
-            kwargs["messages"] = custom_system_message + messages
+            final_messages = custom_system_message + messages
 
-        response = await self._client_completion(model, **kwargs)
+        client = self._get_client(model)
+
+        # Build request parameters - start with any extra kwargs passed through
+        request_params: dict[str, Any] = {**kwargs}
+
+        # Set core required parameters
+        request_params["model"] = model.provider_model_id
+        request_params["messages"] = final_messages
+        request_params["stream"] = stream
+
+        # Add optional parameters only if provided
+        if max_completion_tokens is not None:
+            request_params["max_completion_tokens"] = max_completion_tokens
+        if temperature is not None:
+            request_params["temperature"] = temperature
+        if tools and not model.custom_tool_support:
+            request_params["tools"] = tools
+        if tool_choice and not model.custom_tool_support:
+            request_params["tool_choice"] = tool_choice
+        if parallel_tool_calls is not None and not model.custom_tool_support:
+            request_params["parallel_tool_calls"] = parallel_tool_calls
+        if response_format is not None:
+            request_params["response_format"] = response_format
+
+        response: ChatCompletion | AsyncStream[ChatCompletionChunk] = (
+            await client.chat.completions.create(**request_params)
+        )
+
+        # Post-process for custom tool support
         if model.custom_tool_support:
-            response = cast(ChatCompletion, response)
+            # Custom tool support only works with non-streaming responses
+            assert isinstance(response, ChatCompletion)
             for choice in response.choices:
                 raw_content = choice.message.content or ""
                 content, tool_calls = model.custom_tool_support.parser(raw_content)
@@ -265,7 +291,7 @@ class MultiClient:
 
         return response
 
-    async def close(self):
+    async def close(self) -> None:
         """Close HTTP clients to clean up connections"""
         if hasattr(self, "openai") and self.openai and self.openai._client:
             await self.openai._client.aclose()
@@ -280,14 +306,16 @@ class MultiClient:
 
 
 base_tool_instructions_template = """
-In this environment you have access to a set of tools you can use to answer the user's question.
+In this environment you have access to tools to answer the user's question.
 
-You can invoke functions by writing a "<tool_call>" block like the following as part of your reply to the user:
+You can invoke functions by writing a "<tool_call>" block like the following:
 <tool_call>
-{{"name": "TOOL_NAME", "arguments": {{"ARGUMENT_1_NAME": "ARGUMENT_1_VALUE", "ARGUMENT_2_NAME": "ARGUMENT_2_VALUE", ...}}}}
+{{"name": "TOOL_NAME", "arguments": {{"ARG_1": "VALUE_1", "ARG_2": "VALUE_2", ...}}}}
 </tool_call>
 
-String and scalar parameters should be specified as is, while lists and objects should use JSON format. Note that spaces for string values are not stripped. The output is not expected to be valid XML and is parsed with regular expressions.
+String and scalar parameters should be specified as is, while lists and objects
+should use JSON format. Spaces for string values are not stripped. The output
+is not expected to be valid XML and is parsed with regular expressions.
 
 Here are the functions available in JSONSchema format:
 <tools>
@@ -309,9 +337,15 @@ def base_tool_instructions(
     tools_json = json.dumps(tools, indent=2)
 
     if isinstance(tool_choice, dict):
-        tool_choice_instructions = f"\nYou are ONLY allowed to use the tool `{tool_choice.get('name')}` for this response."
+        tool_name = tool_choice.get("name")
+        tool_choice_instructions = (
+            f"\nYou are ONLY allowed to use the tool `{tool_name}` for this response."
+        )
         if parallel_tool_calls:
-            tool_choice_instructions += "\nYou are allowed to call this tool multiple times to be executed in parallel if necessary."
+            tool_choice_instructions += (
+                "\nYou are allowed to call this tool multiple times "
+                "to be executed in parallel if necessary."
+            )
         else:
             tool_choice_instructions += "\nYou are only allowed to call this tool once."
     elif isinstance(tool_choice, str):
@@ -320,15 +354,25 @@ def base_tool_instructions(
                 "\nYou are REQUIRED to use a tool for this response."
             )
             if parallel_tool_calls:
-                tool_choice_instructions += "\nYour response MUST invoke at least one tool and you are allowed to call multiple tools to be executed in parallel if necessary."
+                tool_choice_instructions += (
+                    "\nYour response MUST invoke at least one tool and you are "
+                    "allowed to call multiple tools to be executed in parallel "
+                    "if necessary."
+                )
             else:
                 tool_choice_instructions += (
                     "\nYour response MUST invoke exactly one tool."
                 )
         elif tool_choice == "auto":
-            tool_choice_instructions = "\nDetermine if any tools are required to complete the request. If so, use the appropriate tool(s)."
+            tool_choice_instructions = (
+                "\nDetermine if any tools are required to complete the request. "
+                "If so, use the appropriate tool(s)."
+            )
             if parallel_tool_calls:
-                tool_choice_instructions += "\nYou are allowed to call multiple tools to be executed in parallel if necessary."
+                tool_choice_instructions += (
+                    "\nYou are allowed to call multiple tools "
+                    "to be executed in parallel if necessary."
+                )
             else:
                 tool_choice_instructions += (
                     "\nYour response may not invoke more than one tool."
@@ -346,7 +390,7 @@ def base_tool_instructions(
     )
 
 
-def base_tool_parser(response: str) -> tuple[str, list[ChatCompletionMessageToolCall]]:
+def base_tool_parser(response: str) -> tuple[str, ToolCallList]:
     # pattern for qwen models
     pattern_a = re.compile(
         r"<tool_call>(?P<json>.*?)</tool_call>", re.DOTALL | re.IGNORECASE
@@ -360,7 +404,8 @@ def base_tool_parser(response: str) -> tuple[str, list[ChatCompletionMessageTool
         re.DOTALL | re.IGNORECASE,
     )
 
-    # pattern for simplified openai format: <|tool_call|>FUNC<|tool_call_argument|>{...}<|tool_call|>
+    # pattern for simplified openai format:
+    # <|tool_call|>FUNC<|tool_call_argument|>{...}<|tool_call|>
     pattern_c = re.compile(
         r"<\|tool_call\|>(?P<func>[^<]+?)"  # function name + optional id
         r"<\|tool_call_argument\|>(?P<args>.*?)"  # JSON args
@@ -506,7 +551,7 @@ def base_tool_parser(response: str) -> tuple[str, list[ChatCompletionMessageTool
             random.choices(string.ascii_letters + string.digits, k=8)
         )
 
-    parsed_tool_calls: list[ChatCompletionMessageToolCall] = []
+    parsed_tool_calls: ToolCallList = []
     for tool in tool_dicts:
         try:
             parsed_tool_calls.append(

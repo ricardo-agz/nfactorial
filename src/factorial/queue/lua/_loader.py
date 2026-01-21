@@ -1,9 +1,10 @@
+import json
 from dataclasses import dataclass
 from pathlib import Path
-import json
+from typing import Any, TypeVar, cast
+
 import redis.asyncio as redis
 from redis.commands.core import AsyncScript
-from typing import Type, TypeVar, Any, cast
 
 from factorial.utils import decode
 
@@ -51,7 +52,7 @@ def get_cached_script(client: redis.Redis, name: str, cls: type[T]) -> T:
 
 
 def create_script(
-    redis_client: redis.Redis, script_name: str, script_class: Type[T]
+    redis_client: redis.Redis, script_name: str, script_class: type[T]
 ) -> T:
     """Create a Redis script from a Lua file"""
     script_content = load_script(script_name)

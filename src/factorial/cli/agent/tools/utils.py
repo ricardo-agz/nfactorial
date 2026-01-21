@@ -1,7 +1,8 @@
-import os
-import subprocess
 import json
+import os
 import re
+import subprocess
+from typing import Any
 
 
 def run_linter(file_path: str) -> str | None:
@@ -109,7 +110,7 @@ def run_pyright(file_path: str) -> str | None:
 
 def line_count(file_path: str) -> int:
     try:
-        with open(file_path, "r", encoding="utf-8", errors="ignore") as handle:
+        with open(file_path, encoding="utf-8", errors="ignore") as handle:
             return sum(1 for _ in handle)
     except Exception:
         return 0
@@ -176,7 +177,7 @@ def replace_block(
     replace_all: bool = False,
     fuzzy: bool = True,
 ) -> tuple[str, int]:
-    """Return *(new_content, replacements_made)* after replacing *old* with *new*.
+    r"""Return *(new_content, replacements_made)* after replacing *old* with *new*.
 
     When *fuzzy* is *True*, contiguous whitespace in *old* is treated as a
     wildcard (``\s+``) so that indentation / line breaks do not affect the
@@ -208,7 +209,7 @@ def count_occurrences(content: str, substring: str) -> int:
     return content.count(substring)
 
 
-def run(cmd: list[str], **kwargs) -> str:
+def run(cmd: list[str], **kwargs: Any) -> str:
     """Wrapper around subprocess.run that captures stdout/stderr."""
     completed = subprocess.run(
         cmd, capture_output=True, text=True, check=True, **kwargs

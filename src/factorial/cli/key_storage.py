@@ -5,11 +5,11 @@ import os
 from pathlib import Path
 
 try:
-    import keyring
-    from keyring import errors as keyring_errors  # type: ignore
+    import keyring  # type: ignore[import-not-found]
+    from keyring import errors as keyring_errors  # type: ignore[import-not-found]
 except ModuleNotFoundError:  # pragma: no cover
-    keyring = None  # type: ignore
-    keyring_errors = None  # type: ignore
+    keyring = None  # type: ignore[assignment]
+    keyring_errors = None  # type: ignore[assignment]
 
 
 SERVICE_NAME = "nfactorial"
@@ -35,7 +35,8 @@ class KeyStorage:
     def _load_file() -> dict[str, str | dict[str, str]]:
         if CONFIG_FILE.exists():
             try:
-                return json.loads(CONFIG_FILE.read_text())
+                data = json.loads(CONFIG_FILE.read_text())
+                return dict(data) if isinstance(data, dict) else {}
             except Exception:
                 return {}
         return {}
@@ -57,7 +58,8 @@ class KeyStorage:
     def _kr_get(self, key_name: str) -> str | None:
         if keyring is None:
             return None
-        return keyring.get_password(SERVICE_NAME, key_name)
+        result = keyring.get_password(SERVICE_NAME, key_name)
+        return str(result) if result is not None else None
 
     def _kr_delete(self, key_name: str) -> None:
         if keyring is None:

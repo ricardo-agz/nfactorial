@@ -1,12 +1,14 @@
-import uuid
-import re
-from typing import Any, Callable, get_origin
-from pydantic import BaseModel
+import base64
 import inspect
+import re
+import uuid
+from collections.abc import Callable
 from dataclasses import is_dataclass
 from datetime import date, datetime, time, timedelta
 from enum import Enum
-import base64
+from typing import Any, get_origin
+
+from pydantic import BaseModel
 
 
 def to_snake_case(camel: str) -> str:
@@ -28,7 +30,7 @@ def serialize_data(data: Any) -> Any:
     elif isinstance(data, (bytes, bytearray, memoryview)):
         # Attempt UTF-8 decode first; fall back to base64 for binary safety
         try:
-            return data.decode("utf-8")  # type: ignore[call-arg]
+            return bytes(data).decode("utf-8")
         except UnicodeDecodeError:
             return base64.b64encode(bytes(data)).decode("ascii")
     elif isinstance(data, (datetime, date, time)):
@@ -38,7 +40,7 @@ def serialize_data(data: Any) -> Any:
     elif isinstance(data, Enum):
         return serialize_data(data.value)
     elif is_dataclass(data) and not isinstance(data, type):
-        """Safely convert dataclass -> dict without deepcopy-ing un-serialisable fields."""
+        # Safely convert dataclass -> dict without deepcopy un-serialisable fields
         result: dict[str, Any] = {}
         for _field in data.__dataclass_fields__.values():
             _val = getattr(data, _field.name)
@@ -129,11 +131,14 @@ def validate_callback_signature(
             and p.default is inspect.Parameter.empty
         ]
         raise TypeError(
-            f"{cb_name} callback must have exactly {len(expected_required)} required "
-            f"positional parameter(s) (got {len(required_positional)}: {required_positional})."
+            f"{cb_name} callback must have exactly {len(expected_required)} "
+            f"required positional parameter(s) "
+            f"(got {len(required_positional)}: {required_positional})."
         )
 
-    for param, expected in zip(sig.parameters.values(), expected_required):
+    for param, expected in zip(
+        sig.parameters.values(), expected_required, strict=True
+    ):
         if not _compatible(param.annotation, expected):
             raise TypeError(
                 f"{cb_name} callback – parameter '{param.name}' should be compatible "

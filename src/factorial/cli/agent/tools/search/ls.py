@@ -21,7 +21,8 @@ def ls(
         Extra glob patterns to exclude from the listing in addition to the default
         *DEFAULT_IGNORE_PATTERNS*.
     recursive:
-        When *True*, list contents recursively (similar to `ls -R`). When *False* (default), only the direct children of *dir_path* are returned.
+        When *True*, list contents recursively (similar to `ls -R`). When
+        *False* (default), only the direct children of *dir_path* are returned.
     """
 
     dir_path = dir_path or os.getcwd()

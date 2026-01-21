@@ -1,66 +1,66 @@
 from factorial.agent import (
-    BaseAgent,
     Agent,
+    BaseAgent,
     ModelSettings,
-    TurnCompletion,
     ResolvedModelSettings,
+    TurnCompletion,
     publish_progress,
     retry,
 )
-from factorial.tools import (
-    FunctionTool,
-    FunctionToolAction,
-    FunctionToolActionResult,
-    function_tool,
-    deferred_result,
-)
-from factorial.orchestrator import (
-    Orchestrator,
-    AgentWorkerConfig,
-    MaintenanceWorkerConfig,
-    TaskTTLConfig,
-    ObservabilityConfig,
-    MetricsTimelineConfig,
-)
-from factorial.context import AgentContext, ExecutionContext, ContextType
-from factorial.queue.task import Task, TaskStatus
-from factorial.events import AgentEvent, QueueEvent, EventPublisher
+from factorial.context import AgentContext, ContextType, ExecutionContext
+from factorial.events import AgentEvent, EventPublisher, QueueEvent
 from factorial.llms import (
+    MODELS,
     Model,
     MultiClient,
+    Provider,
     # Provider wrapper
     ai_gateway,
-    # OpenAI models
-    gpt_52,
-    gpt_5,
-    gpt_5_mini,
-    gpt_5_nano,
-    o3,
-    o4_mini,
-    gpt_41,
-    gpt_41_mini,
-    gpt_41_nano,
+    claude_4_opus,
+    claude_4_sonnet,
+    claude_35_haiku,
+    claude_35_sonnet,
+    claude_37_sonnet,
+    claude_45_haiku,
     # Anthropic models
     claude_45_opus,
     claude_45_sonnet,
-    claude_45_haiku,
-    claude_4_opus,
-    claude_4_sonnet,
-    claude_37_sonnet,
-    claude_35_sonnet,
-    claude_35_haiku,
-    # xAI models
-    grok_4,
-    grok_3,
-    grok_3_mini,
+    # Utilities
+    fallback_models,
     # Fireworks models
     fireworks_kimi_k2,
     fireworks_qwen_3_235b,
     fireworks_qwen_3_coder_480b,
-    # Utilities
-    fallback_models,
-    MODELS,
-    Provider,
+    gpt_5,
+    gpt_5_mini,
+    gpt_5_nano,
+    gpt_41,
+    gpt_41_mini,
+    gpt_41_nano,
+    # OpenAI models
+    gpt_52,
+    grok_3,
+    grok_3_mini,
+    # xAI models
+    grok_4,
+    o3,
+    o4_mini,
+)
+from factorial.orchestrator import (
+    AgentWorkerConfig,
+    MaintenanceWorkerConfig,
+    MetricsTimelineConfig,
+    ObservabilityConfig,
+    Orchestrator,
+    TaskTTLConfig,
+)
+from factorial.queue.task import Task, TaskStatus
+from factorial.tools import (
+    FunctionTool,
+    FunctionToolAction,
+    FunctionToolActionResult,
+    deferred_result,
+    function_tool,
 )
 
 __all__ = [

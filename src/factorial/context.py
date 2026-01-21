@@ -1,8 +1,10 @@
-from dataclasses import dataclass
-from typing import Any, TypeVar, Callable, Awaitable, TYPE_CHECKING
+from collections.abc import Awaitable, Callable
 from contextvars import ContextVar
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, TypeVar
+
 from pydantic import BaseModel
-import asyncio
+
 from factorial.events import EventPublisher
 
 if TYPE_CHECKING:
@@ -101,12 +103,12 @@ class AgentContext(BaseModel):
         return self.model_dump()
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]):
+    def from_dict(cls, data: dict[str, Any]) -> "AgentContext":
         return cls(**data)
 
     def to_json(self) -> str:
         return self.model_dump_json()
 
     @classmethod
-    def from_json(cls, json_str: str):
+    def from_json(cls, json_str: str) -> "AgentContext":
         return cls.model_validate_json(json_str)

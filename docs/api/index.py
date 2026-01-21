@@ -1,9 +1,8 @@
 from pathlib import Path
-import yaml
 
+import yaml
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import Response
-
 
 app = FastAPI(title="Docs + Agent Prompt API")
 
@@ -45,9 +44,9 @@ def _render_prompt(model: str, agent_mode: str) -> str:
 
     base_prompt = base_path.read_text(encoding="utf-8")
 
-    with open(create_yaml, "r") as fh:
+    with open(create_yaml) as fh:
         create_vars = yaml.safe_load(fh) or {}
-    with open(edit_yaml, "r") as fh:
+    with open(edit_yaml) as fh:
         edit_vars = yaml.safe_load(fh) or {}
 
     create_prompt = base_prompt

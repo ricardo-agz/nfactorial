@@ -20,7 +20,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY examples/multi_agent/ ./
 
 # Expose the observability port
-EXPOSE 8080
+EXPOSE 8081
 
 # Run the agent
 CMD ["python", "agent.py"] 

@@ -36,6 +36,8 @@ dev = [
     "mypy",
     "pytest",
     "pytest-asyncio",
+    "fakeredis[lua]>=2.0",
+    "pytest-cov",
     "ruff>=0.4.0",
     "build",
 ]

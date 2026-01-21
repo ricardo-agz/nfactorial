@@ -65,7 +65,7 @@ end
 Usage:
 inc_metrics(
     { agent_metrics_bucket_key, global_metrics_bucket_key },
-    { 'cancelled', pickups, retries, meta_json, metrics_ttl }
+    { 'cancelled', meta_json, metrics_ttl }
 )
 
 Returns:
@@ -76,40 +76,81 @@ local function inc_metrics(keys, args)
     local agent_metrics_bucket_key  = keys[1]
     local global_metrics_bucket_key = keys[2]
     local metric_type               = args[1]
-    local task_pickups              = args[2]
-    local task_retries              = args[3]
-    local task_meta_json            = args[4]
-    local ttl                       = args[5]
+    local task_meta_json            = args[2]
+    local ttl                       = args[3]
 
     local time_result               = redis.call('TIME')
     local timestamp                 = tonumber(time_result[1]) + (tonumber(time_result[2]) / 1000000)
 
     local meta                      = cjson.decode(task_meta_json)
     local duration                  = timestamp - (tonumber(meta.created_at) or timestamp)
-    local pickups                   = tonumber(task_pickups) or 0
-    local retries                   = tonumber(task_retries) or 0
-    local turns                     = pickups - retries
 
-    local metric_count              = metric_type .. '_count'
-    local metric_total_duration     = metric_type .. '_total_duration'
-    local metric_total_turns        = metric_type .. '_total_turns'
-    local metric_total_retries      = metric_type .. '_total_retries'
-    local metric_total_pickups      = metric_type .. '_total_pickups'
+    -- We only track a small, fixed set of metrics used by the dashboard.
+    -- This keeps memory bounded and avoids unbounded key growth.
+    local SUPPORTED = {
+        completed = true,
+        failed = true,
+        cancelled = true,
+        retried = true,
+    }
 
-    -- agent bucket ──────────────────────────────────────────────────────
-    redis.call('HINCRBY', agent_metrics_bucket_key, metric_count, 1)
-    redis.call('HINCRBYFLOAT', agent_metrics_bucket_key, metric_total_duration, duration)
-    redis.call('HINCRBY', agent_metrics_bucket_key, metric_total_turns, turns)
-    redis.call('HINCRBY', agent_metrics_bucket_key, metric_total_retries, retries)
-    redis.call('HINCRBY', agent_metrics_bucket_key, metric_total_pickups, pickups)
-    redis.call('EXPIRE', agent_metrics_bucket_key, ttl)
-    -- global bucket ─────────────────────────────────────────────────────
-    redis.call('HINCRBY', global_metrics_bucket_key, metric_count, 1)
-    redis.call('HINCRBYFLOAT', global_metrics_bucket_key, metric_total_duration, duration)
-    redis.call('HINCRBY', global_metrics_bucket_key, metric_total_turns, turns)
-    redis.call('HINCRBY', global_metrics_bucket_key, metric_total_retries, retries)
-    redis.call('HINCRBY', global_metrics_bucket_key, metric_total_pickups, pickups)
-    redis.call('EXPIRE', global_metrics_bucket_key, ttl)
+    if not SUPPORTED[metric_type] then
+        return true
+    end
+
+    -- Rolling ring buffers:
+    -- - m1: 1-minute buckets, 24h retention (1440 slots)
+    -- - m6: 6-minute buckets, 7d retention (1680 slots)
+    --
+    -- Field layout (HASH):
+    --   {prefix}:ts:{slot}                       -> bucket_start_ts (seconds)
+    --   {prefix}:{metric}_count:{slot}          -> count
+    --   {prefix}:completed_total_duration:{slot} -> sum(duration_seconds)
+    local function update_ring(key, prefix, bucket_seconds, ring_size)
+        local bucket_ts = math.floor(timestamp / bucket_seconds) * bucket_seconds
+        local bucket_id = math.floor(bucket_ts / bucket_seconds)
+        local slot = bucket_id % ring_size
+
+        local ts_field = prefix .. ':ts:' .. slot
+        local existing_ts = redis.call('HGET', key, ts_field)
+
+        if existing_ts ~= tostring(bucket_ts) then
+            -- Reset slot for the new time bucket
+            local args = { ts_field, bucket_ts }
+            args[#args + 1] = prefix .. ':completed_count:' .. slot
+            args[#args + 1] = 0
+            args[#args + 1] = prefix .. ':failed_count:' .. slot
+            args[#args + 1] = 0
+            args[#args + 1] = prefix .. ':cancelled_count:' .. slot
+            args[#args + 1] = 0
+            args[#args + 1] = prefix .. ':retried_count:' .. slot
+            args[#args + 1] = 0
+            args[#args + 1] = prefix .. ':completed_total_duration:' .. slot
+            args[#args + 1] = 0
+            redis.call('HSET', key, unpack(args))
+        end
+
+        redis.call('HINCRBY', key, prefix .. ':' .. metric_type .. '_count:' .. slot, 1)
+        if metric_type == 'completed' then
+            redis.call('HINCRBYFLOAT', key, prefix .. ':completed_total_duration:' .. slot, duration)
+        end
+    end
+
+    -- Update both agent + global keys for both rings
+    update_ring(agent_metrics_bucket_key, 'm1', 60, 1440)
+    update_ring(global_metrics_bucket_key, 'm1', 60, 1440)
+    update_ring(agent_metrics_bucket_key, 'm6', 360, 1680)
+    update_ring(global_metrics_bucket_key, 'm6', 360, 1680)
+
+    -- Expire the whole hash eventually if the system goes idle.
+    -- Ensure TTL is >= ~8d so the 7d ring doesn't disappear between bursts.
+    local min_ttl = 8 * 24 * 60 * 60
+    local ttl_seconds = tonumber(ttl) or 0
+    if ttl_seconds < min_ttl then
+        ttl_seconds = min_ttl
+    end
+    redis.call('EXPIRE', agent_metrics_bucket_key, ttl_seconds)
+    redis.call('EXPIRE', global_metrics_bucket_key, ttl_seconds)
 
     return true
 end

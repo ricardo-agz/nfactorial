@@ -27,6 +27,11 @@ local corrupted_task_ids = {}
 local attempts = batch_size * 2
 
 for i = 1, attempts do
+    -- Stop once we have enough valid tasks
+    if #tasks_to_process_ids >= batch_size then
+        break
+    end
+
     local task_id = redis.call('LPOP', queue_main_key)
     if not task_id then
         break

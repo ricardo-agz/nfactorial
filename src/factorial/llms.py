@@ -40,6 +40,7 @@ class Provider(Enum):
     ANTHROPIC = "anthropic"
     XAI = "xai"
     FIREWORKS = "fireworks"
+    AI_GATEWAY = "ai_gateway"
 
 
 @dataclass
@@ -77,7 +78,7 @@ def fallback_models(*models: "Model") -> Callable[[Any], "Model"]:  # noqa: D401
 
     model_sequence = list(models)
 
-    def _selector(agent_ctx: Any) -> "Model":  # type: ignore[name-defined]
+    def _selector(agent_ctx: Any) -> "Model":
         # ``attempt`` is injected by the retry wrapper (defaults to 0 on first try).
         attempt_idx = getattr(agent_ctx, "attempt", 0)
         if attempt_idx < 0:
@@ -89,6 +90,34 @@ def fallback_models(*models: "Model") -> Callable[[Any], "Model"]:  # noqa: D401
     return _selector
 
 
+def ai_gateway(model: Model) -> Model:
+    """Wrap a model to route through AI Gateway.
+
+    This allows any model to be used via the Vercel AI Gateway, which provides
+    a unified API endpoint with built-in routing, retries, and monitoring.
+
+    Example
+    -------
+    >>> agent = Agent(
+    ...     model=ai_gateway(gpt_5)  # Route GPT-5 through AI Gateway
+    ... )
+    >>> agent = Agent(
+    ...     model=ai_gateway(claude_35_sonnet)  # Route Claude through AI Gateway
+    ... )
+    """
+    if model.provider == Provider.AI_GATEWAY:
+        # Already an AI Gateway model, return as-is
+        return model
+
+    return Model(
+        name=f"ai-gateway/{model.name}",
+        provider=Provider.AI_GATEWAY,
+        provider_model_id=f"{model.provider.value}/{model.provider_model_id}",
+        context_window=model.context_window,
+        custom_tool_support=model.custom_tool_support,
+    )
+
+
 class MultiClient:
     def __init__(
         self,
@@ -96,6 +125,7 @@ class MultiClient:
         xai_api_key: str | None = None,
         anthropic_api_key: str | None = None,
         fireworks_api_key: str | None = None,
+        ai_gateway_api_key: str | None = None,
         http_client: httpx.AsyncClient | None = None,
         max_connections: int = 1500,
         max_keepalive_connections: int = 1000,
@@ -105,6 +135,7 @@ class MultiClient:
         self.xai: AsyncOpenAI | None = None
         self.anthropic: AsyncOpenAI | None = None
         self.fireworks: AsyncOpenAI | None = None
+        self.ai_gateway: AsyncOpenAI | None = None
 
         if http_client:
             self.http_client = http_client
@@ -140,6 +171,12 @@ class MultiClient:
                 api_key=fireworks_api_key or os.environ.get("FIREWORKS_API_KEY"),
                 http_client=self.http_client,
             )
+        if ai_gateway_api_key or os.environ.get("AI_GATEWAY_API_KEY"):
+            self.ai_gateway = AsyncOpenAI(
+                base_url="https://ai-gateway.vercel.sh/v1",
+                api_key=ai_gateway_api_key or os.environ.get("AI_GATEWAY_API_KEY"),
+                http_client=self.http_client,
+            )
 
     async def _client_completion(
         self,
@@ -162,6 +199,10 @@ class MultiClient:
             if not self.fireworks:
                 raise ValueError("Fireworks client not initialized")
             return await self.fireworks.chat.completions.create(**kwargs)
+        if model_obj.provider == Provider.AI_GATEWAY:
+            if not self.ai_gateway:
+                raise ValueError("AI Gateway client not initialized")
+            return await self.ai_gateway.chat.completions.create(**kwargs)
 
         raise ValueError(f"Unsupported provider: {model_obj.provider}")
 
@@ -226,12 +267,16 @@ class MultiClient:
 
     async def close(self):
         """Close HTTP clients to clean up connections"""
-        if hasattr(self, "openai") and self.openai._client:
+        if hasattr(self, "openai") and self.openai and self.openai._client:
             await self.openai._client.aclose()
-        if hasattr(self, "xai") and self.xai._client:
+        if hasattr(self, "xai") and self.xai and self.xai._client:
             await self.xai._client.aclose()
-        if hasattr(self, "anthropic") and self.anthropic._client:
+        if hasattr(self, "anthropic") and self.anthropic and self.anthropic._client:
             await self.anthropic._client.aclose()
+        if hasattr(self, "fireworks") and self.fireworks and self.fireworks._client:
+            await self.fireworks._client.aclose()
+        if hasattr(self, "ai_gateway") and self.ai_gateway and self.ai_gateway._client:
+            await self.ai_gateway._client.aclose()
 
 
 base_tool_instructions_template = """
@@ -483,6 +528,13 @@ def base_tool_parser(response: str) -> tuple[str, list[ChatCompletionMessageTool
 
 # ---------- OPENAI MODELS ----------
 
+gpt_52 = Model(
+    name="gpt-5.2",
+    provider=Provider.OPENAI,
+    provider_model_id="gpt-5.2",
+    context_window=400_000,
+)
+
 gpt_5 = Model(
     name="gpt-5",
     provider=Provider.OPENAI,
@@ -541,7 +593,29 @@ gpt_41_nano = Model(
 
 # ---------- ANTHROPIC MODELS ----------
 
+# Claude 4.5 family
+claude_45_opus = Model(
+    name="claude-4.5-opus",
+    provider=Provider.ANTHROPIC,
+    provider_model_id="claude-opus-4-5-20251101",
+    context_window=200_000,
+)
 
+claude_45_sonnet = Model(
+    name="claude-4.5-sonnet",
+    provider=Provider.ANTHROPIC,
+    provider_model_id="claude-sonnet-4-5-20250929",
+    context_window=200_000,
+)
+
+claude_45_haiku = Model(
+    name="claude-4.5-haiku",
+    provider=Provider.ANTHROPIC,
+    provider_model_id="claude-haiku-4-5-20251001",
+    context_window=200_000,
+)
+
+# Claude 4 family
 claude_4_opus = Model(
     name="claude-4-opus",
     provider=Provider.ANTHROPIC,
@@ -633,6 +707,8 @@ fireworks_qwen_3_coder_480b = Model(
 )
 
 MODELS = [
+    # OpenAI (direct)
+    gpt_52,
     gpt_5,
     gpt_5_mini,
     gpt_5_nano,
@@ -641,14 +717,20 @@ MODELS = [
     gpt_41,
     gpt_41_mini,
     gpt_41_nano,
+    # Anthropic (direct)
+    claude_45_opus,
+    claude_45_sonnet,
+    claude_45_haiku,
     claude_4_opus,
     claude_4_sonnet,
     claude_37_sonnet,
     claude_35_sonnet,
     claude_35_haiku,
+    # xAI (direct)
     grok_4,
     grok_3,
     grok_3_mini,
+    # Fireworks (direct)
     fireworks_kimi_k2,
     fireworks_qwen_3_235b,
     fireworks_qwen_3_coder_480b,

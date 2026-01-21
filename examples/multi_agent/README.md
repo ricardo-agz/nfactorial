@@ -7,10 +7,19 @@ AI agent that can search the web, make plans, spin up independent research subag
 
 ## Quick Start with Docker
 
-1. Set up environment:
+1. Set up environment (one of these):
 ```bash
-cp .env.template .env
-# Add your API keys to .env
+# Option A: export in your shell
+export OPENAI_API_KEY=...
+export EXA_API_KEY=...
+
+# Option B: create a `.env` file next to docker-compose.yml with:
+# OPENAI_API_KEY=...
+# EXA_API_KEY=...
+
+# Optional UI overrides (defaults are fine for local docker-compose):
+# VITE_API_BASE_URL=http://localhost:8000/api
+# VITE_WS_BASE_URL=ws://localhost:8000/ws
 ```
 
 2. Run everything:
@@ -52,4 +61,4 @@ cd ui && npm run dev  # UI
 
 ### URLs
 - UI: http://localhost:5173
-- Dashboard: http://localhost:8080
+- Dashboard: http://localhost:8081

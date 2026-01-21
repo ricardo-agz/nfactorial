@@ -1,9 +1,6 @@
 import { useCallback } from 'react';
 import { Message } from '../types';
-
-const env = import.meta.env;
-
-const API_BASE = env.VITE_API_BASE_URL
+import { API_BASE_URL } from '../constants';
 
 interface UseChatProps {
   userId: string;
@@ -56,7 +53,7 @@ export const useChat = ({
     setLoading(true);
     setCurrentThinking(() => null);
 
-    const res = await fetch(`${API_BASE}/enqueue`, {
+    const res = await fetch(`${API_BASE_URL}/enqueue`, {
       method : 'POST',
       headers: { 'Content-Type': 'application/json' },
       body   : JSON.stringify({
@@ -82,7 +79,7 @@ export const useChat = ({
     setCancelling(true);
 
     try {
-      const res = await fetch(`${API_BASE}/cancel`, {
+      const res = await fetch(`${API_BASE_URL}/cancel`, {
         method : 'POST',
         headers: { 'Content-Type': 'application/json' },
         body   : JSON.stringify({ user_id: userId, task_id: currentTaskId }),
@@ -100,7 +97,7 @@ export const useChat = ({
     setSteeringStatus('sending');
 
     try {
-      const res = await fetch(`${API_BASE}/steer`, {
+      const res = await fetch(`${API_BASE_URL}/steer`, {
         method : 'POST',
         headers: { 'Content-Type': 'application/json' },
         body   : JSON.stringify({

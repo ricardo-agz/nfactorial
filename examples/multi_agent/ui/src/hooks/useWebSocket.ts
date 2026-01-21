@@ -1,8 +1,6 @@
 import { useCallback, useRef, useEffect } from 'react';
 import { AgentEvent, ThinkingProgress, Message } from '../types';
-
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-const WS_BASE: string = (import.meta as any).env.VITE_WS_BASE_URL;
+import { WS_BASE_URL } from '../constants';
 
 interface UseWebSocketProps {
   userId: string;
@@ -444,7 +442,7 @@ export const useWebSocket = ({
   }, [setCurrentThinking, setMessages, setLoading, setCurrentTaskId, setCancelling, setSteering, setSteerMode, setSteeringStatus, setSubAgentProgress, setResearchProgress]);
 
   useEffect(() => {
-    const ws = new WebSocket(`${WS_BASE}/${userId}`);
+    const ws = new WebSocket(`${WS_BASE_URL}/${userId}`);
     ws.onmessage = handleWSMessage;
     wsRef.current = ws;
     return () => ws.close();

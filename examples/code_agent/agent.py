@@ -1,19 +1,17 @@
 import os
 from typing import Any
+
 from dotenv import load_dotenv
 
 from factorial import (
-    BaseAgent,
     AgentContext,
-    ExecutionContext,
-    Orchestrator,
-    ModelSettings,
-    gpt_41_mini,
-    claude_4_sonnet,
-    fireworks_kimi_k2,
-    fireworks_qwen_3_coder_480b,
     AgentWorkerConfig,
+    BaseAgent,
+    ExecutionContext,
+    ModelSettings,
+    Orchestrator,
     deferred_result,
+    fireworks_kimi_k2,
 )
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -65,8 +63,9 @@ def edit_code(
 
     # Check if the find text matches what's at those line numbers
     if find not in existing_text:
+        line_range = f"{find_start_line}-{find_end_line}"
         return (
-            f"Error: Text '{find}' not found at lines {find_start_line}-{find_end_line}",
+            f"Error: Text '{find}' not found at lines {line_range}",
             {
                 "error": "Find text not found at specified lines",
                 "existing_text": existing_text,
@@ -82,8 +81,10 @@ def edit_code(
     # Update the agent context with the modified code
     agent_ctx.code = "\n".join(new_lines)
 
+    line_range = f"{find_start_line}-{find_end_line}"
     return (
-        f"Code successfully edited: replaced '{find}' with '{replace}' at lines {find_start_line}-{find_end_line}",
+        f"Code successfully edited: replaced '{find}' with '{replace}' "
+        f"at lines {line_range}",
         {
             "find": find,
             "find_start_line": find_start_line,
@@ -101,26 +102,30 @@ def request_code_execution(
     response_on_reject: str, agent_ctx: AgentContext, execution_ctx: ExecutionContext
 ) -> None:
     """
-    Request the code to be run. The use must approve this request before the code is run.
+    Request the code to be run.
+
+    The user must approve this request before the code is run.
 
     Parameters
     ----------
     response_on_reject : str
-        A message the agent should send if the user rejects the execution request.
+        A message the agent should send if the user rejects the request.
     """
     pass
 
 
-instructions = """
-You are an IDE assistant that helps with coding tasks. You can write, read, and analyze code. 
-For anything non-trivial, always start by making a plan for the coding task.
+instructions = """\
+You are an IDE assistant that helps with coding tasks. You can write, read,
+and analyze code. For anything non-trivial, always start by making a plan for
+the coding task.
 
-You will be given a code file and a query. Your job is to either respond to the query with an answer,
-or edit the code file if the query requires it.
+You will be given a code file and a query. Your job is to either respond to
+the query with an answer, or edit the code file if the query requires it.
 
-Please note, the code file will be shown to you in a format that displays the line numbers to make
-it easier for you to make edits at the correct line numbers, when you write code you should write
-valid code and NOT include the line numbers as part of the code.
+Please note, the code file will be shown to you in a format that displays the
+line numbers to make it easier for you to make edits at the correct line
+numbers, when you write code you should write valid code and NOT include the
+line numbers as part of the code.
 
 When code is shown to you as:
 [1]def hello_world():
@@ -130,8 +135,9 @@ This means the code is actually:
 def hello_world():
     print("Hello, world!")
 
-In your final response, just clearly and consisely explain what you did without writing any code. The code changes will be 
-shown to the user in a diff editor.
+In your final response, just clearly and consisely explain what you did
+without writing any code. The code changes will be shown to the user in a
+diff editor.
 """
 
 
@@ -154,10 +160,14 @@ class IDEAgent(BaseAgent[IdeAgentContext]):
                 messages.extend(
                     [message for message in agent_ctx.messages if message["content"]]
                 )
+            code_display = self.display_code_with_line_numbers(agent_ctx.code)
             messages.append(
                 {
                     "role": "user",
-                    "content": f"Code file with line numbers:\n{self.display_code_with_line_numbers(agent_ctx.code)}\n---\nQuery: {agent_ctx.query}",
+                    "content": (
+                        f"Code file with line numbers:\n{code_display}\n"
+                        f"---\nQuery: {agent_ctx.query}"
+                    ),
                 }
             )
         else:

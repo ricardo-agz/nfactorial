@@ -4,6 +4,7 @@ import sys
 import time
 from threading import Thread
 from typing import Any
+
 import click
 from click import style
 

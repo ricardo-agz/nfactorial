@@ -1,21 +1,21 @@
-from enum import Enum
+import json
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-import uuid
-import json
-from typing import Generic, Type, Any, cast
+from enum import Enum
+from typing import Any, Generic, cast
+
 import redis.asyncio as redis
 
-from factorial.utils import decode
 from factorial.context import ContextType
 from factorial.exceptions import (
-    TaskNotFoundError,
-    InvalidTaskIdError,
-    CorruptedTaskDataError,
     BatchNotFoundError,
+    CorruptedTaskDataError,
+    InvalidTaskIdError,
+    TaskNotFoundError,
 )
 from factorial.queue.keys import RedisKeys
-from factorial.utils import is_valid_task_id
+from factorial.utils import decode, is_valid_task_id
 
 
 class TaskStatus(str, Enum):
@@ -111,7 +111,7 @@ class Task(Generic[ContextType]):
     def from_dict(
         cls,
         data: dict[str, Any],
-        context_class: Type[ContextType],
+        context_class: type[ContextType],
     ) -> "Task[ContextType]":
         status = TaskStatus(data["status"])
         metadata = TaskMetadata.from_dict(data["metadata"])
@@ -137,7 +137,7 @@ class Task(Generic[ContextType]):
 
     @classmethod
     def from_json(
-        cls, json_str: str | bytes, context_class: Type[ContextType]
+        cls, json_str: str | bytes, context_class: type[ContextType]
     ) -> "Task[ContextType]":
         data = json.loads(decode(json_str))
         return cls.from_dict(data, context_class)

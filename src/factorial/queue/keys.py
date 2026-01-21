@@ -1,5 +1,5 @@
-import time
 from dataclasses import dataclass
+
 # ***** REDIS KEY SPACE *****
 
 # HASH: task_id -> status
@@ -59,15 +59,17 @@ UPDATES_CHANNEL = "{namespace}:updates:{owner_id}"
 # ===== METRICS =====
 # Rolling (fixed-memory) metrics ring buffers.
 # We store bucketed counters inside a single Redis HASH per agent + one global HASH.
-# The Lua `inc_metrics()` helper maintains a rolling window by overwriting slots in-place.
+# The Lua `inc_metrics()` helper maintains a rolling window by overwriting
+# slots in-place.
 #
-# NOTE: These keys intentionally do NOT include a `{bucket}` timestamp. Bucket timestamps live
-# inside hash fields so memory stays bounded.
+# NOTE: These keys intentionally do NOT include a `{bucket}` timestamp.
+# Bucket timestamps live inside hash fields so memory stays bounded.
 AGENT_ACTIVITY_METRICS = "{namespace}:metrics:{agent}"
 GLOBAL_ACTIVITY_METRICS = "{namespace}:metrics:__all__"
 
 # ===== BATCH MANAGEMENT =====
-# HASH: batch_id -> {owner_id, created_at, total_tasks, max_progress, status: 'active'|'cancelled'|'completed'}
+# HASH: batch_id -> {owner_id, created_at, total_tasks, max_progress,
+#                    status: 'active'|'cancelled'|'completed'}
 BATCH_META = "{namespace}:batches:metadata"
 # HASH: batch_id -> task_ids
 BATCH_TASKS = "{namespace}:batches:tasks"
@@ -186,7 +188,8 @@ class RedisKeys:
         """{namespace}:queue:{agent}:main"""
         if self._queue_main is None:
             raise ValueError(
-                "queue_main is not available - agent was not provided during RedisKeys.format()"
+                "queue_main is not available - "
+                "agent was not provided during RedisKeys.format()"
             )
         return self._queue_main
 
@@ -195,7 +198,8 @@ class RedisKeys:
         """{namespace}:queue:{agent}:completed"""
         if self._queue_completions is None:
             raise ValueError(
-                "queue_completions is not available - agent was not provided during RedisKeys.format()"
+                "queue_completions is not available - "
+                "agent was not provided during RedisKeys.format()"
             )
         return self._queue_completions
 
@@ -204,7 +208,8 @@ class RedisKeys:
         """{namespace}:queue:{agent}:backoff"""
         if self._queue_backoff is None:
             raise ValueError(
-                "queue_backoff is not available - agent was not provided during RedisKeys.format()"
+                "queue_backoff is not available - "
+                "agent was not provided during RedisKeys.format()"
             )
         return self._queue_backoff
 
@@ -213,7 +218,8 @@ class RedisKeys:
         """{namespace}:queue:{agent}:failed"""
         if self._queue_failed is None:
             raise ValueError(
-                "queue_failed is not available - agent was not provided during RedisKeys.format()"
+                "queue_failed is not available - "
+                "agent was not provided during RedisKeys.format()"
             )
         return self._queue_failed
 
@@ -222,7 +228,8 @@ class RedisKeys:
         """{namespace}:queue:{agent}:orphaned"""
         if self._queue_orphaned is None:
             raise ValueError(
-                "queue_orphaned is not available - agent was not provided during RedisKeys.format()"
+                "queue_orphaned is not available - "
+                "agent was not provided during RedisKeys.format()"
             )
         return self._queue_orphaned
 
@@ -231,7 +238,8 @@ class RedisKeys:
         """{namespace}:queue:{agent}:pending"""
         if self._queue_pending is None:
             raise ValueError(
-                "queue_pending is not available - agent was not provided during RedisKeys.format()"
+                "queue_pending is not available - "
+                "agent was not provided during RedisKeys.format()"
             )
         return self._queue_pending
 
@@ -240,7 +248,8 @@ class RedisKeys:
         """{namespace}:queue:{agent}:cancelled"""
         if self._queue_cancelled is None:
             raise ValueError(
-                "queue_cancelled is not available - agent was not provided during RedisKeys.format()"
+                "queue_cancelled is not available - "
+                "agent was not provided during RedisKeys.format()"
             )
         return self._queue_cancelled
 
@@ -249,7 +258,8 @@ class RedisKeys:
         """{namespace}:processing:{agent}:heartbeats"""
         if self._processing_heartbeats is None:
             raise ValueError(
-                "processing_heartbeats is not available - agent was not provided during RedisKeys.format()"
+                "processing_heartbeats is not available - "
+                "agent was not provided during RedisKeys.format()"
             )
         return self._processing_heartbeats
 
@@ -258,7 +268,8 @@ class RedisKeys:
         """{namespace}:metrics:{agent}"""
         if self._agent_metrics_bucket is None:
             raise ValueError(
-                "agent_metrics_bucket is not available - agent was not provided during RedisKeys.format()"
+                "agent_metrics_bucket is not available - "
+                "agent was not provided during RedisKeys.format()"
             )
         return self._agent_metrics_bucket
 
@@ -267,7 +278,8 @@ class RedisKeys:
         """{namespace}:metrics:__all__"""
         if self._global_metrics_bucket is None:
             raise ValueError(
-                "global_metrics_bucket is not available - namespace was not provided during RedisKeys.format()"
+                "global_metrics_bucket is not available - "
+                "namespace was not provided during RedisKeys.format()"
             )
         return self._global_metrics_bucket
 
@@ -276,7 +288,8 @@ class RedisKeys:
         """{namespace}:steer:{task_id}:messages"""
         if self._task_steering is None:
             raise ValueError(
-                "task_steering is not available - task_id was not provided during RedisKeys.format()"
+                "task_steering is not available - "
+                "task_id was not provided during RedisKeys.format()"
             )
         return self._task_steering
 
@@ -285,7 +298,8 @@ class RedisKeys:
         """{namespace}:pending:{task_id}:tools"""
         if self._pending_tool_results is None:
             raise ValueError(
-                "pending_tool_results is not available - task_id was not provided during RedisKeys.format()"
+                "pending_tool_results is not available - "
+                "task_id was not provided during RedisKeys.format()"
             )
         return self._pending_tool_results
 
@@ -294,7 +308,8 @@ class RedisKeys:
         """{namespace}:pending:{task_id}:children"""
         if self._pending_child_task_results is None:
             raise ValueError(
-                "pending_child_task_results is not available - task_id was not provided during RedisKeys.format()"
+                "pending_child_task_results is not available - "
+                "task_id was not provided during RedisKeys.format()"
             )
         return self._pending_child_task_results
 
@@ -303,7 +318,8 @@ class RedisKeys:
         """{namespace}:updates:{owner_id}"""
         if self._updates_channel is None:
             raise ValueError(
-                "updates_channel is not available - owner_id was not provided during RedisKeys.format()"
+                "updates_channel is not available - "
+                "owner_id was not provided during RedisKeys.format()"
             )
         return self._updates_channel
 
@@ -326,16 +342,7 @@ class RedisKeys:
         agent: str | None = None,
         task_id: str | None = None,
         owner_id: str | None = None,
-        metrics_bucket_duration: int | None = None,
     ) -> "RedisKeys":
-        # NOTE: metrics_bucket_duration is kept for backwards compatibility with callers,
-        # but rolling metrics keys no longer depend on bucket timestamps.
-        bucket_id = (
-            (int(time.time() / metrics_bucket_duration) * metrics_bucket_duration)
-            if metrics_bucket_duration
-            else None
-        )
-
         return cls(
             # Global keys (namespace only)
             _task_status=TASK_STATUS.format(namespace=namespace),
@@ -376,13 +383,11 @@ class RedisKeys:
             else None,
             # Metrics keys (rolling ring buffers)
             _agent_metrics_bucket=AGENT_ACTIVITY_METRICS.format(
-                namespace=namespace, agent=agent, bucket=bucket_id
+                namespace=namespace, agent=agent
             )
             if agent
             else None,
-            _global_metrics_bucket=GLOBAL_ACTIVITY_METRICS.format(
-                namespace=namespace, bucket=bucket_id
-            ),
+            _global_metrics_bucket=GLOBAL_ACTIVITY_METRICS.format(namespace=namespace),
             # Batch-scoped keys
             _batch_meta=BATCH_META.format(namespace=namespace),
             _batch_tasks=BATCH_TASKS.format(namespace=namespace),

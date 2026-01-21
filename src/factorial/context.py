@@ -1,8 +1,10 @@
-from dataclasses import dataclass
-from typing import Any, TypeVar, Callable, Awaitable, TYPE_CHECKING
+from collections.abc import Awaitable, Callable
 from contextvars import ContextVar
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, TypeVar
+
 from pydantic import BaseModel
-import asyncio
+
 from factorial.events import EventPublisher
 
 if TYPE_CHECKING:

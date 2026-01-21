@@ -1,15 +1,17 @@
+import json
+import os
+import random
+import re
+import string
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
-import os
-import re
-import random
-import string
-from typing import Any, Callable, cast
-from dotenv import load_dotenv
-import httpx
-import json
-from openai import AsyncOpenAI
+from typing import Any, cast
 
+import httpx
+from dotenv import load_dotenv
+from openai import AsyncOpenAI
+from openai._streaming import AsyncStream
 from openai.types.chat import (
     ChatCompletion,
     ChatCompletionChunk,
@@ -17,7 +19,6 @@ from openai.types.chat import (
 )
 from openai.types.chat.chat_completion_message_tool_call import Function
 from openai.types.chat.completion_create_params import ResponseFormat
-from openai._streaming import AsyncStream
 from pydantic import BaseModel
 
 load_dotenv()
@@ -60,11 +61,12 @@ class Model:
 def fallback_models(*models: "Model") -> Callable[[Any], "Model"]:  # noqa: D401
     """Return a model-selection callable cycling through *models* by retry attempt.
 
-    The callable can be passed to the ``model`` parameter of :class:`factorial.agent.BaseAgent`.
-    Inside the agent, the current retry index is exposed via ``agent_ctx.attempt`` which is
-    automatically updated by the built-in ``@retry`` decorator.  The selector will return
-    ``models[attempt]`` for the *n*-th retry, falling back to the last model once the list is
-    exhausted.
+    The callable can be passed to the ``model`` parameter of
+    :class:`factorial.agent.BaseAgent`. Inside the agent, the current retry
+    index is exposed via ``agent_ctx.attempt`` which is automatically updated
+    by the built-in ``@retry`` decorator. The selector will return
+    ``models[attempt]`` for the *n*-th retry, falling back to the last model
+    once the list is exhausted.
 
     Example
     -------
@@ -238,7 +240,8 @@ class MultiClient:
 
         if stream and model.custom_tool_support:
             raise ValueError(
-                "Streaming is not supported for this model when custom tool support is provided"
+                "Streaming is not supported for this model "
+                "when custom tool support is provided"
             )
 
         if model.custom_tool_support and tools:
@@ -280,14 +283,16 @@ class MultiClient:
 
 
 base_tool_instructions_template = """
-In this environment you have access to a set of tools you can use to answer the user's question.
+In this environment you have access to tools to answer the user's question.
 
-You can invoke functions by writing a "<tool_call>" block like the following as part of your reply to the user:
+You can invoke functions by writing a "<tool_call>" block like the following:
 <tool_call>
-{{"name": "TOOL_NAME", "arguments": {{"ARGUMENT_1_NAME": "ARGUMENT_1_VALUE", "ARGUMENT_2_NAME": "ARGUMENT_2_VALUE", ...}}}}
+{{"name": "TOOL_NAME", "arguments": {{"ARG_1": "VALUE_1", "ARG_2": "VALUE_2", ...}}}}
 </tool_call>
 
-String and scalar parameters should be specified as is, while lists and objects should use JSON format. Note that spaces for string values are not stripped. The output is not expected to be valid XML and is parsed with regular expressions.
+String and scalar parameters should be specified as is, while lists and objects
+should use JSON format. Spaces for string values are not stripped. The output
+is not expected to be valid XML and is parsed with regular expressions.
 
 Here are the functions available in JSONSchema format:
 <tools>
@@ -309,9 +314,15 @@ def base_tool_instructions(
     tools_json = json.dumps(tools, indent=2)
 
     if isinstance(tool_choice, dict):
-        tool_choice_instructions = f"\nYou are ONLY allowed to use the tool `{tool_choice.get('name')}` for this response."
+        tool_name = tool_choice.get("name")
+        tool_choice_instructions = (
+            f"\nYou are ONLY allowed to use the tool `{tool_name}` for this response."
+        )
         if parallel_tool_calls:
-            tool_choice_instructions += "\nYou are allowed to call this tool multiple times to be executed in parallel if necessary."
+            tool_choice_instructions += (
+                "\nYou are allowed to call this tool multiple times "
+                "to be executed in parallel if necessary."
+            )
         else:
             tool_choice_instructions += "\nYou are only allowed to call this tool once."
     elif isinstance(tool_choice, str):
@@ -320,15 +331,25 @@ def base_tool_instructions(
                 "\nYou are REQUIRED to use a tool for this response."
             )
             if parallel_tool_calls:
-                tool_choice_instructions += "\nYour response MUST invoke at least one tool and you are allowed to call multiple tools to be executed in parallel if necessary."
+                tool_choice_instructions += (
+                    "\nYour response MUST invoke at least one tool and you are "
+                    "allowed to call multiple tools to be executed in parallel "
+                    "if necessary."
+                )
             else:
                 tool_choice_instructions += (
                     "\nYour response MUST invoke exactly one tool."
                 )
         elif tool_choice == "auto":
-            tool_choice_instructions = "\nDetermine if any tools are required to complete the request. If so, use the appropriate tool(s)."
+            tool_choice_instructions = (
+                "\nDetermine if any tools are required to complete the request. "
+                "If so, use the appropriate tool(s)."
+            )
             if parallel_tool_calls:
-                tool_choice_instructions += "\nYou are allowed to call multiple tools to be executed in parallel if necessary."
+                tool_choice_instructions += (
+                    "\nYou are allowed to call multiple tools "
+                    "to be executed in parallel if necessary."
+                )
             else:
                 tool_choice_instructions += (
                     "\nYour response may not invoke more than one tool."
@@ -360,7 +381,8 @@ def base_tool_parser(response: str) -> tuple[str, list[ChatCompletionMessageTool
         re.DOTALL | re.IGNORECASE,
     )
 
-    # pattern for simplified openai format: <|tool_call|>FUNC<|tool_call_argument|>{...}<|tool_call|>
+    # pattern for simplified openai format:
+    # <|tool_call|>FUNC<|tool_call_argument|>{...}<|tool_call|>
     pattern_c = re.compile(
         r"<\|tool_call\|>(?P<func>[^<]+?)"  # function name + optional id
         r"<\|tool_call_argument\|>(?P<args>.*?)"  # JSON args

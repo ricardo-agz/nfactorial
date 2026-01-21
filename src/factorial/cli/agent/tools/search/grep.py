@@ -69,7 +69,7 @@ def grep(
 
             file_path = os.path.join(current_root, fname)
             try:
-                with open(file_path, "r", encoding="utf-8", errors="ignore") as fh:
+                with open(file_path, encoding="utf-8", errors="ignore") as fh:
                     for lineno, line in enumerate(fh, 1):
                         if regex.search(line):
                             rel_path = os.path.relpath(file_path, dir_path)

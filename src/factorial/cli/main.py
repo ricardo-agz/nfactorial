@@ -1,29 +1,29 @@
 from __future__ import annotations
 
-import sys
-import os
 import asyncio
+import os
+import sys
 from pathlib import Path
 from typing import Any
 
 import click
 
-from .key_storage import key_storage
-from .agent import NFactorialAgent, CLIAgentContext
-from .event_printer import event_printer
-
-from factorial import fallback_models
 from factorial import (
     MODELS,
+    Provider,
+    claude_4_sonnet,
+    claude_35_sonnet,
+    claude_37_sonnet,
+    fallback_models,
     gpt_5,
     gpt_41,
-    claude_4_sonnet,
-    claude_37_sonnet,
-    claude_35_sonnet,
     grok_4,
-    Provider,
 )
-from factorial.llms import MultiClient, Model
+from factorial.llms import Model, MultiClient
+
+from .agent import CLIAgentContext, NFactorialAgent
+from .event_printer import event_printer
+from .key_storage import key_storage
 
 try:
     import inquirer  # type: ignore
@@ -32,7 +32,6 @@ except ModuleNotFoundError:  # pragma: no cover
 
 
 from typing import NamedTuple
-
 
 PROVIDERS: list[Provider] = list(Provider)
 
@@ -157,13 +156,13 @@ def remove_key(provider: str | None) -> None:
         click.echo(f"Removed {provider} API key from key storage.")
     elif env_key:
         click.echo(
-            (
-                f"{provider} API key is provided via environment variable {env_var}.\n"
-                "This CLI cannot remove environment variables from your shell.\n"
-                "To remove it:\n"
-                f"  - Temporarily (current session): 'unset {env_var}' or 'export {env_var}='\n"
-                f"  - Persistently: remove it from your shell profile (e.g., ~/.zshrc, ~/.bashrc) and restart your shell."
-            )
+            f"{provider} API key is provided via environment variable {env_var}.\n"
+            "This CLI cannot remove environment variables from your shell.\n"
+            "To remove it:\n"
+            f"  - Temporarily (current session): 'unset {env_var}' or "
+            f"'export {env_var}='\n"
+            "  - Persistently: remove it from your shell profile "
+            "(e.g., ~/.zshrc, ~/.bashrc) and restart your shell."
         )
     else:
         click.echo(f"No {provider} API key found in key storage or environment.")
@@ -205,7 +204,8 @@ def list_keys() -> None:
 def create(path: Path, description: tuple[str, ...], model_name: str | None) -> None:
     """Bootstrap a new nfactorial project.
 
-    PATH: Where to create the project - use '.' for current directory or provide a name for a new directory
+    PATH: Where to create the project - use '.' for current directory or provide
+          a name for a new directory
     DESCRIPTION: Description of the project to generate"""
     prompt = " ".join(description).strip("'\"").strip()
     if not prompt:
@@ -224,7 +224,8 @@ def create(path: Path, description: tuple[str, ...], model_name: str | None) -> 
     model_setup = _model_setup()
     if not model_setup.configured_providers:
         click.echo(
-            "No API keys configured. Please set up API keys using 'nfactorial setup add-key' command or environment variables.",
+            "No API keys configured. Please set up API keys using "
+            "'nfactorial setup add-key' command or environment variables.",
             err=True,
         )
         sys.exit(1)
@@ -233,21 +234,20 @@ def create(path: Path, description: tuple[str, ...], model_name: str | None) -> 
     if model_name:
         model = model_setup.lookup.get(model_name.lower())
         if not model:
+            available = ", ".join([m.name for m in MODELS])
             click.echo(
-                "Unknown model '{0}'. Available models: {1}".format(
-                    model_name,
-                    ", ".join([model.name for model in MODELS]),
-                ),
+                f"Unknown model '{model_name}'. Available models: {available}",
                 err=True,
             )
             sys.exit(1)
         if model.provider not in model_setup.configured_providers:
+            provider_val = model.provider.value
+            env_var = f"{provider_val.upper()}_API_KEY"
             click.echo(
-                (
-                    f"Model '{model.name}' requires provider '{model.provider.value}', "
-                    "but no API key is configured. Add a key via 'nfactorial setup add-key' "
-                    f"or set the {model.provider.value.upper()}_API_KEY environment variable."
-                ),
+                f"Model '{model.name}' requires provider '{provider_val}', "
+                "but no API key is configured. Add a key via "
+                f"'nfactorial setup add-key' or set the {env_var} "
+                "environment variable.",
                 err=True,
             )
             sys.exit(1)
@@ -328,7 +328,8 @@ def agent(prompt: tuple[str, ...], model_name: str | None) -> None:
     model_setup = _model_setup()
     if not model_setup.configured_providers:
         click.echo(
-            "No API keys configured. Please set up API keys using 'nfactorial setup add-key' command or environment variables.",
+            "No API keys configured. Please set up API keys using "
+            "'nfactorial setup add-key' command or environment variables.",
             err=True,
         )
         sys.exit(1)
@@ -337,11 +338,9 @@ def agent(prompt: tuple[str, ...], model_name: str | None) -> None:
     if model_name:
         model = model_setup.lookup.get(model_name.lower())
         if not model:
+            available = ", ".join([m.name for m in MODELS])
             click.echo(
-                "Unknown model '{0}'. Available models: {1}".format(
-                    model_name,
-                    ", ".join([model.name for model in MODELS]),
-                ),
+                f"Unknown model '{model_name}'. Available models: {available}",
                 err=True,
             )
             sys.exit(1)

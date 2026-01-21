@@ -1,25 +1,28 @@
 import os
 from typing import Any
-from ..utils import run_linter, with_line_numbers
 
+from ..utils import run_linter, with_line_numbers
 
 DIAGNOSTICS_EXTENSIONS = [".py", ".js", ".ts", ".jsx", ".tsx", ".css"]
 
 
 def read(file_path: str, show_line_numbers: bool = True) -> tuple[str, dict[str, Any]]:
     """
-    Reads a file and returns its contents and diagnostics for js, jsx, ts, tsx, css, and py code files.
+    Reads a file and returns its contents and diagnostics for code files.
+
+    Supports js, jsx, ts, tsx, css, and py code files.
 
     Arguments:
     file_path: The path to the file to read
     show_line_numbers: Whether to show line numbers in the file contents
-        - **true** → each line is prefixed like `[42] const foo = "bar"`. Useful to know exactly which line numbers to edit.
-        - **false** → raw text with no prefixes (easier to copy-paste into edits).
+        - **true** → each line is prefixed like `[42] const foo = "bar"`.
+          Useful to know exactly which line numbers to edit.
+        - **false** → raw text with no prefixes (easier to copy-paste).
     """
     if not os.path.exists(file_path):
         return f"Error: File {file_path} does not exist", {"error": "File not found"}
 
-    with open(file_path, "r") as f:
+    with open(file_path) as f:
         content = f.read()
 
     file_size = len(content)

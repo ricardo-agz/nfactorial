@@ -1,12 +1,12 @@
+import asyncio
+import fnmatch
 import os
 import re
-import fnmatch
-import asyncio
 
 from factorial.llms import MultiClient, gpt_41_nano
 from factorial.logging import get_logger
-from ..utils import line_count
 
+from ..utils import line_count
 
 # Default patterns to ignore (common build artifacts and hidden directories)
 DEFAULT_IGNORE_PATTERNS: list[str] = [
@@ -72,7 +72,11 @@ async def _llm_description_from_snippet(snippet: str) -> str | None:
             messages=[
                 {
                     "role": "system",
-                    "content": "Your task is to analyze a source code file and generate a concise 10-15 word description of its purpose. Respond with only the description; no preamble or postamble.",
+                    "content": (
+                        "Your task is to analyze a source code file and generate "
+                        "a concise 10-15 word description of its purpose. "
+                        "Respond with only the description; no preamble or postamble."
+                    ),
                 },
                 {
                     "role": "user",
@@ -253,9 +257,10 @@ def _heuristic_description(file_path: str, snippet: str) -> str | None:
 
         if ext in {".java", ".kt"}:
             class_match = re.search(r"(?:public\s+)?class\s+(\w+)", text)
+            lang = "Java" if ext == ".java" else "Kotlin"
             if class_match:
-                return f"{'Java' if ext == '.java' else 'Kotlin'} class: {class_match.group(1)}"
-            return f"{'Java' if ext == '.java' else 'Kotlin'} source"
+                return f"{lang} class: {class_match.group(1)}"
+            return f"{lang} source"
 
         return None
     except Exception:
@@ -269,7 +274,7 @@ async def _description(file_path: str) -> str | None:
     Falls back to *None* on any error.
     """
     try:
-        with open(file_path, "r", encoding="utf-8", errors="ignore") as fh:
+        with open(file_path, encoding="utf-8", errors="ignore") as fh:
             snippet = fh.read(2500)
 
         if not snippet.strip():
@@ -350,14 +355,19 @@ def _build_tree_lines(
 
 
 async def tree(dir_path: str | None = None, ignore: list[str] | None = None) -> str:
-    """Lists the directory contents in a visual tree format. It works similarly to the Unix `tree` command but with the following enhancements:
-    * Appends a concise description (~15 words) after every js, ts, jsx, tsx, css, md, and py file.
-    * Ignores common bulky or transient directories like `venv`, `node_modules`, and `__pycache__` or any other directories specified in the `.gitignore` file.
+    """Lists the directory contents in a visual tree format.
+
+    Works similarly to the Unix `tree` command but with enhancements:
+    * Appends a concise description (~15 words) after every js, ts, jsx, tsx,
+      css, md, and py file.
+    * Ignores common bulky or transient directories like `venv`, `node_modules`,
+      and `__pycache__` or any other directories specified in `.gitignore`.
 
     Parameters
     ----------
     dir_path:
-        Absolute path to the directory to inspect. Defaults to the current working directory.
+        Absolute path to the directory to inspect. Defaults to the current
+        working directory.
     ignore:
         Additional glob patterns to exclude from the listing.
     """
@@ -372,9 +382,8 @@ async def tree(dir_path: str | None = None, ignore: list[str] | None = None) -> 
         ignore_patterns.extend(ignore)
 
     code_files = _collect_code_files(effective_path, ignore_patterns)
-    descriptions = dict(
-        zip(code_files, await asyncio.gather(*[_description(fp) for fp in code_files]))
-    )
+    description_results = await asyncio.gather(*[_description(fp) for fp in code_files])
+    descriptions = dict(zip(code_files, description_results, strict=True))
 
     display_root = (input_path or ".").rstrip(os.sep) + os.sep
     root_line = display_root

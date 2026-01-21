@@ -1,4 +1,5 @@
 from __future__ import annotations
+
 import asyncio
 import time
 from dataclasses import dataclass
@@ -91,7 +92,7 @@ class MetricsCollector:
             # ---------------------------
             chart_bars = 60
             metric_types = ["completed", "failed", "cancelled", "retried"]
-            # UI only renders these, but we keep `retried` for distribution + completeness
+            # UI only renders these; keep `retried` for distribution
             chart_metric_types = ["completed", "failed", "cancelled"]
 
             window_cfg: dict[str, Any] = {
@@ -125,7 +126,7 @@ class MetricsCollector:
                 num_buckets = 1
 
             if num_buckets % chart_bars != 0:
-                # Should not happen with our fixed configs; fall back to showing raw buckets.
+                # Shouldn't happen with our configs; fall back to raw buckets.
                 chart_bars = min(chart_bars, num_buckets)
 
             group_size = max(1, num_buckets // chart_bars)
@@ -231,11 +232,12 @@ class MetricsCollector:
                 bar_counts = {m: [0] * chart_bars for m in metric_types}
                 bar_completed_duration = [0.0] * chart_bars
 
-                totals = {m: 0 for m in metric_types}
+                totals = dict.fromkeys(metric_types, 0)
                 total_completed_duration = 0.0
                 last_bucket_activity: int | None = None
 
-                # Values are [ts, completed_count, completed_dur, failed_count, cancelled_count, retried_count] per bucket
+                # Values per bucket: [ts, completed_count, completed_dur,
+                #                    failed_count, cancelled_count, retried_count]
                 for i, expected_ts in enumerate(bucket_timestamps):
                     off = i * 6
                     ts_raw = values[off]
@@ -277,9 +279,13 @@ class MetricsCollector:
                 )
 
             # Global first, then per-agent in the same order we queued them
-            global_bar_counts, global_bar_completed_dur, global_totals, global_completed_dur_sum, _ = parse_ring(
-                ring_results[0]
-            )
+            (
+                global_bar_counts,
+                global_bar_completed_dur,
+                global_totals,
+                global_completed_dur_sum,
+                _,
+            ) = parse_ring(ring_results[0])
 
             # Fill per-agent timelines + totals
             agent_activity_charts: dict[str, dict[str, Any]] = {}
@@ -301,13 +307,17 @@ class MetricsCollector:
                 agent_activity_charts[agent_name] = {}
                 for metric_type in chart_metric_types:
                     total_tasks = totals[metric_type]
-                    total_duration = completed_dur_sum if metric_type == "completed" else 0.0
+                    total_duration = (
+                        completed_dur_sum if metric_type == "completed" else 0.0
+                    )
                     buckets = [
                         {
                             "timestamp": bar_timestamps[i],
                             "count": bar_counts[metric_type][i],
                             "total_duration": (
-                                bar_completed_dur[i] if metric_type == "completed" else 0.0
+                                bar_completed_dur[i]
+                                if metric_type == "completed"
+                                else 0.0
                             ),
                             "total_turns": 0,
                             "total_retries": 0,
@@ -348,7 +358,9 @@ class MetricsCollector:
                         "timestamp": bar_timestamps[i],
                         "count": global_bar_counts[metric_type][i],
                         "total_duration": (
-                            global_bar_completed_dur[i] if metric_type == "completed" else 0.0
+                            global_bar_completed_dur[i]
+                            if metric_type == "completed"
+                            else 0.0
                         ),
                         "total_turns": 0,
                         "total_retries": 0,
@@ -605,7 +617,7 @@ def add_observability_routes(
         """Serve the dashboard HTML"""
         dashboard_path = os.path.join(os.path.dirname(__file__), "dashboard.html")
         try:
-            with open(dashboard_path, "r", encoding="utf-8") as f:
+            with open(dashboard_path, encoding="utf-8") as f:
                 html_content = f.read()
                 html_content = html_content.replace("{{APP_NAME}}", dashboard_name)
                 return html_content

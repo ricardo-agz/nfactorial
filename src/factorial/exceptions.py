@@ -1,11 +1,11 @@
 from openai import (
-    RateLimitError as OpenAIRateLimitError,
-    InternalServerError as OpenAIInternalServerError,
-    APITimeoutError as OpenAITimeoutError,
     APIConnectionError as OpenAIConnectionError,
-    BadRequestError as OpenAIBadRequestError,
+    APITimeoutError as OpenAITimeoutError,
     AuthenticationError as OpenAIAuthenticationError,
+    BadRequestError as OpenAIBadRequestError,
+    InternalServerError as OpenAIInternalServerError,
     PermissionDeniedError as OpenAIPermissionDeniedError,
+    RateLimitError as OpenAIRateLimitError,
 )
 
 
@@ -70,7 +70,10 @@ class InvalidLLMResponseError(Exception):
 
 
 class FatalAgentError(Exception):
-    """Exception raised to indicate an unrecoverable error which should fail the task immediately (no retry)."""
+    """Exception for unrecoverable errors that should fail the task immediately.
+
+    When this exception is raised, the task will fail without retry.
+    """
 
     pass
 

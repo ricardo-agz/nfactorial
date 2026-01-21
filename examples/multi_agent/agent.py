@@ -1,26 +1,26 @@
-from typing import Any
 import os
-from dotenv import load_dotenv
+from typing import Any
 
-from factorial import (
-    BaseAgent,
-    Agent,
-    AgentContext,
-    Orchestrator,
-    ModelSettings,
-    gpt_41_mini,
-    AgentWorkerConfig,
-    MaintenanceWorkerConfig,
-    TaskTTLConfig,
-    ObservabilityConfig,
-    MetricsTimelineConfig,
-    function_tool,
-)
-from factorial.tools import forking_tool
-from factorial.context import ExecutionContext
-from factorial.utils import BaseModel
+from dotenv import load_dotenv
 from exa_py import Exa
 
+from factorial import (
+    Agent,
+    AgentContext,
+    AgentWorkerConfig,
+    BaseAgent,
+    MaintenanceWorkerConfig,
+    MetricsTimelineConfig,
+    ModelSettings,
+    ObservabilityConfig,
+    Orchestrator,
+    TaskTTLConfig,
+    function_tool,
+    gpt_41_mini,
+)
+from factorial.context import ExecutionContext
+from factorial.tools import forking_tool
+from factorial.utils import BaseModel
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
 env_path = os.path.join(current_dir, ".env")
@@ -31,7 +31,10 @@ load_dotenv(env_path, override=True)
 def plan(
     overview: str, steps: list[str], agent_ctx: AgentContext
 ) -> tuple[str, dict[str, Any]]:
-    """Structure your plan to accomplish the task. This should be user-readable and not mention any specific tool names."""
+    """Structure your plan to accomplish the task.
+
+    This should be user-readable and not mention any specific tool names.
+    """
     return f"{overview}\n{' -> '.join(steps)}", {"overview": overview, "steps": steps}
 
 
@@ -107,7 +110,7 @@ class MainAgent(BaseAgent[MainAgentContext]):
             name="main_agent",
             description="Main Agent",
             model=gpt_41_mini,
-            instructions="You are a helpful assistant. Always start out by making a plan.",
+            instructions="You are a helpful assistant. Always start by making a plan.",
             tools=[plan, reflect, research, search],
             model_settings=ModelSettings[MainAgentContext](
                 temperature=0.0,

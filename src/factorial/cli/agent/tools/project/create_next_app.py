@@ -10,15 +10,17 @@ def create_next_app(
     """Scaffold a **Next.js** application.
 
     Usage:
-    This should ONLY be used to initialize a NEW frontend project. Do NOT use this if the current project already has a frontend
-    directory set up, work off of the existing frontend directory instead.
+    This should ONLY be used to initialize a NEW frontend project. Do NOT use
+    this if the current project already has a frontend directory set up, work
+    off of the existing frontend directory instead.
 
     Args:
         project_name: Name of the directory / project to generate.
         language: "typescript" (default) or "javascript".
         with_tailwind:
-            * **True** → install and configure Tailwind CSS by running ``npx tailwindcss init -p``
-              and injecting Tailwind CSS directives into ``styles/globals.css``.
+            * **True** → install and configure Tailwind CSS by running
+              ``npx tailwindcss init -p`` and injecting Tailwind CSS directives
+              into ``styles/globals.css``.
             * **False** → skip Tailwind CSS setup.
     """
 
@@ -63,15 +65,17 @@ def create_next_app(
                     fh.write(
                         "@tailwind base;\n@tailwind components;\n@tailwind utilities;\n"
                     )
+                relative_css = os.path.relpath(globals_css)
                 logs.append(
-                    f"# Injected Tailwind CSS directives into {os.path.relpath(globals_css)}"
+                    f"# Injected Tailwind CSS directives into {relative_css}"
                 )
 
         # Compose summary
         summary_lines = [f"Next.js app '{project_name}' created successfully."]
         if with_tailwind:
             summary_lines.append(
-                "Tailwind CSS was installed and configured (tailwind.config.js, postcss.config.js, and styles/globals.css updated)."
+                "Tailwind CSS was installed and configured "
+                "(tailwind.config.js, postcss.config.js, styles/globals.css updated)."
             )
 
         # Combine logs (truncate if >4000 chars)
@@ -85,4 +89,7 @@ def create_next_app(
 
     except subprocess.CalledProcessError as exc:
         error_logs = "\n\n".join(logs)
-        return f"Error during Next.js app creation: {exc}\n\n--- Partial Logs ---\n{error_logs}"
+        return (
+            f"Error during Next.js app creation: {exc}\n\n"
+            f"--- Partial Logs ---\n{error_logs}"
+        )

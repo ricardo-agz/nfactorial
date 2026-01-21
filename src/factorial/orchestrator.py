@@ -1,21 +1,23 @@
-from dataclasses import dataclass, field
 import asyncio
 import os
 import signal
+from collections.abc import AsyncGenerator
+from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
+from typing import Any, Literal
+
 import httpx
 import redis.asyncio as redis
-from typing import Any, Literal, AsyncGenerator
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from contextlib import asynccontextmanager
 
-from factorial.queue import worker_loop, maintenance_loop, Task
-from factorial.queue.keys import RedisKeys
-from factorial.context import ContextType
 from factorial.agent import BaseAgent
+from factorial.context import ContextType
 from factorial.llms import MultiClient
-from factorial.utils import to_snake_case
 from factorial.logging import get_logger
+from factorial.queue import Task, maintenance_loop, worker_loop
+from factorial.queue.keys import RedisKeys
+from factorial.utils import to_snake_case
 
 logger = get_logger(__name__)
 
@@ -70,8 +72,10 @@ class MetricsTimelineConfig:
 
         if self.timeline_duration < min_duration:
             raise ValueError(
-                f"Timeline duration ({self.timeline_duration}s) is too short for bucket size '{self.bucket_size}'. "
-                f"Minimum duration required: {min_duration}s to ensure at least {min_buckets} buckets."
+                f"Timeline duration ({self.timeline_duration}s) is too short "
+                f"for bucket size '{self.bucket_size}'. "
+                f"Minimum duration required: {min_duration}s "
+                f"to ensure at least {min_buckets} buckets."
             )
 
     @property
@@ -108,7 +112,10 @@ class MetricsTimelineConfig:
 
 @dataclass
 class MaintenanceWorkerConfig:
-    """Configuration for the maintenance worker that handles both stale recovery and garbage collection"""
+    """Configuration for the maintenance worker.
+
+    Handles both stale recovery and garbage collection.
+    """
 
     interval: int = 10
     workers: int = 1
@@ -181,7 +188,6 @@ class Runner:
                     max_retries=self.agent_worker_config.max_retries,
                     heartbeat_interval=self.agent_worker_config.heartbeat_interval,
                     task_timeout=self.agent_worker_config.turn_timeout,
-                    metrics_bucket_duration=self.metrics_config.bucket_duration,
                     metrics_retention_duration=self.metrics_config.retention_duration,
                     namespace=self.namespace,
                 )
@@ -199,7 +205,6 @@ class Runner:
                     interval=self.maintenance_worker_config.interval,
                     task_ttl_config=self.maintenance_worker_config.task_ttl,
                     max_cleanup_batch=self.maintenance_worker_config.max_cleanup_batch,
-                    metrics_bucket_duration=self.maintenance_worker_config.metrics_timeline.bucket_duration,
                     metrics_retention_duration=self.maintenance_worker_config.metrics_timeline.retention_duration,
                     namespace=self.namespace,
                 )
@@ -218,11 +223,16 @@ class Orchestrator:
         redis_max_connections: int = 50,
         openai_api_key: str | None = None,
         xai_api_key: str | None = None,
-        observability_config: ObservabilityConfig = ObservabilityConfig(),
-        metrics_config: MetricsTimelineConfig = MetricsTimelineConfig(),
+        observability_config: ObservabilityConfig | None = None,
+        metrics_config: MetricsTimelineConfig | None = None,
         namespace: str | None = None,
     ):
         self.shutdown_event = asyncio.Event()
+
+        if observability_config is None:
+            observability_config = ObservabilityConfig()
+        if metrics_config is None:
+            metrics_config = MetricsTimelineConfig()
 
         if redis_pool:
             self.redis_pool = redis_pool
@@ -300,13 +310,18 @@ class Orchestrator:
         Args:
             owner_id: The owner ID to subscribe to updates for
             timeout: Timeout in seconds for waiting for messages (default: 5.0)
-            ignore_subscribe_messages: Whether to ignore Redis subscription confirmation messages
-            task_ids: Optional list of task IDs to filter for (only events for these tasks)
-            event_types: Optional list of event types to filter for (e.g., ["run_completed", "run_failed"])
-            event_pattern: Optional regex pattern to match against event_type (e.g., "run_.*" for all run events)
+            ignore_subscribe_messages: Whether to ignore Redis subscription
+                confirmation messages
+            task_ids: Optional list of task IDs to filter for (only events
+                for these tasks)
+            event_types: Optional list of event types to filter for
+                (e.g., ["run_completed", "run_failed"])
+            event_pattern: Optional regex pattern to match against event_type
+                (e.g., "run_.*" for all run events)
 
         Yields:
-            dict: Parsed JSON message data from the updates channel (filtered based on criteria)
+            dict: Parsed JSON message data from the updates channel
+                (filtered based on criteria)
 
         Examples:
             # All updates for a user
@@ -398,9 +413,13 @@ class Orchestrator:
     def register_runner(
         self,
         agent: BaseAgent[Any],
-        agent_worker_config: AgentWorkerConfig = AgentWorkerConfig(),
-        maintenance_worker_config: MaintenanceWorkerConfig = MaintenanceWorkerConfig(),
+        agent_worker_config: AgentWorkerConfig | None = None,
+        maintenance_worker_config: MaintenanceWorkerConfig | None = None,
     ):
+        if agent_worker_config is None:
+            agent_worker_config = AgentWorkerConfig()
+        if maintenance_worker_config is None:
+            maintenance_worker_config = MaintenanceWorkerConfig()
         num_connections = agent_worker_config.workers * agent_worker_config.batch_size
         http_client = httpx.AsyncClient(
             limits=httpx.Limits(
@@ -480,7 +499,6 @@ class Orchestrator:
                 namespace=self.namespace,
                 task_id=task_id,
                 agents_by_name=self.agents_by_name,
-                metrics_bucket_duration=self.metrics_config.bucket_duration,
                 metrics_retention_duration=self.metrics_config.retention_duration,
             )
         finally:
@@ -523,7 +541,8 @@ class Orchestrator:
 
         Raises:
             TaskNotFoundError: If the task doesn't exist
-            InactiveTaskError: If the task is not active (completed, failed, or cancelled)
+            InactiveTaskError: If the task is not active (completed, failed,
+                or cancelled)
         """
         from factorial.queue import complete_deferred_tool as q_complete_deferred_tool
 
@@ -606,7 +625,7 @@ class Orchestrator:
         )
         agents = [runner.agent for runner in self.runners]
 
-        # Get metrics config from the first runner (assuming all runners have the same metrics config)
+        # Get metrics config from first runner (all runners have same config)
         metrics_config = None
         if self.runners:
             metrics_config = self.runners[0].maintenance_worker_config.metrics_timeline
@@ -703,7 +722,8 @@ class Orchestrator:
 
                     if still_pending:
                         logger.warning(
-                            f"{len(still_pending)} workers didn't finish in time, cancelling..."
+                            f"{len(still_pending)} workers didn't finish "
+                            "in time, cancelling..."
                         )
                         for worker in still_pending:
                             worker.cancel()

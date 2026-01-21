@@ -1,47 +1,45 @@
+import asyncio
+import json
 import random
 import secrets
 import time
-import asyncio
-import json
-from typing import Any, cast
-import redis.asyncio as redis
 import uuid
-from datetime import datetime, timezone
+from typing import Any, cast
 
-from factorial.utils import decode
+import redis.asyncio as redis
+
 from factorial.agent import BaseAgent, ExecutionContext
-from factorial.events import AgentEvent, EventPublisher, BatchEvent
-from factorial.logging import get_logger, colored
+from factorial.events import AgentEvent, BatchEvent, EventPublisher
+from factorial.exceptions import (
+    InactiveTaskError,
+    InvalidTaskIdError,
+    TaskNotFoundError,
+)
+from factorial.logging import colored, get_logger
+from factorial.queue.keys import PENDING_SENTINEL, RedisKeys
+from factorial.queue.lua import (
+    BatchPickupScript,
+    BatchPickupScriptResult,
+    CancelTaskScriptResult,
+    EnqueueBatchScript,
+    create_cancel_task_script,
+    create_child_task_completion_script,
+    create_enqueue_batch_script,
+    create_enqueue_task_script,
+    create_tool_completion_script,
+)
 from factorial.queue.task import (
     Batch,
     BatchMetadata,
+    ContextType,
     Task,
     TaskStatus,
-    ContextType,
-    get_task_status,
-    get_task_data,
-    get_task_agent,
     get_batch_data,
+    get_task_agent,
+    get_task_data,
+    get_task_status,
 )
-from factorial.utils import is_valid_task_id
-from factorial.exceptions import (
-    InactiveTaskError,
-    TaskNotFoundError,
-    InvalidTaskIdError,
-)
-from factorial.queue.lua import (
-    BatchPickupScriptResult,
-    BatchPickupScript,
-    create_cancel_task_script,
-    CancelTaskScriptResult,
-    create_child_task_completion_script,
-    create_enqueue_task_script,
-    create_tool_completion_script,
-    EnqueueBatchScript,
-    create_enqueue_batch_script,
-)
-from factorial.queue.keys import RedisKeys, PENDING_SENTINEL
-
+from factorial.utils import decode, is_valid_task_id
 
 logger = get_logger(__name__)
 
@@ -266,7 +264,6 @@ async def cancel_batch(
     namespace: str,
     batch_id: str,
     agents_by_name: dict[str, BaseAgent[Any]],
-    metrics_bucket_duration: int,
     metrics_retention_duration: int,
 ) -> Batch:
     """Cancel all tasks in a batch.
@@ -285,7 +282,6 @@ async def cancel_batch(
                 namespace=namespace,
                 task_id=tid,
                 agents_by_name=agents_by_name,
-                metrics_bucket_duration=metrics_bucket_duration,
                 metrics_retention_duration=metrics_retention_duration,
             )
         except (InactiveTaskError, TaskNotFoundError):
@@ -302,7 +298,7 @@ async def cancel_batch(
             await _safe_cancel(tid)
 
     await asyncio.gather(*[_bounded_cancel(tid) for tid in batch.task_ids])
-    # Refresh batch stats in case some tasks were cancelled immediately (e.g. backoff / pending)
+    # Refresh batch stats (some tasks may have been cancelled immediately)
     batch = await get_batch_data(redis_client, namespace, batch_id)
 
     batch.metadata.status = "cancelled"
@@ -338,7 +334,6 @@ async def cancel_task(
     namespace: str,
     task_id: str,
     agents_by_name: dict[str, BaseAgent[Any]],
-    metrics_bucket_duration: int,
     metrics_retention_duration: int,
 ) -> None:
     agent_name = await get_task_agent(redis_client, namespace, task_id)
@@ -346,7 +341,6 @@ async def cancel_task(
         namespace=namespace,
         agent=agent_name,
         task_id=task_id,
-        metrics_bucket_duration=metrics_bucket_duration,
     )
 
     cancel_script = await create_cancel_task_script(redis_client)
@@ -423,7 +417,7 @@ async def resume_if_no_remaining_child_tasks(
     """Resume the parent task if there are no remaining child tasks.
 
     Returns:
-        * True if the task was resumed, False if it was cancelled or still has child tasks
+        * True if the task was resumed, False if cancelled or has child tasks
     """
     task_data = await get_task_data(redis_client, namespace, task_id)
     task_status = TaskStatus(task_data["status"])
@@ -551,7 +545,7 @@ async def process_cancelled_tasks(
     cancelled_task_ids: list[str],
     agent: BaseAgent[Any],
 ) -> None:
-    """Process cancelled tasks. Runs agent-specific cancellation logic and publishes cancellation events."""
+    """Process cancelled tasks with agent-specific logic and publish events."""
     tasks = [
         run_agent_cancellation(redis_client, namespace, agent, task_id)
         for task_id in cancelled_task_ids
@@ -564,7 +558,6 @@ async def get_task_batch(
     namespace: str,
     agent: BaseAgent[Any],
     batch_size: int,
-    metrics_bucket_duration: int,
     metrics_ttl: int,
 ) -> tuple[list[str], list[str]]:
     """
@@ -577,7 +570,6 @@ async def get_task_batch(
     keys = RedisKeys.format(
         namespace=namespace,
         agent=agent.name,
-        metrics_bucket_duration=metrics_bucket_duration,
     )
 
     try:
@@ -600,11 +592,13 @@ async def get_task_batch(
         )
         if result.orphaned_task_ids:
             logger.warning(
-                f"⚠️ Found {len(result.orphaned_task_ids)} orphaned tasks: {result.orphaned_task_ids}"
+                f"⚠️ Found {len(result.orphaned_task_ids)} orphaned tasks: "
+                f"{result.orphaned_task_ids}"
             )
         if result.corrupted_task_ids:
             logger.warning(
-                f"⚠️ Found {len(result.corrupted_task_ids)} corrupted tasks: {result.corrupted_task_ids}"
+                f"⚠️ Found {len(result.corrupted_task_ids)} corrupted tasks: "
+                f"{result.corrupted_task_ids}"
             )
 
         return result.tasks_to_process_ids, result.tasks_to_cancel_ids

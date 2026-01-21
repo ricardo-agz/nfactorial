@@ -1,7 +1,7 @@
+import hashlib
 import logging
 import sys
 import time
-import hashlib
 from threading import Lock
 from typing import Any
 

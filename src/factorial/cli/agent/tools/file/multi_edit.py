@@ -1,7 +1,9 @@
 import os
 from pathlib import Path
+
 from pydantic import BaseModel
-from ..utils import run_linter, replace_block, build_preview, build_full_file_preview
+
+from ..utils import build_full_file_preview, build_preview, replace_block, run_linter
 
 
 def _apply_single(
@@ -67,19 +69,25 @@ def multi_edit(
     Apply *edits* to *file_path* sequentially.
 
     **Guidelines for crafting the *edits* list**
-    - Every *old_string* must be copied **exactly** from the source. Do not introduce additional escape sequences.
+    - Every *old_string* must be copied **exactly** from the source. Do not
+      introduce additional escape sequences.
     - *new_string* is inserted **verbatim**
     - The *start_line* / *end_line* coordinates refer to the ORIGINAL file.
       This function automatically adjusts subsequent edits as earlier ones
       change line numbers.
-    - `tolerance`: number of **extra lines** that the tool is allowed to look **above _and_ below** the `[start_line, end_line]` window when searching for `old_string`.
-        * With at tolerance of 0, the start_line - end_line slice must fully encompass **every line** of `old_string`. If even one character is outside that window, the replacement fails.
-        * For a more forgiving search, increase tolerance for the tool to automatically widen the search window.
+    - `tolerance`: number of **extra lines** that the tool is allowed to look
+      **above _and_ below** the `[start_line, end_line]` window when searching
+      for `old_string`.
+        * With at tolerance of 0, the start_line - end_line slice must fully
+          encompass **every line** of `old_string`. If even one character is
+          outside that window, the replacement fails.
+        * For a more forgiving search, increase tolerance for the tool to
+          automatically widen the search window.
 
 
     Arguments:
     file_path: The absolute filepath to the file to edit
-    edits: A list of edits to apply to the file. Each edit must follow the same requirements as the edit_lines tool.
+    edits: A list of edits to apply. Each edit follows the edit_lines format.
     """
     file_path = os.path.abspath(file_path)
     if not edits:
@@ -100,7 +108,7 @@ def multi_edit(
     total_lines_added = 0
     total_lines_removed = 0
 
-    for idx, edit in enumerate(edits, 1):
+    for _idx, edit in enumerate(edits, 1):
         start = edit.start_line
         end = edit.end_line
         tol = edit.tolerance

@@ -1,7 +1,7 @@
 from .glob import glob
 from .grep import grep
-from .tree import tree
 from .ls import ls
+from .tree import tree
 
 search_tools = [
     glob,

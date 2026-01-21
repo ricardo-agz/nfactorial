@@ -1,9 +1,9 @@
 from .delete import delete
-from .read import read
 from .edit_lines import edit_lines
-from .multi_edit import multi_edit
-from .write import write
 from .find_replace import find_replace
+from .multi_edit import multi_edit
+from .read import read
+from .write import write
 
 file_tools = [
     delete,

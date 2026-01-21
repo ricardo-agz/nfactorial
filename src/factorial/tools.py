@@ -1,33 +1,31 @@
+import asyncio
+import inspect
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
+from enum import Enum  # local import to avoid unnecessary global import
+from functools import wraps
 from typing import (
-    Callable,
     Any,
-    Awaitable,
+    Generic,
     TypeVar,
     Union,
-    Generic,
-    Annotated,
-    get_type_hints,
-    get_origin,
     get_args,
+    get_origin,
+    get_type_hints,
     overload,
 )
-from dataclasses import dataclass
-from pydantic import BaseModel, ConfigDict, Field
-from functools import wraps
+
 from openai.types.chat import ChatCompletionMessageToolCall
-import inspect
-import asyncio
-from enum import Enum  # local import to avoid unnecessary global import
+from pydantic import BaseModel, ConfigDict
 
 from factorial.context import AgentContext, ExecutionContext
 
-
 ContextT = TypeVar("ContextT", bound=AgentContext)
 FunctionToolActionReturn = Union[Any, "FunctionToolActionResult", tuple[str, Any]]
-FunctionToolAction = Union[
-    Callable[..., FunctionToolActionReturn],
-    Callable[..., Awaitable[FunctionToolActionReturn]],
-]
+FunctionToolAction = (
+    Callable[..., FunctionToolActionReturn]
+    | Callable[..., Awaitable[FunctionToolActionReturn]]
+)
 F = Callable[..., Any]
 T = TypeVar("T")
 
@@ -80,7 +78,7 @@ class FunctionTool(Generic[ContextT]):
 
 
 def _python_type_to_json_schema(python_type: type) -> dict[str, Any]:
-    """Convert a Python type (including Annotated and Pydantic types) to JSON schema object."""
+    """Convert a Python type (including Annotated/Pydantic) to JSON schema."""
 
     # ------------------------------------------------------------------
     # Handle ``typing.Annotated`` so we can capture metadata such as
@@ -92,7 +90,7 @@ def _python_type_to_json_schema(python_type: type) -> dict[str, Any]:
         annotated_args = get_args(python_type)
         if not annotated_args:
             # Fallback – treat as plain string
-            python_type = str  # type: ignore[assignment]
+            python_type = str
         else:
             base_type = annotated_args[0]
             metadata = annotated_args[1:]
@@ -107,12 +105,12 @@ def _python_type_to_json_schema(python_type: type) -> dict[str, Any]:
                 if isinstance(meta, str):
                     base_schema["description"] = meta
                 # Case 2: Pydantic Field or FieldInfo-like objects
-                elif hasattr(meta, "description") and getattr(meta, "description"):
-                    base_schema["description"] = getattr(meta, "description")
+                elif hasattr(meta, "description") and meta.description:
+                    base_schema["description"] = meta.description
 
                 # Enum values (if provided via Field(..., enum=[...]))
-                if hasattr(meta, "enum") and getattr(meta, "enum") is not None:
-                    base_schema["enum"] = list(getattr(meta, "enum"))  # type: ignore[arg-type]
+                if hasattr(meta, "enum") and meta.enum is not None:
+                    base_schema["enum"] = list(meta.enum)  # type: ignore[arg-type]
 
             return base_schema
 
@@ -194,7 +192,7 @@ def _function_to_json_schema(func: F) -> tuple[dict[str, Any], bool]:
     has_optional_param = False
 
     for param_name, param in sig.parameters.items():
-        # Skip 'agent_ctx' and 'execution_ctx' parameters as they're injected by the agent
+        # Skip 'agent_ctx' and 'execution_ctx' - they're injected by the agent
         if param_name == "agent_ctx" or (
             param.annotation != inspect.Parameter.empty
             and isinstance(param.annotation, type)
@@ -315,9 +313,9 @@ def function_tool(
 
 
 def convert_tools_list(
-    tools: list[Union[FunctionTool[ContextT], F]],
+    tools: list[FunctionTool[ContextT] | F],
 ) -> tuple[list[FunctionTool[ContextT]], dict[str, FunctionToolAction]]:
-    """Convert a mixed list of FunctionTool instances and Python functions to OpenAI tool schemas and tool actions."""
+    """Convert mixed list of FunctionTool and Python functions to schemas."""
     tool_schemas: list[FunctionTool[ContextT]] = []
     tool_actions: dict[str, FunctionToolAction] = {}
 
@@ -356,7 +354,7 @@ def deferred_result(
     def decorator(
         func: Callable[..., T] | Callable[..., Awaitable[T]],
     ) -> Callable[..., Awaitable[T]]:
-        """Wrap the tool function so it can be awaited regardless of being sync or async.
+        """Wrap tool function so it can be awaited regardless of sync/async.
 
         The orchestrator always awaits the result of the tool wrapper.  If the wrapped
         function is synchronous we simply call it and return the value; if it is a
@@ -387,7 +385,7 @@ def forking_tool(
     def decorator(
         func: Callable[..., T] | Callable[..., Awaitable[T]],
     ) -> Callable[..., Awaitable[T]]:
-        """Wrap the tool function so it can be awaited regardless of being sync or async.
+        """Wrap tool function so it can be awaited regardless of sync/async.
 
         The orchestrator always awaits the result of the tool wrapper.  If the wrapped
         function is synchronous we simply call it and return the value; if it is a

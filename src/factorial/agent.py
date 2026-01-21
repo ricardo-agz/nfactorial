@@ -135,7 +135,7 @@ def retry(
         # can skip all bookkeeping in that case.
 
         @wraps(the_func)
-        async def wrapper(self: "BaseAgent[Any]", *args: Any, **kwargs: Any) -> T:
+        async def wrapper(self: BaseAgent[Any], *args: Any, **kwargs: Any) -> T:
             if max_attempts <= 0:
                 raise ValueError("max_attempts must be greater than 0")
 
@@ -162,7 +162,7 @@ def retry(
                     agent_ctx_obj, AgentContext
                 ):
                     try:
-                        agent_ctx_obj.attempt = attempt  # type: ignore[attr-defined]
+                        agent_ctx_obj.attempt = attempt
                     except Exception:
                         # Never let bookkeeping failure break the retry logic.
                         pass

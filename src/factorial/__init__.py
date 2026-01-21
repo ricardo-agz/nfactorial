@@ -57,16 +57,6 @@ from factorial.llms import (
     fireworks_kimi_k2,
     fireworks_qwen_3_235b,
     fireworks_qwen_3_coder_480b,
-    # AI Gateway-only models (Google, Mistral, Meta, DeepSeek)
-    gemini_2_flash,
-    gemini_2_flash_thinking,
-    gemini_15_pro,
-    mistral_large,
-    codestral,
-    llama_33_70b,
-    llama_31_405b,
-    deepseek_r1,
-    deepseek_v3,
     # Utilities
     fallback_models,
     MODELS,
@@ -131,16 +121,6 @@ __all__ = [
     "fireworks_kimi_k2",
     "fireworks_qwen_3_235b",
     "fireworks_qwen_3_coder_480b",
-    # AI Gateway-only models
-    "gemini_2_flash",
-    "gemini_2_flash_thinking",
-    "gemini_15_pro",
-    "mistral_large",
-    "codestral",
-    "llama_33_70b",
-    "llama_31_405b",
-    "deepseek_r1",
-    "deepseek_v3",
     # Utilities
     "fallback_models",
     "MODELS",

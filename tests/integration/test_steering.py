@@ -1,5 +1,3 @@
-"""Integration tests for task steering operations."""
-
 import json
 
 import pytest

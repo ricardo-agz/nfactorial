@@ -1,6 +1,3 @@
-"""Integration tests for edge cases, invalid states, and error handling."""
-
-
 import pytest
 import redis.asyncio as redis
 

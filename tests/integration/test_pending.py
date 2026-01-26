@@ -1,5 +1,3 @@
-"""Integration tests for pending tool/child task handling."""
-
 import json
 import uuid
 

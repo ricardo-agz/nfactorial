@@ -47,7 +47,7 @@ def search(query: str) -> tuple[str, list[dict[str, Any]]]:
     """Search the web for information"""
     exa = Exa(api_key=os.getenv("EXA_API_KEY"))
 
-    result = exa.search_and_contents(  # type: ignore
+    result = exa.search_and_contents(
         query=query, num_results=10, text={"max_characters": 500}
     )
 

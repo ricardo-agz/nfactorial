@@ -1,5 +1,3 @@
-"""Integration tests for task completion state transitions."""
-
 import json
 import time
 

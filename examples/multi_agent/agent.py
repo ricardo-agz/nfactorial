@@ -15,7 +15,6 @@ from factorial import (
     ObservabilityConfig,
     Orchestrator,
     TaskTTLConfig,
-    ai_gateway,
     function_tool,
     gpt_41_mini,
 )
@@ -74,7 +73,7 @@ class SearchOutput(BaseModel):
 search_agent = Agent(
     name="research_subagent",
     description="Research Sub-Agent",
-    model=ai_gateway(gpt_41_mini),
+    model=gpt_41_mini,
     instructions="You are an intelligent research assistant.",
     tools=[reflect, search],
     output_type=SearchOutput,
@@ -110,7 +109,7 @@ class MainAgent(BaseAgent[MainAgentContext]):
         super().__init__(
             name="main_agent",
             description="Main Agent",
-            model=ai_gateway(gpt_41_mini),
+            model=gpt_41_mini,
             instructions="You are a helpful assistant. Always start by making a plan.",
             tools=[plan, reflect, research, search],
             model_settings=ModelSettings[MainAgentContext](

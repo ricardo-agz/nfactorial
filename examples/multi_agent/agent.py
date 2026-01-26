@@ -15,6 +15,7 @@ from factorial import (
     ObservabilityConfig,
     Orchestrator,
     TaskTTLConfig,
+    ai_gateway,
     function_tool,
     gpt_41_mini,
 )
@@ -47,7 +48,7 @@ def search(query: str) -> tuple[str, list[dict[str, Any]]]:
     """Search the web for information"""
     exa = Exa(api_key=os.getenv("EXA_API_KEY"))
 
-    result = exa.search_and_contents(  # type: ignore
+    result = exa.search_and_contents(
         query=query, num_results=10, text={"max_characters": 500}
     )
 
@@ -73,7 +74,7 @@ class SearchOutput(BaseModel):
 search_agent = Agent(
     name="research_subagent",
     description="Research Sub-Agent",
-    model=gpt_41_mini,
+    model=ai_gateway(gpt_41_mini),
     instructions="You are an intelligent research assistant.",
     tools=[reflect, search],
     output_type=SearchOutput,
@@ -109,7 +110,7 @@ class MainAgent(BaseAgent[MainAgentContext]):
         super().__init__(
             name="main_agent",
             description="Main Agent",
-            model=gpt_41_mini,
+            model=ai_gateway(gpt_41_mini),
             instructions="You are a helpful assistant. Always start by making a plan.",
             tools=[plan, reflect, research, search],
             model_settings=ModelSettings[MainAgentContext](

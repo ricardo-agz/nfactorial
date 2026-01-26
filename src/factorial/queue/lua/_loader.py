@@ -675,7 +675,7 @@ class ChildTaskCompletionScript(AsyncScript):
         task_id: str,
         updated_task_context_json: str,
     ) -> tuple[bool, str]:
-        return await super().__call__(  # type: ignore
+        result: tuple[int, str] = await super().__call__(  # type: ignore
             keys=[
                 queue_main_key,
                 queue_orphaned_key,
@@ -693,6 +693,7 @@ class ChildTaskCompletionScript(AsyncScript):
                 updated_task_context_json,
             ],
         )
+        return (bool(result[0]), decode(result[1]))
 
 
 async def create_child_task_completion_script(

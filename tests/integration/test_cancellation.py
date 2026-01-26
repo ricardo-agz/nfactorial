@@ -1,5 +1,3 @@
-"""Integration tests for task cancellation scenarios."""
-
 import json
 import uuid
 from typing import Any
@@ -254,7 +252,7 @@ class TestCancelProcessingTask:
 
         # Task should be marked for cancellation (picked up by worker later)
         assert result.success
-        is_marked = await redis_client.sismember(keys.task_cancellations, task_id)
+        is_marked = await redis_client.sismember(keys.task_cancellations, task_id)  # type: ignore[misc]
         assert is_marked
 
 

@@ -1,5 +1,3 @@
-"""Integration tests for task recovery and expiration operations."""
-
 import time
 
 import pytest

@@ -1,5 +1,3 @@
-"""Integration tests for task enqueue operations."""
-
 import json
 import uuid
 

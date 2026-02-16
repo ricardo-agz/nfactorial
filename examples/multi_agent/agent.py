@@ -2,7 +2,7 @@ import os
 from typing import Any
 
 from dotenv import load_dotenv
-from exa_py import Exa
+from exa_py import Exa  # type: ignore[import-not-found]
 
 from factorial import (
     Agent,
@@ -15,11 +15,12 @@ from factorial import (
     ObservabilityConfig,
     Orchestrator,
     TaskTTLConfig,
-    function_tool,
+    WaitInstruction,
     gpt_41_mini,
+    subagents,
+    tool,
+    wait,
 )
-from factorial.context import ExecutionContext
-from factorial.tools import forking_tool
 from factorial.utils import BaseModel
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -89,19 +90,16 @@ class MainAgentContext(AgentContext):
     has_used_research: bool = False
 
 
-@function_tool(is_enabled=lambda context: not context.has_used_research)
-@forking_tool(timeout=600)
+@tool(is_enabled=lambda context: not context.has_used_research)
 async def research(
     queries: list[str],
     agent_ctx: MainAgentContext,
-    execution_ctx: ExecutionContext,
-) -> list[str]:
-    """Spawn child search tasks for each query and wait for them to complete."""
-
+) -> WaitInstruction:
+    """Spawn child search tasks and block until they all complete."""
     payloads = [AgentContext(query=q) for q in queries]
-    batch = await execution_ctx.spawn_child_tasks(search_agent, payloads)
+    jobs = await subagents.spawn(agent=search_agent, inputs=payloads, key="research")
     agent_ctx.has_used_research = True
-    return batch.task_ids
+    return wait.jobs(jobs, message="Waiting on research subagents")
 
 
 class MainAgent(BaseAgent[MainAgentContext]):

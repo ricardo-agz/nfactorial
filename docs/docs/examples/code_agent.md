@@ -1,19 +1,15 @@
 # Code Agent
 
-An IDE-based agent that can write and edit code and *request the user* to execute code. 
+An IDE-based agent that can write and edit code and *request the user* to execute code.
 
 ![Dashboard](../../static/img/code-agent.png)
 
-
 ## Recreating Cursor-style 'Waiting for approval...' tools
 
-
-<div style={{textAlign: 'center'}}>
-<img src="/img/cursor-approve.png" alt="Dashboard" width="500" />
-</div>
-<br/>
+![Approval UI](/img/cursor-approve.png)
 
 When we want the agent to do something that requires user approval we want to:
+
 1. Prompt the user of the action we want to take
 2. Put the agent in a pending idle state
 3. Wait for user rejection / approval
@@ -24,21 +20,23 @@ When we want the agent to do something that requires user approval we want to:
 We want to give the agent 3 tools, the ability to think/make a plan, the ability to write code, and the ability to request the user to execute code.
 
 Note that `edit_code` is the only tool that does any real work in this example, think is simply a way to let the agent log its thoughts and
-`request_code_execution` will simply put the agent in the idle pending state until the code has been executed (in the client) or rejected and 
-the result submitted with the _approve_or_reject_ endpoint.
+`request_code_execution` uses a hook approval flow that parks the task until the user approves or rejects via the
+`/api/resolve_hook` endpoint.
 
 `agent.py`
 
 ```python
 import os
-from typing import Any
+from typing import Annotated, Any
 from dotenv import load_dotenv
 from factorial import (
     BaseAgent,
     AgentContext,
-    ExecutionContext,
+    Hook,
+    HookRequestContext,
+    PendingHook,
     gpt_41_mini,
-    deferred_result,
+    hook,
 )
 
 
@@ -109,19 +107,33 @@ def edit_code(
     )
 
 
-@deferred_result(timeout=300.0)  # 5-minute timeout waiting for user decision
-def request_code_execution(
-    response_on_reject: str, agent_ctx: AgentContext, execution_ctx: ExecutionContext
-) -> None:
-    """
-    Request the code to be run. The use must approve this request before the code is run.
+class CodeExecutionApproval(Hook):
+    approved: bool
 
-    Parameters
-    ----------
-    response_on_reject : str
-        A message the agent should send if the user rejects the execution request.
-    """
-    pass
+
+def request_code_execution_approval(
+    ctx: HookRequestContext,
+) -> PendingHook[CodeExecutionApproval]:
+    return CodeExecutionApproval.pending(
+        ctx=ctx,
+        title="Approve code execution",
+        timeout_s=300.0,
+    )
+
+
+async def request_code_execution(
+    approval: Annotated[
+        CodeExecutionApproval,
+        hook.requires(request_code_execution_approval),
+    ],
+    agent_ctx: IdeAgentContext,
+) -> tuple[str, dict[str, Any]]:
+    """Request code execution behind an explicit approval hook."""
+    if not approval.approved:
+        return "User rejected the code execution request.", {"approved": False}
+
+    # In this example, execution can happen in your sandbox/runtime after approval.
+    return "User approved code execution request.", {"approved": True}
 
 
 instructions = """
@@ -208,8 +220,7 @@ from fastapi.exceptions import HTTPException
 from pydantic import BaseModel
 import json
 from starlette.websockets import WebSocket, WebSocketDisconnect
-from agent import basic_agent
-from orchestrator import orchestrator
+from agent import IdeAgentContext, ide_agent, orchestrator
 
 app = FastAPI()
 
@@ -241,17 +252,17 @@ class EnqueueRequest(BaseModel):
 
 @app.post("/api/enqueue")
 async def enqueue(request: EnqueueRequest):
-    task = ide_agent.create_task(
-        owner_id=request.user_id,
-        payload=IdeAgentContext(
-            messages=request.message_history,
-            query=request.query,
-            turn=0,
-            code=request.code,
-        ),
+    payload = IdeAgentContext(
+        messages=request.message_history,
+        query=request.query,
+        turn=0,
+        code=request.code,
     )
-
-    await orchestrator.enqueue_task(agent=ide_agent, task=task)
+    task = await orchestrator.create_agent_task(
+        agent=ide_agent,
+        owner_id=request.user_id,
+        payload=payload,
+    )
     return {"task_id": task.id}
 
 
@@ -271,27 +282,32 @@ async def cancel_task_endpoint(request: CancelRequest):
         return {"success": False, "error": str(e)}
 
 
-class ApproveOrRejectRequest(BaseModel):
-    user_id: str
-    task_id: str
-    tool_call_id: str
-    result: str
+class ResolveHookRequest(BaseModel):
+    hook_id: str
+    token: str
+    approved: bool
+    idempotency_key: str | None = None
 
 
-@app.post("/api/approve_or_reject")
-async def approve_or_reject_endpoint(request: CompleteToolRequest):
-    """Complete a deferred tool call with the provided result."""
+@app.post("/api/resolve_hook")
+async def resolve_hook_endpoint(request: ResolveHookRequest):
+    """Resolve a pending approval hook."""
     try:
-        success = await orchestrator.complete_deferred_tool(
-            task_id=request.task_id,
-            tool_call_id=request.tool_call_id,
-            result=request.result,
+        resolution = await orchestrator.resolve_hook(
+            hook_id=request.hook_id,
+            payload={"approved": request.approved},
+            token=request.token,
+            idempotency_key=request.idempotency_key,
         )
-        if success:
-            return {"success": True}
-        raise HTTPException(status_code=500, detail="Unable to complete deferred tool.")
+        return {
+            "success": True,
+            "status": resolution.status,
+            "task_id": resolution.task_id,
+            "tool_call_id": resolution.tool_call_id,
+            "task_resumed": resolution.task_resumed,
+        }
     except Exception as e:
-        print(f"Failed to complete deferred tool call {request.tool_call_id}: {e}")
+        print(f"Failed to resolve hook {request.hook_id}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 ```

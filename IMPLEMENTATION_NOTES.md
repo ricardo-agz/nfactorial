@@ -455,12 +455,28 @@ This document tracks implementation progress, decisions, and user feedback for t
     scenario modules:
     - `tests/integration/test_hook_lifecycle.py`
     - `tests/integration/test_wait_runtime.py`
-  - Removed phase-numbered integration module names to keep test ownership explicit:
-    - removed `tests/integration/test_hooks_phase3.py`
-    - removed `tests/integration/test_waits_phase5.py`
+  - Retained legacy phase integration modules as non-collected scenario sources
+    (set `__test__ = False`) and re-exported their scenarios from the new modules:
+    - `tests/integration/test_hooks_phase3.py`
+    - `tests/integration/test_waits_phase5.py`
   - Current validation after suite re-organization:
     - `pytest`
       - result: `215 passed`
+- Docs and examples migration to v2 API:
+  - Updated runtime example to canonical subagent orchestration:
+    - `examples/multi_agent/agent.py`
+      - replaced `function_tool` + `forking_tool` + `ExecutionContext.spawn_child_tasks`
+        with `@tool` + `subagents.spawn(...)` + `return wait.jobs(...)`
+  - Updated docs to remove deprecated API patterns and reflect v2 semantics:
+    - `docs/docs/tools.md`
+    - `docs/docs/intro.md`
+    - `docs/docs/agents.md`
+    - `docs/docs/events.md`
+    - `docs/docs/examples/multi_agent.md`
+    - `docs/docs/examples/code_agent.md`
+  - Current validation after docs/examples migration:
+    - `pytest`
+      - result: `224 passed`
 
 ## Decisions
 

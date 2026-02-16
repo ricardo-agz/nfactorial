@@ -279,7 +279,7 @@ Example progress event:
 }
 ```
 
-`task_pending_tool_call_results`: Task is waiting for deferred tools to complete and has been put in an idle state
+`task_pending_tool_call_results`: Task is waiting for pending tool call resolution (including hook-based approvals) and has been moved to the idle queue.
 
 ```python
 {

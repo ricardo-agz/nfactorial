@@ -1,3 +1,5 @@
+"""Contracts for hook dependency inference and validation."""
+
 from typing import Annotated
 
 import pytest
@@ -22,9 +24,10 @@ class LedgerReadyHook(Hook):
     ready: bool
 
 
-def test_hook_compiler_infers_dependencies_and_stages() -> None:
+def test_compiler_infers_dependency_graph_and_stages() -> None:
     def request_manager(
-        ctx: HookRequestContext, amount: int
+        ctx: HookRequestContext,
+        amount: int,
     ) -> PendingHook[ManagerApprovalHook]:
         return ManagerApprovalHook.pending(ctx=ctx, amount=amount)
 
@@ -69,18 +72,21 @@ def test_hook_compiler_infers_dependencies_and_stages() -> None:
     )
     assert approve_expense.hook_plan.nodes["manager"].depends_on == ()
     assert approve_expense.hook_plan.nodes["finance"].depends_on == ("manager",)
-    assert approve_expense.hook_plan.nodes["ledger"].depends_on == ("manager", "finance")
+    ledger_deps = approve_expense.hook_plan.nodes["ledger"].depends_on
+    assert ledger_deps == ("manager", "finance")
     assert approve_expense.hook_plan.nodes["ledger"].mode == "awaits"
 
 
-def test_hook_compiler_groups_independent_hooks_in_same_stage() -> None:
+def test_compiler_groups_independent_hooks_in_same_stage() -> None:
     def request_manager(
-        ctx: HookRequestContext, amount: int
+        ctx: HookRequestContext,
+        amount: int,
     ) -> PendingHook[ManagerApprovalHook]:
         return ManagerApprovalHook.pending(ctx=ctx, amount=amount)
 
     def request_finance(
-        ctx: HookRequestContext, amount: int
+        ctx: HookRequestContext,
+        amount: int,
     ) -> PendingHook[FinanceApprovalHook]:
         return FinanceApprovalHook.pending(ctx=ctx, amount=amount)
 
@@ -96,9 +102,10 @@ def test_hook_compiler_groups_independent_hooks_in_same_stage() -> None:
     assert approve_expense.hook_plan.stages == (("manager", "finance"),)
 
 
-def test_tool_schema_excludes_hook_injected_parameters() -> None:
+def test_tool_schema_excludes_hook_injected_params() -> None:
     def request_manager(
-        ctx: HookRequestContext, amount: int
+        ctx: HookRequestContext,
+        amount: int,
     ) -> PendingHook[ManagerApprovalHook]:
         return ManagerApprovalHook.pending(ctx=ctx, amount=amount)
 
@@ -115,14 +122,16 @@ def test_tool_schema_excludes_hook_injected_parameters() -> None:
     assert approve_expense.params_json_schema["required"] == ["amount"]
 
 
-def test_hook_compiler_fails_for_unresolved_required_builder_parameter() -> None:
+def test_compiler_rejects_unresolved_required_builder_param() -> None:
     def request_manager(
-        ctx: HookRequestContext, unknown: str
+        ctx: HookRequestContext,
+        unknown: str,
     ) -> PendingHook[ManagerApprovalHook]:
         return ManagerApprovalHook.pending(ctx=ctx, unknown=unknown)
 
     with pytest.raises(
-        HookDependencyResolutionError, match="Cannot resolve required parameter 'unknown'"
+        HookDependencyResolutionError,
+        match="Cannot resolve required parameter 'unknown'",
     ):
 
         @tool
@@ -133,19 +142,22 @@ def test_hook_compiler_fails_for_unresolved_required_builder_parameter() -> None
             return f"approved amount={amount}"
 
 
-def test_hook_compiler_fails_for_type_only_hook_reference() -> None:
+def test_compiler_rejects_type_only_hook_reference() -> None:
     def request_manager(
-        ctx: HookRequestContext, amount: int
+        ctx: HookRequestContext,
+        amount: int,
     ) -> PendingHook[ManagerApprovalHook]:
         return ManagerApprovalHook.pending(ctx=ctx, amount=amount)
 
     def request_finance(
-        ctx: HookRequestContext, approval: ManagerApprovalHook
+        ctx: HookRequestContext,
+        approval: ManagerApprovalHook,
     ) -> PendingHook[FinanceApprovalHook]:
         return FinanceApprovalHook.pending(ctx=ctx, manager_approved=approval.approved)
 
     with pytest.raises(
-        HookDependencyResolutionError, match="must reference other hook parameters by name"
+        HookDependencyResolutionError,
+        match="must reference other hook parameters by name",
     ):
 
         @tool
@@ -157,9 +169,10 @@ def test_hook_compiler_fails_for_type_only_hook_reference() -> None:
             return f"approved amount={amount}"
 
 
-def test_hook_compiler_fails_for_hook_reference_type_mismatch() -> None:
+def test_compiler_rejects_hook_reference_type_mismatch() -> None:
     def request_manager(
-        ctx: HookRequestContext, amount: int
+        ctx: HookRequestContext,
+        amount: int,
     ) -> PendingHook[ManagerApprovalHook]:
         return ManagerApprovalHook.pending(ctx=ctx, amount=amount)
 
@@ -180,14 +193,16 @@ def test_hook_compiler_fails_for_hook_reference_type_mismatch() -> None:
             return f"approved amount={amount}"
 
 
-def test_hook_compiler_fails_for_request_builder_return_type_mismatch() -> None:
+def test_compiler_rejects_request_builder_return_type_mismatch() -> None:
     def request_manager(
-        ctx: HookRequestContext, amount: int
+        ctx: HookRequestContext,
+        amount: int,
     ) -> PendingHook[FinanceApprovalHook]:
         return FinanceApprovalHook.pending(ctx=ctx, amount=amount)
 
     with pytest.raises(
-        HookTypeMismatchError, match="must return PendingHook\\[ManagerApprovalHook\\]"
+        HookTypeMismatchError,
+        match=r"must return PendingHook\[ManagerApprovalHook\]",
     ):
 
         @tool
@@ -198,7 +213,7 @@ def test_hook_compiler_fails_for_request_builder_return_type_mismatch() -> None:
             return f"approved amount={amount}"
 
 
-def test_hook_compiler_detects_cycles() -> None:
+def test_compiler_detects_dependency_cycles() -> None:
     class AHook(Hook):
         ok: bool
 
@@ -211,7 +226,8 @@ def test_hook_compiler_detects_cycles() -> None:
     def request_b(ctx: HookRequestContext, a: AHook) -> PendingHook[BHook]:
         return BHook.pending(ctx=ctx, a_ok=a.ok)
 
-    with pytest.raises(HookDependencyCycleError, match="Cyclic hook dependencies detected"):
+    match_msg = "Cyclic hook dependencies detected"
+    with pytest.raises(HookDependencyCycleError, match=match_msg):
 
         @tool
         def cyclic(
@@ -222,7 +238,7 @@ def test_hook_compiler_detects_cycles() -> None:
             return f"value={amount}"
 
 
-def test_hook_compiler_allows_optional_unresolved_builder_parameters() -> None:
+def test_compiler_allows_optional_unresolved_builder_params() -> None:
     def request_manager(
         ctx: HookRequestContext,
         amount: int,
@@ -239,3 +255,4 @@ def test_hook_compiler_allows_optional_unresolved_builder_parameters() -> None:
 
     assert approve_expense.hook_plan is not None
     assert approve_expense.hook_plan.nodes["manager"].depends_on == ()
+

@@ -160,7 +160,7 @@ This document tracks implementation progress, decisions, and user feedback for t
   - Export updates:
     - `factorial.queue` now exports hook control-plane queue ops
     - package root export includes `HookResolutionResult`
-  - Added integration tests in `tests/integration/test_hooks_phase3.py` covering:
+  - Added integration tests in `tests/integration/test_hook_lifecycle.py` covering:
     - hook registration + persisted token hash behavior
     - valid token resolution and task requeue
     - invalid token rejection
@@ -168,7 +168,7 @@ This document tracks implementation progress, decisions, and user feedback for t
     - token rotation with previous-token invalidation
 - Current validation after Phase 3:
   - command:
-    - `source .venv/bin/activate && pytest tests/unit tests/integration/test_pending.py tests/integration/test_hooks_phase3.py -q`
+    - `source .venv/bin/activate && pytest tests/unit tests/integration/test_pending.py tests/integration/test_hook_lifecycle.py -q`
   - result: `100 passed`
 - Follow-up hardening focused on state-machine/Lua interaction quality:
   - Completed a queue/Lua transition audit for hook flow and confirmed:
@@ -197,7 +197,7 @@ This document tracks implementation progress, decisions, and user feedback for t
     - `completion.lua` comment clarifies pending branch trigger is `pending_*_ids_json` presence, not action string
 - Current validation after follow-up hardening:
   - command:
-    - `source .venv/bin/activate && pytest tests/unit tests/integration/test_pending.py tests/integration/test_hooks_phase3.py -q`
+    - `source .venv/bin/activate && pytest tests/unit tests/integration/test_pending.py tests/integration/test_hook_lifecycle.py -q`
   - result: `79 passed`
 - Started Phase 4 staged hook runtime implementation:
   - Added persisted session runtime types in `src/factorial/hooks.py`:
@@ -228,12 +228,12 @@ This document tracks implementation progress, decisions, and user feedback for t
     - request next ready stage when dependencies become satisfied
     - execute final tool continuation only after all session nodes resolve
     - complete tool slot via existing pending-tool wake/requeue primitives
-  - Added high-signal integration coverage in `tests/integration/test_hooks_phase3.py`:
+  - Added high-signal integration coverage in `tests/integration/test_hook_lifecycle.py`:
     - `test_dag_stage_progression_and_final_continuation`
     - validates stage-1 request, stage-2 unlock, final continuation execution, and proper task wake/requeue
 - Current validation after Phase 4 increment:
   - command:
-    - `source .venv/bin/activate && pytest tests/unit/test_phase1_api_scaffolding.py tests/unit/test_phase2_hook_compiler.py tests/unit/test_tools_phase0_regression.py tests/integration/test_hooks_phase3.py`
+    - `source .venv/bin/activate && pytest tests/unit/test_phase1_api_scaffolding.py tests/unit/test_phase2_hook_compiler.py tests/unit/test_tools_phase0_regression.py tests/integration/test_hook_lifecycle.py`
   - result: `34 passed`
 - Completed Phase 4 robustness hardening after deep state-machine/Lua audit:
   - Key architectural correction:
@@ -348,7 +348,7 @@ This document tracks implementation progress, decisions, and user feedback for t
       - `tests/unit/test_waits_phase5.py`
       - validates cron next-run computation + timezone behavior and wait API aliases
     - integration:
-      - `tests/integration/test_waits_phase5.py`
+      - `tests/integration/test_wait_runtime.py`
       - validates worker parking to `paused/scheduled`, child wait/join semantics, scheduled recovery, and paused-task cancellation cleanup
   - Regression confidence checks run against touched paths:
     - `tests/integration/test_recovery.py`
@@ -356,7 +356,7 @@ This document tracks implementation progress, decisions, and user feedback for t
     - `tests/e2e/test_worker_flow.py`
 - Current validation after Phase 5 implementation slice:
   - command:
-    - `source .venv/bin/activate && pytest tests/unit/test_waits_phase5.py tests/integration/test_waits_phase5.py tests/integration/test_recovery.py tests/integration/test_cancellation.py tests/e2e/test_worker_flow.py`
+    - `source .venv/bin/activate && pytest tests/unit/test_waits_phase5.py tests/integration/test_wait_runtime.py tests/integration/test_recovery.py tests/integration/test_cancellation.py tests/e2e/test_worker_flow.py`
   - result: `37 passed`
   - full-suite command:
     - `source .venv/bin/activate && pytest`
@@ -377,7 +377,7 @@ This document tracks implementation progress, decisions, and user feedback for t
   - Added tests for new model:
     - `tests/unit/test_subagents_phase5.py` (spawn/run semantics)
     - expanded `tests/unit/test_waits_phase5.py` (`wait.jobs` validation)
-    - expanded `tests/integration/test_waits_phase5.py` for:
+    - expanded `tests/integration/test_wait_runtime.py` for:
       - mixed-agent `subagents.spawn(...)` + `wait.jobs(...)`
       - non-blocking spawn (no wait)
       - sentinel-preservation race contract
@@ -416,14 +416,14 @@ This document tracks implementation progress, decisions, and user feedback for t
       - deterministic spawn IDs and required key contract
     - `tests/unit/test_waits_phase5.py`:
       - strict `wait.jobs` parent binding validation
-    - `tests/integration/test_waits_phase5.py`:
+    - `tests/integration/test_wait_runtime.py`:
       - retry-idempotent spawn behavior (no duplicate child queue entries)
       - wait-set persistence assertions for parked child joins
       - fast-path continuation failure regression guard (child results are preserved when continue transition is rejected)
     - `tests/integration/test_enqueue.py`:
       - deterministic batch retry preserves existing remaining-task bookkeeping
   - Current validation after production hardening:
-    - `pytest tests/unit/test_subagents_phase5.py tests/unit/test_waits_phase5.py tests/integration/test_waits_phase5.py`
+    - `pytest tests/unit/test_subagents_phase5.py tests/unit/test_waits_phase5.py tests/integration/test_wait_runtime.py`
       - result: `19 passed`
     - `pytest tests/integration/test_completion.py tests/integration/test_cancellation.py tests/integration/test_pending.py tests/integration/test_parent_child.py tests/integration/test_batch_children.py`
       - result: `40 passed`
@@ -431,11 +431,40 @@ This document tracks implementation progress, decisions, and user feedback for t
       - result: `6 passed`
     - `pytest`
       - result: `203 passed`
+- Test-suite re-organization and quality pass (Phase 1-5 coverage):
+  - Replaced phase-numbered unit modules with capability-based modules:
+    - `tests/unit/test_tool_contracts.py`
+    - `tests/unit/test_hook_api_contracts.py`
+    - `tests/unit/test_hook_dependency_compiler.py`
+    - `tests/unit/test_wait_contracts.py`
+    - `tests/unit/test_subagent_contracts.py`
+  - Added explicit edge-case coverage beyond original phase tests:
+    - wait API:
+      - empty-job rejection
+      - deterministic dedupe/order preservation for `wait.jobs(...)`
+      - model-dump job ref support
+      - timezone alias conflict validation for `wait.cron(...)`
+    - subagents API:
+      - empty-input no-op semantics
+      - key normalization behavior
+      - invalid input type rejection
+      - invalid child-agent context_class rejection
+    - hook control plane:
+      - token-rotation semantics when `revoke_previous=False`
+  - Consolidated integration coverage into directly collected, capability-named
+    scenario modules:
+    - `tests/integration/test_hook_lifecycle.py`
+    - `tests/integration/test_wait_runtime.py`
+  - Removed phase-numbered integration module names to keep test ownership explicit:
+    - removed `tests/integration/test_hooks_phase3.py`
+    - removed `tests/integration/test_waits_phase5.py`
+  - Current validation after suite re-organization:
+    - `pytest`
+      - result: `215 passed`
 
 ## Decisions
 
 - Preserve existing queue/Lua reliability semantics and build hook runtime on top.
-- Keep backward compatibility while introducing the new API surface.
 - Treat tests as the migration contract before introducing runtime changes.
 - For iterative testing, use project virtualenv activation + `pytest` directly.
 

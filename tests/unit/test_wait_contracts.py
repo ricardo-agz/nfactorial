@@ -1,3 +1,7 @@
+"""Contracts for wait instruction builders and cron parsing."""
+
+from __future__ import annotations
+
 from datetime import datetime, timezone
 from typing import Any, cast
 
@@ -6,7 +10,24 @@ import pytest
 from factorial.context import ExecutionContext, execution_context
 from factorial.events import EventPublisher
 from factorial.subagents import JobRef
-from factorial.waits import next_cron_wake_timestamp, wait
+from factorial.waits import WaitInstruction, next_cron_wake_timestamp, wait
+
+
+class _NoopEvents:
+    async def publish_event(self, _event: Any) -> None:
+        return None
+
+
+class _ModelDumpJobRef:
+    def __init__(self, task_id: str, agent_name: str, parent_task_id: str):
+        self._payload = {
+            "task_id": task_id,
+            "agent_name": agent_name,
+            "parent_task_id": parent_task_id,
+        }
+
+    def model_dump(self) -> dict[str, str]:
+        return dict(self._payload)
 
 
 def test_next_cron_wake_timestamp_minute_step() -> None:
@@ -37,9 +58,41 @@ def test_wait_namespace_exposes_jobs_not_children() -> None:
     assert not hasattr(wait, "children")
 
 
-class _NoopEvents:
-    async def publish_event(self, _event: Any) -> None:
-        return None
+def test_wait_namespace_builders_return_serializable_instructions() -> None:
+    sleep_wait = wait.sleep(12.5, message="retry shortly")
+    cron_wait = wait.cron("0 * * * *", timezone="UTC", message="hourly sync")
+    jobs_wait = wait.jobs(
+        [
+            {
+                "task_id": "child-task-1",
+                "agent_name": "child-research-agent",
+                "parent_task_id": "parent-task",
+                "key": "research",
+            }
+        ],
+        message="waiting for child tasks",
+    )
+
+    assert isinstance(sleep_wait, WaitInstruction)
+    assert sleep_wait.kind == "sleep"
+    assert sleep_wait.sleep_s == 12.5
+    assert sleep_wait.message == "retry shortly"
+
+    assert isinstance(cron_wait, WaitInstruction)
+    assert cron_wait.kind == "cron"
+    assert cron_wait.cron == "0 * * * *"
+    assert cron_wait.timezone == "UTC"
+    assert cron_wait.message == "hourly sync"
+
+    assert isinstance(jobs_wait, WaitInstruction)
+    assert jobs_wait.kind == "jobs"
+    assert jobs_wait.child_task_ids == ["child-task-1"]
+    assert jobs_wait.message == "waiting for child tasks"
+
+
+def test_wait_jobs_rejects_empty_job_list() -> None:
+    with pytest.raises(ValueError, match="at least one job reference"):
+        wait.jobs([])
 
 
 def test_wait_jobs_builds_join_instruction() -> None:
@@ -75,6 +128,44 @@ def test_wait_jobs_builds_join_instruction() -> None:
     assert instruction.message == "wait for all jobs"
 
 
+def test_wait_jobs_deduplicates_task_ids_preserving_order() -> None:
+    instruction = wait.jobs(
+        [
+            {"task_id": "child-1", "agent_name": "a1"},
+            {"task_id": "child-2", "agent_name": "a1"},
+            {"task_id": "child-1", "agent_name": "a1"},
+            {"task_id": "child-3", "agent_name": "a2"},
+        ]
+    )
+    assert instruction.child_task_ids == ["child-1", "child-2", "child-3"]
+
+
+def test_wait_jobs_accepts_model_dump_refs() -> None:
+    ctx = ExecutionContext(
+        task_id="parent-task",
+        owner_id="owner",
+        retries=0,
+        iterations=0,
+        events=cast(EventPublisher, _NoopEvents()),
+    )
+    token = execution_context.set(ctx)
+    try:
+        instruction = wait.jobs(
+            [
+                _ModelDumpJobRef(
+                    task_id="child-1",
+                    agent_name="a1",
+                    parent_task_id="parent-task",
+                )
+            ]
+        )
+    finally:
+        execution_context.reset(token)
+
+    assert instruction.kind == "jobs"
+    assert instruction.child_task_ids == ["child-1"]
+
+
 def test_wait_jobs_rejects_foreign_parent_refs() -> None:
     ctx = ExecutionContext(
         task_id="parent-task",
@@ -85,7 +176,7 @@ def test_wait_jobs_rejects_foreign_parent_refs() -> None:
     )
     token = execution_context.set(ctx)
     try:
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="belongs to a different parent task"):
             wait.jobs(
                 [
                     JobRef(
@@ -109,15 +200,20 @@ def test_wait_jobs_rejects_missing_parent_ref_in_execution_context() -> None:
     )
     token = execution_context.set(ctx)
     try:
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="non-empty parent_task_id"):
             wait.jobs(
                 [
                     {
                         "task_id": "child-1",
                         "agent_name": "a1",
-                        # Missing parent_task_id should be rejected while running.
                     }
                 ]
             )
     finally:
         execution_context.reset(token)
+
+
+def test_wait_cron_rejects_conflicting_timezone_aliases() -> None:
+    with pytest.raises(ValueError, match="either 'timezone' or 'tz'"):
+        wait.cron("0 * * * *", timezone="Europe/London", tz="America/New_York")
+

@@ -1,3 +1,5 @@
+"""Integration coverage for scheduled waits and child-job joins."""
+
 import json
 import time
 from types import SimpleNamespace
@@ -236,6 +238,52 @@ class _WaitReadyJobsAgent(BaseAgent[AgentContext]):
         )
 
 
+class _DuplicateWaitJobsAgent(BaseAgent[AgentContext]):
+    def __init__(
+        self,
+        *,
+        child_task_ids: list[str],
+        name: str = "duplicate_wait_jobs_parent",
+    ):
+        super().__init__(
+            name=name,
+            instructions="Wait on duplicate child job refs",
+            context_class=AgentContext,
+        )
+        self._child_task_ids = child_task_ids
+
+    async def run_turn(self, agent_ctx: AgentContext) -> TurnCompletion[AgentContext]:
+        agent_ctx.turn += 1
+        parent_task_id = ExecutionContext.current().task_id
+        jobs = [
+            {
+                "task_id": self._child_task_ids[0],
+                "agent_name": "child",
+                "parent_task_id": parent_task_id,
+            },
+            {
+                "task_id": self._child_task_ids[1],
+                "agent_name": "child",
+                "parent_task_id": parent_task_id,
+            },
+            {
+                "task_id": self._child_task_ids[0],
+                "agent_name": "child",
+                "parent_task_id": parent_task_id,
+            },
+        ]
+        return TurnCompletion(
+            is_done=False,
+            context=agent_ctx,
+            tool_call_results=[
+                (
+                    _make_tool_call("wait_jobs", "call_wait_jobs_dup"),
+                    wait.jobs(jobs),
+                )
+            ],
+        )
+
+
 class _FailContinueCompletionScript:
     def __init__(self, base_script: TaskCompletionScript, *, task_id: str):
         self._base_script = base_script
@@ -466,6 +514,74 @@ async def test_process_task_subagents_run_spawns_children_and_parks_parent(
         )
         assert child_task_data["agent"] == test_agent.name
         assert child_task_data["metadata"]["parent_id"] == parent_task_id
+
+
+@pytest.mark.asyncio
+async def test_wait_jobs_deduplicates_child_ids_before_parent_parking(
+    redis_client: redis.Redis,
+    test_namespace: str,
+    test_owner_id: str,
+    pickup_script: BatchPickupScript,
+    completion_script: TaskCompletionScript,
+    steering_script: TaskSteeringScript,
+) -> None:
+    parent_agent = _DuplicateWaitJobsAgent(child_task_ids=["child-1", "child-2"])
+    parent_keys = RedisKeys.format(namespace=test_namespace, agent=parent_agent.name)
+    parent_task = Task.create(
+        owner_id=test_owner_id,
+        agent=parent_agent.name,
+        payload=AgentContext(query="wait on duplicate refs"),
+    )
+    parent_task_id = await enqueue_task(
+        redis_client=redis_client,
+        namespace=test_namespace,
+        agent=parent_agent,
+        task=parent_task,
+    )
+    picked = await _pickup_single_task(
+        redis_client=redis_client,
+        keys=parent_keys,
+        pickup_script=pickup_script,
+    )
+    assert picked == [parent_task_id]
+
+    await process_task(
+        redis_client=redis_client,
+        namespace=test_namespace,
+        task_id=parent_task_id,
+        completion_script=completion_script,
+        steering_script=steering_script,
+        agent=parent_agent,
+        agents_by_name={parent_agent.name: parent_agent},
+        max_retries=3,
+        heartbeat_interval=30,
+        task_timeout=30,
+        metrics_retention_duration=3600,
+    )
+
+    parent_task_keys = RedisKeys.format(
+        namespace=test_namespace,
+        agent=parent_agent.name,
+        task_id=parent_task_id,
+    )
+    pending_children = cast(
+        dict[str, str],
+        await cast(
+            Any,
+            redis_client.hgetall(parent_task_keys.pending_child_task_results),
+        ),
+    )
+    wait_ids = set(
+        await cast(
+            Any,
+            redis_client.smembers(parent_task_keys.pending_child_wait_ids),
+        )
+    )
+    assert await get_task_status(redis_client, test_namespace, parent_task_id) == (
+        TaskStatus.PENDING_CHILD_TASKS
+    )
+    assert set(pending_children.keys()) == {"child-1", "child-2"}
+    assert wait_ids == {"child-1", "child-2"}
 
 
 @pytest.mark.asyncio

@@ -1,3 +1,5 @@
+"""Integration coverage for hook registration, resolution, and runtime flow."""
+
 import json
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -653,6 +655,110 @@ class TestHookResolutionFlow:
             hook_id=pending.hook_id,
             payload={"approved": True},
             token=rotated_token,
+        )
+        assert resolved.status == "resolved"
+
+    async def test_rotate_without_revocation_accepts_existing_token(
+        self,
+        redis_client: redis.Redis,
+        test_namespace: str,
+        test_agent: SimpleTestAgent,
+        sample_task,
+        pickup_script,
+        completion_script,
+    ) -> None:
+        tool_call_id = "tool_call_rotate_keep_old"
+        task_id = await self._setup_pending_tool_task(
+            redis_client,
+            test_namespace,
+            test_agent,
+            sample_task,
+            pickup_script,
+            completion_script,
+            tool_call_id,
+        )
+        pending = _make_pending_hook(
+            task_id=task_id,
+            owner_id=sample_task.metadata.owner_id,
+            agent_name=test_agent.name,
+            tool_call_id=tool_call_id,
+        )
+        await self._persist_requested_hook_session(
+            redis_client=redis_client,
+            namespace=test_namespace,
+            task_id=task_id,
+            owner_id=sample_task.metadata.owner_id,
+            agent_name=test_agent.name,
+            tool_call_id=tool_call_id,
+            requested_nodes=[
+                ("approval", pending, (), "requires", pending.hook_type.__name__)
+            ],
+        )
+
+        await rotate_hook_token(
+            redis_client=redis_client,
+            namespace=test_namespace,
+            hook_id=pending.hook_id,
+            revoke_previous=False,
+        )
+        resolved = await resolve_hook(
+            redis_client=redis_client,
+            namespace=test_namespace,
+            hook_id=pending.hook_id,
+            payload={"approved": True},
+            token=pending.token,
+        )
+        assert resolved.status == "resolved"
+
+    async def test_rotate_without_revocation_accepts_new_token(
+        self,
+        redis_client: redis.Redis,
+        test_namespace: str,
+        test_agent: SimpleTestAgent,
+        sample_task,
+        pickup_script,
+        completion_script,
+    ) -> None:
+        tool_call_id = "tool_call_rotate_use_new"
+        task_id = await self._setup_pending_tool_task(
+            redis_client,
+            test_namespace,
+            test_agent,
+            sample_task,
+            pickup_script,
+            completion_script,
+            tool_call_id,
+        )
+        pending = _make_pending_hook(
+            task_id=task_id,
+            owner_id=sample_task.metadata.owner_id,
+            agent_name=test_agent.name,
+            tool_call_id=tool_call_id,
+        )
+        await self._persist_requested_hook_session(
+            redis_client=redis_client,
+            namespace=test_namespace,
+            task_id=task_id,
+            owner_id=sample_task.metadata.owner_id,
+            agent_name=test_agent.name,
+            tool_call_id=tool_call_id,
+            requested_nodes=[
+                ("approval", pending, (), "requires", pending.hook_type.__name__)
+            ],
+        )
+
+        rotated = await rotate_hook_token(
+            redis_client=redis_client,
+            namespace=test_namespace,
+            hook_id=pending.hook_id,
+            revoke_previous=False,
+        )
+        resolved = await resolve_hook(
+            redis_client=redis_client,
+            namespace=test_namespace,
+            hook_id=pending.hook_id,
+            payload={"approved": True},
+            token=rotated,
         )
         assert resolved.status == "resolved"
 

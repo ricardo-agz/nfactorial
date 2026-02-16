@@ -582,7 +582,6 @@ class Orchestrator:
             return await q_resolve_hook(
                 redis_client=redis_client,
                 namespace=self.namespace,
-                agents_by_name=self.agents_by_name,
                 hook_id=hook_id,
                 payload=payload,
                 token=token,

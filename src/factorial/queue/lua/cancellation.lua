@@ -13,6 +13,9 @@ local pending_tool_results_key = KEYS[12]
 local pending_child_task_results_key = KEYS[13]
 local agent_metrics_bucket_key = KEYS[14]
 local global_metrics_bucket_key = KEYS[15]
+local queue_scheduled_key = KEYS[16]
+local scheduled_wait_meta_key = KEYS[17]
+local pending_child_wait_ids_key = KEYS[18]
 
 local task_id = ARGV[1]
 local metrics_ttl = tonumber(ARGV[2])
@@ -49,18 +52,33 @@ local owner_id = meta.owner_id
 redis.call('DEL', pending_tool_results_key)
 redis.call('ZREM', queue_pending_key, task_id)
 redis.call('ZREM', queue_backoff_key, task_id)
+if queue_scheduled_key and queue_scheduled_key ~= "" then
+    redis.call('ZREM', queue_scheduled_key, task_id)
+end
+if scheduled_wait_meta_key and scheduled_wait_meta_key ~= "" then
+    redis.call('HDEL', scheduled_wait_meta_key, task_id)
+end
 
 if status == "pending_tool_results" or status == "pending_child_tasks" then
     if status == "pending_child_tasks" then
-        -- The pending_child_task_results_key is stored as a **hash** where each
-        -- field name is a child task ID and the value is either a PENDING sentinel
-        -- or the serialized final output once the child task completes. We only
-        -- care about the *IDs*, so read the hash field names with HKEYS.
-        local child_task_ids = redis.call('HKEYS', pending_child_task_results_key)
+        -- Prefer the explicit join set for the currently awaited children.
+        local child_task_ids = {}
+        if pending_child_wait_ids_key and pending_child_wait_ids_key ~= "" then
+            child_task_ids = redis.call('SMEMBERS', pending_child_wait_ids_key)
+        else
+            child_task_ids = redis.call('HKEYS', pending_child_task_results_key)
+        end
         if #child_task_ids > 0 then
             redis.call('SADD', pending_cancellations_key, unpack(child_task_ids))
         end
-        redis.call('DEL', pending_child_task_results_key)
+        if pending_child_wait_ids_key and pending_child_wait_ids_key ~= "" then
+            if #child_task_ids > 0 then
+                redis.call('HDEL', pending_child_task_results_key, unpack(child_task_ids))
+            end
+            redis.call('DEL', pending_child_wait_ids_key)
+        else
+            redis.call('DEL', pending_child_task_results_key)
+        end
     end
 
     -- Update task status to cancelled
@@ -74,8 +92,8 @@ if status == "pending_tool_results" or status == "pending_child_tasks" then
     )
 
     return { true, status, "Task cancelled", owner_id or "" }
-elseif status == "backoff" then
-    -- Task is in backoff queue - cancel immediately
+elseif status == "backoff" or status == "paused" then
+    -- Task is in a parked queue (backoff/scheduled) - cancel immediately
     redis.call('HSET', task_statuses_key, task_id, 'cancelled')
     -- Add to cancelled queue
     redis.call('ZADD', queue_cancelled_key, timestamp, task_id)

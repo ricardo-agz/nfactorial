@@ -23,7 +23,7 @@ This document tracks implementation progress, decisions, and user feedback for t
 - [x] Phase 2 - Signature compiler and dependency inference
 - [x] Phase 3 - Hook persistence and control-plane resolution APIs
 - [x] Phase 4 - Worker hook runtime and staged continuation
-- [ ] Phase 5 - Wait helpers (`sleep`, `cron`, `children`)
+- [x] Phase 5 - Wait helpers (`sleep`, `cron`, `subagents.spawn` + `wait.jobs`)
 - [ ] Phase 6 - Managed endpoints, docs, migration utilities
 
 ## Progress Log
@@ -69,7 +69,7 @@ This document tracks implementation progress, decisions, and user feedback for t
     - `WaitInstruction`
     - `wait.sleep(...)`
     - `wait.cron(...)`
-    - `wait.children(...)`
+    - child wait helper (later replaced by `wait.jobs(...)`)
   - Extended `src/factorial/tools.py`:
     - `ToolResult`
     - `ToolNamespace`
@@ -292,6 +292,145 @@ This document tracks implementation progress, decisions, and user feedback for t
   - command:
     - `source .venv/bin/activate && pytest`
   - result: `177 passed`
+- Hook robustness hardening pass (post-audit):
+  - Added explicit hook timeout maintenance sweep:
+    - `expire_pending_hooks(...)` scans `hooks_expiring`, marks hook/session nodes expired, and wakes parked tasks so workers can unblock them.
+    - maintenance loop now calls the sweep each interval.
+  - Removed deadlock-prone resolve behavior:
+    - `resolve_hook(...)` no longer hard-fails on already-resolved records before attempting session repair.
+    - supports crash-recovery replay where hook record may be resolved before session node/wake updates.
+    - removed unused `agents_by_name` parameter from queue-level `resolve_hook(...)`.
+  - Hardened worker hook tick terminal/error handling:
+    - detects invalid/missing session and missing hook plan states.
+    - converts those states into deterministic completion errors and clears pending sentinels instead of silently re-parking forever.
+    - centralizes pending runtime cleanup via helper utilities for readability/maintainability.
+  - Preserved continuation result semantics:
+    - hook continuation now returns full `ToolResult` (not just `output_data`).
+    - worker now handles pending child task IDs emitted by hook continuations and parks to `pending_child_tasks` when needed.
+    - fixed `Agent.tool_action(...)` to preserve explicit `ToolResult.pending_child_task_ids` instead of overwriting them.
+  - Added high-signal regression coverage:
+    - `test_resolve_hook_recovers_from_partial_resolve_write`
+    - `test_process_hook_runtime_missing_plan_unblocks_pending_tool`
+    - `test_expire_pending_hooks_wakes_and_unblocks_expired_session`
+    - `test_process_task_parks_child_results_from_hook_continuation`
+- Current validation after robustness hardening:
+  - command:
+    - `source .venv/bin/activate && pytest`
+  - result: `181 passed`
+- Started Phase 5 wait-runtime implementation:
+  - Added time-wait queue/state primitives:
+    - new Redis keys:
+      - `queue_scheduled` (agent-scoped zset)
+      - `scheduled_wait_meta` (namespace-scoped hash: `task_id -> wait metadata json`)
+    - new Lua scripts:
+      - `schedule_wait.lua` for atomic transition `processing -> paused + scheduled`
+      - `scheduled.lua` for atomic due-task recovery `paused -> active + main queue`
+    - maintenance loop now recovers due scheduled waits each interval.
+  - Worker runtime now executes wait semantics directly:
+    - `wait.sleep(...)`:
+      - parks task as `paused`
+      - stores wake timestamp in `queue_scheduled`
+      - preserves retry/backoff semantics (no retry counter mutation)
+    - `wait.cron(...)`:
+      - computes next wake timestamp with timezone-aware cron helper
+      - parks in the same `paused + scheduled` path
+    - child-join waits (`subagents.run(...)` / `wait.jobs(...)`):
+      - enqueues child tasks through worker-managed parent linkage
+      - parks parent via existing `pending_child_tasks` path with sentinel contract
+  - Cancellation path hardened for scheduled waits:
+    - `cancellation.lua` now clears scheduled queue + wait metadata.
+    - `paused` tasks are cancelled immediately (same behavior class as `backoff`/parked states).
+  - API/runtime ergonomics updates:
+    - `wait.cron(..., tz="UTC")` alias supported in addition to `timezone=...`.
+    - direct tool returns of `WaitInstruction` now produce readable tool-result text in `Agent.tool_action(...)`.
+  - Added high-signal Phase 5 tests:
+    - unit:
+      - `tests/unit/test_waits_phase5.py`
+      - validates cron next-run computation + timezone behavior and wait API aliases
+    - integration:
+      - `tests/integration/test_waits_phase5.py`
+      - validates worker parking to `paused/scheduled`, child wait/join semantics, scheduled recovery, and paused-task cancellation cleanup
+  - Regression confidence checks run against touched paths:
+    - `tests/integration/test_recovery.py`
+    - `tests/integration/test_cancellation.py`
+    - `tests/e2e/test_worker_flow.py`
+- Current validation after Phase 5 implementation slice:
+  - command:
+    - `source .venv/bin/activate && pytest tests/unit/test_waits_phase5.py tests/integration/test_waits_phase5.py tests/integration/test_recovery.py tests/integration/test_cancellation.py tests/e2e/test_worker_flow.py`
+  - result: `37 passed`
+  - full-suite command:
+    - `source .venv/bin/activate && pytest`
+  - full-suite result: `190 passed`
+- Phase 5 DX refactor (imperative subagents + explicit wait join):
+  - Added new imperative subagent namespace:
+    - `subagents.spawn(agent=..., inputs=..., key=...) -> list[JobRef]`
+    - `subagents.run(...)` sugar for spawn + blocking wait
+  - Added explicit join primitive:
+    - `wait.jobs(job_refs)` parks parent until referenced child jobs resolve
+  - removed the unshipped child-wait alias, so canonical API is now only:
+    - imperative `subagents.spawn(...)` / `subagents.run(...)`
+    - explicit blocking join via `wait.jobs(...)`
+  - Removed child wait timeout from wait instruction/API surface for subagent waits.
+  - Runtime safety hardening for imperative spawn then wait:
+    - `completion.lua` now uses `HSETNX` for pending child sentinel slots so already-written child outputs are never overwritten.
+    - worker now attempts immediate parent resume after parking on child waits to avoid deadlocks when all child outputs are already present.
+  - Added tests for new model:
+    - `tests/unit/test_subagents_phase5.py` (spawn/run semantics)
+    - expanded `tests/unit/test_waits_phase5.py` (`wait.jobs` validation)
+    - expanded `tests/integration/test_waits_phase5.py` for:
+      - mixed-agent `subagents.spawn(...)` + `wait.jobs(...)`
+      - non-blocking spawn (no wait)
+      - sentinel-preservation race contract
+- Current validation after DX refactor:
+  - full-suite command:
+    - `source .venv/bin/activate && pytest`
+  - full-suite result: `196 passed`
+- Phase 5 production hardening completion:
+  - Added spawn idempotency contract:
+    - `subagents.spawn(...)` now requires a non-empty logical `key`.
+    - child task IDs are deterministic from `(parent_task_id, key, agent_name, input_index, payload_hash)`.
+    - `enqueue.lua` is idempotent by `task_id` (duplicate enqueue attempts no-op safely).
+    - `JobRef.key` remains metadata-only (grouping/debugging), not a server-side result-ingestion partition key.
+  - Tightened wait join correctness:
+    - `wait.jobs(...)` now requires each `JobRef` to carry a non-empty `parent_task_id` when called inside an active parent execution context.
+    - cross-parent joins fail fast with explicit errors.
+  - Hardened pending-child resolution with explicit wait-set tracking:
+    - new key: `pending_child_wait_ids` tracks only the child IDs for the current blocking join.
+    - `completion.lua` stores the active wait-set on park.
+    - `resume_if_no_remaining_child_tasks(...)` now evaluates only the active wait-set, not the entire accumulated parent child-result hash.
+    - `child_completion.lua` and `cancellation.lua` now clean up only the active wait-set keys/results.
+  - Added crash-window mitigation:
+    - worker fast-path continues immediately when all requested child results are already materialized (no unnecessary park).
+    - worker now commits parent continuation before deleting fast-path child result slots, preventing data-loss deadlocks if continuation commit fails.
+    - maintenance loop now includes pending-child recovery sweep, so parents can still resume if a worker crashes between park and immediate resume.
+  - Restored scalable spawn throughput while preserving idempotency:
+    - `subagents.spawn(...)` now uses batched enqueue when worker batch callback is available.
+    - deterministic child IDs are passed into batch enqueue (`create_batch_and_enqueue(..., task_ids=..., batch_id=...)`).
+    - `enqueue_batch.lua` now mirrors enqueue idempotency semantics by skipping enqueue/mutation for existing task IDs.
+    - deterministic batch IDs avoid duplicate batch-record churn across parent retries for the same logical spawn key.
+    - `enqueue_batch.lua` now preserves existing batch bookkeeping (`batch_remaining_tasks`, `batch_progress`) on deterministic retry, so completed-child progress is never reset by replayed spawn calls.
+  - Transition safety hardening:
+    - worker `complete(...)` now fails fast on rejected Lua completion transitions (no silent `success=False` continuation).
+  - Added/updated high-signal tests:
+    - `tests/unit/test_subagents_phase5.py`:
+      - deterministic spawn IDs and required key contract
+    - `tests/unit/test_waits_phase5.py`:
+      - strict `wait.jobs` parent binding validation
+    - `tests/integration/test_waits_phase5.py`:
+      - retry-idempotent spawn behavior (no duplicate child queue entries)
+      - wait-set persistence assertions for parked child joins
+      - fast-path continuation failure regression guard (child results are preserved when continue transition is rejected)
+    - `tests/integration/test_enqueue.py`:
+      - deterministic batch retry preserves existing remaining-task bookkeeping
+  - Current validation after production hardening:
+    - `pytest tests/unit/test_subagents_phase5.py tests/unit/test_waits_phase5.py tests/integration/test_waits_phase5.py`
+      - result: `19 passed`
+    - `pytest tests/integration/test_completion.py tests/integration/test_cancellation.py tests/integration/test_pending.py tests/integration/test_parent_child.py tests/integration/test_batch_children.py`
+      - result: `40 passed`
+    - `pytest tests/unit/test_phase1_api_scaffolding.py`
+      - result: `6 passed`
+    - `pytest`
+      - result: `203 passed`
 
 ## Decisions
 
@@ -302,9 +441,8 @@ This document tracks implementation progress, decisions, and user feedback for t
 
 ## Open Questions (Tracking)
 
-- Naming strategy for pending wait APIs vs existing `pending_tool_results` internals.
 - Managed vs BYO endpoint defaults in docs and examples.
 
 ## Next Step
 
-- Start Phase 5: wait helpers runtime (`sleep`, `cron`, `children`) with the same Lua/atomic state-machine standards and high-signal tests.
+- Start Phase 6: managed endpoints, migration utilities, and final docs/examples polish.

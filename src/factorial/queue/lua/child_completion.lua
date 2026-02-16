@@ -2,12 +2,13 @@ local queue_main_key = KEYS[1]
 local queue_orphaned_key = KEYS[2]
 local queue_pending_key = KEYS[3]
 local pending_child_task_results_key = KEYS[4]
-local task_statuses_key = KEYS[5]
-local task_agents_key = KEYS[6]
-local task_payloads_key = KEYS[7]
-local task_pickups_key = KEYS[8]
-local task_retries_key = KEYS[9]
-local task_metas_key = KEYS[10]
+local pending_child_wait_ids_key = KEYS[5]
+local task_statuses_key = KEYS[6]
+local task_agents_key = KEYS[7]
+local task_payloads_key = KEYS[8]
+local task_pickups_key = KEYS[9]
+local task_retries_key = KEYS[10]
+local task_metas_key = KEYS[11]
 
 local task_id = ARGV[1]
 local updated_task_context_json = ARGV[2]
@@ -16,12 +17,29 @@ local time_result = redis.call('TIME')
 local timestamp = tonumber(time_result[1]) + (tonumber(time_result[2]) / 1000000)
 
 local task_result = load_task(
-    { task_statuses_key, task_agents_key, task_payloads_key, task_pickups_key, task_retries_key, task_metas_key },
+    {
+        task_statuses_key,
+        task_agents_key,
+        task_payloads_key,
+        task_pickups_key,
+        task_retries_key,
+        task_metas_key,
+    },
     { task_id }
 )
 
--- Always delete the pending child task results and remove from parked queue
-redis.call('DEL', pending_child_task_results_key)
+local wait_child_ids = {}
+if pending_child_wait_ids_key and pending_child_wait_ids_key ~= "" then
+    wait_child_ids = redis.call('SMEMBERS', pending_child_wait_ids_key)
+end
+if next(wait_child_ids) ~= nil then
+    redis.call('HDEL', pending_child_task_results_key, unpack(wait_child_ids))
+else
+    redis.call('DEL', pending_child_task_results_key)
+end
+if pending_child_wait_ids_key and pending_child_wait_ids_key ~= "" then
+    redis.call('DEL', pending_child_wait_ids_key)
+end
 redis.call('ZREM', queue_pending_key, task_id)
 
 if task_result.state == "ok" then

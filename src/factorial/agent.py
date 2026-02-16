@@ -70,6 +70,7 @@ from factorial.utils import (
     to_snake_case,
     validate_callback_signature as _vcs,
 )
+from factorial.waits import WaitInstruction
 
 logger = get_logger(__name__)
 
@@ -1013,7 +1014,15 @@ class BaseAgent(Generic[ContextType]):
 
         if isinstance(result, ToolResult):
             result.tool_call = tool_call
-            result.pending_child_task_ids = pending_child_task_ids
+            if pending_child_task_ids:
+                # Preserve explicit ToolResult child IDs while merging IDs inferred
+                # from legacy forking-tool return shapes.
+                merged_ids = list(
+                    dict.fromkeys(
+                        [*result.pending_child_task_ids, *pending_child_task_ids]
+                    )
+                )
+                result.pending_child_task_ids = merged_ids
             return result
         else:
             if (
@@ -1026,6 +1035,21 @@ class BaseAgent(Generic[ContextType]):
             elif result is None:
                 output_str = ""
                 output_data = None
+            elif isinstance(result, WaitInstruction):
+                if result.kind == "sleep":
+                    duration = result.sleep_s if result.sleep_s is not None else 0
+                    output_str = result.message or f"Waiting for {duration}s"
+                elif result.kind == "cron":
+                    expression = result.cron or "<cron>"
+                    timezone_name = result.timezone or "UTC"
+                    output_str = result.message or (
+                        f"Waiting for next cron tick '{expression}' ({timezone_name})"
+                    )
+                elif result.kind == "jobs":
+                    output_str = result.message or "Waiting for spawned jobs"
+                else:
+                    output_str = result.message or "Waiting"
+                output_data = result
             else:
                 result = cast(Any, result)
                 output_str = str(result)

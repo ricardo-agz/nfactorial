@@ -64,6 +64,7 @@ from factorial.orchestrator import (
     TaskTTLConfig,
 )
 from factorial.queue.task import Task, TaskStatus
+from factorial.subagents import JobRef, SubagentsNamespace, subagents
 from factorial.tools import (
     FunctionTool,
     FunctionToolAction,
@@ -103,6 +104,9 @@ __all__ = [
     "ContextType",
     "Task",
     "TaskStatus",
+    "JobRef",
+    "SubagentsNamespace",
+    "subagents",
     "AgentEvent",
     "QueueEvent",
     "EventPublisher",

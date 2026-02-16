@@ -277,7 +277,8 @@ class TaskCompletionScript(AsyncScript):
     * KEYS[19] = pending_child_task_results_key (str)
     * KEYS[20] = agent_metrics_bucket_key (str)
     * KEYS[21] = global_metrics_bucket_key (str)
-    * KEYS[22] = parent_pending_child_task_results_key (str | None)
+    * KEYS[22] = pending_child_wait_ids_key (str)
+    * KEYS[23] = parent_pending_child_task_results_key (str | None)
 
     Args:
     * ARGV[1] = task_id (str)
@@ -321,6 +322,7 @@ class TaskCompletionScript(AsyncScript):
         metrics_ttl: int,
         pending_sentinel: str,
         current_turn: int,
+        pending_child_wait_ids_key: str | None = None,
         parent_pending_child_task_results_key: str | None = None,
         pending_tool_call_ids_json: str | None = None,
         pending_child_task_ids_json: str | None = None,
@@ -348,9 +350,9 @@ class TaskCompletionScript(AsyncScript):
             pending_child_task_results_key,
             agent_metrics_bucket_key,
             global_metrics_bucket_key,
+            pending_child_wait_ids_key or "",
+            parent_pending_child_task_results_key or "",
         ]
-        if parent_pending_child_task_results_key:
-            keys.append(parent_pending_child_task_results_key)
 
         result: tuple[bool, bool] = await super().__call__(
             keys=keys,
@@ -715,12 +717,13 @@ class ChildTaskCompletionScript(AsyncScript):
     * KEYS[2] = queue_orphaned_key (str)
     * KEYS[3] = queue_pending_key (str)
     * KEYS[4] = pending_child_task_results_key (str)
-    * KEYS[5] = task_statuses_key (str)
-    * KEYS[6] = task_agents_key (str)
-    * KEYS[7] = task_payloads_key (str)
-    * KEYS[8] = task_pickups_key (str)
-    * KEYS[9] = task_retries_key (str)
-    * KEYS[10] = task_metas_key (str)
+    * KEYS[5] = pending_child_wait_ids_key (str)
+    * KEYS[6] = task_statuses_key (str)
+    * KEYS[7] = task_agents_key (str)
+    * KEYS[8] = task_payloads_key (str)
+    * KEYS[9] = task_pickups_key (str)
+    * KEYS[10] = task_retries_key (str)
+    * KEYS[11] = task_metas_key (str)
 
     Args:
     * ARGV[1] = task_id (str)
@@ -742,6 +745,7 @@ class ChildTaskCompletionScript(AsyncScript):
         task_metas_key: str,
         task_id: str,
         updated_task_context_json: str,
+        pending_child_wait_ids_key: str | None = None,
     ) -> tuple[bool, str]:
         result: tuple[int, str] = await super().__call__(
             keys=[
@@ -749,6 +753,7 @@ class ChildTaskCompletionScript(AsyncScript):
                 queue_orphaned_key,
                 queue_pending_key,
                 pending_child_task_results_key,
+                pending_child_wait_ids_key or "",
                 task_statuses_key,
                 task_agents_key,
                 task_payloads_key,
@@ -842,6 +847,86 @@ async def create_enqueue_task_script(redis_client: redis.Redis) -> EnqueueTaskSc
     return get_cached_script(redis_client, "enqueue", EnqueueTaskScript)
 
 
+@dataclass
+class WaitScheduleScriptResult:
+    success: bool
+    message: str
+
+
+class WaitScheduleScript(AsyncScript):
+    """
+    Atomically park a task in paused/scheduled wait state.
+
+    Keys:
+    * KEYS[1] = queue_scheduled_key (str)
+    * KEYS[2] = queue_pending_key (str)
+    * KEYS[3] = queue_orphaned_key (str)
+    * KEYS[4] = processing_heartbeats_key (str)
+    * KEYS[5] = task_statuses_key (str)
+    * KEYS[6] = task_agents_key (str)
+    * KEYS[7] = task_payloads_key (str)
+    * KEYS[8] = task_pickups_key (str)
+    * KEYS[9] = task_retries_key (str)
+    * KEYS[10] = task_metas_key (str)
+    * KEYS[11] = scheduled_wait_meta_key (str)
+
+    Args:
+    * ARGV[1] = task_id (str)
+    * ARGV[2] = updated_task_payload_json (str)
+    * ARGV[3] = wake_timestamp (float)
+    * ARGV[4] = wait_metadata_json (str)
+    """
+
+    async def execute(
+        self,
+        *,
+        queue_scheduled_key: str,
+        queue_pending_key: str,
+        queue_orphaned_key: str,
+        processing_heartbeats_key: str,
+        task_statuses_key: str,
+        task_agents_key: str,
+        task_payloads_key: str,
+        task_pickups_key: str,
+        task_retries_key: str,
+        task_metas_key: str,
+        scheduled_wait_meta_key: str,
+        task_id: str,
+        updated_task_payload_json: str,
+        wake_timestamp: float,
+        wait_metadata_json: str,
+    ) -> WaitScheduleScriptResult:
+        result: tuple[bool, str | bytes] = await super().__call__(  # type: ignore
+            keys=[
+                queue_scheduled_key,
+                queue_pending_key,
+                queue_orphaned_key,
+                processing_heartbeats_key,
+                task_statuses_key,
+                task_agents_key,
+                task_payloads_key,
+                task_pickups_key,
+                task_retries_key,
+                task_metas_key,
+                scheduled_wait_meta_key,
+            ],
+            args=[
+                task_id,
+                updated_task_payload_json,
+                wake_timestamp,
+                wait_metadata_json,
+            ],
+        )
+        return WaitScheduleScriptResult(
+            success=bool(result[0]),
+            message=decode(result[1]),
+        )
+
+
+async def create_wait_schedule_script(redis_client: redis.Redis) -> WaitScheduleScript:
+    return get_cached_script(redis_client, "schedule_wait", WaitScheduleScript)
+
+
 class BackoffRecoveryScript(AsyncScript):
     """
     Handles recovering tasks from backoff queue
@@ -901,6 +986,65 @@ async def create_backoff_recovery_script(
     return get_cached_script(redis_client, "backoff", BackoffRecoveryScript)
 
 
+class ScheduledRecoveryScript(AsyncScript):
+    """
+    Handles recovering tasks from scheduled wait queue.
+
+    Keys:
+    * KEYS[1] = queue_scheduled_key (str)
+    * KEYS[2] = queue_main_key (str)
+    * KEYS[3] = queue_orphaned_key (str)
+    * KEYS[4] = task_statuses_key (str)
+    * KEYS[5] = task_agents_key (str)
+    * KEYS[6] = task_payloads_key (str)
+    * KEYS[7] = task_pickups_key (str)
+    * KEYS[8] = task_retries_key (str)
+    * KEYS[9] = task_metas_key (str)
+    * KEYS[10] = scheduled_wait_meta_key (str)
+
+    Args:
+    * ARGV[1] = max_batch_size (int)
+    """
+
+    async def execute(
+        self,
+        *,
+        queue_scheduled_key: str,
+        queue_main_key: str,
+        queue_orphaned_key: str,
+        task_statuses_key: str,
+        task_agents_key: str,
+        task_payloads_key: str,
+        task_pickups_key: str,
+        task_retries_key: str,
+        task_metas_key: str,
+        scheduled_wait_meta_key: str,
+        max_batch_size: int,
+    ) -> list[str]:
+        res: list[str | bytes] = await super().__call__(  # type: ignore
+            keys=[
+                queue_scheduled_key,
+                queue_main_key,
+                queue_orphaned_key,
+                task_statuses_key,
+                task_agents_key,
+                task_payloads_key,
+                task_pickups_key,
+                task_retries_key,
+                task_metas_key,
+                scheduled_wait_meta_key,
+            ],
+            args=[max_batch_size],
+        )
+        return [decode(id) for id in res]
+
+
+async def create_scheduled_recovery_script(
+    redis_client: redis.Redis,
+) -> ScheduledRecoveryScript:
+    return get_cached_script(redis_client, "scheduled", ScheduledRecoveryScript)
+
+
 @dataclass
 class CancelTaskScriptResult:
     """Result of the cancel task script"""
@@ -931,6 +1075,9 @@ class CancelTaskScript(AsyncScript):
     * KEYS[13] = pending_child_task_results_key (str)
     * KEYS[14] = agent_metrics_bucket_key (str)
     * KEYS[15] = global_metrics_bucket_key (str)
+    * KEYS[16] = queue_scheduled_key (str, optional)
+    * KEYS[17] = scheduled_wait_meta_key (str, optional)
+    * KEYS[18] = pending_child_wait_ids_key (str, optional)
 
     Args:
     * ARGV[1] = task_id (str)
@@ -957,6 +1104,9 @@ class CancelTaskScript(AsyncScript):
         global_metrics_bucket_key: str,
         task_id: str,
         metrics_ttl: int,
+        queue_scheduled_key: str | None = None,
+        scheduled_wait_meta_key: str | None = None,
+        pending_child_wait_ids_key: str | None = None,
     ) -> CancelTaskScriptResult:
         result: tuple[bool, str | None, str, str | None] = await super().__call__(  # type: ignore
             keys=[
@@ -975,6 +1125,9 @@ class CancelTaskScript(AsyncScript):
                 pending_child_task_results_key,
                 agent_metrics_bucket_key,
                 global_metrics_bucket_key,
+                queue_scheduled_key or "",
+                scheduled_wait_meta_key or "",
+                pending_child_wait_ids_key or "",
             ],
             args=[
                 task_id,

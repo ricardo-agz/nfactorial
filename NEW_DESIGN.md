@@ -9,7 +9,7 @@
 > - implicit dependency ordering from DI signatures in request builders (no user DAG DSL)
 > - internal hook-session runtime for correctness, idempotency, and resumption
 > - explicit tool outcomes (`tool.ok`, `tool.fail`) with plain returns still supported
-> - wait helpers with clear queue semantics (`wait.sleep`, `wait.cron`, `wait.children`)
+> - wait helpers with clear queue semantics (`wait.sleep`, `wait.cron`, `subagents.spawn`, `wait.jobs`)
 
 ## Problem Statement
 
@@ -504,7 +504,8 @@ async def monitor_release(...):
         return wait.sleep(300, message="Cooling down")
     if awaiting_next_tick:
         return wait.cron("*/5 * * * *", tz="UTC", message="Waiting for next tick")
-    return wait.children(agent=search_agent, payloads=payloads, timeout_s=600)
+    jobs = await subagents.spawn(agent=search_agent, inputs=payloads, key="search")
+    return wait.jobs(jobs)
 ```
 
 State mapping:
@@ -512,7 +513,7 @@ State mapping:
 - external waits (`hook.awaits`, deferred external completions):
   - keep pending path (`pending_tool_results` / pending-wait alias)
   - queue: existing `queue_pending`
-- child waits (`wait.children`):
+- child waits (`wait.jobs` over jobs returned by `subagents.spawn`):
   - keep existing `pending_child_tasks` path in v1
 - time waits (`wait.sleep`, `wait.cron`):
   - status: `paused`

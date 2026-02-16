@@ -98,6 +98,38 @@ async def _save_hook_session(
     await redis_client.hset(keys.hook_sessions, session.session_id, session.to_json())
 
 
+async def _clear_pending_tool_call_runtime_state(
+    redis_client: redis.Redis,
+    *,
+    keys: RedisKeys,
+    tool_call_id: str,
+) -> None:
+    """Clear task-scoped pending hook runtime markers for one tool call."""
+    pipe = redis_client.pipeline(transaction=True)
+    pipe.hdel(keys.pending_tool_results, tool_call_id)
+    pipe.hdel(keys.hook_runtime_ready, tool_call_id)
+    pipe.hdel(keys.hook_session_by_tool_call, tool_call_id)
+    await pipe.execute()
+
+
+async def _finalize_hook_session_state(
+    redis_client: redis.Redis,
+    *,
+    keys: RedisKeys,
+    session: HookSessionRecord,
+    status: Literal["completed", "failed", "expired"],
+) -> None:
+    """Persist final session status and clear pending runtime state."""
+    session.status = status
+    session.updated_at = time.time()
+    await _save_hook_session(redis_client=redis_client, keys=keys, session=session)
+    await _clear_pending_tool_call_runtime_state(
+        redis_client=redis_client,
+        keys=keys,
+        tool_call_id=session.tool_call_id,
+    )
+
+
 async def persist_hook_runtime_payload(
     redis_client: redis.Redis,
     namespace: str,
@@ -318,7 +350,7 @@ async def _execute_hook_tool_continuation(
     task: Task[Any],
     execution_ctx: ExecutionContext,
     session: HookSessionRecord,
-) -> Any:
+) -> Any | ToolResult:
     continuation_args = dict(session.tool_args)
     for node in session.nodes.values():
         if node.status == "resolved":
@@ -345,8 +377,6 @@ async def _execute_hook_tool_continuation(
             "which is not supported in this phase."
         )
 
-    if isinstance(continuation_result, ToolResult):
-        return continuation_result.output_data
     return continuation_result
 
 
@@ -386,17 +416,108 @@ async def process_hook_runtime_wake_requests(
     ):
         tool_call_id = decode(raw_tool_call_id)
         session_id = decode(raw_session_id)
+        pending_value_raw = await redis_client.hget(
+            task_keys.pending_tool_results, tool_call_id
+        )
+        has_pending_sentinel = (
+            pending_value_raw is not None
+            and decode(pending_value_raw) == PENDING_SENTINEL
+        )
         session = await _load_hook_session(
             redis_client,
             keys=task_keys,
             session_id=session_id,
         )
-        if (
-            session is None
-            or session.status != "active"
-            or session.tool_call_id != tool_call_id
-        ):
-            await redis_client.hdel(task_keys.hook_runtime_ready, tool_call_id)
+        if session is None:
+            if has_pending_sentinel:
+                completed_results.append(
+                    (
+                        tool_call_id,
+                        RuntimeError(
+                            f"Hook session '{session_id}' was missing for "
+                            f"pending tool call '{tool_call_id}'."
+                        ),
+                    )
+                )
+                await _clear_pending_tool_call_runtime_state(
+                    redis_client=redis_client,
+                    keys=task_keys,
+                    tool_call_id=tool_call_id,
+                )
+            else:
+                await redis_client.hdel(task_keys.hook_runtime_ready, tool_call_id)
+            continue
+
+        if session.tool_call_id != tool_call_id:
+            if has_pending_sentinel:
+                completed_results.append(
+                    (
+                        tool_call_id,
+                        RuntimeError(
+                            f"Hook session/tool call mismatch for session "
+                            f"'{session_id}': expected '{tool_call_id}', got "
+                            f"'{session.tool_call_id}'."
+                        ),
+                    )
+                )
+                await _finalize_hook_session_state(
+                    redis_client=redis_client,
+                    keys=task_keys,
+                    session=session,
+                    status="failed",
+                )
+            else:
+                await redis_client.hdel(task_keys.hook_runtime_ready, tool_call_id)
+            continue
+
+        if session.status != "active":
+            if has_pending_sentinel:
+                completed_results.append(
+                    (
+                        tool_call_id,
+                        RuntimeError(
+                            f"Hook session '{session.session_id}' is in terminal "
+                            f"state '{session.status}' for pending tool call "
+                            f"'{tool_call_id}'."
+                        ),
+                    )
+                )
+                await _clear_pending_tool_call_runtime_state(
+                    redis_client=redis_client,
+                    keys=task_keys,
+                    tool_call_id=tool_call_id,
+                )
+            else:
+                await redis_client.hdel(task_keys.hook_runtime_ready, tool_call_id)
+            continue
+
+        terminal_nodes = [
+            node.param_name
+            for node in session.nodes.values()
+            if node.status in {"expired", "failed"}
+        ]
+        if terminal_nodes:
+            if has_pending_sentinel:
+                has_expired_nodes = any(
+                    node.status == "expired" for node in session.nodes.values()
+                )
+                completed_results.append(
+                    (
+                        tool_call_id,
+                        RuntimeError(
+                            f"Hook session '{session.session_id}' cannot continue: "
+                            f"terminal dependency nodes={terminal_nodes}."
+                        ),
+                    )
+                )
+                await _finalize_hook_session_state(
+                    redis_client=redis_client,
+                    keys=task_keys,
+                    session=session,
+                    status="expired" if has_expired_nodes else "failed",
+                )
+            else:
+                await redis_client.hdel(task_keys.hook_runtime_ready, tool_call_id)
             continue
 
         tool_def = next(
@@ -405,7 +526,24 @@ async def process_hook_runtime_wake_requests(
         )
         hook_plan = tool_def.hook_plan if tool_def else None
         if hook_plan is None:
-            await redis_client.hdel(task_keys.hook_runtime_ready, tool_call_id)
+            if has_pending_sentinel:
+                completed_results.append(
+                    (
+                        tool_call_id,
+                        RuntimeError(
+                            f"Hook continuation tool '{session.tool_name}' was "
+                            "not found or has no hook plan."
+                        ),
+                    )
+                )
+                await _finalize_hook_session_state(
+                    redis_client=redis_client,
+                    keys=task_keys,
+                    session=session,
+                    status="failed",
+                )
+            else:
+                await redis_client.hdel(task_keys.hook_runtime_ready, tool_call_id)
             continue
 
         requested_unresolved = [
@@ -503,20 +641,12 @@ async def process_hook_runtime_wake_requests(
                 session=session,
             )
             completed_results.append((tool_call_id, final_result))
-
-            session.status = "completed"
-            session.updated_at = time.time()
-            await _save_hook_session(
+            await _finalize_hook_session_state(
                 redis_client=redis_client,
                 keys=task_keys,
                 session=session,
+                status="completed",
             )
-
-            pipe = redis_client.pipeline(transaction=True)
-            pipe.hdel(task_keys.pending_tool_results, tool_call_id)
-            pipe.hdel(task_keys.hook_runtime_ready, tool_call_id)
-            pipe.hdel(task_keys.hook_session_by_tool_call, tool_call_id)
-            await pipe.execute()
             continue
 
         await redis_client.hdel(task_keys.hook_runtime_ready, tool_call_id)
@@ -536,7 +666,6 @@ async def process_hook_runtime_wake_requests(
 async def resolve_hook(
     redis_client: redis.Redis,
     namespace: str,
-    agents_by_name: dict[str, BaseAgent[Any]],
     hook_id: str,
     payload: Any,
     token: str,
@@ -585,10 +714,10 @@ async def resolve_hook(
             )
 
     already_resolved = hook_record.status == "resolved"
-    if already_resolved and not idempotency_key:
-        raise HookAlreadyResolvedError(hook_id)
     if hook_record.status == "expired":
         raise HookExpiredError(hook_id)
+    if hook_record.status == "failed":
+        raise HookAlreadyResolvedError(hook_id)
 
     if not already_resolved:
         hook_record.status = "resolved"
@@ -599,6 +728,14 @@ async def resolve_hook(
             keys.hooks_index, hook_id, hook_record.to_json()
         )
         await redis_client.zrem(keys.hooks_expiring, hook_id)
+    elif hook_record.payload is None:
+        # Recovery path: persist payload if the first attempt marked resolved
+        # but crashed before storing the payload/session updates.
+        hook_record.payload = payload
+        hook_record.resolved_at = hook_record.resolved_at or now
+        await redis_client.hset(
+            keys.hooks_index, hook_id, hook_record.to_json()
+        )
 
     resolved_payload = hook_record.payload
     task_keys = RedisKeys.format(
@@ -608,52 +745,68 @@ async def resolve_hook(
         owner_id=hook_record.owner_id,
     )
     task_resumed = False
-    session_handled = False
-    if hook_record.session_id:
-        session = await _load_hook_session(
-            redis_client,
-            keys=task_keys,
-            session_id=hook_record.session_id,
-        )
-        if session and hook_record.hook_param_name in session.nodes:
-            session_handled = True
-            node = session.nodes[hook_record.hook_param_name]
-            if node.status != "resolved":
-                node.status = "resolved"
-                node.payload = resolved_payload
-                node.resolved_at = hook_record.resolved_at or now
-                node.hook_id = hook_record.hook_id
-                session.updated_at = now
-                await _save_hook_session(
-                    redis_client=redis_client,
-                    keys=task_keys,
-                    session=session,
-                )
-
-            if not any(
-                current.status == "requested" for current in session.nodes.values()
-            ):
-                wake_script = await create_hook_wake_script(redis_client)
-                task_resumed, _ = await wake_script.execute(
-                    queue_main_key=task_keys.queue_main,
-                    queue_pending_key=task_keys.queue_pending,
-                    queue_orphaned_key=task_keys.queue_orphaned,
-                    task_statuses_key=task_keys.task_status,
-                    task_agents_key=task_keys.task_agent,
-                    task_payloads_key=task_keys.task_payload,
-                    task_pickups_key=task_keys.task_pickups,
-                    task_retries_key=task_keys.task_retries,
-                    task_metas_key=task_keys.task_meta,
-                    hook_runtime_ready_key=task_keys.hook_runtime_ready,
-                    task_id=task_id,
-                    tool_call_id=tool_call_id,
-                    session_id=session.session_id,
-                )
-
-    if not session_handled:
+    if not hook_record.session_id:
         raise ValueError(
             "resolve_hook requires a hook session. "
             "Legacy non-session hook completion paths are no longer supported."
+        )
+    if not hook_record.hook_param_name:
+        raise ValueError(
+            f"Hook '{hook_id}' is missing hook_param_name linkage metadata."
+        )
+
+    session = await _load_hook_session(
+        redis_client,
+        keys=task_keys,
+        session_id=hook_record.session_id,
+    )
+    if session is None:
+        raise ValueError(
+            f"Hook session '{hook_record.session_id}' was not found for "
+            f"hook '{hook_id}'."
+        )
+    if session.status == "expired":
+        raise HookExpiredError(hook_id)
+    if session.status in {"completed", "failed"}:
+        raise HookAlreadyResolvedError(hook_id)
+
+    if hook_record.hook_param_name not in session.nodes:
+        raise ValueError(
+            f"Hook parameter '{hook_record.hook_param_name}' was not found in "
+            f"session '{session.session_id}'."
+        )
+
+    node = session.nodes[hook_record.hook_param_name]
+    if node.status in {"expired", "failed"}:
+        raise HookExpiredError(hook_id)
+    if node.status != "resolved":
+        node.status = "resolved"
+        node.payload = resolved_payload
+        node.resolved_at = hook_record.resolved_at or now
+        node.hook_id = hook_record.hook_id
+        session.updated_at = now
+        await _save_hook_session(
+            redis_client=redis_client,
+            keys=task_keys,
+            session=session,
+        )
+
+    if not any(current.status == "requested" for current in session.nodes.values()):
+        wake_script = await create_hook_wake_script(redis_client)
+        task_resumed, _ = await wake_script.execute(
+            queue_main_key=task_keys.queue_main,
+            queue_pending_key=task_keys.queue_pending,
+            queue_orphaned_key=task_keys.queue_orphaned,
+            task_statuses_key=task_keys.task_status,
+            task_agents_key=task_keys.task_agent,
+            task_payloads_key=task_keys.task_payload,
+            task_pickups_key=task_keys.task_pickups,
+            task_retries_key=task_keys.task_retries,
+            task_metas_key=task_keys.task_meta,
+            hook_runtime_ready_key=task_keys.hook_runtime_ready,
+            task_id=task_id,
+            tool_call_id=tool_call_id,
+            session_id=session.session_id,
         )
 
     if idempotency_key:
@@ -723,6 +876,112 @@ async def rotate_hook_token(
     return next_token
 
 
+async def expire_pending_hooks(
+    *,
+    redis_client: redis.Redis,
+    namespace: str,
+    max_cleanup_batch: int,
+) -> int:
+    """Expire hook records past TTL and wake affected pending tool calls."""
+    if max_cleanup_batch <= 0:
+        raise ValueError("max_cleanup_batch must be greater than 0")
+
+    now = time.time()
+    keys = RedisKeys.format(namespace=namespace)
+    expired_hook_ids_raw = cast(
+        list[str | bytes],
+        await redis_client.zrangebyscore(
+            keys.hooks_expiring,
+            "-inf",
+            now,
+            start=0,
+            num=max_cleanup_batch,
+        ),  # type: ignore[arg-type]
+    )
+    if not expired_hook_ids_raw:
+        return 0
+
+    wake_script = await create_hook_wake_script(redis_client)
+    expired_count = 0
+
+    for raw_hook_id in expired_hook_ids_raw:
+        hook_id = decode(raw_hook_id)
+        record_json = await redis_client.hget(keys.hooks_index, hook_id)
+        if not record_json:
+            await redis_client.zrem(keys.hooks_expiring, hook_id)
+            continue
+
+        hook_record = HookRecord.from_json(record_json)
+        if hook_record.status in {"resolved", "expired", "failed"}:
+            await redis_client.zrem(keys.hooks_expiring, hook_id)
+            continue
+        if hook_record.expires_at > now:
+            continue
+
+        hook_record.status = "expired"
+        await redis_client.hset(keys.hooks_index, hook_id, hook_record.to_json())
+        await redis_client.zrem(keys.hooks_expiring, hook_id)
+        expired_count += 1
+
+        if not hook_record.session_id:
+            continue
+
+        task_keys = RedisKeys.format(
+            namespace=namespace,
+            task_id=hook_record.task_id,
+            agent=hook_record.agent_name,
+            owner_id=hook_record.owner_id,
+        )
+        session = await _load_hook_session(
+            redis_client,
+            keys=task_keys,
+            session_id=hook_record.session_id,
+        )
+        if session is not None:
+            if hook_record.hook_param_name in session.nodes:
+                node = session.nodes[hook_record.hook_param_name]
+                if node.status not in {"resolved", "expired", "failed"}:
+                    node.status = "expired"
+                    node.resolved_at = now
+            if session.status == "active":
+                session.status = "expired"
+            session.updated_at = now
+            await _save_hook_session(
+                redis_client=redis_client,
+                keys=task_keys,
+                session=session,
+            )
+            session_id_for_wake = session.session_id
+        else:
+            session_id_for_wake = hook_record.session_id
+
+        try:
+            await wake_script.execute(
+                queue_main_key=task_keys.queue_main,
+                queue_pending_key=task_keys.queue_pending,
+                queue_orphaned_key=task_keys.queue_orphaned,
+                task_statuses_key=task_keys.task_status,
+                task_agents_key=task_keys.task_agent,
+                task_payloads_key=task_keys.task_payload,
+                task_pickups_key=task_keys.task_pickups,
+                task_retries_key=task_keys.task_retries,
+                task_metas_key=task_keys.task_meta,
+                hook_runtime_ready_key=task_keys.hook_runtime_ready,
+                task_id=hook_record.task_id,
+                tool_call_id=hook_record.tool_call_id,
+                session_id=session_id_for_wake,
+            )
+        except Exception as exc:
+            logger.error(
+                "Failed to wake task %s after hook expiry %s",
+                hook_record.task_id,
+                hook_id,
+                exc_info=exc,
+            )
+
+    return expired_count
+
+
 async def enqueue_task(
     redis_client: redis.Redis,
     namespace: str,
@@ -761,21 +1020,35 @@ async def create_batch_and_enqueue(
     payloads: list[ContextType],
     owner_id: str,
     parent_id: str | None = None,
+    task_ids: list[str] | None = None,
+    batch_id: str | None = None,
 ) -> Batch:
     """Atomically enqueue a batch of tasks via batch_enqueue.lua.
 
     Returns the *batch_id* created.
     """
-    batch_id = str(uuid.uuid4())
+    if batch_id is None:
+        batch_id = str(uuid.uuid4())
     created_at = time.time()
+    if task_ids is not None:
+        if len(task_ids) != len(payloads):
+            raise ValueError(
+                "create_batch_and_enqueue task_ids length must match payload count"
+            )
+        if len(set(task_ids)) != len(task_ids):
+            raise ValueError("create_batch_and_enqueue task_ids must be unique")
 
     task_objs: list[Task[ContextType]] = []
-    for payload in payloads:
+    for index, payload in enumerate(payloads):
         t: Task[ContextType] = Task.create(
             owner_id=owner_id, agent=agent.name, payload=payload, batch_id=batch_id
         )
+        if task_ids is not None:
+            t.id = task_ids[index]
         if parent_id is not None:
             t.metadata.parent_id = parent_id
+        if not is_valid_task_id(t.id):
+            raise InvalidTaskIdError(t.id)
         task_objs.append(t)
 
     tasks_json = [
@@ -942,6 +1215,9 @@ async def cancel_task(
         global_metrics_bucket_key=keys.global_metrics_bucket,
         task_id=task_id,
         metrics_ttl=metrics_retention_duration,
+        queue_scheduled_key=keys.queue_scheduled,
+        scheduled_wait_meta_key=keys.scheduled_wait_meta,
+        pending_child_wait_ids_key=keys.pending_child_wait_ids,
     )
 
     if not result.success:
@@ -1016,25 +1292,28 @@ async def resume_if_no_remaining_child_tasks(
         )
         return False
 
-    # Get all results and check if any are still pending
-    all_results = cast(
-        dict[str | bytes, str | bytes],
-        await redis_client.hgetall(keys.pending_child_task_results),  # type: ignore
+    wait_child_ids_raw = cast(
+        set[str | bytes],
+        await redis_client.smembers(keys.pending_child_wait_ids),  # type: ignore
     )
-    if not all_results:
+    if not wait_child_ids_raw:
         return False
+    wait_child_ids = sorted(decode(child_id) for child_id in wait_child_ids_raw)
 
-    # Check if any results are still pending (sentinel value)
+    # Read only the child results for the currently awaited wait-set.
+    result_values = cast(
+        list[str | bytes | None],
+        await redis_client.hmget(keys.pending_child_task_results, wait_child_ids),  # type: ignore[arg-type]
+    )
+
     completed_results: list[tuple[str, Any]] = []
-
-    for child_task_id, result_json in all_results.items():
-        child_task_id_str = decode(child_task_id)
+    for child_task_id, result_json in zip(wait_child_ids, result_values, strict=True):
+        if result_json is None:
+            return False
         result_str = decode(result_json)
-
         if result_str == PENDING_SENTINEL:
             return False
-        else:
-            completed_results.append((child_task_id_str, json.loads(result_str)))
+        completed_results.append((child_task_id, json.loads(result_str)))
 
     # Update the task context with the completed results
     updated_context = agent.process_child_task_results(
@@ -1050,6 +1329,7 @@ async def resume_if_no_remaining_child_tasks(
         queue_orphaned_key=keys.queue_orphaned,
         queue_pending_key=keys.queue_pending,
         pending_child_task_results_key=keys.pending_child_task_results,
+        pending_child_wait_ids_key=keys.pending_child_wait_ids,
         task_statuses_key=keys.task_status,
         task_agents_key=keys.task_agent,
         task_payloads_key=keys.task_payload,

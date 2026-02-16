@@ -113,15 +113,17 @@ def test_hook_namespace_dependency_metadata() -> None:
 
 
 def test_wait_namespace_builders_return_serializable_instructions() -> None:
-    class DummyAgent:
-        name = "child-research-agent"
-
     sleep_wait = wait.sleep(12.5, message="retry shortly")
     cron_wait = wait.cron("0 * * * *", timezone="UTC", message="hourly sync")
-    children_wait = wait.children(
-        agent=DummyAgent(),
-        inputs=[{"query": "redis hooks"}],
-        timeout_s=300,
+    jobs_wait = wait.jobs(
+        [
+            {
+                "task_id": "child-task-1",
+                "agent_name": "child-research-agent",
+                "parent_task_id": "parent-task",
+                "key": "research",
+            }
+        ],
         message="waiting for child tasks",
     )
 
@@ -136,9 +138,7 @@ def test_wait_namespace_builders_return_serializable_instructions() -> None:
     assert cron_wait.timezone == "UTC"
     assert cron_wait.message == "hourly sync"
 
-    assert isinstance(children_wait, WaitInstruction)
-    assert children_wait.kind == "children"
-    assert children_wait.child_agent_name == "child-research-agent"
-    assert children_wait.child_inputs == [{"query": "redis hooks"}]
-    assert children_wait.timeout_s == 300
-    assert children_wait.message == "waiting for child tasks"
+    assert isinstance(jobs_wait, WaitInstruction)
+    assert jobs_wait.kind == "jobs"
+    assert jobs_wait.child_task_ids == ["child-task-1"]
+    assert jobs_wait.message == "waiting for child tasks"

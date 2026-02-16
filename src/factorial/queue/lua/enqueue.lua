@@ -13,6 +13,11 @@ local task_pickups = tonumber(ARGV[4])
 local task_retries = tonumber(ARGV[5])
 local task_meta_json = ARGV[6]
 
+-- Idempotency: if a task with the same ID already exists, do not enqueue again.
+if redis.call('HEXISTS', task_statuses_key, task_id) == 1 then
+    return false
+end
+
 -- Push task_id to the back of the agent queue
 redis.call('RPUSH', agent_queue_key, task_id)
 

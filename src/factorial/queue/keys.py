@@ -36,6 +36,8 @@ QUEUE_ORPHANED = "{namespace}:queue:{agent}:orphaned"
 # ZSET: task_id -> timestamp of when task was parked pending
 #       external tool/hook completions or child task results
 QUEUE_PENDING = "{namespace}:queue:{agent}:pending"
+# ZSET: task_id -> wake timestamp for time waits (sleep/cron)
+QUEUE_SCHEDULED = "{namespace}:queue:{agent}:scheduled"
 
 # ===== ACTIVE TASK PROCESSING =====
 # ZSET: task_id -> timestamp of last heartbeat
@@ -53,6 +55,10 @@ TASK_STEERING = "{namespace}:steer:{task_id}:messages"
 PENDING_TOOL_RESULTS = "{namespace}:pending:{task_id}:tools"
 # HASH: child_task_id -> result_json or <|PENDING|>
 PENDING_CHILD_TASK_RESULTS = "{namespace}:pending:{task_id}:children"
+# SET: child_task_id values currently being awaited by the parent task
+PENDING_CHILD_WAIT_IDS = "{namespace}:pending:{task_id}:children_wait_ids"
+# HASH: task_id -> scheduled wait metadata JSON
+SCHEDULED_WAIT_META = "{namespace}:scheduled:wait_meta"
 
 # ===== HOOK STATE MANAGEMENT =====
 # HASH: hook_id -> hook_record_json
@@ -119,6 +125,7 @@ class RedisKeys:
     _hooks_expiring: str
     _hook_idempotency: str
     _hook_sessions: str
+    _scheduled_wait_meta: str
     # Batch keys
     _batch_tasks: str
     _batch_remaining_tasks: str
@@ -133,6 +140,7 @@ class RedisKeys:
     _queue_failed: str | None = None
     _queue_orphaned: str | None = None
     _queue_pending: str | None = None
+    _queue_scheduled: str | None = None
     _queue_cancelled: str | None = None
     _processing_heartbeats: str | None = None
 
@@ -144,6 +152,7 @@ class RedisKeys:
     _task_steering: str | None = None
     _pending_tool_results: str | None = None
     _pending_child_task_results: str | None = None
+    _pending_child_wait_ids: str | None = None
     _hooks_by_task: str | None = None
     _hook_session_by_tool_call: str | None = None
     _hook_sessions_by_task: str | None = None
@@ -207,6 +216,11 @@ class RedisKeys:
     def hook_sessions(self) -> str:
         """{namespace}:hooks:sessions"""
         return self._hook_sessions
+
+    @property
+    def scheduled_wait_meta(self) -> str:
+        """{namespace}:scheduled:wait_meta"""
+        return self._scheduled_wait_meta
 
     @property
     def batch_completed(self) -> str:
@@ -294,6 +308,16 @@ class RedisKeys:
         return self._queue_pending
 
     @property
+    def queue_scheduled(self) -> str:
+        """{namespace}:queue:{agent}:scheduled"""
+        if self._queue_scheduled is None:
+            raise ValueError(
+                "queue_scheduled is not available - "
+                "agent was not provided during RedisKeys.format()"
+            )
+        return self._queue_scheduled
+
+    @property
     def queue_cancelled(self) -> str:
         """{namespace}:queue:{agent}:cancelled"""
         if self._queue_cancelled is None:
@@ -362,6 +386,16 @@ class RedisKeys:
                 "task_id was not provided during RedisKeys.format()"
             )
         return self._pending_child_task_results
+
+    @property
+    def pending_child_wait_ids(self) -> str:
+        """{namespace}:pending:{task_id}:children_wait_ids"""
+        if self._pending_child_wait_ids is None:
+            raise ValueError(
+                "pending_child_wait_ids is not available - "
+                "task_id was not provided during RedisKeys.format()"
+            )
+        return self._pending_child_wait_ids
 
     @property
     def hooks_by_task(self) -> str:
@@ -450,6 +484,7 @@ class RedisKeys:
                 idempotency_key="{idempotency_key}",
             ),
             _hook_sessions=HOOK_SESSIONS.format(namespace=namespace),
+            _scheduled_wait_meta=SCHEDULED_WAIT_META.format(namespace=namespace),
             # Agent-scoped keys
             _queue_main=QUEUE_MAIN.format(namespace=namespace, agent=agent)
             if agent
@@ -469,6 +504,9 @@ class RedisKeys:
             if agent
             else None,
             _queue_pending=QUEUE_PENDING.format(namespace=namespace, agent=agent)
+            if agent
+            else None,
+            _queue_scheduled=QUEUE_SCHEDULED.format(namespace=namespace, agent=agent)
             if agent
             else None,
             _queue_cancelled=QUEUE_CANCELLED.format(namespace=namespace, agent=agent)
@@ -503,6 +541,12 @@ class RedisKeys:
             else None,
             _pending_child_task_results=PENDING_CHILD_TASK_RESULTS.format(
                 namespace=namespace, task_id=task_id
+            )
+            if task_id
+            else None,
+            _pending_child_wait_ids=PENDING_CHILD_WAIT_IDS.format(
+                namespace=namespace,
+                task_id=task_id,
             )
             if task_id
             else None,

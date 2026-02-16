@@ -2,6 +2,7 @@ from factorial.queue.maintenance import maintenance_loop
 from factorial.queue.operations import (
     cancel_task,
     enqueue_task,
+    expire_pending_hooks,
     register_pending_hook,
     resolve_hook,
     rotate_hook_token,
@@ -25,6 +26,7 @@ __all__ = [
     "enqueue_task",
     "cancel_task",
     "steer_task",
+    "expire_pending_hooks",
     "register_pending_hook",
     "resolve_hook",
     "rotate_hook_token",

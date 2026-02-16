@@ -19,7 +19,8 @@ local pending_tool_results_key       = KEYS[18]
 local pending_child_tasks_key        = KEYS[19]
 local agent_metrics_bucket_key       = KEYS[20]
 local global_metrics_bucket_key      = KEYS[21]
-local parent_pending_child_tasks_key = KEYS[22]
+local pending_child_wait_ids_key     = KEYS[22]
+local parent_pending_child_tasks_key = KEYS[23]
 
 local task_id                        = ARGV[1]
 local action                         = ARGV[2] -- complete, continue, retry, fail, pending
@@ -78,8 +79,17 @@ end
 
 if pending_child_task_ids_json ~= "" then
     local pending_child_task_ids = cjson.decode(pending_child_task_ids_json)
+    -- Track exactly which child task IDs this pending wait is joining on.
+    if pending_child_wait_ids_key and pending_child_wait_ids_key ~= "" then
+        redis.call('DEL', pending_child_wait_ids_key)
+    end
     for _, child_task_id in ipairs(pending_child_task_ids) do
-        redis.call('HSET', pending_child_tasks_key, child_task_id, pending_sentinel)
+        if pending_child_wait_ids_key and pending_child_wait_ids_key ~= "" then
+            redis.call('SADD', pending_child_wait_ids_key, child_task_id)
+        end
+        -- Preserve already-completed child outputs if they landed before parent
+        -- entered pending_child_tasks state.
+        redis.call('HSETNX', pending_child_tasks_key, child_task_id, pending_sentinel)
     end
     -- Set task status to pending child tasks
     redis.call('HSET', task_statuses_key, task_id, "pending_child_tasks")
@@ -181,7 +191,7 @@ if action == "complete" then
     )
 
     -- If the task is a child task, update the parent task's pending child task results
-    if parent_task_id and parent_pending_child_tasks_key then
+    if parent_task_id and parent_pending_child_tasks_key and parent_pending_child_tasks_key ~= "" then
         redis.call('HSET', parent_pending_child_tasks_key, task_id, final_output_json)
     end
 
@@ -252,7 +262,7 @@ elseif action == "fail" then
     )
 
     -- If the task is a child task, update the parent task's pending child task results
-    if parent_task_id and parent_pending_child_tasks_key then
+    if parent_task_id and parent_pending_child_tasks_key and parent_pending_child_tasks_key ~= "" then
         redis.call('HSET', parent_pending_child_tasks_key, task_id, final_output_json)
     end
 

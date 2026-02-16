@@ -50,23 +50,29 @@ for i = 1, #tasks_json do
     local task_id      = task["id"]
     local payload_json = task["payload_json"]
 
-    -- Queue the task at the tail of the agent queue
-    redis.call('RPUSH', agent_queue_key, task_id)
+    -- Idempotency: if this task ID already exists, do not enqueue/mutate it.
+    if redis.call('HEXISTS', task_statuses_key, task_id) == 0 then
+        -- Queue the task at the tail of the agent queue
+        redis.call('RPUSH', agent_queue_key, task_id)
 
-    -- Core task hashes (mirrors enqueue.lua)
-    redis.call('HSET', task_statuses_key, task_id, 'queued')
-    redis.call('HSET', task_agents_key, task_id, agent_name)
-    redis.call('HSET', task_payloads_key, task_id, payload_json)
-    redis.call('HSET', task_pickups_key, task_id, 0)
-    redis.call('HSET', task_retries_key, task_id, 0)
-    redis.call('HSET', task_metas_key, task_id, base_task_meta_json)
+        -- Core task hashes (mirrors enqueue.lua)
+        redis.call('HSET', task_statuses_key, task_id, 'queued')
+        redis.call('HSET', task_agents_key, task_id, agent_name)
+        redis.call('HSET', task_payloads_key, task_id, payload_json)
+        redis.call('HSET', task_pickups_key, task_id, 0)
+        redis.call('HSET', task_retries_key, task_id, 0)
+        redis.call('HSET', task_metas_key, task_id, base_task_meta_json)
+    end
 
     table.insert(task_ids, task_id)
 end
 
-redis.call('HSET', batch_meta_key, batch_id, batch_meta_json)
-redis.call('HSET', batch_tasks_key, batch_id, cjson.encode(task_ids))
-redis.call('HSET', batch_remaining_tasks_key, batch_id, cjson.encode(task_ids))
-redis.call('HSET', batch_progress_key, batch_id, 0)
+-- Preserve existing batch progress/remaining bookkeeping on retries.
+if redis.call('HEXISTS', batch_meta_key, batch_id) == 0 then
+    redis.call('HSET', batch_meta_key, batch_id, batch_meta_json)
+    redis.call('HSET', batch_tasks_key, batch_id, cjson.encode(task_ids))
+    redis.call('HSET', batch_remaining_tasks_key, batch_id, cjson.encode(task_ids))
+    redis.call('HSET', batch_progress_key, batch_id, 0)
+end
 
 return cjson.encode(task_ids)

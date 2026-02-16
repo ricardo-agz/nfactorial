@@ -92,6 +92,28 @@ search_agent = Agent(
 )
 ```
 
+You can optionally add output verification to force revisions until results meet your bar:
+
+```python
+from factorial import VerificationRejected
+
+def verify_subagent_output(output: SubAgentOutput) -> SubAgentOutput:
+    if len(output.findings) < 3:
+        raise VerificationRejected(
+            message="Provide at least 3 findings from different sources.",
+            code="not_enough_findings",
+            metadata={"minimum": 3, "actual": len(output.findings)},
+        )
+    return output
+
+search_agent = Agent(
+    ...,
+    output_type=SubAgentOutput,
+    verifier=verify_subagent_output,
+    verifier_max_attempts=3,
+)
+```
+
 Register the subagent's runner in your orchestrator:
 
 ```python

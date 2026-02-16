@@ -166,6 +166,73 @@ Published when an agent produces its final output.
 }
 ```
 
+### Verification Events
+
+These events are emitted only when an agent is configured with `verifier=...`.
+
+#### `verification_passed`
+
+Published when verifier validation succeeds and the run is allowed to complete.
+
+```python
+{
+    "event_type": "verification_passed",
+    "task_id": "task-123",
+    "owner_id": "user-456",
+    "agent_name": "my_agent",
+    "turn": 3,
+    "timestamp": "2024-01-01T12:04:45Z",
+    "data": {
+        "attempts_used": 1,
+        "max_attempts": 3,
+    },
+}
+```
+
+#### `verification_rejected`
+
+Published when verifier validation rejects output and asks the model to revise.
+
+```python
+{
+    "event_type": "verification_rejected",
+    "task_id": "task-123",
+    "owner_id": "user-456",
+    "agent_name": "my_agent",
+    "turn": 3,
+    "timestamp": "2024-01-01T12:04:45Z",
+    "data": {
+        "attempts_used": 1,
+        "max_attempts": 3,
+        "attempt_counted": True,
+        "message": "Score below acceptance threshold",
+        "code": "score_low",
+        "metadata": {"score": 72, "minimum": 80},
+    },
+}
+```
+
+#### `verification_exhausted`
+
+Published when `verifier_max_attempts` is reached and the task is about to fail.
+
+```python
+{
+    "event_type": "verification_exhausted",
+    "task_id": "task-123",
+    "owner_id": "user-456",
+    "agent_name": "my_agent",
+    "turn": 5,
+    "timestamp": "2024-01-01T12:05:00Z",
+    "data": {
+        "attempts_used": 3,
+        "max_attempts": 3,
+        "message": "Score below acceptance threshold",
+        "code": "score_low",
+    },
+}
+```
+
 ### Agent Progress Events
 
 Progress events are automatically published for key agent operations and follow the pattern `progress_update_{operation}_{status}`:

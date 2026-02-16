@@ -7,8 +7,14 @@ from factorial.agent import (
     publish_progress,
     retry,
 )
-from factorial.context import AgentContext, ContextType, ExecutionContext
+from factorial.context import (
+    AgentContext,
+    ContextType,
+    ExecutionContext,
+    VerificationState,
+)
 from factorial.events import AgentEvent, EventPublisher, QueueEvent
+from factorial.exceptions import FatalAgentError, VerificationRejected
 from factorial.hooks import (
     Hook,
     HookDependency,
@@ -77,6 +83,7 @@ __all__ = [
     "Agent",
     "AgentContext",
     "ExecutionContext",
+    "VerificationState",
     "ModelSettings",
     "ResolvedModelSettings",
     "TurnCompletion",
@@ -100,6 +107,8 @@ __all__ = [
     "AgentEvent",
     "QueueEvent",
     "EventPublisher",
+    "FatalAgentError",
+    "VerificationRejected",
     "Hook",
     "PendingHook",
     "HookRequestContext",

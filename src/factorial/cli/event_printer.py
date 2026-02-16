@@ -187,6 +187,14 @@ async def event_printer(event: Any) -> None:
             # Graceful degradation - just show basic tool execution
             click.echo(style("[agent] ", fg="blue") + "ran a tool")
 
+    elif event_type in {
+        "verification_passed",
+        "verification_rejected",
+        "verification_exhausted",
+    }:
+        _spinner.stop()
+        click.echo(_format_verification_message(event_type, event))
+
     elif event_type.endswith("_failed"):
         # Stop spinner on failure and show detailed error
         _spinner.stop()
@@ -294,6 +302,39 @@ def _format_error_message(event_type: str, event: Any) -> str:
         details = style(" - Unknown error", fg="bright_black")
 
     return base_msg + details
+
+
+def _format_verification_message(event_type: str, event: Any) -> str:
+    data = event.data if isinstance(getattr(event, "data", None), dict) else {}
+
+    attempts_used = data.get("attempts_used")
+    max_attempts = data.get("max_attempts")
+    attempt_suffix = ""
+    if attempts_used is not None and max_attempts is not None:
+        attempt_suffix = f" ({attempts_used}/{max_attempts} attempts)"
+
+    code = data.get("code")
+    code_suffix = f" [{code}]" if code else ""
+    detail = data.get("message") or ""
+    detail_suffix = f": {detail}" if detail else ""
+
+    if event_type == "verification_passed":
+        return style("[agent] ", fg="blue") + style(
+            f"verification passed{attempt_suffix}",
+            fg="green",
+        )
+
+    if event_type == "verification_exhausted":
+        return style("[agent] ", fg="blue") + style(
+            f"verification exhausted{attempt_suffix}{code_suffix}{detail_suffix}",
+            fg="red",
+            bold=True,
+        )
+
+    return style("[agent] ", fg="blue") + style(
+        f"verification rejected{attempt_suffix}{code_suffix}{detail_suffix}",
+        fg="yellow",
+    )
 
 
 def _format_tool_message(

@@ -17,6 +17,7 @@ from factorial import (
     ObservabilityConfig,
     Orchestrator,
     TaskTTLConfig,
+    VerificationRejected,
     WaitInstruction,
     ai_gateway,
     gpt_41_mini,
@@ -107,6 +108,37 @@ class MainAgentContext(AgentContext):
     has_used_research: bool = False
 
 
+def verify_final_output(
+    output: FinalOutput,
+    agent_ctx: MainAgentContext,
+) -> dict[str, Any]:
+    text = output.final_output.strip()
+    if not text:
+        raise VerificationRejected(
+            message="Final output cannot be empty.",
+            code="empty_output",
+        )
+    if len(text) < 40:
+        raise VerificationRejected(
+            message="Final output is too short; provide a more complete response.",
+            code="output_too_short",
+            metadata={"min_chars": 40, "actual_chars": len(text)},
+        )
+    if not agent_ctx.has_used_research:
+        raise VerificationRejected(
+            message="Use the research tool at least once before finalizing.",
+            code="research_required",
+        )
+
+    return {
+        "final_output": text,
+        "verification": {
+            "used_research": agent_ctx.has_used_research,
+            "char_count": len(text),
+        },
+    }
+
+
 @tool(is_enabled=lambda context: not context.has_used_research)
 async def research(
     queries: list[str],
@@ -141,6 +173,8 @@ class MainAgent(BaseAgent[MainAgentContext]):
             ),
             context_class=MainAgentContext,
             output_type=FinalOutput,
+            verifier=verify_final_output,
+            verifier_max_attempts=3,
             max_turns=15,
         )
 

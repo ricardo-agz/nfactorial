@@ -3,7 +3,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, TypeVar
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from factorial.events import EventPublisher
 
@@ -99,6 +99,12 @@ class ExecutionContext:
         await self.persist_hook_runtime(runtime_payload)
 
 
+class VerificationState(BaseModel):
+    attempts_used: int = 0
+    last_candidate_hash: str | None = None
+    last_outcome: str | None = None
+
+
 class AgentContext(BaseModel):
     """
     Agent state passed to the agent for turn execution.
@@ -115,6 +121,7 @@ class AgentContext(BaseModel):
     turn: int = 0
     output: Any = None
     attempt: int = 0
+    verification: VerificationState = Field(default_factory=VerificationState)
 
     class Config:
         extra = "allow"  # Users can add extra fields

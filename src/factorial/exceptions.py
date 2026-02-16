@@ -101,6 +101,21 @@ class InvalidLLMResponseError(Exception):
     pass
 
 
+class VerificationRejected(Exception):
+    """Raised by an agent verifier when output should be revised."""
+
+    def __init__(
+        self,
+        message: str,
+        code: str | None = None,
+        metadata: dict[str, object] | None = None,
+    ):
+        self.message = message
+        self.code = code
+        self.metadata = metadata
+        super().__init__(message)
+
+
 class FatalAgentError(Exception):
     """Exception for unrecoverable errors that should fail the task immediately.
 
@@ -142,4 +157,5 @@ __all__ = [
     "OpenAIConnectionError",
     "FatalAgentError",
     "InvalidLLMResponseError",
+    "VerificationRejected",
 ]

@@ -48,7 +48,12 @@ from factorial.context import (
     execution_context,
 )
 from factorial.events import AgentEvent, EventPublisher
-from factorial.exceptions import RETRYABLE_EXCEPTIONS, FatalAgentError
+from factorial.exceptions import (
+    RETRYABLE_EXCEPTIONS,
+    FatalAgentError,
+    InvalidLLMResponseError,
+    VerificationRejected,
+)
 from factorial.hooks import (
     HookRequestContext,
     HookSessionNode,
@@ -457,6 +462,8 @@ class BaseAgent(Generic[ContextType]):
         parse_tool_args: bool = True,
         context_class: type = AgentContext,
         output_type: type[BaseModel] | None = None,
+        verifier: Callable[..., Any] | None = None,
+        verifier_max_attempts: int = 3,
         # ---- Lifecycle callbacks ---- #
         on_run_start: Callable[[ContextType, ExecutionContext], Awaitable[None] | None]
         | None = None,
@@ -503,9 +510,24 @@ class BaseAgent(Generic[ContextType]):
         self.parse_tool_args = parse_tool_args
         self.context_class = context_class
         self.output_type = output_type
+        self.verifier = verifier
+        self.verifier_max_attempts = verifier_max_attempts
         self.final_output_tool = (
             create_final_output_tool(self.output_type) if self.output_type else None
         )
+
+        if self.verifier is not None and not callable(self.verifier):
+            raise TypeError("verifier must be callable")
+        if self.verifier_max_attempts <= 0:
+            raise ValueError("verifier_max_attempts must be greater than 0")
+        if self.verifier is not None and (
+            self.output_type is None
+            or not isinstance(self.output_type, type)
+            or not issubclass(self.output_type, BaseModel)
+        ):
+            raise ValueError(
+                "verifier requires output_type to be a Pydantic BaseModel subclass"
+            )
 
         # Lifecycle callbacks
         self.on_run_start = on_run_start
@@ -1254,6 +1276,97 @@ class BaseAgent(Generic[ContextType]):
 
         if self._is_done(response):
             output = self._extract_output(response)
+            if self.verifier is not None:
+                validated_output = self._validate_output_for_verifier(output)
+                candidate_hash = self._compute_candidate_hash(validated_output)
+                verifier_kwargs = self._resolve_verifier_injected_kwargs(
+                    agent_ctx,
+                    execution_ctx,
+                )
+                try:
+                    verifier_result = await _invoke_callable_non_blocking(
+                        self.verifier,
+                        validated_output,
+                        **verifier_kwargs,
+                    )
+                except VerificationRejected as rejection:
+                    verification_state = agent_ctx.verification
+                    attempts_counted = False
+                    if verification_state.last_candidate_hash != candidate_hash:
+                        verification_state.attempts_used += 1
+                        attempts_counted = True
+                    verification_state.last_candidate_hash = candidate_hash
+                    verification_state.last_outcome = "rejected"
+
+                    await self._publish_verification_event(
+                        execution_ctx=execution_ctx,
+                        agent_ctx=agent_ctx,
+                        event_type="verification_rejected",
+                        data={
+                            "attempts_used": verification_state.attempts_used,
+                            "max_attempts": self.verifier_max_attempts,
+                            "attempt_counted": attempts_counted,
+                            "message": rejection.message,
+                            "code": rejection.code,
+                            "metadata": rejection.metadata,
+                        },
+                    )
+
+                    if verification_state.attempts_used >= self.verifier_max_attempts:
+                        await self._publish_verification_event(
+                            execution_ctx=execution_ctx,
+                            agent_ctx=agent_ctx,
+                            event_type="verification_exhausted",
+                            data={
+                                "attempts_used": verification_state.attempts_used,
+                                "max_attempts": self.verifier_max_attempts,
+                                "message": rejection.message,
+                                "code": rejection.code,
+                            },
+                        )
+                        raise FatalAgentError(
+                            "Verification attempt budget exhausted "
+                            f"({verification_state.attempts_used}/"
+                            f"{self.verifier_max_attempts}): {rejection.message}"
+                        ) from rejection
+
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": self._format_verification_feedback(rejection),
+                        }
+                    )
+                    agent_ctx.messages = messages
+                    agent_ctx.turn += 1
+                    completion = TurnCompletion(
+                        is_done=False,
+                        context=agent_ctx,
+                    )
+
+                    await self._safe_call(
+                        self.on_turn_end, agent_ctx, execution_ctx, completion
+                    )
+                    return completion
+                except FatalAgentError:
+                    agent_ctx.verification.last_outcome = "system_error"
+                    raise
+                except Exception:
+                    agent_ctx.verification.last_outcome = "system_error"
+                    raise
+
+                agent_ctx.verification.last_candidate_hash = candidate_hash
+                agent_ctx.verification.last_outcome = "passed"
+                output = serialize_data(verifier_result)
+                await self._publish_verification_event(
+                    execution_ctx=execution_ctx,
+                    agent_ctx=agent_ctx,
+                    event_type="verification_passed",
+                    data={
+                        "attempts_used": agent_ctx.verification.attempts_used,
+                        "max_attempts": self.verifier_max_attempts,
+                    },
+                )
+
             agent_ctx.output = output  # Store the final output in the agent context
             agent_ctx.messages = messages
             completion = TurnCompletion(
@@ -1477,6 +1590,156 @@ class BaseAgent(Generic[ContextType]):
                         return tool_call.function.arguments
 
         return None
+
+    def _extract_output_payload_for_verifier(
+        self, output: str | dict[str, Any] | None
+    ) -> dict[str, Any]:
+        if isinstance(output, dict):
+            return output
+        if isinstance(output, str):
+            try:
+                parsed = json.loads(output)
+            except json.JSONDecodeError as e:
+                raise InvalidLLMResponseError(
+                    "final_output arguments must be valid JSON object"
+                ) from e
+            if not isinstance(parsed, dict):
+                raise InvalidLLMResponseError(
+                    "final_output arguments must decode to a JSON object"
+                )
+            return parsed
+        raise InvalidLLMResponseError("Missing final_output payload for verification")
+
+    def _validate_output_for_verifier(
+        self, output: str | dict[str, Any] | None
+    ) -> BaseModel:
+        if (
+            self.output_type is None
+            or not isinstance(self.output_type, type)
+            or not issubclass(self.output_type, BaseModel)
+        ):
+            raise InvalidLLMResponseError(
+                "Verifier requires output_type to be a Pydantic BaseModel subclass"
+            )
+
+        payload = self._extract_output_payload_for_verifier(output)
+        try:
+            return self.output_type.model_validate(payload)
+        except Exception as e:
+            raise InvalidLLMResponseError(
+                f"final_output payload failed output_type validation: {e}"
+            ) from e
+
+    def _compute_candidate_hash(self, output_model: BaseModel) -> str:
+        canonical_payload = json.dumps(
+            output_model.model_dump(mode="json"),
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
+        return hashlib.sha256(canonical_payload.encode("utf-8")).hexdigest()
+
+    def _resolve_verifier_injected_kwargs(
+        self,
+        agent_ctx: ContextType,
+        execution_ctx: ExecutionContext,
+    ) -> dict[str, Any]:
+        verifier = self.verifier
+        if verifier is None:
+            return {}
+
+        signature = inspect.signature(verifier)
+        params = list(signature.parameters.values())
+        if not params:
+            raise TypeError("verifier must accept at least one argument for output")
+
+        kwargs: dict[str, Any] = {}
+        for param in params[1:]:
+            param_name = param.name
+
+            if param.kind in (
+                inspect.Parameter.VAR_POSITIONAL,
+                inspect.Parameter.VAR_KEYWORD,
+            ):
+                continue
+
+            annotation = param.annotation
+            injected = False
+
+            if param_name == "agent_ctx":
+                kwargs[param_name] = agent_ctx
+                injected = True
+            elif (
+                annotation is not inspect.Parameter.empty
+                and isinstance(annotation, type)
+                and issubclass(annotation, AgentContext)
+            ):
+                kwargs[param_name] = agent_ctx
+                injected = True
+            elif param_name == "execution_ctx":
+                kwargs[param_name] = execution_ctx
+                injected = True
+            elif (
+                annotation is not inspect.Parameter.empty
+                and isinstance(annotation, type)
+                and issubclass(annotation, ExecutionContext)
+            ):
+                kwargs[param_name] = execution_ctx
+                injected = True
+
+            if injected:
+                continue
+            if param.default is not inspect.Parameter.empty:
+                continue
+            raise TypeError(
+                f"Unsupported required verifier parameter '{param_name}'. "
+                "Only output (first arg), agent_ctx, and execution_ctx are supported."
+            )
+
+        return kwargs
+
+    async def _publish_verification_event(
+        self,
+        *,
+        execution_ctx: ExecutionContext,
+        agent_ctx: ContextType,
+        event_type: str,
+        data: dict[str, Any] | None = None,
+        error: str | None = None,
+    ) -> None:
+        try:
+            await execution_ctx.events.publish_event(
+                AgentEvent(
+                    event_type=event_type,
+                    task_id=execution_ctx.task_id,
+                    owner_id=execution_ctx.owner_id,
+                    agent_name=self.name,
+                    turn=agent_ctx.turn,
+                    data=serialize_data(data) if data is not None else None,
+                    error=error,
+                )
+            )
+        except Exception:
+            logger.exception("Failed to publish verification event", exc_info=True)
+
+    def _format_verification_feedback(self, rejection: VerificationRejected) -> str:
+        code_attr = (
+            f' code="{rejection.code}"'
+            if rejection.code is not None and rejection.code != ""
+            else ""
+        )
+        lines = [
+            f"<verification_rejected{code_attr}>",
+            f"Summary: {rejection.message}",
+        ]
+        if rejection.metadata:
+            metadata_json = json.dumps(
+                serialize_data(rejection.metadata),
+                sort_keys=True,
+            )
+            lines.append(f"Metadata: {metadata_json}")
+        lines.append("</verification_rejected>")
+        return "\n".join(lines)
 
     # ===== Core logic ===== #
 

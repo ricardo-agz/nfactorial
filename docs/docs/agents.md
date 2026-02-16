@@ -72,6 +72,10 @@ agent = Agent(
 
 **`output_type`** (BaseModel): Pydantic model for structured output. When set, the agent must use the `final_output` tool to complete.
 
+**`verifier`** (Callable): Optional sync/async callable that validates the parsed `output_type` value before completion. The first argument is the validated output model instance. Raise `VerificationRejected` to request a revision.
+
+**`verifier_max_attempts`** (int): Maximum number of counted verification rejections before the task fails (default: 3).
+
 **`context_class`** (type): Custom context class to use instead of the default `AgentContext`.
 
 **`context_window_limit`** (int): Maximum number of tokens in the context window.
@@ -141,6 +145,56 @@ agent = Agent(
 ```
 
 When `output_type` is set, the agent automatically creates a `final_output` tool that the agent must call to complete.
+
+## Output Verification
+
+You can gate completion by passing a verifier callable to `Agent(...)`.
+The verifier can be sync or async.
+
+```python
+from pydantic import BaseModel
+from factorial import Agent, AgentContext, ExecutionContext, VerificationRejected
+
+
+class AgentOutput(BaseModel):
+    summary: str
+    score: int
+
+
+class FinalResult(BaseModel):
+    summary: str
+    verified: bool
+
+
+async def verify_output(
+    output: AgentOutput,
+    agent_ctx: AgentContext,
+    execution_ctx: ExecutionContext,
+) -> FinalResult:
+    if output.score < 80:
+        raise VerificationRejected(
+            message="Score below acceptance threshold",
+            code="score_low",
+            metadata={"score": output.score, "minimum": 80},
+        )
+    return FinalResult(summary=output.summary, verified=True)
+
+
+agent = Agent(
+    description="Verified agent",
+    instructions="Return structured output only.",
+    output_type=AgentOutput,
+    verifier=verify_output,
+    verifier_max_attempts=5,
+)
+```
+
+Verification semantics:
+
+- `verifier` returns -> task completes with verifier return value.
+- `verifier` raises `VerificationRejected` -> agent continues with verifier feedback.
+- counted attempts are bounded by `verifier_max_attempts`.
+- `FatalAgentError` inside verifier fails immediately.
 
 ## Creating and Running Tasks
 

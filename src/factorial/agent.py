@@ -77,6 +77,22 @@ logger = get_logger(__name__)
 T = TypeVar("T")
 
 
+async def _invoke_callable_non_blocking(
+    fn: Callable[..., Any],
+    *args: Any,
+    **kwargs: Any,
+) -> Any:
+    """Invoke callback without blocking the event loop.
+
+    Async callbacks are awaited directly. Sync callbacks are always executed in a
+    worker thread so tool and hook callback code cannot stall heartbeats.
+    """
+    if asyncio.iscoroutinefunction(fn):
+        async_fn = cast(Callable[..., Awaitable[Any]], fn)
+        return await async_fn(*args, **kwargs)
+    return await asyncio.to_thread(fn, *args, **kwargs)
+
+
 @overload
 def retry(
     func: Callable[..., Awaitable[T]],
@@ -742,11 +758,7 @@ class BaseAgent(Generic[ContextType]):
         is_forking_tool = getattr(action, "forking_tool", False)
 
         if not self.parse_tool_args:
-            result = (
-                await action(tool_args, agent_ctx)
-                if asyncio.iscoroutinefunction(action)
-                else action(tool_args, agent_ctx)
-            )
+            result = await _invoke_callable_non_blocking(action, tool_args, agent_ctx)
 
         else:
             raw_tool_args = json.loads(tool_args)
@@ -908,10 +920,9 @@ class BaseAgent(Generic[ContextType]):
                             tool_args=request_tool_args,
                             resolved_hook_payloads={},
                         )
-                        pending_hook = (
-                            await node_spec.request_builder(**request_kwargs)
-                            if asyncio.iscoroutinefunction(node_spec.request_builder)
-                            else node_spec.request_builder(**request_kwargs)
+                        pending_hook = await _invoke_callable_non_blocking(
+                            node_spec.request_builder,
+                            **request_kwargs,
                         )
                         if not isinstance(pending_hook, PendingHook):
                             raise TypeError(
@@ -972,11 +983,7 @@ class BaseAgent(Generic[ContextType]):
                         pending_result=True,
                     )
 
-            result = (
-                await action(**parsed_tool_args)
-                if asyncio.iscoroutinefunction(action)
-                else action(**parsed_tool_args)
-            )
+            result = await _invoke_callable_non_blocking(action, **parsed_tool_args)
 
         pending_child_task_ids: list[str] = []
         if is_forking_tool:

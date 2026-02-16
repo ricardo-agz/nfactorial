@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import threading
 import uuid
 from collections.abc import Callable
 from contextvars import Token
@@ -187,6 +188,28 @@ async def test_tool_action_extracts_child_ids_from_forking_list_return() -> None
         tool_call = _make_tool_call("spawn_children")
         result = await agent.tool_action(tool_call, AgentContext(query="q"))
         assert result.pending_child_task_ids == child_ids
+    finally:
+        execution_context.reset(token)
+        await agent.http_client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_tool_action_offloads_sync_callbacks_to_worker_thread() -> None:
+    callback_thread_ids: list[int] = []
+    loop_thread_id = threading.get_ident()
+
+    def sync_search(query: str) -> str:
+        callback_thread_ids.append(threading.get_ident())
+        return f"result:{query}"
+
+    agent = _make_agent_with_tools([sync_search])
+    token = _set_test_execution_context()
+    try:
+        tool_call = _make_tool_call("sync_search", {"query": "weather"})
+        result = await agent.tool_action(tool_call, AgentContext(query="q"))
+        assert result.output_str == "result:weather"
+        assert callback_thread_ids
+        assert callback_thread_ids[0] != loop_thread_id
     finally:
         execution_context.reset(token)
         await agent.http_client.aclose()

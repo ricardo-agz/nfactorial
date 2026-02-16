@@ -16,6 +16,7 @@ from factorial import (
     Orchestrator,
     TaskTTLConfig,
     WaitInstruction,
+    ai_gateway,
     gpt_41_mini,
     subagents,
     tool,
@@ -74,7 +75,7 @@ class SearchOutput(BaseModel):
 search_agent = Agent(
     name="research_subagent",
     description="Research Sub-Agent",
-    model=gpt_41_mini,
+    model=ai_gateway(gpt_41_mini),
     instructions="You are an intelligent research assistant.",
     tools=[reflect, search],
     output_type=SearchOutput,
@@ -107,7 +108,7 @@ class MainAgent(BaseAgent[MainAgentContext]):
         super().__init__(
             name="main_agent",
             description="Main Agent",
-            model=gpt_41_mini,
+            model=ai_gateway(gpt_41_mini),
             instructions="You are a helpful assistant. Always start by making a plan.",
             tools=[plan, reflect, research, search],
             model_settings=ModelSettings[MainAgentContext](
@@ -135,8 +136,6 @@ orchestrator = Orchestrator(
     redis_port=int(os.getenv("REDIS_PORT", 6379)),
     redis_db=int(os.getenv("REDIS_DB", 0)),
     redis_max_connections=int(os.getenv("REDIS_MAX_CONNECTIONS", 1000)),
-    openai_api_key=os.getenv("OPENAI_API_KEY"),
-    xai_api_key=os.getenv("XAI_API_KEY"),
     observability_config=ObservabilityConfig(
         enabled=True,
         host="0.0.0.0",

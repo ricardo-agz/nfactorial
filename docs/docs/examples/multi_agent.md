@@ -12,7 +12,7 @@ A complex research agent that can search the web and spin up multiple independen
 import os
 from typing import Any
 from dotenv import load_dotenv
-from factorial import Agent, AgentContext, gpt_41
+from factorial import Agent, AgentContext, ai_gateway, gpt_41
 from exa_py import Exa
 
 
@@ -35,11 +35,13 @@ def search(query: str) -> tuple[str, list[dict[str, Any]]]:
 basic_agent = Agent(
     instructions="You are a helpful assistant. Always start by making a plan.",
     tools=[search],
-    model=gpt_41,
+    model=ai_gateway(gpt_41),
 )
 ```
 
 The agent now has the ability to search the web.
+This example routes model calls through Vercel AI Gateway, so set
+`AI_GATEWAY_API_KEY` in your environment before running it.
 
 ## 2. Register the runner
 
@@ -49,7 +51,7 @@ The agent now has the ability to search the web.
 from factorial import Orchestrator, AgentWorkerConfig
 from agent import basic_agent
 
-orchestrator = Orchestrator(openai_api_key=os.getenv("OPENAI_API_KEY"))
+orchestrator = Orchestrator()
 
 orchestrator.register_runner(
     agent=basic_agent,
@@ -69,7 +71,7 @@ Let's say we want to give our agent the ability to spin up multiple independent 
 First, create the research subagent:
 
 ```python
-from factorial import BaseModel
+from factorial import BaseModel, ai_gateway, gpt_41_mini
 
 class SubAgentOutput(BaseModel):
     findings: list[str]
@@ -77,7 +79,7 @@ class SubAgentOutput(BaseModel):
 search_agent = Agent(
     name="research_subagent",
     description="Research Sub-Agent",
-    model=gpt_41_mini,
+    model=ai_gateway(gpt_41_mini),
     instructions="You are an intelligent research assistant.",
     tools=[plan, reflect, search],
     output_type=SubAgentOutput,

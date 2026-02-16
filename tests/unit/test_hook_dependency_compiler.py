@@ -1,11 +1,21 @@
 """Contracts for hook dependency inference and validation."""
 
-from typing import Annotated
+from collections.abc import Awaitable, Coroutine
+from typing import Annotated, Any, cast
 
 import pytest
 
-from factorial import Hook, HookRequestContext, PendingHook, hook, tool
+from factorial import (
+    AgentContext,
+    ExecutionContext,
+    Hook,
+    HookRequestContext,
+    PendingHook,
+    hook,
+    tool,
+)
 from factorial.hooks import (
+    HookCompilationError,
     HookDependencyCycleError,
     HookDependencyResolutionError,
     HookTypeMismatchError,
@@ -22,6 +32,42 @@ class FinanceApprovalHook(Hook):
 
 class LedgerReadyHook(Hook):
     ready: bool
+
+
+def test_compiler_returns_none_for_tools_without_hook_dependencies() -> None:
+    @tool
+    def summarize(amount: int, note: str) -> str:
+        return f"{amount}:{note}"
+
+    assert summarize.hook_plan is None
+
+
+def test_compiler_excludes_execution_injected_params_from_tool_args() -> None:
+    def request_manager(
+        ctx: HookRequestContext,
+        amount: int,
+    ) -> PendingHook[ManagerApprovalHook]:
+        return ManagerApprovalHook.pending(ctx=ctx, amount=amount)
+
+    @tool
+    def approve_expense(
+        amount: int,
+        agent_ctx: AgentContext,
+        execution_ctx: ExecutionContext,
+        ctx_alias: AgentContext,
+        exec_alias: ExecutionContext,
+        manager: Annotated[ManagerApprovalHook, hook.requires(request_manager)],
+    ) -> str:
+        return (
+            f"{amount}:{agent_ctx.query}:{execution_ctx.task_id}:"
+            f"{ctx_alias.query}:{exec_alias.task_id}:{manager.approved}"
+        )
+
+    assert approve_expense.hook_plan is not None
+    assert approve_expense.hook_plan.tool_args == ("amount",)
+    assert approve_expense.params_json_schema["properties"] == {
+        "amount": {"type": "integer"}
+    }
 
 
 def test_compiler_infers_dependency_graph_and_stages() -> None:
@@ -137,7 +183,9 @@ def test_compiler_rejects_unresolved_required_builder_param() -> None:
         @tool
         def approve_expense(
             amount: int,
-            manager: Annotated[ManagerApprovalHook, hook.requires(request_manager)],
+            manager: Annotated[
+                ManagerApprovalHook, hook.requires(cast(Any, request_manager))
+            ],
         ) -> str:
             return f"approved amount={amount}"
 
@@ -208,9 +256,87 @@ def test_compiler_rejects_request_builder_return_type_mismatch() -> None:
         @tool
         def approve_expense(
             amount: int,
-            manager: Annotated[ManagerApprovalHook, hook.requires(request_manager)],
+            manager: Annotated[
+                ManagerApprovalHook, hook.requires(cast(Any, request_manager))
+            ],
         ) -> str:
             return f"approved amount={amount}"
+
+
+def test_compiler_rejects_non_pending_hook_request_return_annotation() -> None:
+    def request_manager(
+        ctx: HookRequestContext,
+        amount: int,
+    ) -> int:
+        return amount
+
+    with pytest.raises(
+        HookTypeMismatchError,
+        match=r"must return PendingHook\[ManagerApprovalHook\]",
+    ):
+
+        @tool
+        def approve_expense(
+            amount: int,
+            manager: Annotated[
+                ManagerApprovalHook, hook.requires(cast(Any, request_manager))
+            ],
+        ) -> str:
+            return f"approved amount={amount}"
+
+
+def test_compiler_accepts_unparameterized_pending_hook_return_annotation() -> None:
+    def request_manager(
+        ctx: HookRequestContext,
+        amount: int,
+    ) -> PendingHook:
+        raise AssertionError("request builder must not execute during compilation")
+
+    @tool
+    def approve_expense(
+        amount: int,
+        manager: Annotated[ManagerApprovalHook, hook.requires(request_manager)],
+    ) -> str:
+        return f"approved amount={amount}"
+
+    assert approve_expense.hook_plan is not None
+    assert approve_expense.hook_plan.nodes["manager"].depends_on == ()
+
+
+def test_compiler_accepts_awaitable_pending_hook_return_annotation() -> None:
+    def request_manager(
+        ctx: HookRequestContext,
+        amount: int,
+    ) -> Awaitable[PendingHook[ManagerApprovalHook]]:
+        raise AssertionError("request builder must not execute during compilation")
+
+    @tool
+    def approve_expense(
+        amount: int,
+        manager: Annotated[ManagerApprovalHook, hook.requires(request_manager)],
+    ) -> str:
+        return f"approved amount={amount}"
+
+    assert approve_expense.hook_plan is not None
+    assert approve_expense.hook_plan.nodes["manager"].depends_on == ()
+
+
+def test_compiler_accepts_coroutine_pending_hook_return_annotation() -> None:
+    def request_manager(
+        ctx: HookRequestContext,
+        amount: int,
+    ) -> Coroutine[Any, Any, PendingHook[ManagerApprovalHook]]:
+        raise AssertionError("request builder must not execute during compilation")
+
+    @tool
+    def approve_expense(
+        amount: int,
+        manager: Annotated[ManagerApprovalHook, hook.requires(request_manager)],
+    ) -> str:
+        return f"approved amount={amount}"
+
+    assert approve_expense.hook_plan is not None
+    assert approve_expense.hook_plan.nodes["manager"].depends_on == ()
 
 
 def test_compiler_detects_dependency_cycles() -> None:
@@ -255,4 +381,73 @@ def test_compiler_allows_optional_unresolved_builder_params() -> None:
 
     assert approve_expense.hook_plan is not None
     assert approve_expense.hook_plan.nodes["manager"].depends_on == ()
+
+
+def test_compiler_allows_untyped_named_hook_references() -> None:
+    def request_manager(
+        ctx: HookRequestContext,
+        amount: int,
+    ) -> PendingHook[ManagerApprovalHook]:
+        return ManagerApprovalHook.pending(ctx=ctx, amount=amount)
+
+    def request_finance(
+        ctx: HookRequestContext,
+        manager,
+    ) -> PendingHook[FinanceApprovalHook]:
+        return FinanceApprovalHook.pending(ctx=ctx, manager_approved=manager.approved)
+
+    @tool
+    def approve_expense(
+        amount: int,
+        manager: Annotated[ManagerApprovalHook, hook.requires(request_manager)],
+        finance: Annotated[FinanceApprovalHook, hook.requires(request_finance)],
+    ) -> str:
+        return f"approved amount={amount}"
+
+    assert approve_expense.hook_plan is not None
+    assert approve_expense.hook_plan.nodes["finance"].depends_on == ("manager",)
+
+
+def test_compiler_rejects_multiple_hook_markers_on_single_param() -> None:
+    def request_manager(
+        ctx: HookRequestContext,
+        amount: int,
+    ) -> PendingHook[ManagerApprovalHook]:
+        return ManagerApprovalHook.pending(ctx=ctx, amount=amount)
+
+    with pytest.raises(
+        HookCompilationError,
+        match="only have one hook.requires/awaits dependency marker",
+    ):
+
+        @tool
+        def approve_expense(
+            amount: int,
+            manager: Annotated[
+                ManagerApprovalHook,
+                hook.requires(request_manager),
+                hook.awaits(request_manager),
+            ],
+        ) -> str:
+            return f"approved amount={amount}"
+
+
+def test_compiler_rejects_non_hook_annotated_dependency_param() -> None:
+    def request_manager(
+        ctx: HookRequestContext,
+        amount: int,
+    ) -> PendingHook[ManagerApprovalHook]:
+        return ManagerApprovalHook.pending(ctx=ctx, amount=amount)
+
+    with pytest.raises(
+        HookCompilationError,
+        match=r"must be Annotated\[YourHookType, hook\.requires",
+    ):
+
+        @tool
+        def approve_expense(
+            amount: int,
+            manager: Annotated[str, hook.requires(request_manager)],
+        ) -> str:
+            return f"approved amount={amount}"
 

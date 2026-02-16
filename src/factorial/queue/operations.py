@@ -83,7 +83,7 @@ async def _load_hook_session(
     keys: RedisKeys,
     session_id: str,
 ) -> HookSessionRecord | None:
-    session_json = await redis_client.hget(keys.hook_sessions, session_id)
+    session_json = await redis_client.hget(keys.hook_sessions, session_id)  # type: ignore[misc]
     if not session_json:
         return None
     return HookSessionRecord.from_json(session_json)
@@ -95,7 +95,7 @@ async def _save_hook_session(
     keys: RedisKeys,
     session: HookSessionRecord,
 ) -> None:
-    await redis_client.hset(keys.hook_sessions, session.session_id, session.to_json())
+    await redis_client.hset(keys.hook_sessions, session.session_id, session.to_json())  # type: ignore[misc]
 
 
 async def _clear_pending_tool_call_runtime_state(
@@ -159,7 +159,7 @@ async def persist_hook_runtime_payload(
             f"Hook session task mismatch: payload={session.task_id}, task={task_id}"
         )
 
-    existing_session_id = await redis_client.hget(
+    existing_session_id = await redis_client.hget(  # type: ignore[misc]
         task_keys.hook_session_by_tool_call, session.tool_call_id
     )
     if existing_session_id:
@@ -265,7 +265,7 @@ async def register_pending_hook(
         owner_id=owner_id,
     )
 
-    existing_json = await redis_client.hget(task_keys.hooks_index, pending_hook.hook_id)
+    existing_json = await redis_client.hget(task_keys.hooks_index, pending_hook.hook_id)  # type: ignore[misc]
     if existing_json:
         existing = HookRecord.from_json(existing_json)
         if (
@@ -416,7 +416,7 @@ async def process_hook_runtime_wake_requests(
     ):
         tool_call_id = decode(raw_tool_call_id)
         session_id = decode(raw_session_id)
-        pending_value_raw = await redis_client.hget(
+        pending_value_raw = await redis_client.hget(  # type: ignore[misc]
             task_keys.pending_tool_results, tool_call_id
         )
         has_pending_sentinel = (
@@ -445,7 +445,7 @@ async def process_hook_runtime_wake_requests(
                     tool_call_id=tool_call_id,
                 )
             else:
-                await redis_client.hdel(task_keys.hook_runtime_ready, tool_call_id)
+                await redis_client.hdel(task_keys.hook_runtime_ready, tool_call_id)  # type: ignore[misc]
             continue
 
         if session.tool_call_id != tool_call_id:
@@ -467,7 +467,7 @@ async def process_hook_runtime_wake_requests(
                     status="failed",
                 )
             else:
-                await redis_client.hdel(task_keys.hook_runtime_ready, tool_call_id)
+                await redis_client.hdel(task_keys.hook_runtime_ready, tool_call_id)  # type: ignore[misc]
             continue
 
         if session.status != "active":
@@ -488,7 +488,7 @@ async def process_hook_runtime_wake_requests(
                     tool_call_id=tool_call_id,
                 )
             else:
-                await redis_client.hdel(task_keys.hook_runtime_ready, tool_call_id)
+                await redis_client.hdel(task_keys.hook_runtime_ready, tool_call_id)  # type: ignore[misc]
             continue
 
         terminal_nodes = [
@@ -517,7 +517,7 @@ async def process_hook_runtime_wake_requests(
                     status="expired" if has_expired_nodes else "failed",
                 )
             else:
-                await redis_client.hdel(task_keys.hook_runtime_ready, tool_call_id)
+                await redis_client.hdel(task_keys.hook_runtime_ready, tool_call_id)  # type: ignore[misc]
             continue
 
         tool_def = next(
@@ -543,7 +543,7 @@ async def process_hook_runtime_wake_requests(
                     status="failed",
                 )
             else:
-                await redis_client.hdel(task_keys.hook_runtime_ready, tool_call_id)
+                await redis_client.hdel(task_keys.hook_runtime_ready, tool_call_id)  # type: ignore[misc]
             continue
 
         requested_unresolved = [
@@ -551,7 +551,7 @@ async def process_hook_runtime_wake_requests(
         ]
         if requested_unresolved:
             # Another callback is still pending; drop this wake marker.
-            await redis_client.hdel(task_keys.hook_runtime_ready, tool_call_id)
+            await redis_client.hdel(task_keys.hook_runtime_ready, tool_call_id)  # type: ignore[misc]
             continue
 
         ready_unrequested: list[str] = []
@@ -629,7 +629,7 @@ async def process_hook_runtime_wake_requests(
                 keys=task_keys,
                 session=session,
             )
-            await redis_client.hdel(task_keys.hook_runtime_ready, tool_call_id)
+            await redis_client.hdel(task_keys.hook_runtime_ready, tool_call_id)  # type: ignore[misc]
             should_repark = True
             continue
 
@@ -649,7 +649,7 @@ async def process_hook_runtime_wake_requests(
             )
             continue
 
-        await redis_client.hdel(task_keys.hook_runtime_ready, tool_call_id)
+        await redis_client.hdel(task_keys.hook_runtime_ready, tool_call_id)  # type: ignore[misc]
 
     pending_tool_call_ids = await _pending_sentinel_tool_call_ids(
         redis_client,
@@ -674,7 +674,7 @@ async def resolve_hook(
 ) -> HookResolutionResult:
     """Resolve a pending hook and wake the parent task when ready."""
     keys = RedisKeys.format(namespace=namespace)
-    record_json = await redis_client.hget(keys.hooks_index, hook_id)
+    record_json = await redis_client.hget(keys.hooks_index, hook_id)  # type: ignore[misc]
     if not record_json:
         raise HookNotFoundError(hook_id)
 
@@ -685,7 +685,7 @@ async def resolve_hook(
     now = time.time()
     if hook_record.expires_at <= now:
         hook_record.status = "expired"
-        await redis_client.hset(
+        await redis_client.hset(  # type: ignore[misc]
             keys.hooks_index, hook_id, hook_record.to_json()
         )
         await redis_client.zrem(keys.hooks_expiring, hook_id)
@@ -724,7 +724,7 @@ async def resolve_hook(
         hook_record.resolved_at = now
         hook_record.payload = payload
 
-        await redis_client.hset(
+        await redis_client.hset(  # type: ignore[misc]
             keys.hooks_index, hook_id, hook_record.to_json()
         )
         await redis_client.zrem(keys.hooks_expiring, hook_id)
@@ -733,7 +733,7 @@ async def resolve_hook(
         # but crashed before storing the payload/session updates.
         hook_record.payload = payload
         hook_record.resolved_at = hook_record.resolved_at or now
-        await redis_client.hset(
+        await redis_client.hset(  # type: ignore[misc]
             keys.hooks_index, hook_id, hook_record.to_json()
         )
 
@@ -840,7 +840,7 @@ async def rotate_hook_token(
 ) -> str:
     """Rotate token for a pending hook and return the new token."""
     keys = RedisKeys.format(namespace=namespace)
-    record_json = await redis_client.hget(keys.hooks_index, hook_id)
+    record_json = await redis_client.hget(keys.hooks_index, hook_id)  # type: ignore[misc]
     if not record_json:
         raise HookNotFoundError(hook_id)
 
@@ -851,7 +851,7 @@ async def rotate_hook_token(
     now = time.time()
     if hook_record.expires_at <= now:
         hook_record.status = "expired"
-        await redis_client.hset(
+        await redis_client.hset(  # type: ignore[misc]
             keys.hooks_index, hook_id, hook_record.to_json()
         )
         await redis_client.zrem(keys.hooks_expiring, hook_id)
@@ -869,7 +869,7 @@ async def rotate_hook_token(
         hook_record.token_hashes = list(dict.fromkeys([*existing_hashes, next_hash]))
 
     hook_record.token_version = int(hook_record.token_version) + 1
-    await redis_client.hset(
+    await redis_client.hset(  # type: ignore[misc]
         keys.hooks_index, hook_id, hook_record.to_json()
     )
 
@@ -906,7 +906,7 @@ async def expire_pending_hooks(
 
     for raw_hook_id in expired_hook_ids_raw:
         hook_id = decode(raw_hook_id)
-        record_json = await redis_client.hget(keys.hooks_index, hook_id)
+        record_json = await redis_client.hget(keys.hooks_index, hook_id)  # type: ignore[misc]
         if not record_json:
             await redis_client.zrem(keys.hooks_expiring, hook_id)
             continue
@@ -919,7 +919,7 @@ async def expire_pending_hooks(
             continue
 
         hook_record.status = "expired"
-        await redis_client.hset(keys.hooks_index, hook_id, hook_record.to_json())
+        await redis_client.hset(keys.hooks_index, hook_id, hook_record.to_json())  # type: ignore[misc]
         await redis_client.zrem(keys.hooks_expiring, hook_id)
         expired_count += 1
 
@@ -1303,7 +1303,7 @@ async def resume_if_no_remaining_child_tasks(
     # Read only the child results for the currently awaited wait-set.
     result_values = cast(
         list[str | bytes | None],
-        await redis_client.hmget(keys.pending_child_task_results, wait_child_ids),  # type: ignore[arg-type]
+        await redis_client.hmget(keys.pending_child_task_results, wait_child_ids),  # type: ignore[arg-type,misc]
     )
 
     completed_results: list[tuple[str, Any]] = []

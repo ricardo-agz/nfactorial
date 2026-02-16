@@ -11,6 +11,7 @@ from typing import (
     Literal,
     TypeVar,
     Union,
+    cast,
     get_args,
     get_origin,
     get_type_hints,
@@ -450,7 +451,7 @@ def forking_tool(
         async def wrapper(*args: Any, **kwargs: Any) -> T:
             if asyncio.iscoroutinefunction(func):
                 # Async tool — await normally
-                return await func(*args, **kwargs)
+                return await cast(Callable[..., Awaitable[T]], func)(*args, **kwargs)
             # Sync tool — run directly
             return func(*args, **kwargs)  # type: ignore[return-value,arg-type,no-any-return]
 

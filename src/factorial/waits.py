@@ -182,7 +182,7 @@ class WaitNamespace:
         for job in jobs:
             if isinstance(job, dict):
                 job_ref = dict(job)
-            elif is_dataclass(job):
+            elif is_dataclass(job) and not isinstance(job, type):
                 job_ref = asdict(job)
             elif hasattr(job, "model_dump") and callable(job.model_dump):
                 dumped = job.model_dump()

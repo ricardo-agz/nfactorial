@@ -435,7 +435,7 @@ async def process_task(
         raw_results = await redis_client.hmget(
             keys.pending_child_task_results,
             deduped_child_task_ids,
-        )  # type: ignore[arg-type]
+        )  # type: ignore[arg-type,misc]
         completed_results: list[tuple[str, Any]] = []
         all_ready = True
         for child_task_id, raw_result in zip(

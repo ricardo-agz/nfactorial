@@ -191,7 +191,7 @@ async def recover_ready_pending_child_tasks(
                 if isinstance(pending_task_id, bytes)
                 else str(pending_task_id)
             )
-            status = await redis_client.hget(keys.task_status, task_id)
+            status = await redis_client.hget(keys.task_status, task_id)  # type: ignore[misc]
             if status != TaskStatus.PENDING_CHILD_TASKS:
                 continue
             if await resume_if_no_remaining_child_tasks(

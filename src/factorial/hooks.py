@@ -4,7 +4,7 @@ import inspect
 import json
 import secrets
 import uuid
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Coroutine
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from types import UnionType
@@ -524,6 +524,11 @@ def _unwrap_awaitable_return(annotation: Any) -> Any:
             args = get_args(current)
             if args:
                 current = args[0]
+                continue
+        if origin in {Coroutine}:
+            args = get_args(current)
+            if args:
+                current = args[-1]
                 continue
         if str(origin) in {"typing.Coroutine", "collections.abc.Coroutine"}:
             args = get_args(current)

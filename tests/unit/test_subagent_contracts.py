@@ -107,14 +107,14 @@ async def test_run_returns_wait_jobs_instruction() -> None:
             agent=_DummyChildAgent(),
             inputs=[{"query": "q1"}],
             key="research",
-            message="waiting for research",
+            data="waiting for research",
         )
     finally:
         execution_context.reset(token)
 
     assert instruction.kind == "jobs"
     assert instruction.child_task_ids == captured_task_ids
-    assert instruction.message == "waiting for research"
+    assert instruction.data == "waiting for research"
 
 
 @pytest.mark.asyncio

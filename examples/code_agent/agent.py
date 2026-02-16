@@ -2,11 +2,13 @@ import os
 from typing import Annotated, Any
 
 from dotenv import load_dotenv
+from pydantic import BaseModel
 
 from factorial import (
     AgentContext,
     AgentWorkerConfig,
     BaseAgent,
+    Hidden,
     Hook,
     HookRequestContext,
     ModelSettings,
@@ -32,13 +34,20 @@ def think(thoughts: str) -> str:
     return thoughts
 
 
+class EditResult(BaseModel):
+    summary: str
+    new_code: Annotated[str, Hidden]
+    old_text: Annotated[str, Hidden]
+    new_text: Annotated[str, Hidden]
+
+
 def edit_code(
     find: str,
     find_start_line: int,
     find_end_line: int,
     replace: str,
     agent_ctx: IdeAgentContext,
-) -> tuple[str, dict[str, Any]]:
+) -> EditResult:
     """
     Edit code in a file
 
@@ -56,10 +65,9 @@ def edit_code(
 
     # Validate line numbers
     if start_idx < 0 or end_idx >= len(lines) or start_idx > end_idx:
-        return "Error: Invalid line numbers", {
-            "error": "Line numbers out of range or invalid",
-            "total_lines": len(lines),
-        }
+        raise ValueError(
+            f"Line numbers out of range or invalid (total lines: {len(lines)})"
+        )
 
     # Extract the text from the specified lines
     existing_text = "\n".join(lines[start_idx : end_idx + 1])
@@ -67,12 +75,9 @@ def edit_code(
     # Check if the find text matches what's at those line numbers
     if find not in existing_text:
         line_range = f"{find_start_line}-{find_end_line}"
-        return (
-            f"Error: Text '{find}' not found at lines {line_range}",
-            {
-                "error": "Find text not found at specified lines",
-                "existing_text": existing_text,
-            },
+        raise ValueError(
+            f"Text '{find}' not found at lines {line_range}. "
+            f"Existing text: {existing_text}"
         )
 
     # Perform the replacement
@@ -85,18 +90,14 @@ def edit_code(
     agent_ctx.code = "\n".join(new_lines)
 
     line_range = f"{find_start_line}-{find_end_line}"
-    return (
-        f"Code successfully edited: replaced '{find}' with '{replace}' "
-        f"at lines {line_range}",
-        {
-            "find": find,
-            "find_start_line": find_start_line,
-            "find_end_line": find_end_line,
-            "replace": replace,
-            "old_text": existing_text,
-            "new_text": new_text,
-            "new_code": agent_ctx.code,
-        },
+    return EditResult(
+        summary=(
+            f"Code successfully edited: replaced '{find}' with '{replace}' "
+            f"at lines {line_range}"
+        ),
+        new_code=agent_ctx.code,
+        old_text=existing_text,
+        new_text=new_text,
     )
 
 
@@ -158,25 +159,33 @@ def request_code_execution_approval(
     )
 
 
+class CodeExecutionResult(BaseModel):
+    summary: str
+    approved: bool
+    executed: bool
+    exit_code: Annotated[int | None, Hidden] = None
+    stdout: Annotated[str | None, Hidden] = None
+    stderr: Annotated[str | None, Hidden] = None
+    runtime: Annotated[str | None, Hidden] = None
+
+
 async def request_code_execution(
     approval: Annotated[
         CodeExecutionApproval,
         hook.requires(request_code_execution_approval),
     ],
     agent_ctx: IdeAgentContext,
-) -> tuple[str, dict[str, Any]]:
+) -> CodeExecutionResult:
     """
     Request the code to be run.
 
     The user must approve this request before the code is run.
     """
     if not approval.approved:
-        return (
-            "User rejected the code execution request.",
-            {
-                "approved": False,
-                "executed": False,
-            },
+        return CodeExecutionResult(
+            summary="User rejected the code execution request.",
+            approved=False,
+            executed=False,
         )
 
     execution = await execute_code(agent_ctx.code)
@@ -192,13 +201,14 @@ async def request_code_execution(
             f"(exit code {execution['exit_code']}).\n{stderr}"
         )
 
-    return (
-        message,
-        {
-            "approved": True,
-            "executed": True,
-            **execution,
-        },
+    return CodeExecutionResult(
+        summary=message,
+        approved=True,
+        executed=True,
+        exit_code=execution["exit_code"],
+        stdout=execution.get("stdout"),
+        stderr=execution.get("stderr"),
+        runtime=execution.get("runtime"),
     )
 
 

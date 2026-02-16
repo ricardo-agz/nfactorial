@@ -60,7 +60,7 @@ class _WaitSleepAgent(BaseAgent[AgentContext]):
             tool_call_results=[
                 (
                     _make_tool_call("sleep_wait", "call_wait_sleep"),
-                    wait.sleep(self._seconds, message="cooling down"),
+                    wait.sleep(self._seconds, data="cooling down"),
                 )
             ],
         )
@@ -91,7 +91,7 @@ class _SubagentsRunAgent(BaseAgent[AgentContext]):
             agent=self._child_agent,
             inputs=self._payloads,
             key="children",
-            message="waiting on child tasks",
+            data="waiting on child tasks",
         )
         return TurnCompletion(
             is_done=False,
@@ -148,7 +148,7 @@ class _SpawnThenWaitJobsAgent(BaseAgent[AgentContext]):
                     _make_tool_call("wait_jobs", "call_wait_jobs"),
                     wait.jobs(
                         [*research_jobs, *risk_jobs],
-                        message="Waiting for mixed subagent jobs",
+                        data="Waiting for mixed subagent jobs",
                     ),
                 )
             ],
@@ -232,7 +232,7 @@ class _WaitReadyJobsAgent(BaseAgent[AgentContext]):
             tool_call_results=[
                 (
                     _make_tool_call("wait_jobs", "call_wait_ready_jobs"),
-                    wait.jobs(jobs, message="wait on already completed jobs"),
+                    wait.jobs(jobs, data="wait on already completed jobs"),
                 )
             ],
         )

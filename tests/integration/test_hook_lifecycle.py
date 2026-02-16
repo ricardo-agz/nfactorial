@@ -13,7 +13,7 @@ from openai.types.chat.chat_completion_message_function_tool_call import (
     Function as ToolCallFunction,
 )
 
-from factorial import Agent, AgentContext, ToolResult, hook, tool
+from factorial import Agent, AgentContext, hook, tool
 from factorial.context import ExecutionContext, execution_context
 from factorial.exceptions import HookExpiredError, HookTokenValidationError
 from factorial.hooks import (
@@ -35,6 +35,7 @@ from factorial.queue.operations import (
 )
 from factorial.queue.task import Task, TaskStatus, get_task_data, get_task_status
 from factorial.queue.worker import CompletionAction, process_task
+from factorial.tools import _ToolResultInternal
 from factorial.utils import decode
 
 from .conftest import SimpleTestAgent
@@ -1262,9 +1263,9 @@ class TestHookResolutionFlow:
         assert tick_2.pending_tool_call_ids == []
         assert len(tick_2.completed_results) == 1
         assert tick_2.completed_results[0][0] == tool_call_id
-        assert isinstance(tick_2.completed_results[0][1], ToolResult)
+        assert isinstance(tick_2.completed_results[0][1], _ToolResultInternal)
         assert (
-            tick_2.completed_results[0][1].output_data
+            tick_2.completed_results[0][1].client_output
             == "transfer-approved:42:True:True"
         )
 
@@ -1487,10 +1488,10 @@ class TestHookResolutionFlow:
         @tool(name="spawn_after_approval")
         def spawn_after_approval(
             approval: Annotated[Approval, hook.requires(request_approval)],
-        ) -> ToolResult:
-            return ToolResult(
-                output_str="spawned child tasks",
-                output_data={
+        ) -> _ToolResultInternal:
+            return _ToolResultInternal(
+                model_output="spawned child tasks",
+                client_output={
                     "child_count": len(child_ids),
                     "approved": approval.approved,
                 },

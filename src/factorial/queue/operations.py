@@ -59,7 +59,7 @@ from factorial.queue.task import (
     get_task_data,
     get_task_status,
 )
-from factorial.tools import ToolResult
+from factorial.tools import _ToolResultInternal
 from factorial.utils import decode, is_valid_task_id
 
 logger = get_logger(__name__)
@@ -350,7 +350,7 @@ async def _execute_hook_tool_continuation(
     task: Task[Any],
     execution_ctx: ExecutionContext,
     session: HookSessionRecord,
-) -> Any | ToolResult:
+) -> Any | _ToolResultInternal:
     continuation_args = dict(session.tool_args)
     for node in session.nodes.values():
         if node.status == "resolved":

@@ -8,7 +8,8 @@
 > - typed `Hook` payloads (`Approval`, `CodeExecResult`, etc.)
 > - implicit dependency ordering from DI signatures in request builders (no user DAG DSL)
 > - internal hook-session runtime for correctness, idempotency, and resumption
-> - explicit tool outcomes (`tool.ok`, `tool.fail`) with plain returns still supported
+> - plain returns for simple tools; Pydantic `BaseModel` + `Hidden` for model/client split
+> - no `tool.ok/fail/error`, no `ToolResult`, no `FunctionTool` -- just Python types
 > - wait helpers with clear queue semantics (`wait.sleep`, `wait.cron`, `subagents.spawn`, `wait.jobs`)
 
 ## Problem Statement
@@ -23,14 +24,15 @@ Current patterns around deferred and forking tools are powerful but can feel imp
 We want a design that is:
 
 - explicit and type-safe
-- ergonomic in common cases
+- ergonomic in common cases (plain returns for simple tools, typed models for complex ones)
 - compatible with distributed execution (no fragile coroutine/frame persistence)
 - suitable for multi-agent teams and long-running workflows
 - as lightweight to learn as FastAPI, not a heavyweight workflow framework
+- no implicit tuple conventions or framework-specific return constructors
 
 ## Design Goals
 
-- One primary tool model (`@tool`) with signature-level hook dependencies as the canonical pattern.
+- One primary tool decorator (`@tool`) with signature-level hook dependencies as the canonical pattern.
 - Hooks are first-class typed schemas (`class Approval(Hook): ...`).
 - Request creation should be ergonomic (`Approval.pending(...)`).
 - Multi-hook flows must be first-class without forcing a user-facing DAG DSL.
@@ -53,15 +55,16 @@ Use namespace-first imports for clarity and to avoid global symbol pollution:
 
 ```python
 from typing import Annotated
-from factorial import tool, hook, wait, Hook, ToolResult
+from factorial import tool, hook, wait, Hook, Hidden
 ```
 
 Conventions:
 
-- `tool.*` for tool decorators and return constructors
+- `tool` as a decorator (no `.ok`, `.fail`, or `.error` methods)
 - `hook.*` for hook dependencies (`requires`, `awaits`)
 - `wait.*` for non-hook scheduling primitives
-- `Hook` and `ToolResult` as explicit types
+- `Hook` as a typed base for hook payloads
+- `Hidden` as a field annotation to exclude fields from model context
 
 ## Hook Types
 
@@ -205,18 +208,24 @@ builders do not need to reach into `ctx.args[...]` for common cases.
 The primary pattern is FastAPI-like dependency injection via `Annotated`:
 
 ```python
+class CodeExecOutput(BaseModel):
+    summary: str
+    stdout: Annotated[str, Hidden]
+    stderr: Annotated[str, Hidden]
+
 @tool
 async def run_code(
     code: str,
     approval: Annotated[Approval, hook.requires(request_code_exec_approval)],
-) -> ToolResult[dict]:
+) -> str | CodeExecOutput:
     if not approval.granted:
-        return tool.ok(message=f"Rejected: {approval.reason}")
+        return f"Rejected: {approval.reason}"
 
     result = await sandbox.run(code)
-    return tool.ok(
-        message=f"Execution complete (exit={result.exit_code})",
-        data={"stdout": result.stdout, "stderr": result.stderr},
+    return CodeExecOutput(
+        summary=f"Execution complete (exit={result.exit_code})",
+        stdout=result.stdout,
+        stderr=result.stderr,
     )
 ```
 
@@ -230,7 +239,7 @@ async def wire_transfer(
     amount: int,
     manager: Annotated[Approval, hook.requires(request_manager_approval)],
     finance: Annotated[Approval, hook.requires(request_finance_approval)],
-) -> ToolResult[str]:
+) -> str:
     ...
 ```
 
@@ -299,19 +308,155 @@ async def run_code_external(...): ...
 
 These are convenience wrappers over the signature-level dependency model.
 
-## Tool Outcomes
+## Tool Results
+
+Tools return plain Python values. The framework handles serialization to the model
+and client/event streams automatically.
+
+### Design Principles
+
+- No `tool.ok`, `tool.fail`, or `tool.error`. `tool` is only a decorator.
+- No `ToolResult`, `FunctionTool`, `FunctionToolAction`, or `FunctionToolActionResult`.
+- No implicit tuple conventions (`tuple[str, dict]`).
+- Plain returns go to both model and client. `Hidden` fields on Pydantic models
+  go only to the client.
+- Failures are exceptions.
+
+### Plain Returns (Simple Tools)
+
+Return any serializable value (`str`, `dict`, `list`, `int`, etc.). The model and
+client both receive the full serialized value.
 
 ```python
-tool.ok(message="...", data={...})    # success
-tool.error(message="...", data={...}) # error
-tool.fail(message="...", data={...})  # fatal/unrecoverable
+@tool
+def think(thoughts: str) -> str:
+    """Think about the task."""
+    return thoughts
+
+@tool
+def execute_code(code: str) -> dict:
+    result = sandbox.run(code)
+    return {
+        "exit_code": result.exit_code,
+        "stdout": result.stdout,
+        "stderr": result.stderr,
+    }
 ```
 
-Notes:
+### Typed Returns with `Hidden` (Model/Client Split)
 
-- Keep plain returns (`str`, `dict`) supported for simple tools.
-- `tool.ok` and `tool.fail` are the primary explicit constructors.
-- A separate `tool.error` helper can be added if semantics justify it.
+When the client needs data that the model does not (e.g., full file contents for a
+diff viewer, structured metadata for UI rendering), use a Pydantic `BaseModel` with
+`Hidden`-annotated fields.
+
+```python
+from pydantic import BaseModel
+from typing import Annotated
+from factorial import Hidden
+
+class EditResult(BaseModel):
+    summary: str
+    new_code: Annotated[str, Hidden]
+    lines_changed: Annotated[int, Hidden]
+```
+
+The framework serializes the result in two ways:
+
+- **Model context:** all fields *except* those annotated with `Hidden`. In the example
+  above, the model sees `{"summary": "Replaced 'foo' with 'bar'"}`.
+- **Client/event stream:** all fields including `Hidden`. The client receives the full
+  `EditResult` with `summary`, `new_code`, and `lines_changed`.
+
+Usage:
+
+```python
+@tool
+def edit_code(
+    find: str, replace: str, agent_ctx: IdeAgentContext,
+) -> EditResult:
+    agent_ctx.code = agent_ctx.code.replace(find, replace)
+    return EditResult(
+        summary=f"Replaced '{find}' with '{replace}'",
+        new_code=agent_ctx.code,
+        lines_changed=5,
+    )
+```
+
+`Hidden` is a simple sentinel object. It works with standard `typing.Annotated` and
+any Pydantic `BaseModel` -- no framework base class required.
+
+### Failures
+
+Raise exceptions. The framework catches them, formats an error message for the model,
+and includes the error in the event stream.
+
+```python
+@tool
+def fetch_user(user_id: str) -> dict:
+    user = db.get(user_id)
+    if not user:
+        raise ValueError("User not found")
+    return {"name": user["name"], "email": user["email"]}
+```
+
+- `raise` any exception for expected failures (not found, validation, rejection).
+- `raise FatalAgentError(...)` to hard-stop the task without retry.
+- Transient exceptions (network, rate limit) are retried automatically per retry policy.
+
+### Wait Results
+
+`wait.*` methods accept an optional `data` parameter with the same rules:
+
+```python
+# Simple -- string goes to model and client
+return wait.sleep(30, data="Retrying shortly")
+
+# Dict -- model and client both see it
+return wait.jobs(jobs, data={"query_count": len(queries)})
+
+# Typed with Hidden -- model sees non-hidden fields, client sees all
+class ResearchProgress(BaseModel):
+    status: str
+    job_ids: Annotated[list[str], Hidden]
+
+return wait.jobs(jobs, data=ResearchProgress(
+    status="Researching...",
+    job_ids=[j.task_id for j in jobs],
+))
+
+# No data -- framework generates a default message for the model
+return wait.cron("0 * * * *")
+```
+
+### Serialization Rules Summary
+
+| Return type | Model sees | Client/events see |
+|---|---|---|
+| `str`, `dict`, `list`, primitive | Full serialized value | Full serialized value |
+| `BaseModel` (no `Hidden` fields) | All fields | All fields |
+| `BaseModel` (with `Hidden` fields) | Non-hidden fields only | All fields |
+| Exception (raised) | Error message | Error message + traceback |
+
+### `Hidden` Implementation
+
+`Hidden` is a sentinel that the framework checks via `typing.get_type_hints` with
+`include_extras=True` on `BaseModel` return values:
+
+```python
+from factorial import Hidden  # just a sentinel object
+
+# Framework logic (simplified):
+def serialize_for_model(result: BaseModel) -> dict:
+    hints = get_type_hints(type(result), include_extras=True)
+    return {
+        name: getattr(result, name)
+        for name, hint in hints.items()
+        if not _has_hidden_annotation(hint)
+    }
+
+def serialize_for_client(result: BaseModel) -> dict:
+    return result.model_dump()
+```
 
 ## Why No Mid-Function Freeze
 
@@ -501,9 +646,9 @@ should resume:
 @tool
 async def monitor_release(...):
     if cooling_down:
-        return wait.sleep(300, message="Cooling down")
+        return wait.sleep(300, data="Cooling down")
     if awaiting_next_tick:
-        return wait.cron("*/5 * * * *", tz="UTC", message="Waiting for next tick")
+        return wait.cron("*/5 * * * *", tz="UTC", data="Waiting for next tick")
     jobs = await subagents.spawn(agent=search_agent, inputs=payloads, key="search")
     return wait.jobs(jobs)
 ```
@@ -549,7 +694,7 @@ async def wire_transfer(
     manager: Annotated[Approval, hook.requires(request_manager_approval)],
     finance: Annotated[Approval, hook.requires(request_finance_approval)],
     bank_ack: Annotated[BankAck, hook.awaits(submit_bank_transfer)],
-) -> ToolResult[str]:
+) -> str:
     ...
 ```
 
@@ -599,28 +744,55 @@ Structured lifecycle events:
 - Keep request builders small and focused.
 - Encode ordering via DI data dependencies first.
 - Rely on implicit DI ordering; avoid explicit ordering knobs in v1.
-- Prefer namespace imports (`tool`, `hook`, `wait`) over global helper imports.
-- Use `tool.ok` and `tool.fail` as explicit constructors.
+- `tool` is a decorator only. No `.ok()`, `.fail()`, or `.error()` methods.
+- Return plain values for simple tools. Use `BaseModel` + `Hidden` when the client
+  needs data that would be wasteful or redundant in the model context.
+- Use exceptions for failures. Use `FatalAgentError` for unrecoverable errors.
+- `wait.*` accepts `data=` with the same serialization rules as tool returns.
 
 ## Migration Plan
 
+This is a new major version. No backwards compatibility with v1 or current v2 draft
+is required. All deprecated aliases and legacy patterns are removed outright.
+
+### Removals
+
+- `tool.ok()`, `tool.fail()`, `tool.error()` -- `tool` is a decorator only
+- `ToolResult`, `FunctionToolActionResult`, `FunctionToolActionReturn`
+- `FunctionTool`, `FunctionToolAction`, `function_tool`
+- `ToolNamespace` result builder methods
+- implicit `tuple[str, Any]` return convention
+- `output_str` / `output_data` fields on internal result objects
+
+### Additions
+
+- `Hidden` sentinel for `Annotated[T, Hidden]` field exclusion from model context
+- `data=` parameter on `wait.sleep`, `wait.cron`, `wait.jobs`
+- Pydantic `BaseModel` return type support with `Hidden`-aware serialization
+
+### Implementation
+
 Phase 1:
+
+- implement `Hidden` sentinel and model/client serialization split in `agent.py`
+- rewrite `tool_action` return normalization to handle `BaseModel` with `Hidden`
+- rewrite `format_tool_result` / `extract_tool_call_result` for new contract
+- remove `ToolNamespace.ok/fail/error`, `ToolResult`, and all deprecated aliases
+- remove tuple return convention handling
+- add `data=` parameter to `WaitNamespace.sleep/cron/jobs`
+
+Phase 2:
+
+- update all examples (`code_agent`, `multi_agent`) to new patterns
+- update all docs
+- update all tests
+
+Phase 3:
 
 - add `Hook`, `PendingHook`, `HookRequestContext`
 - add `hook.requires(...)` and `hook.awaits(...)` with implicit DI dependency inference
 - add internal hook-session runtime and persistence
 - add `orchestrator.resolve_hook` and token rotation
-- keep worker-only continuation and reuse existing deferred completion internals
-
-Phase 2:
-
-- add wait helpers (`sleep`, `cron`, `children`) with explicit scheduled/pending states
-- add default UI/email helper primitives
-
-Phase 3:
-
-- deprecate legacy decorator flags and tuple-only conventions
-- provide codemods/examples for migration
 
 ## Open Questions
 
@@ -633,12 +805,26 @@ Phase 3:
 
 This model keeps reliability guarantees of the current queue architecture while improving DX:
 
-- typed hooks
-- signature-level dependency injection
+- plain returns for simple tools, Pydantic models for complex ones
+- `Hidden` annotation for model/client split -- no framework base class required
+- exceptions for failures instead of `tool.fail/error` constructors
+- typed hooks with signature-level dependency injection
 - implicit dependency ordering from DI signatures
 - first-class multi-hook workflows without a user DAG DSL
 - worker-only continuation (no control-plane execution leakage)
 - strong callback correctness guarantees
+
+The tool result contract is:
+
+| Return type | Model sees | Client/events see |
+|---|---|---|
+| `str`, `dict`, `list`, primitive | Everything | Everything |
+| `BaseModel` (no `Hidden` fields) | All fields | All fields |
+| `BaseModel` (with `Hidden` fields) | Non-hidden fields only | All fields |
+| Exception (raised) | Error message | Error + traceback |
+
+One rule: `Annotated[T, Hidden]` excludes a field from the model. Everything else
+is visible everywhere.
 
 This gives a practical path for human-in-the-loop approvals, external webhooks, multi-gated
 flows, and long-running team workflows with a FastAPI-like learning curve.

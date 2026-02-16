@@ -204,10 +204,10 @@ class SubagentsNamespace:
         agent: Any,
         inputs: list[Any],
         key: str,
-        message: str | None = None,
+        data: Any = None,
     ) -> WaitInstruction:
         jobs = await self.spawn(agent=agent, inputs=inputs, key=key)
-        return wait.jobs(jobs, message=message)
+        return wait.jobs(jobs, data=data)
 
 
 subagents = SubagentsNamespace()

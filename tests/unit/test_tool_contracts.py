@@ -7,7 +7,7 @@ import threading
 import uuid
 from collections.abc import Callable
 from contextvars import Token
-from typing import Any, cast
+from typing import Annotated, Any, cast
 
 import httpx
 import pytest
@@ -15,19 +15,27 @@ from openai.types.chat.chat_completion_message_function_tool_call import (
     ChatCompletionMessageFunctionToolCall,
     Function as ToolCallFunction,
 )
+from pydantic import BaseModel
 
 from factorial import (
     Agent,
     AgentContext,
     ExecutionContext,
-    FunctionTool,
-    ToolResult,
-    function_tool,
+    Hidden,
+    ToolDefinition,
     tool,
 )
 from factorial.context import execution_context
 from factorial.events import EventPublisher
-from factorial.tools import convert_tools_list, forking_tool
+from factorial.tools import (
+    _ToolResultInternal,
+    convert_tools_list,
+    forking_tool,
+    has_hidden_annotation,
+    serialize_for_client,
+    serialize_for_model,
+)
+from factorial.waits import WaitInstruction, wait
 
 
 def _make_tool_call(
@@ -60,25 +68,83 @@ def _set_test_execution_context() -> Token[ExecutionContext]:
 
 
 def _make_agent_with_tools(
-    tools: list[FunctionTool[AgentContext] | Callable[..., Any]],
+    tools: list[ToolDefinition[AgentContext] | Callable[..., Any]],
 ) -> Agent:
-    # Disable cert verification in tests to avoid platform cert store coupling.
     http_client = httpx.AsyncClient(verify=False, trust_env=False)
     return Agent(tools=tools, http_client=http_client)
 
 
-def test_legacy_function_tool_uses_docstring_and_schema() -> None:
+# ---------------------------------------------------------------------------
+# Hidden sentinel and serialization
+# ---------------------------------------------------------------------------
+
+
+class _SampleModel(BaseModel):
+    summary: str
+    secret: Annotated[str, Hidden]
+    count: Annotated[int, Hidden]
+
+
+class _PlainModel(BaseModel):
+    name: str
+    value: int
+
+
+def test_hidden_annotation_detected() -> None:
+    from typing import get_type_hints
+
+    hints = get_type_hints(_SampleModel, include_extras=True)
+    assert has_hidden_annotation(hints["secret"])
+    assert has_hidden_annotation(hints["count"])
+    assert not has_hidden_annotation(hints["summary"])
+
+
+def test_serialize_for_model_excludes_hidden() -> None:
+    obj = _SampleModel(summary="done", secret="s3cr3t", count=42)
+    result = serialize_for_model(obj)
+    assert result == {"summary": "done"}
+    assert "secret" not in result
+    assert "count" not in result
+
+
+def test_serialize_for_client_includes_all() -> None:
+    obj = _SampleModel(summary="done", secret="s3cr3t", count=42)
+    result = serialize_for_client(obj)
+    assert result == {"summary": "done", "secret": "s3cr3t", "count": 42}
+
+
+def test_serialize_plain_model_same_for_model_and_client() -> None:
+    obj = _PlainModel(name="test", value=99)
+    assert serialize_for_model(obj) == {"name": "test", "value": 99}
+    assert serialize_for_client(obj) == {"name": "test", "value": 99}
+
+
+# ---------------------------------------------------------------------------
+# Tool decorator
+# ---------------------------------------------------------------------------
+
+
+def test_tool_decorator_defaults_name_and_description() -> None:
+    @tool
+    def greet(name: str) -> str:
+        return f"hi {name}"
+
+    assert isinstance(greet, ToolDefinition)
+    assert greet.name == "greet"
+    assert greet.description == "Execute greet"
+
+
+def test_tool_decorator_uses_docstring() -> None:
+    @tool
     def greet(name: str) -> str:
         """Return a friendly greeting."""
         return f"hi {name}"
 
-    tool_def = function_tool(greet)
-
-    assert isinstance(tool_def, FunctionTool)
-    assert tool_def.name == "greet"
-    assert tool_def.description == "Return a friendly greeting."
-    assert tool_def.strict_json_schema is True
-    assert tool_def.params_json_schema == {
+    assert isinstance(greet, ToolDefinition)
+    assert greet.name == "greet"
+    assert greet.description == "Return a friendly greeting."
+    assert greet.strict_json_schema is True
+    assert greet.params_json_schema == {
         "type": "object",
         "properties": {"name": {"type": "string"}},
         "additionalProperties": False,
@@ -86,17 +152,28 @@ def test_legacy_function_tool_uses_docstring_and_schema() -> None:
     }
 
 
+def test_tool_decorator_accepts_explicit_name_and_description() -> None:
+    @tool(name="lookup", description="Lookup data")
+    def query(term: str) -> str:
+        return term
+
+    assert isinstance(query, ToolDefinition)
+    assert query.name == "lookup"
+    assert query.description == "Lookup data"
+
+
 def test_optional_params_disable_strict_schema() -> None:
+    @tool
     def search(query: str, limit: int | None = None) -> str:
         return f"{query}:{limit}"
 
-    tool_def = function_tool(search)
-    assert tool_def.strict_json_schema is False
-    assert "query" in tool_def.params_json_schema["required"]
-    assert "limit" not in tool_def.params_json_schema["required"]
+    assert search.strict_json_schema is False
+    assert "query" in search.params_json_schema["required"]
+    assert "limit" not in search.params_json_schema["required"]
 
 
 def test_tool_schema_excludes_injected_context_params() -> None:
+    @tool
     def contextual(
         query: str,
         agent_ctx: AgentContext,
@@ -104,12 +181,11 @@ def test_tool_schema_excludes_injected_context_params() -> None:
     ) -> str:
         return f"{query}:{agent_ctx.query}:{execution_ctx.task_id}"
 
-    tool_def = function_tool(contextual)
-    assert set(tool_def.params_json_schema["properties"]) == {"query"}
+    assert set(contextual.params_json_schema["properties"]) == {"query"}
 
 
 def test_convert_tools_list_accepts_tool_defs_and_callables() -> None:
-    @function_tool
+    @tool
     def first_tool(value: int) -> str:
         return str(value)
 
@@ -121,43 +197,166 @@ def test_convert_tools_list_accepts_tool_defs_and_callables() -> None:
     assert set(actions) == {"first_tool", "second_tool"}
 
 
-def test_tool_namespace_decorator_defaults_name_and_description() -> None:
-    @tool
-    def greet(name: str) -> str:
-        return f"hi {name}"
-
-    assert isinstance(greet, FunctionTool)
-    assert greet.name == "greet"
-    assert greet.description == "Execute greet"
+# ---------------------------------------------------------------------------
+# tool.ok/fail/error are REMOVED -- no test for them
+# ---------------------------------------------------------------------------
 
 
-def test_tool_namespace_decorator_accepts_explicit_name_and_description() -> None:
-    @tool(name="lookup", description="Lookup data")
-    def query(term: str) -> str:
-        return term
-
-    assert isinstance(query, FunctionTool)
-    assert query.name == "lookup"
-    assert query.description == "Lookup data"
+# ---------------------------------------------------------------------------
+# tool_action return normalization
+# ---------------------------------------------------------------------------
 
 
-def test_tool_namespace_result_builders_set_status_and_payload() -> None:
-    ok_result = tool.ok("completed", {"id": 1})
-    fail_result = tool.fail("needs action", {"code": "REVIEW"})
-    error_result = tool.error("unexpected", {"code": "E_GENERIC"})
+@pytest.mark.asyncio
+async def test_tool_action_plain_string_return() -> None:
+    def echo(text: str) -> str:
+        return f"echo: {text}"
 
-    assert isinstance(ok_result, ToolResult)
-    assert ok_result.status == "ok"
-    assert ok_result.output_str == "completed"
-    assert ok_result.output_data == {"id": 1}
+    agent = _make_agent_with_tools([echo])
+    token = _set_test_execution_context()
+    try:
+        tool_call = _make_tool_call("echo", {"text": "hello"})
+        result = await agent.tool_action(tool_call, AgentContext(query="q"))
+        assert isinstance(result, _ToolResultInternal)
+        assert result.model_output == "echo: hello"
+        assert result.client_output == "echo: hello"
+    finally:
+        execution_context.reset(token)
+        await agent.http_client.aclose()
 
-    assert fail_result.status == "fail"
-    assert fail_result.output_str == "needs action"
-    assert fail_result.output_data == {"code": "REVIEW"}
 
-    assert error_result.status == "error"
-    assert error_result.output_str == "unexpected"
-    assert error_result.output_data == {"code": "E_GENERIC"}
+@pytest.mark.asyncio
+async def test_tool_action_dict_return() -> None:
+    def get_data() -> dict[str, Any]:
+        return {"key": "value", "count": 42}
+
+    agent = _make_agent_with_tools([get_data])
+    token = _set_test_execution_context()
+    try:
+        tool_call = _make_tool_call("get_data")
+        result = await agent.tool_action(tool_call, AgentContext(query="q"))
+        assert isinstance(result, _ToolResultInternal)
+        assert result.client_output == {"key": "value", "count": 42}
+        assert "key" in result.model_output
+        assert "value" in result.model_output
+    finally:
+        execution_context.reset(token)
+        await agent.http_client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_tool_action_none_return() -> None:
+    def noop() -> None:
+        pass
+
+    agent = _make_agent_with_tools([noop])
+    token = _set_test_execution_context()
+    try:
+        tool_call = _make_tool_call("noop")
+        result = await agent.tool_action(tool_call, AgentContext(query="q"))
+        assert isinstance(result, _ToolResultInternal)
+        assert result.model_output == ""
+        assert result.client_output is None
+    finally:
+        execution_context.reset(token)
+        await agent.http_client.aclose()
+
+
+class _EditResult(BaseModel):
+    summary: str
+    new_code: Annotated[str, Hidden]
+
+
+class _InfoModel(BaseModel):
+    name: str
+    value: int
+
+
+@pytest.mark.asyncio
+async def test_tool_action_basemodel_with_hidden() -> None:
+    def edit() -> _EditResult:
+        return _EditResult(summary="Edited file", new_code="print('hello')")
+
+    agent = _make_agent_with_tools([edit])
+    token = _set_test_execution_context()
+    try:
+        tool_call = _make_tool_call("edit")
+        result = await agent.tool_action(tool_call, AgentContext(query="q"))
+        assert isinstance(result, _ToolResultInternal)
+        # Model sees only non-hidden fields
+        assert "summary" in result.model_output
+        assert "Edited file" in result.model_output
+        assert "print('hello')" not in result.model_output
+        # Client sees all fields
+        assert result.client_output == {
+            "summary": "Edited file",
+            "new_code": "print('hello')",
+        }
+    finally:
+        execution_context.reset(token)
+        await agent.http_client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_tool_action_basemodel_without_hidden() -> None:
+    def get_info() -> _InfoModel:
+        return _InfoModel(name="test", value=99)
+
+    agent = _make_agent_with_tools([get_info])
+    token = _set_test_execution_context()
+    try:
+        tool_call = _make_tool_call("get_info")
+        result = await agent.tool_action(tool_call, AgentContext(query="q"))
+        assert isinstance(result, _ToolResultInternal)
+        # Both model and client see all fields
+        assert "name" in result.model_output
+        assert "test" in result.model_output
+        assert result.client_output == {"name": "test", "value": 99}
+    finally:
+        execution_context.reset(token)
+        await agent.http_client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_tool_action_wait_instruction_with_data() -> None:
+    def wait_tool() -> WaitInstruction:
+        return wait.sleep(30, data="Cooling down")
+
+    agent = _make_agent_with_tools([wait_tool])
+    token = _set_test_execution_context()
+    try:
+        tool_call = _make_tool_call("wait_tool")
+        result = await agent.tool_action(tool_call, AgentContext(query="q"))
+        assert isinstance(result, _ToolResultInternal)
+        assert result.model_output == "Cooling down"
+        assert isinstance(result.client_output, WaitInstruction)
+        assert result.client_output.data == "Cooling down"
+    finally:
+        execution_context.reset(token)
+        await agent.http_client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_tool_action_wait_instruction_default_message() -> None:
+    def wait_tool() -> WaitInstruction:
+        return wait.sleep(60)
+
+    agent = _make_agent_with_tools([wait_tool])
+    token = _set_test_execution_context()
+    try:
+        tool_call = _make_tool_call("wait_tool")
+        result = await agent.tool_action(tool_call, AgentContext(query="q"))
+        assert isinstance(result, _ToolResultInternal)
+        assert "60" in result.model_output
+        assert isinstance(result.client_output, WaitInstruction)
+    finally:
+        execution_context.reset(token)
+        await agent.http_client.aclose()
+
+
+# ---------------------------------------------------------------------------
+# Forking tools
+# ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
@@ -207,7 +406,7 @@ async def test_tool_action_offloads_sync_callbacks_to_worker_thread() -> None:
     try:
         tool_call = _make_tool_call("sync_search", {"query": "weather"})
         result = await agent.tool_action(tool_call, AgentContext(query="q"))
-        assert result.output_str == "result:weather"
+        assert result.model_output == "result:weather"
         assert callback_thread_ids
         assert callback_thread_ids[0] != loop_thread_id
     finally:
@@ -216,7 +415,7 @@ async def test_tool_action_offloads_sync_callbacks_to_worker_thread() -> None:
 
 
 @pytest.mark.asyncio
-async def test_tool_action_extracts_child_ids_from_forking_tuple_return() -> None:
+async def test_tool_action_rejects_legacy_forking_tuple_return() -> None:
     child_ids = [str(uuid.uuid4())]
 
     @forking_tool(timeout=600.0)
@@ -227,10 +426,8 @@ async def test_tool_action_extracts_child_ids_from_forking_tuple_return() -> Non
     token = _set_test_execution_context()
     try:
         tool_call = _make_tool_call("spawn_children_with_message")
-        result = await agent.tool_action(tool_call, AgentContext(query="q"))
-        assert result.output_str == "spawned"
-        assert result.output_data == child_ids
-        assert result.pending_child_task_ids == child_ids
+        with pytest.raises(ValueError, match="must return list\\[str\\]"):
+            await agent.tool_action(tool_call, AgentContext(query="q"))
     finally:
         execution_context.reset(token)
         await agent.http_client.aclose()
@@ -252,3 +449,29 @@ async def test_tool_action_rejects_invalid_forking_child_ids() -> None:
         execution_context.reset(token)
         await agent.http_client.aclose()
 
+
+# ---------------------------------------------------------------------------
+# WaitInstruction data= parameter
+# ---------------------------------------------------------------------------
+
+
+def test_wait_sleep_data_string() -> None:
+    instr = wait.sleep(10, data="pausing")
+    assert instr.data == "pausing"
+    assert instr.sleep_s == 10
+
+
+def test_wait_sleep_data_dict() -> None:
+    instr = wait.sleep(10, data={"reason": "cooldown"})
+    assert instr.data == {"reason": "cooldown"}
+
+
+def test_wait_cron_data() -> None:
+    instr = wait.cron("*/5 * * * *", data="next tick")
+    assert instr.data == "next tick"
+    assert instr.cron == "*/5 * * * *"
+
+
+def test_wait_sleep_no_data_defaults_none() -> None:
+    instr = wait.sleep(5)
+    assert instr.data is None

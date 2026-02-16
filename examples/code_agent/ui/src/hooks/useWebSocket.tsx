@@ -83,13 +83,13 @@ export const useWebSocket = ({
         if (!toolCall) break;
 
         // If this is an edit_code tool completion, propose the code change
-        if (toolCall.function.name === 'edit_code' && resp.output_data?.new_code) {
-          setProposedCode(resp.output_data.new_code);
+        if (toolCall.function.name === 'edit_code' && resp.client_output?.new_code) {
+          setProposedCode(resp.client_output.new_code);
         }
 
         if (toolCall.function.name === 'request_code_execution') {
-          const outputData = (resp.output_data && typeof resp.output_data === 'object')
-            ? (resp.output_data as Record<string, unknown>)
+          const outputData = (resp.client_output && typeof resp.client_output === 'object')
+            ? (resp.client_output as Record<string, unknown>)
             : null;
 
           if (resp.pending_result && outputData?.kind === 'hook_session_pending') {
@@ -122,7 +122,7 @@ export const useWebSocket = ({
 
             const outputText = formatExecOutput(
               outputData,
-              typeof resp.output_str === 'string' ? resp.output_str : 'Execution completed.'
+              typeof resp.model_output === 'string' ? resp.model_output : 'Execution completed.'
             );
 
             const resultAction: Action = {
@@ -146,16 +146,16 @@ export const useWebSocket = ({
             }),
             kind: 'tool_completed',
             status: 'done',
-            result: resp.output_data,
+            result: resp.client_output,
           }) as Action);
 
           // Special handling for think tool – show thought content
-          if (toolCall.function.name === 'think' && typeof resp.output_data === 'string') {
+          if (toolCall.function.name === 'think' && typeof resp.client_output === 'string') {
             const thoughtAction: Action = {
               id: `thought_${Date.now()}`,
               kind: 'assistant_thought',
               status: 'done',
-              content: resp.output_data,
+              content: resp.client_output,
               timestamp: event.timestamp,
             } as Action;
             addAction(event.task_id, thoughtAction);

@@ -1,14 +1,16 @@
 import os
-from typing import Any
+from typing import Annotated, Any
 
 from dotenv import load_dotenv
 from exa_py import Exa  # type: ignore[import-not-found]
+from pydantic import BaseModel
 
 from factorial import (
     Agent,
     AgentContext,
     AgentWorkerConfig,
     BaseAgent,
+    Hidden,
     MaintenanceWorkerConfig,
     MetricsTimelineConfig,
     ModelSettings,
@@ -22,7 +24,6 @@ from factorial import (
     tool,
     wait,
 )
-from factorial.utils import BaseModel
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
 env_path = os.path.join(current_dir, ".env")
@@ -30,22 +31,37 @@ env_path = os.path.join(current_dir, ".env")
 load_dotenv(env_path, override=True)
 
 
+class PlanResult(BaseModel):
+    summary: str
+    overview: Annotated[str, Hidden]
+    steps: Annotated[list[str], Hidden]
+
+
 def plan(
     overview: str, steps: list[str], agent_ctx: AgentContext
-) -> tuple[str, dict[str, Any]]:
+) -> PlanResult:
     """Structure your plan to accomplish the task.
 
     This should be user-readable and not mention any specific tool names.
     """
-    return f"{overview}\n{' -> '.join(steps)}", {"overview": overview, "steps": steps}
+    return PlanResult(
+        summary=f"{overview}\n{' -> '.join(steps)}",
+        overview=overview,
+        steps=steps,
+    )
 
 
-def reflect(reflection: str, agent_ctx: AgentContext) -> tuple[str, str]:
+def reflect(reflection: str, agent_ctx: AgentContext) -> str:
     """Reflect on a task"""
-    return reflection, reflection
+    return reflection
 
 
-def search(query: str) -> tuple[str, list[dict[str, Any]]]:
+class SearchResult(BaseModel):
+    summary: str
+    results: Annotated[list[dict[str, Any]], Hidden]
+
+
+def search(query: str) -> SearchResult:
     """Search the web for information"""
     exa = Exa(api_key=os.getenv("EXA_API_KEY"))
 
@@ -61,7 +77,7 @@ def search(query: str) -> tuple[str, list[dict[str, Any]]]:
         for r in result.results
     ]
 
-    return str(result), data
+    return SearchResult(summary=str(result), results=data)
 
 
 class FinalOutput(BaseModel):
@@ -100,7 +116,7 @@ async def research(
     payloads = [AgentContext(query=q) for q in queries]
     jobs = await subagents.spawn(agent=search_agent, inputs=payloads, key="research")
     agent_ctx.has_used_research = True
-    return wait.jobs(jobs, message="Waiting on research subagents")
+    return wait.jobs(jobs, data="Waiting on research subagents")
 
 
 class MainAgent(BaseAgent[MainAgentContext]):

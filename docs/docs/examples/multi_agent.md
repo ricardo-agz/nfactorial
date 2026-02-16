@@ -10,9 +10,10 @@ A complex research agent that can search the web and spin up multiple independen
 
 ```python
 import os
-from typing import Any
+from typing import Annotated, Any
 from dotenv import load_dotenv
-from factorial import Agent, AgentContext, ai_gateway, gpt_41
+from pydantic import BaseModel
+from factorial import Agent, AgentContext, Hidden, ai_gateway, gpt_41
 from exa_py import Exa
 
 
@@ -20,7 +21,12 @@ load_dotenv()
 exa = Exa(api_key=os.getenv("EXA_API_KEY"))
 
 
-def search(query: str) -> tuple[str, list[dict[str, Any]]]:
+class SearchResult(BaseModel):
+    summary: str
+    results: Annotated[list[dict[str, Any]], Hidden]
+
+
+def search(query: str) -> SearchResult:
     """Search the web for information"""
     result = exa.search_and_contents(
         query=query, num_results=10, text={"max_characters": 500}
@@ -30,7 +36,7 @@ def search(query: str) -> tuple[str, list[dict[str, Any]]]:
         for r in result.results
     ]
 
-    return str(result), data
+    return SearchResult(summary=str(result), results=data)
 
 basic_agent = Agent(
     instructions="You are a helpful assistant. Always start by making a plan.",
@@ -113,7 +119,7 @@ async def research(
         inputs=payloads,
         key="research",
     )
-    return wait.jobs(jobs, message="Waiting for research subagents")
+    return wait.jobs(jobs, data="Waiting for research subagents")
 ```
 
 **Key points:**

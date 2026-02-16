@@ -29,9 +29,11 @@ Note that `edit_code` is the only tool that does any real work in this example, 
 import os
 from typing import Annotated, Any
 from dotenv import load_dotenv
+from pydantic import BaseModel
 from factorial import (
     BaseAgent,
     AgentContext,
+    Hidden,
     Hook,
     HookRequestContext,
     PendingHook,
@@ -52,13 +54,18 @@ def think(thoughts: str) -> str:
     return thoughts
 
 
+class EditResult(BaseModel):
+    summary: str
+    new_code: Annotated[str, Hidden]
+
+
 def edit_code(
     find: str,
     find_start_line: int,
     find_end_line: int,
     replace: str,
     agent_ctx: IdeAgentContext,
-) -> tuple[str, dict[str, Any]]:
+) -> EditResult:
     """
     Edit code in a file
 
@@ -72,21 +79,17 @@ def edit_code(
     start_idx = find_start_line - 1
     end_idx = find_end_line - 1
     if start_idx < 0 or end_idx >= len(lines) or start_idx > end_idx:
-        return "Error: Invalid line numbers", {
-            "error": "Line numbers out of range or invalid",
-            "total_lines": len(lines),
-        }
+        raise ValueError(
+            f"Line numbers out of range or invalid (total lines: {len(lines)})"
+        )
 
     existing_text = "\n".join(lines[start_idx : end_idx + 1])
 
     # Check if the find text matches what's at those line numbers
     if find not in existing_text:
-        return (
-            f"Error: Text '{find}' not found at lines {find_start_line}-{find_end_line}",
-            {
-                "error": "Find text not found at specified lines",
-                "existing_text": existing_text,
-            },
+        raise ValueError(
+            f"Text '{find}' not found at lines {find_start_line}-{find_end_line}. "
+            f"Existing text: {existing_text}"
         )
 
     new_text = existing_text.replace(find, replace)
@@ -95,15 +98,12 @@ def edit_code(
     # Update the agent context with the modified code
     agent_ctx.code = "\n".join(new_lines)
 
-    return (
-        f"Code successfully edited: replaced '{find}' with '{replace}' at lines {find_start_line}-{find_end_line}",
-        {
-            "find": find,
-            "find_start_line": find_start_line,
-            "find_end_line": find_end_line,
-            "replace": replace,
-            "new_code": agent_ctx.code,
-        },
+    return EditResult(
+        summary=(
+            f"Code successfully edited: replaced '{find}' with '{replace}' "
+            f"at lines {find_start_line}-{find_end_line}"
+        ),
+        new_code=agent_ctx.code,
     )
 
 
@@ -121,19 +121,30 @@ def request_code_execution_approval(
     )
 
 
+class CodeExecutionResult(BaseModel):
+    summary: str
+    approved: bool
+
+
 async def request_code_execution(
     approval: Annotated[
         CodeExecutionApproval,
         hook.requires(request_code_execution_approval),
     ],
     agent_ctx: IdeAgentContext,
-) -> tuple[str, dict[str, Any]]:
+) -> CodeExecutionResult:
     """Request code execution behind an explicit approval hook."""
     if not approval.approved:
-        return "User rejected the code execution request.", {"approved": False}
+        return CodeExecutionResult(
+            summary="User rejected the code execution request.",
+            approved=False,
+        )
 
     # In this example, execution can happen in your sandbox/runtime after approval.
-    return "User approved code execution request.", {"approved": True}
+    return CodeExecutionResult(
+        summary="User approved code execution request.",
+        approved=True,
+    )
 
 
 instructions = """

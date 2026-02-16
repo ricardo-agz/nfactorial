@@ -66,13 +66,8 @@ from factorial.orchestrator import (
 from factorial.queue.task import Task, TaskStatus
 from factorial.subagents import JobRef, SubagentsNamespace, subagents
 from factorial.tools import (
-    FunctionTool,
-    FunctionToolAction,
-    FunctionToolActionResult,
+    Hidden,
     ToolDefinition,
-    ToolNamespace,
-    ToolResult,
-    function_tool,
     tool,
 )
 from factorial.waits import WaitInstruction, WaitNamespace, wait
@@ -85,13 +80,8 @@ __all__ = [
     "ModelSettings",
     "ResolvedModelSettings",
     "TurnCompletion",
-    "FunctionTool",
-    "FunctionToolAction",
-    "FunctionToolActionResult",
+    "Hidden",
     "ToolDefinition",
-    "ToolResult",
-    "ToolNamespace",
-    "function_tool",
     "tool",
     "publish_progress",
     "retry",

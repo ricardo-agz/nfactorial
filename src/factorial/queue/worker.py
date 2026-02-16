@@ -42,7 +42,7 @@ from factorial.queue.task import (
     get_task_data,
     get_task_steering_messages,
 )
-from factorial.tools import ToolResult
+from factorial.tools import _ToolResultInternal
 from factorial.waits import WaitInstruction, next_cron_wake_timestamp
 
 logger = get_logger("factorial.queue")
@@ -382,7 +382,7 @@ async def process_task(
         wait_kind: str,
         wake_timestamp: float,
         source_tool_call_ids: list[str],
-        message: str | None = None,
+        data: Any = None,
         cron_expression: str | None = None,
         cron_timezone: str | None = None,
     ) -> None:
@@ -392,8 +392,8 @@ async def process_task(
             "wake_timestamp": wake_timestamp,
             "source_tool_call_ids": source_tool_call_ids,
         }
-        if message is not None:
-            wait_metadata["message"] = message
+        if data is not None:
+            wait_metadata["data"] = serialize_data(data)
         if cron_expression is not None:
             wait_metadata["cron"] = cron_expression
         if cron_timezone is not None:
@@ -654,7 +654,7 @@ async def process_task(
             if hook_tick.completed_results:
                 for _, hook_result in hook_tick.completed_results:
                     if (
-                        isinstance(hook_result, ToolResult)
+                        isinstance(hook_result, _ToolResultInternal)
                         and hook_result.pending_child_task_ids
                     ):
                         hook_pending_child_task_ids.extend(
@@ -774,10 +774,10 @@ async def process_task(
                     return
 
                 wake_timestamps: list[float] = []
-                wait_message: str | None = None
+                wait_data: Any = None
                 for _, wait_instruction in wait_instructions:
-                    if wait_message is None and wait_instruction.message:
-                        wait_message = wait_instruction.message
+                    if wait_data is None and wait_instruction.data is not None:
+                        wait_data = wait_instruction.data
 
                     if wait_instruction.kind == "sleep":
                         if wait_instruction.sleep_s is None:
@@ -823,7 +823,7 @@ async def process_task(
                     wait_kind=wait_kind,
                     wake_timestamp=wake_timestamp,
                     source_tool_call_ids=source_tool_call_ids,
-                    message=wait_message,
+                    data=wait_data,
                     cron_expression=(
                         representative.cron if wait_kind == "cron" else None
                     ),

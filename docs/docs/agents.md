@@ -165,7 +165,7 @@ await orchestrator.enqueue_task(agent=agent, task=task)
 For advanced use cases, extend `BaseAgent` or `Agent`:
 
 ```python
-from factorial import BaseAgent, AgentContext, ExecutionContext, ToolResult
+from factorial import BaseAgent, AgentContext, ExecutionContext
 
 class CustomAgent(BaseAgent[AgentContext]):
     async def completion(
@@ -189,7 +189,7 @@ class CustomAgent(BaseAgent[AgentContext]):
         self, 
         tool_call: ChatCompletionMessageToolCall, 
         agent_ctx: AgentContext
-    ) -> ToolResult:
+    ):
         """Override to customize tool execution"""
         print(f"Executing tool: {tool_call.function.name}")
         

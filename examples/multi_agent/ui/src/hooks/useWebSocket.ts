@@ -145,7 +145,7 @@ export const useWebSocket = ({
                 [toolCall.id]: {
                   ...base.tool_calls[toolCall.id],
                   status: 'completed',
-                  result: resp.output_data,
+                  result: resp.client_output,
                 },
               },
             };
@@ -300,14 +300,14 @@ export const useWebSocket = ({
               [toolCall.id]: {
                 ...prev.tool_calls[toolCall.id],
                 status: 'completed',
-                result: resp.output_data,
+                result: resp.client_output,
               },
             },
           };
         });
 
         if (resp?.tool_call?.function?.name === 'research') {
-          const taskIds = extractResearchTaskIds(resp.output_data);
+          const taskIds = extractResearchTaskIds(resp.client_output);
           if (!taskIds.length) break;
 
           // Reset batch progress when a new research batch starts

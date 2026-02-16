@@ -13,7 +13,7 @@ class WaitInstruction:
     """Serializable wait intent used by the namespace-style API."""
 
     kind: Literal["sleep", "cron", "jobs"]
-    message: str | None = None
+    data: Any = None
     sleep_s: float | None = None
     cron: str | None = None
     timezone: str | None = None
@@ -141,8 +141,8 @@ def next_cron_wake_timestamp(
 class WaitNamespace:
     """Namespace-style wait API (`wait.sleep`, `wait.cron`, `wait.jobs`)."""
 
-    def sleep(self, seconds: float, *, message: str | None = None) -> WaitInstruction:
-        return WaitInstruction(kind="sleep", sleep_s=float(seconds), message=message)
+    def sleep(self, seconds: float, *, data: Any = None) -> WaitInstruction:
+        return WaitInstruction(kind="sleep", sleep_s=float(seconds), data=data)
 
     def cron(
         self,
@@ -150,7 +150,7 @@ class WaitNamespace:
         *,
         timezone: str = "UTC",
         tz: str | None = None,
-        message: str | None = None,
+        data: Any = None,
     ) -> WaitInstruction:
         if tz and timezone != "UTC" and tz != timezone:
             raise ValueError("Provide either 'timezone' or 'tz', not both")
@@ -159,14 +159,14 @@ class WaitNamespace:
             kind="cron",
             cron=expression,
             timezone=resolved_timezone,
-            message=message,
+            data=data,
         )
 
     def jobs(
         self,
         jobs: list[Any],
         *,
-        message: str | None = None,
+        data: Any = None,
     ) -> WaitInstruction:
         if not jobs:
             raise ValueError("wait.jobs requires at least one job reference")
@@ -223,7 +223,7 @@ class WaitNamespace:
             kind="jobs",
             child_task_ids=deduped_ids,
             job_refs=serialized_refs,
-            message=message,
+            data=data,
         )
 
 

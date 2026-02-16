@@ -60,9 +60,11 @@ from factorial.llms import Model, MultiClient
 from factorial.logging import get_logger
 from factorial.tools import (
     ToolDefinition,
-    ToolResult,
+    _ToolResultInternal,
     convert_tools_list,
     create_final_output_tool,
+    serialize_for_client,
+    serialize_for_model,
 )
 from factorial.utils import (
     is_valid_task_id,
@@ -742,7 +744,7 @@ class BaseAgent(Generic[ContextType]):
         self,
         tool_call: ChatCompletionMessageToolCall,
         agent_ctx: ContextType,
-    ) -> ToolResult:
+    ) -> _ToolResultInternal:
         """Execute a tool action. Override to customize."""
         tool_name = tool_call.function.name
         tool_args = tool_call.function.arguments
@@ -972,10 +974,10 @@ class BaseAgent(Generic[ContextType]):
                             "requested_hooks": requested_hooks,
                         }
                     )
-                    return ToolResult(
+                    return _ToolResultInternal(
                         tool_call=tool_call,
-                        output_str="Awaiting hook dependency resolution",
-                        output_data={
+                        model_output="Awaiting hook dependency resolution",
+                        client_output={
                             "kind": "hook_session_pending",
                             "session_id": session_id,
                             "requested_hooks": requested_hooks,
@@ -987,124 +989,140 @@ class BaseAgent(Generic[ContextType]):
 
         pending_child_task_ids: list[str] = []
         if is_forking_tool:
-            # Determine candidate ID list depending on the return shape
-            candidate_ids: list[str] | tuple[str, ...] | None = None
+            candidate_ids: list[str] | tuple[str, ...] | None
 
-            # Case 1 – raw list/tuple of IDs returned by the tool
-            if isinstance(result, (list, tuple)) and all(
+            if isinstance(result, _ToolResultInternal):
+                if not result.pending_child_task_ids:
+                    raise ValueError(
+                        f"Forking tool '{tool_call.function.name}' returned an "
+                        "_ToolResultInternal without pending_child_task_ids."
+                    )
+                candidate_ids = result.pending_child_task_ids
+            elif isinstance(result, (list, tuple)) and all(
                 isinstance(item, str) for item in result
             ):
-                candidate_ids = result  # type: ignore[assignment]
+                candidate_ids = result
+            else:
+                raise ValueError(
+                    f"Forking tool '{tool_call.function.name}' must return "
+                    "list[str] or tuple[str, ...] of task IDs."
+                )
 
-            # Case 2 – (message: str, ids: list/tuple[str])
-            if (
-                candidate_ids is None
-                and isinstance(result, tuple)
-                and len(result) == 2
-                and isinstance(result[0], str)
-                and isinstance(result[1], (list, tuple))
+            if not all(
+                isinstance(item, str) and is_valid_task_id(item)
+                for item in candidate_ids
             ):
-                candidate_ids = result[1]  # type: ignore[assignment]
+                raise ValueError(
+                    f"Forking tool '{tool_call.function.name}' "
+                    f"returned invalid task IDs: {candidate_ids}"
+                )
+            pending_child_task_ids = list(candidate_ids)
 
-            # Validate candidate IDs (if any)
-            if candidate_ids is not None:
-                if all(
-                    isinstance(item, str) and is_valid_task_id(item)
-                    for item in candidate_ids
-                ):
-                    pending_child_task_ids = list(candidate_ids)
-                else:
-                    raise ValueError(
-                        f"Forking tool '{tool_call.function.name}' "
-                        f"returned invalid task IDs: {candidate_ids}"
-                    )
+        return self._normalize_tool_result(
+            result, tool_call, pending_child_task_ids or None
+        )
 
-        if isinstance(result, ToolResult):
+    @staticmethod
+    def _stringify_for_model(value: Any) -> str:
+        """Convert arbitrary output into stable model-facing text."""
+        if value is None:
+            return ""
+        if isinstance(value, str):
+            return value
+
+        serialized = serialize_data(value)
+        if isinstance(serialized, str):
+            return serialized
+        try:
+            return json.dumps(serialized, ensure_ascii=False, sort_keys=True)
+        except (TypeError, ValueError):
+            return str(serialized)
+
+    @classmethod
+    def _wait_model_output(cls, wait_instr: WaitInstruction) -> str:
+        """Generate model-facing text for a WaitInstruction."""
+        if wait_instr.data is not None:
+            if isinstance(wait_instr.data, BaseModel):
+                return cls._stringify_for_model(serialize_for_model(wait_instr.data))
+            return cls._stringify_for_model(wait_instr.data)
+        if wait_instr.kind == "sleep":
+            return f"Waiting for {wait_instr.sleep_s or 0}s"
+        if wait_instr.kind == "cron":
+            expr = wait_instr.cron or "<cron>"
+            tz = wait_instr.timezone or "UTC"
+            return f"Waiting for next cron tick '{expr}' ({tz})"
+        if wait_instr.kind == "jobs":
+            return "Waiting for spawned jobs"
+        return "Waiting"
+
+    def _normalize_tool_result(
+        self,
+        result: Any,
+        tool_call: ChatCompletionMessageToolCall,
+        pending_child_task_ids: list[str] | None = None,
+    ) -> _ToolResultInternal:
+        """Normalize any tool return value into _ToolResultInternal.
+
+        Handles the v2 return contract:
+        - BaseModel with Hidden fields -> model sees non-hidden, client sees all
+        - BaseModel without Hidden -> both see all
+        - WaitInstruction -> model sees description, client sees WaitInstruction
+        - None -> empty
+        - Plain types (str, dict, list, etc.) -> both see the same thing
+        """
+        if isinstance(result, _ToolResultInternal):
             result.tool_call = tool_call
             if pending_child_task_ids:
-                # Preserve explicit ToolResult child IDs while merging IDs inferred
-                # from legacy forking-tool return shapes.
-                merged_ids = list(
-                    dict.fromkeys(
-                        [*result.pending_child_task_ids, *pending_child_task_ids]
-                    )
+                existing = result.pending_child_task_ids or []
+                result.pending_child_task_ids = list(
+                    dict.fromkeys([*existing, *pending_child_task_ids])
                 )
-                result.pending_child_task_ids = merged_ids
             return result
-        else:
-            if (
-                isinstance(result, tuple)
-                and len(cast(tuple[Any, ...], result)) == 2
-                and isinstance(result[0], str)
-            ):
-                result = cast(tuple[str, Any], result)
-                output_str, output_data = result
-            elif result is None:
-                output_str = ""
-                output_data = None
-            elif isinstance(result, WaitInstruction):
-                if result.kind == "sleep":
-                    duration = result.sleep_s if result.sleep_s is not None else 0
-                    output_str = result.message or f"Waiting for {duration}s"
-                elif result.kind == "cron":
-                    expression = result.cron or "<cron>"
-                    timezone_name = result.timezone or "UTC"
-                    output_str = result.message or (
-                        f"Waiting for next cron tick '{expression}' ({timezone_name})"
-                    )
-                elif result.kind == "jobs":
-                    output_str = result.message or "Waiting for spawned jobs"
-                else:
-                    output_str = result.message or "Waiting"
-                output_data = result
-            else:
-                result = cast(Any, result)
-                output_str = str(result)
-                output_data = result
 
-            return ToolResult(
+        if isinstance(result, WaitInstruction):
+            return _ToolResultInternal(
                 tool_call=tool_call,
-                output_str=output_str,
-                output_data=output_data,
+                model_output=self._wait_model_output(result),
+                client_output=result,
                 pending_child_task_ids=pending_child_task_ids,
             )
 
-    def extract_tool_call_result(
-        self,
-        tool_call: ChatCompletionMessageToolCall,
-        result: Any | ToolResult | Exception,
-    ) -> tuple[str, Any | None, Exception | None]:
-        if isinstance(result, Exception):
-            str_result = (
-                f'<tool_call_error tool="{tool_call.id}">\n'
-                f"Error running tool:\n{result}\n</tool_call_error>"
+        if isinstance(result, BaseModel):
+            return _ToolResultInternal(
+                tool_call=tool_call,
+                model_output=self._stringify_for_model(serialize_for_model(result)),
+                client_output=serialize_for_client(result),
+                pending_child_task_ids=pending_child_task_ids,
             )
-            return str_result, None, result
-        elif isinstance(result, ToolResult):
-            str_result = (
-                f'<tool_call_result tool="{tool_call.id}">\n'
-                f"{result.output_str}\n</tool_call_result>"
+
+        if result is None:
+            return _ToolResultInternal(
+                tool_call=tool_call,
+                model_output="",
+                client_output=None,
+                pending_child_task_ids=pending_child_task_ids,
             )
-            return str_result, result.output_data, None
-        else:
-            str_result = (
-                f'<tool_call_result tool="{tool_call.id}">\n'
-                f"{str(result)}\n</tool_call_result>"
-            )
-            return str_result, result, None
+
+        # Plain types: str, dict, list, int, float, etc.
+        return _ToolResultInternal(
+            tool_call=tool_call,
+            model_output=self._stringify_for_model(result),
+            client_output=result,
+            pending_child_task_ids=pending_child_task_ids,
+        )
 
     def format_tool_result(
-        self, tool_call_id: str, result: Any | ToolResult | Exception
+        self, tool_call_id: str, result: Any | _ToolResultInternal | Exception
     ) -> str:
         if isinstance(result, Exception):
             return (
                 f'<tool_call_error tool="{tool_call_id}">\n'
                 f"Error running tool:\n{result}\n</tool_call_error>"
             )
-        elif isinstance(result, ToolResult):
+        elif isinstance(result, _ToolResultInternal):
             return (
                 f'<tool_call_result tool="{tool_call_id}">\n'
-                f"{result.output_str}\n</tool_call_result>"
+                f"{result.model_output}\n</tool_call_result>"
             )
         else:
             return (
@@ -1156,14 +1174,14 @@ class BaseAgent(Generic[ContextType]):
                     tc,
                     result
                     if isinstance(result, Exception)
-                    else result.output_data
-                    if isinstance(result, ToolResult)
+                    else result.client_output
+                    if isinstance(result, _ToolResultInternal)
                     else result,
                 )
             )
 
             if (
-                isinstance(result, ToolResult)
+                isinstance(result, _ToolResultInternal)
                 and result.pending_child_task_ids
             ):
                 all_pending_child_task_ids.extend(result.pending_child_task_ids)
@@ -1177,7 +1195,7 @@ class BaseAgent(Generic[ContextType]):
                 new_messages.append(
                     {"role": "tool", "tool_call_id": tc.id, "content": content}
                 )
-            elif isinstance(result, ToolResult) and result.pending_result:
+            elif isinstance(result, _ToolResultInternal) and result.pending_result:
                 pending_tool_call_ids.append(tc.id)
                 # Invoke lifecycle callback for pending tool calls
                 await self._safe_call(
@@ -1484,7 +1502,7 @@ class BaseAgent(Generic[ContextType]):
         self,
         tool_call: ChatCompletionMessageToolCall,
         agent_ctx: ContextType,
-    ) -> ToolResult:
+    ) -> _ToolResultInternal:
         """Internal method that wraps tool_action with retry and progress publishing"""
         return await self.tool_action(tool_call, agent_ctx)
 

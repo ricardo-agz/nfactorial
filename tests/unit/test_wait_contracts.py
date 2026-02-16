@@ -59,8 +59,8 @@ def test_wait_namespace_exposes_jobs_not_children() -> None:
 
 
 def test_wait_namespace_builders_return_serializable_instructions() -> None:
-    sleep_wait = wait.sleep(12.5, message="retry shortly")
-    cron_wait = wait.cron("0 * * * *", timezone="UTC", message="hourly sync")
+    sleep_wait = wait.sleep(12.5, data="retry shortly")
+    cron_wait = wait.cron("0 * * * *", timezone="UTC", data="hourly sync")
     jobs_wait = wait.jobs(
         [
             {
@@ -70,24 +70,24 @@ def test_wait_namespace_builders_return_serializable_instructions() -> None:
                 "key": "research",
             }
         ],
-        message="waiting for child tasks",
+        data="waiting for child tasks",
     )
 
     assert isinstance(sleep_wait, WaitInstruction)
     assert sleep_wait.kind == "sleep"
     assert sleep_wait.sleep_s == 12.5
-    assert sleep_wait.message == "retry shortly"
+    assert sleep_wait.data == "retry shortly"
 
     assert isinstance(cron_wait, WaitInstruction)
     assert cron_wait.kind == "cron"
     assert cron_wait.cron == "0 * * * *"
     assert cron_wait.timezone == "UTC"
-    assert cron_wait.message == "hourly sync"
+    assert cron_wait.data == "hourly sync"
 
     assert isinstance(jobs_wait, WaitInstruction)
     assert jobs_wait.kind == "jobs"
     assert jobs_wait.child_task_ids == ["child-task-1"]
-    assert jobs_wait.message == "waiting for child tasks"
+    assert jobs_wait.data == "waiting for child tasks"
 
 
 def test_wait_jobs_rejects_empty_job_list() -> None:
@@ -119,13 +119,13 @@ def test_wait_jobs_builds_join_instruction() -> None:
                 key="risk",
             ),
         ]
-        instruction = wait.jobs(jobs, message="wait for all jobs")
+        instruction = wait.jobs(jobs, data="wait for all jobs")
     finally:
         execution_context.reset(token)
 
     assert instruction.kind == "jobs"
     assert instruction.child_task_ids == ["child-1", "child-2"]
-    assert instruction.message == "wait for all jobs"
+    assert instruction.data == "wait for all jobs"
 
 
 def test_wait_jobs_deduplicates_task_ids_preserving_order() -> None:

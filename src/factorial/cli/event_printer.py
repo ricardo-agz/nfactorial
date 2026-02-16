@@ -168,12 +168,12 @@ async def event_printer(event: Any) -> None:
 
             result_metadata = None
             output_content = None
-            if result_data and hasattr(result_data, "output_data"):
-                result_metadata = result_data.output_data
-                output_content = getattr(result_data, "output_str", None)
+            if result_data and hasattr(result_data, "client_output"):
+                result_metadata = result_data.client_output
+                output_content = getattr(result_data, "model_output", None)
             elif isinstance(result_data, dict):
-                result_metadata = result_data
-                output_content = result_data.get("output_str")
+                result_metadata = result_data.get("client_output", result_data)
+                output_content = result_data.get("model_output")
 
             message = _format_tool_message(
                 tool_name, parsed_args, result_metadata, output_content

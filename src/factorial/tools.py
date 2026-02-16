@@ -1,5 +1,6 @@
 import asyncio
 import inspect
+import warnings
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from enum import Enum  # local import to avoid unnecessary global import
@@ -7,6 +8,7 @@ from functools import wraps
 from typing import (
     Any,
     Generic,
+    Literal,
     TypeVar,
     Union,
     get_args,
@@ -19,18 +21,20 @@ from openai.types.chat import ChatCompletionMessageToolCall
 from pydantic import BaseModel, ConfigDict
 
 from factorial.context import AgentContext, ExecutionContext
+from factorial.hooks import (
+    HookExecutionPlan,
+    compile_hook_plan,
+    is_hook_dependency_annotation,
+)
 
 ContextT = TypeVar("ContextT", bound=AgentContext)
-FunctionToolActionReturn = Union[Any, "FunctionToolActionResult", tuple[str, Any]]
-FunctionToolAction = (
-    Callable[..., FunctionToolActionReturn]
-    | Callable[..., Awaitable[FunctionToolActionReturn]]
-)
 F = Callable[..., Any]
 T = TypeVar("T")
 
 
-class FunctionToolActionResult(BaseModel):
+class ToolResult(BaseModel):
+    """Structured tool outcome for the namespace-style API (`tool.ok/fail/error`)."""
+
     # Allow pydantic to accept Exception and other arbitrary types
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
@@ -40,11 +44,25 @@ class FunctionToolActionResult(BaseModel):
     tool_call: ChatCompletionMessageToolCall | None = None
     pending_result: bool = False
     pending_child_task_ids: list[str] = []
+    status: Literal["ok", "fail", "error"] = "ok"
+
+
+# Backward-compatible alias. Prefer `ToolResult` in new code.
+FunctionToolActionResult = ToolResult
+
+ToolActionReturn = Any | ToolResult | tuple[str, Any]
+ToolAction = Callable[..., ToolActionReturn] | Callable[
+    ..., Awaitable[ToolActionReturn]
+]
+
+# Backward-compatible type aliases. Prefer `ToolAction*` in new code.
+FunctionToolActionReturn = ToolActionReturn
+FunctionToolAction = ToolAction
 
 
 @dataclass
-class FunctionTool(Generic[ContextT]):
-    """A tool that wraps a function."""
+class ToolDefinition(Generic[ContextT]):
+    """Canonical tool definition used by `@tool`."""
 
     name: str
     """The name of the tool, as shown to the LLM."""
@@ -55,7 +73,7 @@ class FunctionTool(Generic[ContextT]):
     params_json_schema: dict[str, Any]
     """The JSON schema for the tool's parameters."""
 
-    on_invoke_tool: FunctionToolAction
+    on_invoke_tool: ToolAction
     """The function that implements the tool."""
 
     strict_json_schema: bool = True
@@ -64,8 +82,11 @@ class FunctionTool(Generic[ContextT]):
     is_enabled: bool | Callable[[ContextT], bool] = True
     """Whether the tool is enabled."""
 
+    hook_plan: HookExecutionPlan | None = None
+    """Compiled hook dependency metadata, if any."""
+
     def to_openai_tool_schema(self) -> dict[str, Any]:
-        """Convert this FunctionTool to OpenAI tool schema format."""
+        """Convert this tool definition to OpenAI tool schema format."""
         return {
             "type": "function",
             "function": {
@@ -75,6 +96,10 @@ class FunctionTool(Generic[ContextT]):
                 "strict": self.strict_json_schema,
             },
         }
+
+
+# Backward-compatible alias. Prefer `ToolDefinition` in new code.
+FunctionTool = ToolDefinition
 
 
 def _python_type_to_json_schema(python_type: type) -> dict[str, Any]:
@@ -110,7 +135,7 @@ def _python_type_to_json_schema(python_type: type) -> dict[str, Any]:
 
                 # Enum values (if provided via Field(..., enum=[...]))
                 if hasattr(meta, "enum") and meta.enum is not None:
-                    base_schema["enum"] = list(meta.enum)  # type: ignore[arg-type]
+                    base_schema["enum"] = list(meta.enum)
 
             return base_schema
 
@@ -142,7 +167,7 @@ def _python_type_to_json_schema(python_type: type) -> dict[str, Any]:
     # an ``enum`` list containing all member *values* and set the type based on
     # the value type (string vs integer).
     if isinstance(python_type, type) and issubclass(python_type, Enum):
-        enum_values = [member.value for member in python_type]  # type: ignore[arg-type]
+        enum_values = [member.value for member in python_type]
 
         # Determine JSON type – if **all** enum values are ints → integer, else → string
         json_type = (
@@ -186,12 +211,18 @@ def _function_to_json_schema(func: F) -> tuple[dict[str, Any], bool]:
     """
     sig = inspect.signature(func)
     type_hints = get_type_hints(func)
+    type_hints_with_extras = get_type_hints(func, include_extras=True)
 
     properties: dict[str, Any] = {}
     required: list[str] = []
     has_optional_param = False
 
     for param_name, param in sig.parameters.items():
+        full_annotation = type_hints_with_extras.get(param_name, param.annotation)
+        if is_hook_dependency_annotation(full_annotation):
+            # Hook payload params are runtime-injected after hook resolution.
+            continue
+
         # Skip 'agent_ctx' and 'execution_ctx' - they're injected by the agent
         if param_name == "agent_ctx" or (
             param.annotation != inspect.Parameter.empty
@@ -235,10 +266,56 @@ def _function_to_json_schema(func: F) -> tuple[dict[str, Any], bool]:
     return schema, has_optional_param
 
 
+def _tool_factory(
+    func: F | None = None,
+    *,
+    name: str | None = None,
+    description: str | None = None,
+    strict_json_schema: bool = True,
+    is_enabled: bool | Callable[[ContextT], bool] = True,
+) -> ToolDefinition[Any] | Callable[[F], ToolDefinition[Any]]:
+    """Create a tool decorator or convert a callable to a tool definition."""
+
+    def _create(the_func: F) -> ToolDefinition[Any]:
+        func_name = getattr(the_func, "__name__", "tool")
+        tool_name = name or func_name
+
+        if description is None:
+            if the_func.__doc__:
+                tool_description = the_func.__doc__.strip().split("\n")[0]
+            else:
+                tool_description = f"Execute {func_name}"
+        else:
+            tool_description = description
+
+        params_schema, has_optional = _function_to_json_schema(the_func)
+        effective_strict_json_schema = strict_json_schema and not has_optional
+        hook_plan = compile_hook_plan(the_func)
+
+        return ToolDefinition(
+            name=tool_name,
+            description=tool_description,
+            params_json_schema=params_schema,
+            on_invoke_tool=the_func,
+            strict_json_schema=effective_strict_json_schema,
+            is_enabled=is_enabled,
+            hook_plan=hook_plan,
+        )
+
+    if func is not None:
+        return _create(func)
+    return _create
+
+
 @overload
 def function_tool(
     func: F,
-) -> FunctionTool[Any]: ...
+    *,
+    name: str | None = None,
+    description: str | None = None,
+    strict_json_schema: bool = True,
+    is_enabled: bool | Callable[[ContextT], bool] = True,
+) -> ToolDefinition[Any]: ...
 
 
 @overload
@@ -249,7 +326,7 @@ def function_tool(
     description: str | None = None,
     strict_json_schema: bool = True,
     is_enabled: bool | Callable[[ContextT], bool] = True,
-) -> Callable[[F], FunctionTool[Any]]: ...
+) -> Callable[[F], ToolDefinition[Any]]: ...
 
 
 def function_tool(
@@ -259,72 +336,85 @@ def function_tool(
     description: str | None = None,
     strict_json_schema: bool = True,
     is_enabled: bool | Callable[[ContextT], bool] = True,
-) -> FunctionTool[ContextT] | Callable[[F], FunctionTool[ContextT]]:
-    """Convert a Python function to a FunctionTool.
+) -> ToolDefinition[Any] | Callable[[F], ToolDefinition[Any]]:
+    """Legacy alias for `@tool` / `tool(...)`.
 
-    Can be used as a decorator with or without arguments:
-
-    @function_tool
-    def my_tool(param: str) -> str:
-        '''Tool description'''
-        return f"Result: {param}"
-
-    @function_tool(name="custom_name", description="Custom description")
-    def my_tool(param: str) -> str:
-        return f"Result: {param}"
+    Prefer `@tool` in new code. This alias is kept for backward compatibility.
     """
+    warnings.warn(
+        "`function_tool` is deprecated. Prefer `tool` / `@tool`.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    return _tool_factory(
+        func,
+        name=name,
+        description=description,
+        strict_json_schema=strict_json_schema,
+        is_enabled=is_enabled,
+    )
 
-    def _create_function_tool(the_func: F) -> FunctionTool[ContextT]:
-        tool_name = name or the_func.__name__
 
-        # Extract description from docstring if not provided
-        if description is None:
-            if the_func.__doc__:
-                tool_description = the_func.__doc__.strip().split("\n")[0]
-            else:
-                tool_description = f"Execute {the_func.__name__}"
-        else:
-            tool_description = description
+class ToolNamespace:
+    """Namespace-style tool API used by the redesign (`tool.*`)."""
 
-        params_schema, has_optional = _function_to_json_schema(the_func)
+    @overload
+    def __call__(self, func: F) -> ToolDefinition[Any]: ...
 
-        # ------------------------------------------------------------------
-        # Strict-mode logic: if *any* parameter is optional the function **cannot**
-        # be in strict mode because strict mode mandates all properties are
-        # required.
-        # ------------------------------------------------------------------
-        effective_strict_json_schema = strict_json_schema and not has_optional
+    @overload
+    def __call__(
+        self,
+        func: None = None,
+        *,
+        name: str | None = None,
+        description: str | None = None,
+        strict_json_schema: bool = True,
+        is_enabled: bool | Callable[[ContextT], bool] = True,
+    ) -> Callable[[F], ToolDefinition[Any]]: ...
 
-        return FunctionTool(
-            name=tool_name,
-            description=tool_description,
-            params_json_schema=params_schema,
-            on_invoke_tool=the_func,
-            strict_json_schema=effective_strict_json_schema,
+    def __call__(
+        self,
+        func: F | None = None,
+        *,
+        name: str | None = None,
+        description: str | None = None,
+        strict_json_schema: bool = True,
+        is_enabled: bool | Callable[[ContextT], bool] = True,
+    ) -> ToolDefinition[Any] | Callable[[F], ToolDefinition[Any]]:
+        return _tool_factory(
+            func,
+            name=name,
+            description=description,
+            strict_json_schema=strict_json_schema,
             is_enabled=is_enabled,
         )
 
-    # If func is provided, we were used as @function_tool (no parentheses)
-    if func is not None:
-        return _create_function_tool(func)
+    def ok(self, message: str = "", data: Any = None) -> ToolResult:
+        return ToolResult(status="ok", output_str=message, output_data=data)
 
-    # Otherwise, we were used as @function_tool(...), so return a decorator
-    return _create_function_tool
+    def fail(self, message: str, data: Any = None) -> ToolResult:
+        return ToolResult(status="fail", output_str=message, output_data=data)
+
+    def error(self, message: str, data: Any = None) -> ToolResult:
+        return ToolResult(status="error", output_str=message, output_data=data)
+
+
+tool = ToolNamespace()
 
 
 def convert_tools_list(
-    tools: list[FunctionTool[ContextT] | F],
-) -> tuple[list[FunctionTool[ContextT]], dict[str, FunctionToolAction]]:
-    """Convert mixed list of FunctionTool and Python functions to schemas."""
-    tool_schemas: list[FunctionTool[ContextT]] = []
-    tool_actions: dict[str, FunctionToolAction] = {}
+    tools: list[ToolDefinition[ContextT] | F],
+) -> tuple[list[ToolDefinition[ContextT]], dict[str, ToolAction]]:
+    """Convert mixed list of tool definitions and callables to schemas."""
+    tool_schemas: list[ToolDefinition[ContextT]] = []
+    tool_actions: dict[str, ToolAction] = {}
 
-    for tool in tools:
-        if isinstance(tool, FunctionTool):
-            function_tool_instance = tool
+    for tool_like in tools:
+        if isinstance(tool_like, ToolDefinition):
+            function_tool_instance = tool_like
         else:
-            # Convert Python function to FunctionTool
-            function_tool_instance = function_tool(tool)
+            # Convert Python function via the primary interface.
+            function_tool_instance = tool(tool_like)
 
         tool_schemas.append(function_tool_instance)
         tool_actions[function_tool_instance.name] = (
@@ -346,37 +436,6 @@ def create_final_output_tool(output_type: type[BaseModel]) -> dict[str, Any]:
     return tool
 
 
-def deferred_result(
-    timeout: float,
-) -> Callable[
-    [Callable[..., T] | Callable[..., Awaitable[T]]], Callable[..., Awaitable[T]]
-]:
-    def decorator(
-        func: Callable[..., T] | Callable[..., Awaitable[T]],
-    ) -> Callable[..., Awaitable[T]]:
-        """Wrap tool function so it can be awaited regardless of sync/async.
-
-        The orchestrator always awaits the result of the tool wrapper.  If the wrapped
-        function is synchronous we simply call it and return the value; if it is a
-        coroutine function we *await* it.  This prevents the "NoneType can't be used in
-        'await' expression" error when developers create synchronous deferred tools.
-        """
-
-        @wraps(func)
-        async def wrapper(*args: Any, **kwargs: Any) -> T:
-            if asyncio.iscoroutinefunction(func):
-                # Async tool — await normally
-                return await func(*args, **kwargs)  # type: ignore[arg-type,no-any-return]
-            # Sync tool — run directly
-            return func(*args, **kwargs)  # type: ignore[return-value,arg-type,no-any-return]
-
-        wrapper.deferred_result = True  # type: ignore[attr-defined]
-        wrapper.timeout = timeout  # type: ignore[attr-defined]
-        return wrapper
-
-    return decorator
-
-
 def forking_tool(
     timeout: float,
 ) -> Callable[
@@ -385,19 +444,13 @@ def forking_tool(
     def decorator(
         func: Callable[..., T] | Callable[..., Awaitable[T]],
     ) -> Callable[..., Awaitable[T]]:
-        """Wrap tool function so it can be awaited regardless of sync/async.
-
-        The orchestrator always awaits the result of the tool wrapper.  If the wrapped
-        function is synchronous we simply call it and return the value; if it is a
-        coroutine function we *await* it.  This prevents the "NoneType can't be used in
-        'await' expression" error when developers create synchronous deferred tools.
-        """
+        """Wrap tool function so it can be awaited regardless of sync/async."""
 
         @wraps(func)
         async def wrapper(*args: Any, **kwargs: Any) -> T:
             if asyncio.iscoroutinefunction(func):
                 # Async tool — await normally
-                return await func(*args, **kwargs)  # type: ignore[arg-type,no-any-return]
+                return await func(*args, **kwargs)
             # Sync tool — run directly
             return func(*args, **kwargs)  # type: ignore[return-value,arg-type,no-any-return]
 

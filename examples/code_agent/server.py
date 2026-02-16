@@ -84,28 +84,32 @@ async def cancel_task_endpoint(request: CancelRequest) -> dict[str, Any]:
         ) from e
 
 
-class CompleteToolRequest(BaseModel):
-    user_id: str
-    task_id: str
-    tool_call_id: str
-    result: str
+class ResolveHookRequest(BaseModel):
+    hook_id: str
+    token: str
+    approved: bool
+    idempotency_key: str | None = None
 
 
-@app.post("/api/complete_tool")
-async def complete_deferred_tool_endpoint(request: CompleteToolRequest):
-    """Complete a deferred tool call with the provided result."""
+@app.post("/api/resolve_hook")
+async def resolve_hook_endpoint(request: ResolveHookRequest):
+    """Resolve a pending hook with approval payload."""
     try:
-        success = await orchestrator.complete_deferred_tool(
-            task_id=request.task_id,
-            tool_call_id=request.tool_call_id,
-            result=request.result,
+        resolution = await orchestrator.resolve_hook(
+            hook_id=request.hook_id,
+            payload={"approved": request.approved},
+            token=request.token,
+            idempotency_key=request.idempotency_key,
         )
-
-        if success:
-            return {"success": True}
-        raise HTTPException(status_code=500, detail="Unable to complete deferred tool.")
+        return {
+            "success": True,
+            "status": resolution.status,
+            "task_id": resolution.task_id,
+            "tool_call_id": resolution.tool_call_id,
+            "task_resumed": resolution.task_resumed,
+        }
     except Exception as e:
-        print(f"Failed to complete deferred tool call {request.tool_call_id}: {e}")
+        print(f"Failed to resolve hook {request.hook_id}: {e}")
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 

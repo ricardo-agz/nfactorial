@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
 import json
 import random
@@ -10,6 +11,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from functools import wraps
 from typing import (
+    Annotated,
     Any,
     Generic,
     Literal,
@@ -47,11 +49,18 @@ from factorial.context import (
 )
 from factorial.events import AgentEvent, EventPublisher
 from factorial.exceptions import RETRYABLE_EXCEPTIONS, FatalAgentError
+from factorial.hooks import (
+    HookRequestContext,
+    HookSessionNode,
+    HookSessionRecord,
+    PendingHook,
+    build_request_builder_kwargs,
+)
 from factorial.llms import Model, MultiClient
 from factorial.logging import get_logger
 from factorial.tools import (
-    FunctionTool,
-    FunctionToolActionResult,
+    ToolDefinition,
+    ToolResult,
     convert_tools_list,
     create_final_output_tool,
 )
@@ -247,7 +256,7 @@ def publish_progress(
     def _create_progress_decorator(
         the_func: Callable[..., Awaitable[T]],
     ) -> Callable[..., Awaitable[T]]:
-        actual_func_name = func_name or the_func.__name__
+        actual_func_name = func_name or getattr(the_func, "__name__", "unknown")
 
         @wraps(the_func)
         async def wrapper(self: BaseAgent[Any], *args: Any, **kwargs: Any) -> T:
@@ -417,7 +426,7 @@ class BaseAgent(Generic[ContextType]):
         name: str | None = None,
         instructions: str | Callable[..., str] | None = None,
         description: str | None = None,
-        tools: list[FunctionTool[ContextType] | Callable[..., Any]] | None = None,
+        tools: list[ToolDefinition[ContextType] | Callable[..., Any]] | None = None,
         model: Model | Callable[[ContextType], Model] | None = None,
         model_settings: ModelSettings[ContextType] | None = None,
         stream: bool = False,
@@ -716,18 +725,19 @@ class BaseAgent(Generic[ContextType]):
         self,
         tool_call: ChatCompletionMessageToolCall,
         agent_ctx: ContextType,
-    ) -> FunctionToolActionResult:
+    ) -> ToolResult:
         """Execute a tool action. Override to customize."""
         tool_name = tool_call.function.name
         tool_args = tool_call.function.arguments
         action = self.tool_actions.get(tool_name)
+        tool_def = next((tool for tool in self.tools if tool.name == tool_name), None)
+        hook_plan = tool_def.hook_plan if tool_def else None
 
         execution_ctx = ExecutionContext.current()
 
         if not action:
             raise ValueError(f"Agent {self.name} has no tool action for {tool_name}")
 
-        is_deferred_result = getattr(action, "deferred_result", False)
         is_forking_tool = getattr(action, "forking_tool", False)
 
         if not self.parse_tool_args:
@@ -738,7 +748,8 @@ class BaseAgent(Generic[ContextType]):
             )
 
         else:
-            parsed_tool_args = json.loads(tool_args)
+            raw_tool_args = json.loads(tool_args)
+            parsed_tool_args = dict(raw_tool_args)
 
             for param_name, param in inspect.signature(action).parameters.items():
                 # Skip if the argument is already provided by the LLM call
@@ -789,6 +800,11 @@ class BaseAgent(Generic[ContextType]):
                     continue
 
                 try:
+                    if get_origin(_expected) is Annotated:
+                        _annotated_args = get_args(_expected)
+                        if _annotated_args:
+                            _expected = _annotated_args[0]
+
                     _origin = get_origin(_expected)
 
                     # Case 1 – standalone BaseModel
@@ -822,6 +838,137 @@ class BaseAgent(Generic[ContextType]):
                         _pname,
                         _expected,
                         _e,
+                    )
+
+            if hook_plan is not None:
+                hook_param_names = list(hook_plan.hook_order)
+                present_hook_params = [
+                    param_name
+                    for param_name in hook_param_names
+                    if param_name in parsed_tool_args
+                ]
+
+                if present_hook_params and len(present_hook_params) != len(
+                    hook_param_names
+                ):
+                    raise ValueError(
+                        f"Tool '{tool_name}' continuation received partial hook "
+                        f"payloads: {present_hook_params}. Expected all of "
+                        f"{hook_param_names}."
+                    )
+
+                if not present_hook_params:
+                    request_tool_args = {
+                        key: parsed_tool_args[key]
+                        for key in raw_tool_args.keys()
+                        if key in parsed_tool_args
+                    }
+                    serialized_tool_args = cast(
+                        dict[str, Any], serialize_data(request_tool_args)
+                    )
+                    now_ts = datetime.now(timezone.utc).timestamp()
+                    session_seed = (
+                        f"{execution_ctx.task_id}:{tool_call.id}:{tool_name}"
+                    )
+                    session_id = hashlib.sha256(
+                        session_seed.encode("utf-8")
+                    ).hexdigest()
+                    session_nodes: dict[str, HookSessionNode] = {}
+                    for hook_param_name in hook_plan.hook_order:
+                        node_spec = hook_plan.nodes[hook_param_name]
+                        session_nodes[hook_param_name] = HookSessionNode(
+                            param_name=hook_param_name,
+                            mode=node_spec.mode,
+                            hook_type=node_spec.hook_type.__name__,
+                            depends_on=node_spec.depends_on,
+                        )
+
+                    first_stage = hook_plan.stages[0] if hook_plan.stages else ()
+                    if not first_stage:
+                        raise ValueError(
+                            f"Hook plan for tool '{tool_name}' has no "
+                            "requestable stage."
+                        )
+
+                    request_ctx = HookRequestContext(
+                        task_id=execution_ctx.task_id,
+                        owner_id=execution_ctx.owner_id,
+                        agent_name=self.name,
+                        tool_name=tool_name,
+                        tool_call_id=tool_call.id,
+                        args=serialized_tool_args,
+                    )
+                    requested_hooks: list[dict[str, Any]] = []
+                    for hook_param_name in first_stage:
+                        node_spec = hook_plan.nodes[hook_param_name]
+                        request_kwargs = build_request_builder_kwargs(
+                            request_builder=node_spec.request_builder,
+                            request_ctx=request_ctx,
+                            tool_args=request_tool_args,
+                            resolved_hook_payloads={},
+                        )
+                        pending_hook = (
+                            await node_spec.request_builder(**request_kwargs)
+                            if asyncio.iscoroutinefunction(node_spec.request_builder)
+                            else node_spec.request_builder(**request_kwargs)
+                        )
+                        if not isinstance(pending_hook, PendingHook):
+                            raise TypeError(
+                                f"Hook request builder for '{hook_param_name}' must "
+                                "return PendingHook[...]"
+                            )
+
+                        stable_hook_id = f"{session_id}:{hook_param_name}"
+                        pending_hook.hook_id = stable_hook_id
+
+                        node_state = session_nodes[hook_param_name]
+                        node_state.status = "requested"
+                        node_state.hook_id = stable_hook_id
+                        node_state.requested_at = now_ts
+
+                        requested_hooks.append(
+                            {
+                                "param_name": hook_param_name,
+                                "mode": node_spec.mode,
+                                "hook_type": node_spec.hook_type.__name__,
+                                "depends_on": list(node_spec.depends_on),
+                                "hook_id": stable_hook_id,
+                                "submit_url": pending_hook.submit_url,
+                                "token": pending_hook.token,
+                                "expires_at": pending_hook.expires_at.timestamp(),
+                                "title": pending_hook.title,
+                                "metadata": pending_hook.metadata,
+                            }
+                        )
+
+                    session = HookSessionRecord(
+                        session_id=session_id,
+                        task_id=execution_ctx.task_id,
+                        tool_call_id=tool_call.id,
+                        tool_name=tool_name,
+                        tool_args=serialized_tool_args,
+                        nodes=session_nodes,
+                        status="active",
+                        created_at=now_ts,
+                        updated_at=now_ts,
+                    )
+
+                    await execution_ctx.persist_hook_session(
+                        {
+                            "kind": "hook_session_init",
+                            "session": session.to_dict(),
+                            "requested_hooks": requested_hooks,
+                        }
+                    )
+                    return ToolResult(
+                        tool_call=tool_call,
+                        output_str="Awaiting hook dependency resolution",
+                        output_data={
+                            "kind": "hook_session_pending",
+                            "session_id": session_id,
+                            "requested_hooks": requested_hooks,
+                        },
+                        pending_result=True,
                     )
 
             result = (
@@ -864,9 +1011,8 @@ class BaseAgent(Generic[ContextType]):
                         f"returned invalid task IDs: {candidate_ids}"
                     )
 
-        if isinstance(result, FunctionToolActionResult):
+        if isinstance(result, ToolResult):
             result.tool_call = tool_call
-            result.pending_result = is_deferred_result
             result.pending_child_task_ids = pending_child_task_ids
             return result
         else:
@@ -885,18 +1031,17 @@ class BaseAgent(Generic[ContextType]):
                 output_str = str(result)
                 output_data = result
 
-            return FunctionToolActionResult(
+            return ToolResult(
                 tool_call=tool_call,
                 output_str=output_str,
                 output_data=output_data,
-                pending_result=is_deferred_result,
                 pending_child_task_ids=pending_child_task_ids,
             )
 
     def extract_tool_call_result(
         self,
         tool_call: ChatCompletionMessageToolCall,
-        result: Any | FunctionToolActionResult | Exception,
+        result: Any | ToolResult | Exception,
     ) -> tuple[str, Any | None, Exception | None]:
         if isinstance(result, Exception):
             str_result = (
@@ -904,7 +1049,7 @@ class BaseAgent(Generic[ContextType]):
                 f"Error running tool:\n{result}\n</tool_call_error>"
             )
             return str_result, None, result
-        elif isinstance(result, FunctionToolActionResult):
+        elif isinstance(result, ToolResult):
             str_result = (
                 f'<tool_call_result tool="{tool_call.id}">\n'
                 f"{result.output_str}\n</tool_call_result>"
@@ -918,14 +1063,14 @@ class BaseAgent(Generic[ContextType]):
             return str_result, result, None
 
     def format_tool_result(
-        self, tool_call_id: str, result: Any | FunctionToolActionResult | Exception
+        self, tool_call_id: str, result: Any | ToolResult | Exception
     ) -> str:
         if isinstance(result, Exception):
             return (
                 f'<tool_call_error tool="{tool_call_id}">\n'
                 f"Error running tool:\n{result}\n</tool_call_error>"
             )
-        elif isinstance(result, FunctionToolActionResult):
+        elif isinstance(result, ToolResult):
             return (
                 f'<tool_call_result tool="{tool_call_id}">\n'
                 f"{result.output_str}\n</tool_call_result>"
@@ -981,13 +1126,13 @@ class BaseAgent(Generic[ContextType]):
                     result
                     if isinstance(result, Exception)
                     else result.output_data
-                    if isinstance(result, FunctionToolActionResult)
+                    if isinstance(result, ToolResult)
                     else result,
                 )
             )
 
             if (
-                isinstance(result, FunctionToolActionResult)
+                isinstance(result, ToolResult)
                 and result.pending_child_task_ids
             ):
                 all_pending_child_task_ids.extend(result.pending_child_task_ids)
@@ -1001,7 +1146,7 @@ class BaseAgent(Generic[ContextType]):
                 new_messages.append(
                     {"role": "tool", "tool_call_id": tc.id, "content": content}
                 )
-            elif isinstance(result, FunctionToolActionResult) and result.pending_result:
+            elif isinstance(result, ToolResult) and result.pending_result:
                 pending_tool_call_ids.append(tc.id)
                 # Invoke lifecycle callback for pending tool calls
                 await self._safe_call(
@@ -1308,7 +1453,7 @@ class BaseAgent(Generic[ContextType]):
         self,
         tool_call: ChatCompletionMessageToolCall,
         agent_ctx: ContextType,
-    ) -> FunctionToolActionResult:
+    ) -> ToolResult:
         """Internal method that wraps tool_action with retry and progress publishing"""
         return await self.tool_action(tool_call, agent_ctx)
 

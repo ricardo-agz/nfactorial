@@ -352,7 +352,7 @@ class TaskCompletionScript(AsyncScript):
         if parent_pending_child_task_results_key:
             keys.append(parent_pending_child_task_results_key)
 
-        result: tuple[bool, bool] = await super().__call__(  # type: ignore
+        result: tuple[bool, bool] = await super().__call__(
             keys=keys,
             args=[
                 task_id,
@@ -436,7 +436,7 @@ class StaleRecoveryScript(AsyncScript):
         max_retries: int,
         metrics_ttl: int,
     ) -> StaleRecoveryScriptResult:
-        result: tuple[int, int, list[tuple[str, str]]] = await super().__call__(  # type: ignore
+        result: tuple[int, int, list[tuple[str, str]]] = await super().__call__(
             keys=[
                 queue_main_key,
                 queue_failed_key,
@@ -530,7 +530,7 @@ class TaskExpirationScript(AsyncScript):
         cancelled_cutoff_timestamp: float,
         max_cleanup_batch: int,
     ) -> TaskExpirationScriptResult:
-        result: tuple[int, int, int, list[tuple[str, str]]] = await super().__call__(  # type: ignore
+        result: tuple[int, int, int, list[tuple[str, str]]] = await super().__call__(
             keys=[
                 queue_completions_key,
                 queue_failed_key,
@@ -638,6 +638,74 @@ async def create_tool_completion_script(
     return get_cached_script(redis_client, "tool_completion", ToolCompletionScript)
 
 
+class HookWakeScript(AsyncScript):
+    """
+    Atomically mark a hook runtime wake request and wake a pending task.
+
+    Keys:
+    * KEYS[1] = queue_main_key (str)
+    * KEYS[2] = queue_pending_key (str)
+    * KEYS[3] = queue_orphaned_key (str)
+    * KEYS[4] = task_statuses_key (str)
+    * KEYS[5] = task_agents_key (str)
+    * KEYS[6] = task_payloads_key (str)
+    * KEYS[7] = task_pickups_key (str)
+    * KEYS[8] = task_retries_key (str)
+    * KEYS[9] = task_metas_key (str)
+    * KEYS[10] = hook_runtime_ready_key (str)
+
+    Args:
+    * ARGV[1] = task_id (str)
+    * ARGV[2] = tool_call_id (str)
+    * ARGV[3] = session_id (str)
+    """
+
+    async def execute(
+        self,
+        *,
+        queue_main_key: str,
+        queue_pending_key: str,
+        queue_orphaned_key: str,
+        task_statuses_key: str,
+        task_agents_key: str,
+        task_payloads_key: str,
+        task_pickups_key: str,
+        task_retries_key: str,
+        task_metas_key: str,
+        hook_runtime_ready_key: str,
+        task_id: str,
+        tool_call_id: str,
+        session_id: str,
+    ) -> tuple[bool, str]:
+        result: tuple[int, str] = await super().__call__(  # type: ignore
+            keys=[
+                queue_main_key,
+                queue_pending_key,
+                queue_orphaned_key,
+                task_statuses_key,
+                task_agents_key,
+                task_payloads_key,
+                task_pickups_key,
+                task_retries_key,
+                task_metas_key,
+                hook_runtime_ready_key,
+            ],
+            args=[
+                task_id,
+                tool_call_id,
+                session_id,
+            ],
+        )
+        return (bool(result[0]), decode(result[1]))
+
+
+async def create_hook_wake_script(
+    redis_client: redis.Redis,
+) -> HookWakeScript:
+    """Create atomic hook wake script."""
+    return get_cached_script(redis_client, "hook_wake", HookWakeScript)
+
+
 class ChildTaskCompletionScript(AsyncScript):
     """
     Simple atomic script to move completed task back to queue and cleanup
@@ -675,7 +743,7 @@ class ChildTaskCompletionScript(AsyncScript):
         task_id: str,
         updated_task_context_json: str,
     ) -> tuple[bool, str]:
-        result: tuple[int, str] = await super().__call__(  # type: ignore
+        result: tuple[int, str] = await super().__call__(
             keys=[
                 queue_main_key,
                 queue_orphaned_key,

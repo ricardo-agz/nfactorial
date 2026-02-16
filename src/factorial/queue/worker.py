@@ -28,6 +28,8 @@ from factorial.queue.operations import (
     create_batch_and_enqueue,
     enqueue_task,
     get_task_batch,
+    persist_hook_runtime_payload,
+    process_hook_runtime_wake_requests,
     process_cancelled_tasks,
     resume_if_no_remaining_child_tasks,
 )
@@ -418,6 +420,14 @@ async def process_task(
             )
         )
 
+    async def _persist_hook_runtime(runtime_payload: dict[str, Any]) -> None:
+        await persist_hook_runtime_payload(
+            redis_client=redis_client,
+            namespace=namespace,
+            task_id=task.id,
+            runtime_payload=runtime_payload,
+        )
+
     task_failed = False
     final_action: CompletionAction | None = (
         None  # records the action taken on completion when failing
@@ -439,6 +449,7 @@ async def process_task(
                 events=event_publisher,
                 enqueue_child_task=_enqueue_child_task,  # type: ignore[arg-type]
                 enqueue_batch=_enqueue_batch,  # type: ignore[arg-type]
+                persist_hook_runtime=_persist_hook_runtime,
             )
 
             if task.payload.turn == 0 and task.retries == 0:
@@ -466,6 +477,47 @@ async def process_task(
                 namespace=namespace,
                 event_publisher=event_publisher,
             )
+
+            hook_tick = await process_hook_runtime_wake_requests(
+                redis_client=redis_client,
+                namespace=namespace,
+                agent=agent,
+                task=task,
+                execution_ctx=execution_ctx,
+            )
+            if hook_tick.completed_results:
+                task.payload = agent.process_deferred_tool_results(
+                    task.payload,
+                    hook_tick.completed_results,
+                ).context
+                await agent._safe_call(
+                    agent.on_pending_tool_results,
+                    task.payload,
+                    execution_ctx,
+                    hook_tick.completed_results,
+                )
+
+            if hook_tick.should_repark:
+                if not hook_tick.pending_tool_call_ids:
+                    raise RuntimeError(
+                        "Hook runtime requested re-park with no pending tool calls."
+                    )
+                await complete(
+                    action=CompletionAction.PENDING_TOOL,
+                    pending_tool_call_ids=hook_tick.pending_tool_call_ids,
+                    pending_child_task_ids=None,
+                    final_output=None,
+                )
+                await event_publisher.publish_event(
+                    AgentEvent(
+                        event_type="task_pending_tool_call_results",
+                        task_id=task.id,
+                        owner_id=task.metadata.owner_id,
+                        agent_name=agent.name,
+                        turn=task.payload.turn,
+                    )
+                )
+                return
 
             turn_completion = await asyncio.wait_for(
                 agent.execute(task.payload, execution_ctx),

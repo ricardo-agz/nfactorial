@@ -1,5 +1,5 @@
 import os
-from typing import Any
+from typing import Annotated, Any
 
 from dotenv import load_dotenv
 
@@ -7,11 +7,14 @@ from factorial import (
     AgentContext,
     AgentWorkerConfig,
     BaseAgent,
-    ExecutionContext,
+    Hook,
+    HookRequestContext,
     ModelSettings,
     Orchestrator,
-    deferred_result,
-    fireworks_kimi_k2,
+    PendingHook,
+    ai_gateway,
+    gpt_41,
+    hook,
 )
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -97,21 +100,106 @@ def edit_code(
     )
 
 
-@deferred_result(timeout=300.0)  # 5-minute timeout waiting for user decision
-def request_code_execution(
-    response_on_reject: str, agent_ctx: AgentContext, execution_ctx: ExecutionContext
-) -> None:
+async def execute_code(code: str) -> dict[str, Any]:
+    """Execute JavaScript in Vercel Sandbox."""
+    from vercel.sandbox import AsyncSandbox as Sandbox  # type: ignore[import-not-found]
+
+    runtime = "node22"
+    timeout_ms = 120_000
+
+    async with await Sandbox.create(timeout=timeout_ms, runtime=runtime) as sandbox:
+        await sandbox.write_files(
+            [
+                {
+                    "path": "main.js",
+                    "content": code.encode("utf-8"),
+                }
+            ]
+        )
+
+        command = await sandbox.run_command_detached(
+            "bash",
+            [
+                "-lc",
+                f"cd {sandbox.sandbox.cwd} && node main.js",
+            ],
+        )
+
+        stdout_parts: list[str] = []
+        stderr_parts: list[str] = []
+        async for line in command.logs():
+            if line.stream == "stdout":
+                stdout_parts.append(line.data)
+            elif line.stream == "stderr":
+                stderr_parts.append(line.data)
+
+        done = await command.wait()
+
+    return {
+        "runtime": runtime,
+        "timeout_ms": timeout_ms,
+        "exit_code": done.exit_code,
+        "stdout": "".join(stdout_parts).strip(),
+        "stderr": "".join(stderr_parts).strip(),
+    }
+
+
+class CodeExecutionApproval(Hook):
+    approved: bool
+
+
+def request_code_execution_approval(
+    ctx: HookRequestContext,
+) -> PendingHook[CodeExecutionApproval]:
+    return CodeExecutionApproval.pending(
+        ctx=ctx,
+        title="Approve server-side code execution (Vercel Sandbox)",
+        timeout_s=300.0,
+    )
+
+
+async def request_code_execution(
+    approval: Annotated[
+        CodeExecutionApproval,
+        hook.requires(request_code_execution_approval),
+    ],
+    agent_ctx: IdeAgentContext,
+) -> tuple[str, dict[str, Any]]:
     """
     Request the code to be run.
 
     The user must approve this request before the code is run.
-
-    Parameters
-    ----------
-    response_on_reject : str
-        A message the agent should send if the user rejects the request.
     """
-    pass
+    if not approval.approved:
+        return (
+            "User rejected the code execution request.",
+            {
+                "approved": False,
+                "executed": False,
+            },
+        )
+
+    execution = await execute_code(agent_ctx.code)
+    success = execution["exit_code"] == 0
+
+    if success:
+        stdout = execution["stdout"] or "Code executed successfully (no output)."
+        message = f"Code execution succeeded.\n{stdout}"
+    else:
+        stderr = execution["stderr"] or "No stderr output."
+        message = (
+            "Code execution failed "
+            f"(exit code {execution['exit_code']}).\n{stderr}"
+        )
+
+    return (
+        message,
+        {
+            "approved": True,
+            "executed": True,
+            **execution,
+        },
+    )
 
 
 instructions = """\
@@ -147,7 +235,7 @@ class IDEAgent(BaseAgent[IdeAgentContext]):
             context_class=IdeAgentContext,
             instructions=instructions,
             tools=[think, edit_code, request_code_execution],
-            model=fireworks_kimi_k2,
+            model=ai_gateway(gpt_41),
             model_settings=ModelSettings(
                 temperature=0.1,
             ),

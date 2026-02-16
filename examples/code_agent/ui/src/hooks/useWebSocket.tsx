@@ -22,6 +22,35 @@ export const useWebSocket = ({
   const wsRef = useRef<WebSocket | null>(null);
   const { addAction, updateAction } = useRuns();
 
+  const parseToolArguments = (raw: unknown): Record<string, unknown> => {
+    if (typeof raw === 'string') {
+      try {
+        const parsed = JSON.parse(raw);
+        if (parsed && typeof parsed === 'object') return parsed as Record<string, unknown>;
+      } catch {
+        return {};
+      }
+    }
+    if (raw && typeof raw === 'object') return raw as Record<string, unknown>;
+    return {};
+  };
+
+  const formatExecOutput = (outputData: Record<string, unknown> | null, fallback: string): string => {
+    if (!outputData) return fallback;
+
+    const exitCode = outputData.exit_code;
+    const stdout = typeof outputData.stdout === 'string' ? outputData.stdout : '';
+    const stderr = typeof outputData.stderr === 'string' ? outputData.stderr : '';
+    const lines: string[] = [];
+
+    if (typeof exitCode === 'number') lines.push(`Exit code: ${exitCode}`);
+    if (stdout) lines.push(`stdout:\n${stdout}`);
+    if (stderr) lines.push(`stderr:\n${stderr}`);
+
+    if (lines.length > 0) return lines.join('\n\n');
+    return fallback;
+  };
+
   const handleWSMessage = useCallback((evt: MessageEvent) => {
     const event: AgentEvent = JSON.parse(evt.data);
     console.log('WS event:', event);
@@ -30,6 +59,7 @@ export const useWebSocket = ({
       case 'progress_update_tool_action_started': {
         const toolCall = event.data?.args?.[0];
         if (!toolCall) break;
+        const parsedArgs = parseToolArguments(toolCall.function.arguments);
 
         const startAction: Action = {
           id: toolCall.id,
@@ -37,7 +67,7 @@ export const useWebSocket = ({
           status: 'running',
           timestamp: event.timestamp,
           ...(toolCall.function.name === 'request_code_execution'
-            ? { responseOnReject: toolCall.function.arguments?.response_on_reject }
+            ? { responseOnReject: parsedArgs.response_on_reject as string | undefined }
             : {
                 toolName: toolCall.function.name,
                 arguments: toolCall.function.arguments,
@@ -58,7 +88,52 @@ export const useWebSocket = ({
         }
 
         if (toolCall.function.name === 'request_code_execution') {
-          // exec result action created after user accepts, skip for now
+          const outputData = (resp.output_data && typeof resp.output_data === 'object')
+            ? (resp.output_data as Record<string, unknown>)
+            : null;
+
+          if (resp.pending_result && outputData?.kind === 'hook_session_pending') {
+            const requestedHooks = Array.isArray(outputData.requested_hooks)
+              ? (outputData.requested_hooks as Array<Record<string, unknown>>)
+              : [];
+            const firstHook = requestedHooks[0];
+
+            updateAction(event.task_id, toolCall.id, prev => ({
+              ...(prev ?? {
+                id: toolCall.id,
+                kind: 'exec_request',
+                timestamp: event.timestamp,
+              }),
+              kind: 'exec_request',
+              status: 'running',
+              hookId: typeof firstHook?.hook_id === 'string' ? firstHook.hook_id : undefined,
+              hookToken: typeof firstHook?.token === 'string' ? firstHook.token : undefined,
+            }) as Action);
+          } else {
+            updateAction(event.task_id, toolCall.id, prev => ({
+              ...(prev ?? {
+                id: toolCall.id,
+                kind: 'exec_request',
+                timestamp: event.timestamp,
+              }),
+              kind: 'exec_request',
+              status: 'done',
+            }) as Action);
+
+            const outputText = formatExecOutput(
+              outputData,
+              typeof resp.output_str === 'string' ? resp.output_str : 'Execution completed.'
+            );
+
+            const resultAction: Action = {
+              id: `exec_result_${Date.now()}`,
+              kind: 'exec_result',
+              status: 'done',
+              output: outputText,
+              timestamp: event.timestamp,
+            } as Action;
+            addAction(event.task_id, resultAction);
+          }
         } else {
           // mark tool completed
           updateAction(event.task_id, toolCall.id, prev => ({
@@ -93,17 +168,29 @@ export const useWebSocket = ({
         const toolCall = event.data?.args?.[0];
         if (!toolCall) break;
 
-        updateAction(event.task_id, toolCall.id, prev => ({
-          ...(prev ?? {
-            id: toolCall.id,
+        if (toolCall.function.name === 'request_code_execution') {
+          updateAction(event.task_id, toolCall.id, prev => ({
+            ...(prev ?? {
+              id: toolCall.id,
+              kind: 'exec_request',
+              timestamp: event.timestamp,
+            }),
+            kind: 'exec_request',
+            status: 'failed',
+          }) as Action);
+        } else {
+          updateAction(event.task_id, toolCall.id, prev => ({
+            ...(prev ?? {
+              id: toolCall.id,
+              kind: 'tool_failed',
+              toolName: toolCall.function.name,
+              timestamp: event.timestamp,
+            }),
             kind: 'tool_failed',
-            toolName: toolCall.function.name,
-            timestamp: event.timestamp,
-          }),
-          kind: 'tool_failed',
-          status: 'failed',
-          error: event.error,
-        }) as Action);
+            status: 'failed',
+            error: event.error,
+          }) as Action);
+        }
         break;
       }
 

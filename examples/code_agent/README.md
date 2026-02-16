@@ -1,13 +1,14 @@
 # Basic Agent Example
 
-An IDE-based agent that can write and edit code and request the user to execute code.
+An IDE-based agent that can write and edit code and request execution approval.
+When approved, code is executed server-side in Vercel Sandbox.
 
 ## Quick Start with Docker
 
 1. Set up environment:
 ```bash
 cp .env.template .env
-# Add your API keys to .env
+# Add your API keys to .env (OpenAI + Vercel Sandbox credentials)
 ```
 
 2. Run everything:
@@ -23,12 +24,14 @@ docker-compose up
 
 ### Prerequisites
 - Python 3.9+, Node.js 18+, Redis
+- Vercel Sandbox credentials (`VERCEL_TOKEN` or `VERCEL_OIDC_TOKEN`, plus
+  `VERCEL_PROJECT_ID` and `VERCEL_TEAM_ID`)
 
 ### Install & Run
 ```bash
 # 1. Set up .env file
 cp .env.template .env
-# Set your OpenAI and Exa API keys
+# Set your OpenAI and Vercel Sandbox credentials
 
 # 2. Install Python Dependencies
 pip install -r requirements.txt

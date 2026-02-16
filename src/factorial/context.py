@@ -32,6 +32,7 @@ class ExecutionContext:
     enqueue_batch: (
         Callable[["BaseAgent[Any]", list[Any]], Awaitable["Batch"]] | None
     ) = None
+    persist_hook_runtime: Callable[[dict[str, Any]], Awaitable[None]] | None = None
 
     @classmethod
     def current(cls) -> "ExecutionContext":
@@ -76,6 +77,14 @@ class ExecutionContext:
             )
 
         return await self.enqueue_batch(agent, payloads)
+
+    async def persist_hook_session(self, runtime_payload: dict[str, Any]) -> None:
+        """Persist hook-session runtime metadata for staged continuation."""
+        if self.persist_hook_runtime is None:
+            raise RuntimeError(
+                "persist_hook_runtime is not configured for this execution context"
+            )
+        await self.persist_hook_runtime(runtime_payload)
 
 
 class AgentContext(BaseModel):

@@ -145,69 +145,40 @@ function App() {
   };
 
   /* ------------------------------------------------------------------ */
-  /* Helper – Run the current JS code and capture console output         */
-  /* ------------------------------------------------------------------ */
-
-  const runCurrentCode = () => {
-    const logs: string[] = [];
-    const originalLog = console.log;
-    // Capture console.log output
-    console.log = (...args: unknown[]) => {
-      logs.push(
-        (args as unknown[])
-          .map((arg) =>
-            typeof arg === 'object' ? JSON.stringify(arg) : String(arg)
-          )
-          .join(' ')
-      );
-      // Also forward to the real console
-      originalLog(...(args as unknown[]));
-    };
-
-    try {
-      // Execute the code in an isolated function scope
-      const result = new Function(code)();
-      if (result !== undefined) {
-        logs.push(`Returned: ${String(result)}`);
-      }
-    } catch (err: unknown) {
-      logs.push(`Error: ${String(err)}`);
-    } finally {
-      console.log = originalLog;
-    }
-
-    return logs.join('\n');
-  };
-
-  /* ------------------------------------------------------------------ */
-  /* Deferred execution request helpers                                  */
+  /* Server-side execution request helpers                                */
   /* ------------------------------------------------------------------ */
 
   const pendingExecRequest = React.useMemo(() => {
     if (timelineActions.length === 0) return null;
     return [...timelineActions].reverse().find(
       (a) => a.kind === 'exec_request' && a.status === 'running'
-    ) as (Action & { kind: 'exec_request' }) | undefined | null;
+    ) as (Action & { kind: 'exec_request'; hookId?: string; hookToken?: string }) | undefined | null;
   }, [timelineActions]);
 
   const handleRejectExecution = async () => {
     if (!pendingExecRequest || !currentTaskId) return;
+    if (!pendingExecRequest.hookId || !pendingExecRequest.hookToken) {
+      console.error('Missing hook metadata for execution rejection');
+      return;
+    }
     setExecutingCode(true);
     setExecutionAction('reject');
 
     const rejectMsg = (pendingExecRequest.responseOnReject) ?? 'Execution rejected.';
+    let resolved = false;
 
     try {
-      await fetch(`${API_BASE}/complete_tool`, {
+      const res = await fetch(`${API_BASE}/resolve_hook`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          user_id: USER_ID,
-          task_id: currentTaskId,
-          tool_call_id: pendingExecRequest.id,
-          result: rejectMsg,
+          hook_id: pendingExecRequest.hookId,
+          token: pendingExecRequest.hookToken,
+          approved: false,
+          idempotency_key: `exec-reject-${pendingExecRequest.id}-${Date.now()}`,
         }),
       });
+      resolved = res.ok;
     } catch (err: unknown) {
       console.error('Failed to send reject for execution request', err);
     }
@@ -215,7 +186,7 @@ function App() {
     // Update action locally
     updateAction(currentTaskId!, pendingExecRequest.id, prev => ({
       ...(prev as Action),
-      status: 'failed',
+      status: resolved ? 'done' : 'failed',
     }));
 
     const noticeAction: Action = {
@@ -233,39 +204,33 @@ function App() {
 
   const handleAcceptExecution = async () => {
     if (!pendingExecRequest || !currentTaskId) return;
+    if (!pendingExecRequest.hookId || !pendingExecRequest.hookToken) {
+      console.error('Missing hook metadata for execution approval');
+      return;
+    }
     setExecutingCode(true);
     setExecutionAction('accept');
-
-    const output = runCurrentCode();
+    let resolved = false;
 
     try {
-      await fetch(`${API_BASE}/complete_tool`, {
+      const res = await fetch(`${API_BASE}/resolve_hook`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          user_id: USER_ID,
-          task_id: currentTaskId,
-          tool_call_id: pendingExecRequest.id,
-          result: output || 'Code executed successfully (no output).',
+          hook_id: pendingExecRequest.hookId,
+          token: pendingExecRequest.hookToken,
+          approved: true,
+          idempotency_key: `exec-accept-${pendingExecRequest.id}-${Date.now()}`,
         }),
       });
+      resolved = res.ok;
     } catch (err: unknown) {
-      console.error('Failed to complete execution request', err);
+      console.error('Failed to send execution approval', err);
     }
-
-    // add exec result action locally so timeline shows output immediately
-    const resultAction: Action = {
-      id: `exec_result_${Date.now()}`,
-      kind: 'exec_result',
-      status: 'done',
-      output,
-      timestamp: new Date().toISOString(),
-    } as Action;
-    updateAction(currentTaskId!, resultAction.id, () => resultAction);
 
     updateAction(currentTaskId!, pendingExecRequest.id, prev => ({
       ...(prev as Action),
-      status: 'done',
+      status: resolved ? 'done' : 'failed',
     }));
 
     setExecutingCode(false);

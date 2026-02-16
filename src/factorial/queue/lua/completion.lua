@@ -58,6 +58,8 @@ local retries = task_result.retries
 local meta = cjson.decode(meta_json)
 local parent_task_id = meta.parent_id
 
+-- NOTE: Pending branches are triggered by presence of pending_*_ids_json,
+-- not by the `action` string value.
 -- Handle pending tool call results only if both parameters are provided
 if pending_tool_call_ids_json ~= "" then
     local pending_tool_call_ids = cjson.decode(pending_tool_call_ids_json)

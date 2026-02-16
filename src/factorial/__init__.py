@@ -9,6 +9,15 @@ from factorial.agent import (
 )
 from factorial.context import AgentContext, ContextType, ExecutionContext
 from factorial.events import AgentEvent, EventPublisher, QueueEvent
+from factorial.hooks import (
+    Hook,
+    HookDependency,
+    HookRequestBuilder,
+    HookRequestContext,
+    HookResolutionResult,
+    PendingHook,
+    hook,
+)
 from factorial.llms import (
     MODELS,
     Model,
@@ -59,9 +68,13 @@ from factorial.tools import (
     FunctionTool,
     FunctionToolAction,
     FunctionToolActionResult,
-    deferred_result,
+    ToolDefinition,
+    ToolNamespace,
+    ToolResult,
     function_tool,
+    tool,
 )
+from factorial.waits import WaitInstruction, WaitNamespace, wait
 
 __all__ = [
     "BaseAgent",
@@ -74,7 +87,11 @@ __all__ = [
     "FunctionTool",
     "FunctionToolAction",
     "FunctionToolActionResult",
+    "ToolDefinition",
+    "ToolResult",
+    "ToolNamespace",
     "function_tool",
+    "tool",
     "publish_progress",
     "retry",
     "Orchestrator",
@@ -89,9 +106,18 @@ __all__ = [
     "AgentEvent",
     "QueueEvent",
     "EventPublisher",
+    "Hook",
+    "PendingHook",
+    "HookRequestContext",
+    "HookRequestBuilder",
+    "HookDependency",
+    "HookResolutionResult",
+    "hook",
+    "WaitInstruction",
+    "WaitNamespace",
+    "wait",
     "Model",
     "MultiClient",
-    "deferred_result",
     # Provider wrapper
     "ai_gateway",
     # OpenAI models

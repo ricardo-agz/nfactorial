@@ -14,7 +14,7 @@ TASK_PAYLOAD = "{namespace}:tasks:payload"
 TASK_PICKUPS = "{namespace}:tasks:pickups"
 # HASH: task_id -> num retries (int)
 TASK_RETRIES = "{namespace}:tasks:retries"
-# HASH: task_id -> {created_at, owner_id, parent_id, batch_id}
+# HASH: task_id -> {created_at, owner_id, parent_id, resumed_from_task_id, batch_id}
 TASK_META = "{namespace}:tasks:meta"
 # HASH: task_id -> {current_turn: int, max_turns: int | None, progress: float}
 TASK_PROGRESS = "{namespace}:tasks:progress"
@@ -69,6 +69,14 @@ HOOKS_BY_TASK = "{namespace}:hooks:by_task:{task_id}"
 HOOKS_EXPIRING = "{namespace}:hooks:expiring"
 # STRING: idempotency envelope for repeated hook callbacks
 HOOK_IDEMPOTENCY = "{namespace}:hooks:idem:{hook_id}:{idempotency_key}"
+# STRING: idempotency envelope for repeated resume_task callbacks
+RESUME_IDEMPOTENCY = "{namespace}:resume:idem:{source_task_id}:{idempotency_key}"
+# STRING: idempotency envelope for repeated enqueue_task requests
+ENQUEUE_IDEMPOTENCY = "{namespace}:enqueue:idem:{owner_id}:{agent}:{idempotency_key}"
+# STRING: idempotency envelope for repeated create_batch_and_enqueue requests
+BATCH_ENQUEUE_IDEMPOTENCY = (
+    "{namespace}:enqueue_batch:idem:{owner_id}:{agent}:{idempotency_key}"
+)
 # HASH: session_id -> hook_session_json
 HOOK_SESSIONS = "{namespace}:hooks:sessions"
 # HASH: tool_call_id -> session_id (task scoped)
@@ -124,6 +132,9 @@ class RedisKeys:
     _hooks_index: str
     _hooks_expiring: str
     _hook_idempotency: str
+    _resume_idempotency: str
+    _enqueue_idempotency: str
+    _batch_enqueue_idempotency: str
     _hook_sessions: str
     _scheduled_wait_meta: str
     # Batch keys
@@ -206,10 +217,47 @@ class RedisKeys:
         """{namespace}:hooks:expiring"""
         return self._hooks_expiring
 
-    def hook_idempotency(self, hook_id: str, idempotency_key: str) -> str:
-        """{namespace}:hooks:idem:{hook_id}:{idempotency_key}"""
+    def hook_resolution(self, hook_id: str, request_key: str) -> str:
+        """{namespace}:hooks:idem:{hook_id}:{request_key}"""
         return self._hook_idempotency.format(
-            hook_id=hook_id, idempotency_key=idempotency_key
+            hook_id=hook_id, idempotency_key=request_key
+        )
+
+    def hook_idempotency(self, hook_id: str, idempotency_key: str) -> str:
+        """Backward-compatible alias for hook_resolution()."""
+        return self.hook_resolution(hook_id=hook_id, request_key=idempotency_key)
+
+    def resume_idempotency(self, source_task_id: str, idempotency_key: str) -> str:
+        """{namespace}:resume:idem:{source_task_id}:{idempotency_key}"""
+        return self._resume_idempotency.format(
+            source_task_id=source_task_id,
+            idempotency_key=idempotency_key,
+        )
+
+    def enqueue_idempotency(
+        self,
+        owner_id: str,
+        agent_name: str,
+        idempotency_key: str,
+    ) -> str:
+        """{namespace}:enqueue:idem:{owner_id}:{agent}:{idempotency_key}"""
+        return self._enqueue_idempotency.format(
+            owner_id=owner_id,
+            agent=agent_name,
+            idempotency_key=idempotency_key,
+        )
+
+    def batch_enqueue_idempotency(
+        self,
+        owner_id: str,
+        agent_name: str,
+        idempotency_key: str,
+    ) -> str:
+        """{namespace}:enqueue_batch:idem:{owner_id}:{agent}:{idempotency_key}"""
+        return self._batch_enqueue_idempotency.format(
+            owner_id=owner_id,
+            agent=agent_name,
+            idempotency_key=idempotency_key,
         )
 
     @property
@@ -481,6 +529,23 @@ class RedisKeys:
             _hook_idempotency=HOOK_IDEMPOTENCY.format(
                 namespace=namespace,
                 hook_id="{hook_id}",
+                idempotency_key="{idempotency_key}",
+            ),
+            _resume_idempotency=RESUME_IDEMPOTENCY.format(
+                namespace=namespace,
+                source_task_id="{source_task_id}",
+                idempotency_key="{idempotency_key}",
+            ),
+            _enqueue_idempotency=ENQUEUE_IDEMPOTENCY.format(
+                namespace=namespace,
+                owner_id="{owner_id}",
+                agent="{agent}",
+                idempotency_key="{idempotency_key}",
+            ),
+            _batch_enqueue_idempotency=BATCH_ENQUEUE_IDEMPOTENCY.format(
+                namespace=namespace,
+                owner_id="{owner_id}",
+                agent="{agent}",
                 idempotency_key="{idempotency_key}",
             ),
             _hook_sessions=HOOK_SESSIONS.format(namespace=namespace),

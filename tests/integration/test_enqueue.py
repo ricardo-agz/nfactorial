@@ -186,6 +186,76 @@ class TestEnqueueTask:
         first_in_queue = await cast(Any, redis_client.lindex(keys.queue_main, 0))
         assert first_in_queue == task_ids[0]
 
+    async def test_enqueue_idempotency_replays_same_task(
+        self,
+        redis_client: redis.Redis,
+        test_namespace: str,
+        test_agent: SimpleTestAgent,
+        test_owner_id: str,
+    ) -> None:
+        keys = RedisKeys.format(namespace=test_namespace, agent=test_agent.name)
+        first_task = Task.create(
+            owner_id=test_owner_id,
+            agent=test_agent.name,
+            payload=AgentContext(query="idempotent enqueue"),
+        )
+        second_task = Task.create(
+            owner_id=test_owner_id,
+            agent=test_agent.name,
+            payload=AgentContext(query="idempotent enqueue"),
+        )
+
+        first_id = await enqueue_task(
+            redis_client=redis_client,
+            namespace=test_namespace,
+            agent=test_agent,
+            task=first_task,
+            idempotency_key="enqueue-1",
+        )
+        second_id = await enqueue_task(
+            redis_client=redis_client,
+            namespace=test_namespace,
+            agent=test_agent,
+            task=second_task,
+            idempotency_key="enqueue-1",
+        )
+
+        assert first_id == second_id
+        queued_ids = await cast(Any, redis_client.lrange(keys.queue_main, 0, -1))
+        assert queued_ids == [first_id]
+
+    async def test_enqueue_idempotency_rejects_conflicting_payload(
+        self,
+        redis_client: redis.Redis,
+        test_namespace: str,
+        test_agent: SimpleTestAgent,
+        test_owner_id: str,
+    ) -> None:
+        await enqueue_task(
+            redis_client=redis_client,
+            namespace=test_namespace,
+            agent=test_agent,
+            task=Task.create(
+                owner_id=test_owner_id,
+                agent=test_agent.name,
+                payload=AgentContext(query="first payload"),
+            ),
+            idempotency_key="enqueue-conflict",
+        )
+
+        with pytest.raises(ValueError, match="idempotency_key conflict"):
+            await enqueue_task(
+                redis_client=redis_client,
+                namespace=test_namespace,
+                agent=test_agent,
+                task=Task.create(
+                    owner_id=test_owner_id,
+                    agent=test_agent.name,
+                    payload=AgentContext(query="second payload"),
+                ),
+                idempotency_key="enqueue-conflict",
+            )
+
 
 @pytest.mark.asyncio
 class TestEnqueueBatch:
@@ -365,6 +435,75 @@ class TestEnqueueBatch:
         queue_ids = await cast(Any, redis_client.lrange(keys.queue_main, 0, -1))
         assert queue_ids.count(task_ids[0]) == 1
         assert queue_ids.count(task_ids[1]) == 1
+
+    async def test_batch_enqueue_idempotency_replays_without_task_ids(
+        self,
+        redis_client: redis.Redis,
+        test_namespace: str,
+        test_agent: SimpleTestAgent,
+        test_owner_id: str,
+    ) -> None:
+        payloads = [AgentContext(query=f"Query {i}") for i in range(2)]
+        first = await create_batch_and_enqueue(
+            redis_client=redis_client,
+            namespace=test_namespace,
+            agent=test_agent,
+            payloads=payloads,
+            owner_id=test_owner_id,
+            idempotency_key="batch-enqueue-1",
+        )
+        keys = RedisKeys.format(namespace=test_namespace, agent=test_agent.name)
+        await cast(
+            Any,
+            redis_client.hset(
+                keys.batch_remaining_tasks,
+                first.id,
+                json.dumps([first.task_ids[1]]),
+            ),
+        )
+
+        second = await create_batch_and_enqueue(
+            redis_client=redis_client,
+            namespace=test_namespace,
+            agent=test_agent,
+            payloads=payloads,
+            owner_id=test_owner_id,
+            idempotency_key="batch-enqueue-1",
+        )
+
+        assert second.id == first.id
+        assert second.task_ids == first.task_ids
+        assert second.remaining_task_ids == [first.task_ids[1]]
+
+        queue_ids = await cast(Any, redis_client.lrange(keys.queue_main, 0, -1))
+        assert queue_ids.count(first.task_ids[0]) == 1
+        assert queue_ids.count(first.task_ids[1]) == 1
+
+    async def test_batch_enqueue_idempotency_rejects_conflicting_payload(
+        self,
+        redis_client: redis.Redis,
+        test_namespace: str,
+        test_agent: SimpleTestAgent,
+        test_owner_id: str,
+    ) -> None:
+        await create_batch_and_enqueue(
+            redis_client=redis_client,
+            namespace=test_namespace,
+            agent=test_agent,
+            payloads=[AgentContext(query="first")],
+            owner_id=test_owner_id,
+            idempotency_key="batch-enqueue-conflict",
+        )
+
+        with pytest.raises(ValueError, match="idempotency_key conflict"):
+            await create_batch_and_enqueue(
+                redis_client=redis_client,
+                namespace=test_namespace,
+                agent=test_agent,
+                payloads=[AgentContext(query="second")],
+                owner_id=test_owner_id,
+                idempotency_key="batch-enqueue-conflict",
+            )
 
 
 @pytest.mark.asyncio

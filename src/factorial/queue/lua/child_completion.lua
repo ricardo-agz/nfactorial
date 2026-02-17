@@ -1,3 +1,14 @@
+--[[
+-- Resume a parent task after child-task results are applied.
+--
+-- Parent tasks parked in pending_child_tasks need atomic cleanup of pending
+-- child markers plus a safe requeue back to the main queue.
+--
+-- State transitions:
+-- - pending_child_tasks -> active (and LPUSH to main queue)
+-- - missing task data -> orphaned queue marker
+-- - any other status -> no transition (returns already_completed)
+]]--
 local queue_main_key = KEYS[1]
 local queue_orphaned_key = KEYS[2]
 local queue_pending_key = KEYS[3]

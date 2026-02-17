@@ -81,13 +81,20 @@ from factorial import AgentContext
 
 async def submit_task():
     context = AgentContext(query="Analyze this data")
-    task = agent.create_task(owner_id="user123", payload=context)
-    
-    await orchestrator.enqueue_task(agent, task)
+    task = await orchestrator.create_agent_task(
+        agent=agent,
+        payload=context,
+        owner_id="user123",
+        idempotency_key="request-123",  # optional
+    )
     return task.id
 
 task_id = asyncio.run(submit_task())
 ```
+
+If you retry the same enqueue call with the same `idempotency_key` and payload,
+the orchestrator returns the same `task_id` instead of creating a duplicate task.
+Reusing a key with a different payload raises a conflict error.
 
 ### Check Task Status
 
@@ -145,6 +152,29 @@ async def steer_task(task_id: str):
 asyncio.run(steer_task(task_id))
 ```
 
+### Resume Tasks
+
+Resume a terminal task (completed, failed, or cancelled) as a new queued task:
+
+```python
+async def resume_task(task_id: str):
+    messages = [
+        {"role": "user", "content": "Please revise with stricter evidence."}
+    ]
+    resumed_task = await orchestrator.resume_task(
+        task_id,
+        messages,
+        idempotency_key="resume:task-123:revision-1",  # optional
+    )
+    print(f"Resumed as new task: {resumed_task.id}")
+
+asyncio.run(resume_task(task_id))
+```
+
+`resume_task` creates a brand new task ID, carries forward the prior context,
+appends your messages, preserves `parent_id`, sets `resumed_from_task_id`,
+and resets run-scoped state (`turn`, `output`, verification counters).
+
 ## Observability
 
 ### Dashboard
@@ -164,7 +194,7 @@ orchestrator = Orchestrator(
 )
 ```
 
-Access at: http://localhost:8080/observability
+Access at: <http://localhost:8080/observability>
 
 ### Metrics
 

@@ -345,6 +345,9 @@ async def process_task(
                 parent_pending_child_task_results_key=parent_keys.pending_child_task_results
                 if parent_keys
                 else None,
+                parent_pending_child_wait_ids_key=parent_keys.pending_child_wait_ids
+                if parent_keys
+                else None,
                 task_id=task.id,
                 action=action.value,
                 updated_task_payload_json=task.payload.to_json(),

@@ -1,7 +1,7 @@
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, TypeVar, cast
+from typing import Any, Literal, TypeVar, cast
 
 import redis.asyncio as redis
 from redis.commands.core import AsyncScript
@@ -279,6 +279,7 @@ class TaskCompletionScript(AsyncScript):
     * KEYS[21] = global_metrics_bucket_key (str)
     * KEYS[22] = pending_child_wait_ids_key (str)
     * KEYS[23] = parent_pending_child_task_results_key (str | None)
+    * KEYS[24] = parent_pending_child_wait_ids_key (str | None)
 
     Args:
     * ARGV[1] = task_id (str)
@@ -324,6 +325,7 @@ class TaskCompletionScript(AsyncScript):
         current_turn: int,
         pending_child_wait_ids_key: str | None = None,
         parent_pending_child_task_results_key: str | None = None,
+        parent_pending_child_wait_ids_key: str | None = None,
         pending_tool_call_ids_json: str | None = None,
         pending_child_task_ids_json: str | None = None,
         final_output_json: str | None = None,
@@ -352,6 +354,7 @@ class TaskCompletionScript(AsyncScript):
             global_metrics_bucket_key,
             pending_child_wait_ids_key or "",
             parent_pending_child_task_results_key or "",
+            parent_pending_child_wait_ids_key or "",
         ]
 
         result: tuple[bool, bool] = await super().__call__(
@@ -708,6 +711,131 @@ async def create_hook_wake_script(
     return get_cached_script(redis_client, "hook_wake", HookWakeScript)
 
 
+@dataclass
+class HookResolveScriptResult:
+    decision: Literal["claimed", "pending", "replay", "conflict", "resolved"]
+    task_resumed: bool | None
+    request_hash: str
+
+
+class HookResolveScript(AsyncScript):
+    """
+    Claim/finalize resolve-hook request state.
+
+    Keys:
+    * KEYS[1] = hook_resolution_key (str)
+
+    Args:
+    * ARGV[1] = mode ("claim" | "finalize")
+    * ARGV[2] = request_hash (str)
+    * ARGV[3] = ttl_seconds (int)
+    * ARGV[4] = hook_id (str)
+    * ARGV[5] = task_id (str)
+    * ARGV[6] = tool_call_id (str)
+    * ARGV[7] = task_resumed_flag ("1" | "0" | "")
+    """
+
+    @staticmethod
+    def _decode_task_resumed_flag(flag: str) -> bool | None:
+        if flag == "1":
+            return True
+        if flag == "0":
+            return False
+        return None
+
+    @staticmethod
+    def _encode_task_resumed_flag(task_resumed: bool | None) -> str:
+        if task_resumed is True:
+            return "1"
+        if task_resumed is False:
+            return "0"
+        return ""
+
+    async def _execute(
+        self,
+        *,
+        mode: Literal["claim", "finalize"],
+        hook_resolution_key: str,
+        request_hash: str,
+        ttl_seconds: int,
+        hook_id: str,
+        task_id: str,
+        tool_call_id: str,
+        task_resumed: bool | None = None,
+    ) -> HookResolveScriptResult:
+        result: tuple[str | bytes, str | bytes, str | bytes] = await super().__call__(  # type: ignore
+            keys=[hook_resolution_key],
+            args=[
+                mode,
+                request_hash,
+                ttl_seconds,
+                hook_id,
+                task_id,
+                tool_call_id,
+                self._encode_task_resumed_flag(task_resumed),
+            ],
+        )
+        decision = decode(result[0])
+        if decision not in {"claimed", "pending", "replay", "conflict", "resolved"}:
+            raise ValueError(
+                "hook_resolve script returned unexpected decision "
+                f"'{decision}'"
+            )
+        return HookResolveScriptResult(
+            decision=decision,  # type: ignore[arg-type]
+            task_resumed=self._decode_task_resumed_flag(decode(result[1])),
+            request_hash=decode(result[2]),
+        )
+
+    async def claim(
+        self,
+        *,
+        hook_resolution_key: str,
+        request_hash: str,
+        ttl_seconds: int,
+        hook_id: str,
+        task_id: str,
+        tool_call_id: str,
+    ) -> HookResolveScriptResult:
+        return await self._execute(
+            mode="claim",
+            hook_resolution_key=hook_resolution_key,
+            request_hash=request_hash,
+            ttl_seconds=ttl_seconds,
+            hook_id=hook_id,
+            task_id=task_id,
+            tool_call_id=tool_call_id,
+        )
+
+    async def finalize(
+        self,
+        *,
+        hook_resolution_key: str,
+        request_hash: str,
+        ttl_seconds: int,
+        hook_id: str,
+        task_id: str,
+        tool_call_id: str,
+        task_resumed: bool,
+    ) -> HookResolveScriptResult:
+        return await self._execute(
+            mode="finalize",
+            hook_resolution_key=hook_resolution_key,
+            request_hash=request_hash,
+            ttl_seconds=ttl_seconds,
+            hook_id=hook_id,
+            task_id=task_id,
+            tool_call_id=tool_call_id,
+            task_resumed=task_resumed,
+        )
+
+
+async def create_hook_resolve_script(
+    redis_client: redis.Redis,
+) -> HookResolveScript:
+    return get_cached_script(redis_client, "hook_resolve", HookResolveScript)
+
+
 class ChildTaskCompletionScript(AsyncScript):
     """
     Simple atomic script to move completed task back to queue and cleanup
@@ -780,6 +908,13 @@ async def create_child_task_completion_script(
     )
 
 
+@dataclass
+class EnqueueTaskScriptResult:
+    decision: Literal["enqueued", "replay", "conflict"]
+    task_id: str
+    request_hash: str
+
+
 class EnqueueTaskScript(AsyncScript):
     """
     Creates a script for enqueuing a task
@@ -792,6 +927,7 @@ class EnqueueTaskScript(AsyncScript):
     * KEYS[5] = task_pickups_key (str)
     * KEYS[6] = task_retries_key (str)
     * KEYS[7] = task_metas_key (str)
+    * KEYS[8] = enqueue_idempotency_key (str | empty)
 
     Args:
     * ARGV[1] = task_id (str)
@@ -800,6 +936,9 @@ class EnqueueTaskScript(AsyncScript):
     * ARGV[4] = task_pickups (int)
     * ARGV[5] = task_retries (int)
     * ARGV[6] = task_meta_json (str)
+    * ARGV[7] = request_hash (str)
+    * ARGV[8] = ttl_seconds (int)
+    * ARGV[9] = idempotency_enabled ("1" | "0")
     """
 
     async def execute(
@@ -818,8 +957,12 @@ class EnqueueTaskScript(AsyncScript):
         task_pickups: int,
         task_retries: int,
         task_meta_json: str,
-    ) -> bool:
-        return await super().__call__(  # type: ignore
+        enqueue_idempotency_key: str = "",
+        request_hash: str = "",
+        ttl_seconds: int = 1,
+        idempotency_enabled: bool = False,
+    ) -> EnqueueTaskScriptResult:
+        result: tuple[str | bytes, str | bytes, str | bytes] = await super().__call__(  # type: ignore
             keys=[
                 agent_queue_key,
                 task_statuses_key,
@@ -828,6 +971,7 @@ class EnqueueTaskScript(AsyncScript):
                 task_pickups_key,
                 task_retries_key,
                 task_metas_key,
+                enqueue_idempotency_key,
             ],
             args=[
                 task_id,
@@ -836,7 +980,21 @@ class EnqueueTaskScript(AsyncScript):
                 task_pickups,
                 task_retries,
                 task_meta_json,
+                request_hash,
+                ttl_seconds,
+                "1" if idempotency_enabled else "0",
             ],
+        )
+        decision = decode(result[0])
+        if decision not in {"enqueued", "replay", "conflict"}:
+            raise ValueError(
+                "enqueue script returned unexpected decision "
+                f"'{decision}'"
+            )
+        return EnqueueTaskScriptResult(
+            decision=decision,  # type: ignore[arg-type]
+            task_id=decode(result[1]),
+            request_hash=decode(result[2]),
         )
 
 
@@ -845,6 +1003,109 @@ async def create_enqueue_task_script(redis_client: redis.Redis) -> EnqueueTaskSc
     Creates a script for enqueuing a task
     """
     return get_cached_script(redis_client, "enqueue", EnqueueTaskScript)
+
+
+@dataclass
+class ResumeEnqueueScriptResult:
+    decision: Literal["enqueued", "replay", "conflict"]
+    resumed_task_id: str
+    request_hash: str
+
+
+class ResumeEnqueueScript(AsyncScript):
+    """
+    Atomically enqueue a resumed task and resolve idempotency.
+
+    Keys:
+    * KEYS[1] = agent_queue_key (str)
+    * KEYS[2] = task_statuses_key (str)
+    * KEYS[3] = task_agents_key (str)
+    * KEYS[4] = task_payloads_key (str)
+    * KEYS[5] = task_pickups_key (str)
+    * KEYS[6] = task_retries_key (str)
+    * KEYS[7] = task_metas_key (str)
+    * KEYS[8] = resume_idempotency_key (str | empty)
+
+    Args:
+    * ARGV[1] = task_id (str)
+    * ARGV[2] = task_agent (str)
+    * ARGV[3] = task_payload_json (str)
+    * ARGV[4] = task_pickups (int)
+    * ARGV[5] = task_retries (int)
+    * ARGV[6] = task_meta_json (str)
+    * ARGV[7] = request_hash (str)
+    * ARGV[8] = source_task_id (str)
+    * ARGV[9] = ttl_seconds (int)
+    * ARGV[10] = idempotency_enabled ("1" | "0")
+    """
+
+    async def execute(
+        self,
+        *,
+        agent_queue_key: str,
+        task_statuses_key: str,
+        task_agents_key: str,
+        task_payloads_key: str,
+        task_pickups_key: str,
+        task_retries_key: str,
+        task_metas_key: str,
+        resume_idempotency_key: str,
+        task_id: str,
+        task_agent: str,
+        task_payload_json: str,
+        task_pickups: int,
+        task_retries: int,
+        task_meta_json: str,
+        request_hash: str,
+        source_task_id: str,
+        ttl_seconds: int,
+        idempotency_enabled: bool,
+    ) -> ResumeEnqueueScriptResult:
+        result: tuple[str | bytes, str | bytes, str | bytes] = await super().__call__(  # type: ignore
+            keys=[
+                agent_queue_key,
+                task_statuses_key,
+                task_agents_key,
+                task_payloads_key,
+                task_pickups_key,
+                task_retries_key,
+                task_metas_key,
+                resume_idempotency_key,
+            ],
+            args=[
+                task_id,
+                task_agent,
+                task_payload_json,
+                task_pickups,
+                task_retries,
+                task_meta_json,
+                request_hash,
+                source_task_id,
+                ttl_seconds,
+                "1" if idempotency_enabled else "0",
+            ],
+        )
+        decision = decode(result[0])
+        if decision not in {"enqueued", "replay", "conflict"}:
+            raise ValueError(
+                "resume_enqueue script returned unexpected decision "
+                f"'{decision}'"
+            )
+        return ResumeEnqueueScriptResult(
+            decision=decision,  # type: ignore[arg-type]
+            resumed_task_id=decode(result[1]),
+            request_hash=decode(result[2]),
+        )
+
+
+async def create_resume_enqueue_script(
+    redis_client: redis.Redis,
+) -> ResumeEnqueueScript:
+    return get_cached_script(
+        redis_client,
+        "resume_enqueue",
+        ResumeEnqueueScript,
+    )
 
 
 @dataclass
@@ -1154,7 +1415,10 @@ async def create_cancel_task_script(
 
 @dataclass
 class EnqueueBatchScriptResult:
+    decision: Literal["enqueued", "replay", "conflict"]
+    batch_id: str
     task_ids: list[str]
+    request_hash: str
 
 
 class EnqueueBatchScript(AsyncScript):
@@ -1181,8 +1445,13 @@ class EnqueueBatchScript(AsyncScript):
         batch_meta_json: str,
         batch_remaining_tasks_key: str,
         batch_progress_key: str,
+        batch_enqueue_idempotency_key: str = "",
+        request_hash: str = "",
+        ttl_seconds: int = 1,
+        idempotency_enabled: bool = False,
     ) -> EnqueueBatchScriptResult:
-        res: str = await super().__call__(  # type: ignore
+        res: tuple[str | bytes, str | bytes, str | bytes, str | bytes] = (
+            await super().__call__(  # type: ignore
             keys=[
                 agent_queue_key,
                 task_statuses_key,
@@ -1195,6 +1464,7 @@ class EnqueueBatchScript(AsyncScript):
                 batch_meta_key,
                 batch_remaining_tasks_key,
                 batch_progress_key,
+                batch_enqueue_idempotency_key,
             ],
             args=[
                 batch_id,
@@ -1204,9 +1474,24 @@ class EnqueueBatchScript(AsyncScript):
                 tasks_json,
                 base_task_meta_json,
                 batch_meta_json,
+                request_hash,
+                ttl_seconds,
+                "1" if idempotency_enabled else "0",
             ],
+            )
         )
-        return EnqueueBatchScriptResult(task_ids=json.loads(decode(res)))
+        decision = decode(res[0])
+        if decision not in {"enqueued", "replay", "conflict"}:
+            raise ValueError(
+                "enqueue_batch script returned unexpected decision "
+                f"'{decision}'"
+            )
+        return EnqueueBatchScriptResult(
+            decision=decision,  # type: ignore[arg-type]
+            batch_id=decode(res[1]),
+            task_ids=json.loads(decode(res[2])),
+            request_hash=decode(res[3]),
+        )
 
 
 async def create_enqueue_batch_script(redis_client: redis.Redis) -> EnqueueBatchScript:

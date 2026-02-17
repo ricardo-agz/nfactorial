@@ -73,7 +73,7 @@ class TestParentChildEnqueue:
             batch_completed_key=keys.batch_completed,
             parent_pending_child_task_results_key=None,
             task_id=task_id,
-            action="wait_child",
+            action="pending_child_task_results",
             updated_task_payload_json=json.dumps({"query": "test", "turn": 1}),
             metrics_ttl=3600,
             pending_sentinel=PENDING_SENTINEL,
@@ -143,7 +143,7 @@ class TestParentChildEnqueue:
             batch_completed_key=keys.batch_completed,
             parent_pending_child_task_results_key=None,
             task_id=task_id,
-            action="wait_child",
+            action="pending_child_task_results",
             updated_task_payload_json=json.dumps({"query": "test", "turn": 1}),
             metrics_ttl=3600,
             pending_sentinel=PENDING_SENTINEL,
@@ -293,6 +293,7 @@ class TestChildCompletion:
             parent_pending_child_task_results_key=(
                 parent_keys.pending_child_task_results
             ),
+            parent_pending_child_wait_ids_key=parent_keys.pending_child_wait_ids,
             task_id=child_id,
             action="complete",
             updated_task_payload_json=json.dumps({
@@ -383,6 +384,7 @@ class TestChildCompletion:
             parent_pending_child_task_results_key=(
                 parent_keys.pending_child_task_results
             ),
+            parent_pending_child_wait_ids_key=parent_keys.pending_child_wait_ids,
             task_id=child_ids[0],
             action="complete",
             updated_task_payload_json=json.dumps({"query": "child1", "turn": 1}),
@@ -438,6 +440,7 @@ class TestChildCompletion:
             parent_pending_child_task_results_key=(
                 parent_keys.pending_child_task_results
             ),
+            parent_pending_child_wait_ids_key=parent_keys.pending_child_wait_ids,
             task_id=child_ids[1],
             action="complete",
             updated_task_payload_json=json.dumps({"query": "child2", "turn": 1}),
@@ -556,6 +559,7 @@ class TestChildCompletion:
             parent_pending_child_task_results_key=(
                 parent_keys.pending_child_task_results
             ),
+            parent_pending_child_wait_ids_key=parent_keys.pending_child_wait_ids,
             task_id=child_id,
             action="fail",
             updated_task_payload_json=json.dumps({
@@ -573,9 +577,191 @@ class TestChildCompletion:
         # Verify error is stored in parent's pending results
         stored_result = await redis_client.hget(
             parent_keys.pending_child_task_results, child_id
-        )
+        )  # type: ignore[misc]
         assert stored_result is not None
         assert json.loads(str(stored_result)) == error_output
+
+    async def test_child_completion_does_not_write_when_parent_is_not_pending(
+        self,
+        redis_client: redis.Redis,
+        test_namespace: str,
+        test_owner_id: str,
+    ) -> None:
+        """Child completion should not mutate a terminal parent's pending results."""
+        completion_script = await create_task_completion_script(redis_client)
+        parent_id = str(uuid.uuid4())
+        child_id = str(uuid.uuid4())
+        parent_agent = "parent_agent"
+        child_agent = "child_agent"
+        parent_keys = RedisKeys.format(
+            namespace=test_namespace,
+            task_id=parent_id,
+            agent=parent_agent,
+        )
+        child_keys = RedisKeys.format(
+            namespace=test_namespace,
+            task_id=child_id,
+            agent=child_agent,
+        )
+
+        # Parent is terminal, even though stale child metadata still exists.
+        await redis_client.hset(parent_keys.task_status, parent_id, "completed")
+        await redis_client.hset(parent_keys.task_agent, parent_id, parent_agent)
+        await redis_client.hset(parent_keys.task_payload, parent_id, json.dumps({}))
+        await redis_client.hset(parent_keys.task_pickups, parent_id, 1)
+        await redis_client.hset(parent_keys.task_retries, parent_id, 0)
+        await redis_client.hset(
+            parent_keys.task_meta,
+            parent_id,
+            json.dumps({"owner_id": test_owner_id}),
+        )
+        await redis_client.hset(
+            parent_keys.pending_child_task_results,
+            child_id,
+            PENDING_SENTINEL,
+        )
+        await redis_client.sadd(parent_keys.pending_child_wait_ids, child_id)
+
+        await self._setup_processing_child(
+            redis_client,
+            child_keys,
+            child_id,
+            child_agent,
+            test_owner_id,
+            parent_id,
+        )
+
+        await completion_script.execute(
+            queue_main_key=child_keys.queue_main,
+            queue_completions_key=child_keys.queue_completions,
+            queue_failed_key=child_keys.queue_failed,
+            queue_backoff_key=child_keys.queue_backoff,
+            queue_orphaned_key=child_keys.queue_orphaned,
+            queue_pending_key=child_keys.queue_pending,
+            task_statuses_key=child_keys.task_status,
+            task_agents_key=child_keys.task_agent,
+            task_payloads_key=child_keys.task_payload,
+            task_pickups_key=child_keys.task_pickups,
+            task_retries_key=child_keys.task_retries,
+            task_metas_key=child_keys.task_meta,
+            processing_heartbeats_key=child_keys.processing_heartbeats,
+            pending_tool_results_key=child_keys.pending_tool_results,
+            pending_child_task_results_key=child_keys.pending_child_task_results,
+            agent_metrics_bucket_key=child_keys.agent_metrics_bucket,
+            global_metrics_bucket_key=child_keys.global_metrics_bucket,
+            batch_meta_key=child_keys.batch_meta,
+            batch_progress_key=child_keys.batch_progress,
+            batch_remaining_tasks_key=child_keys.batch_remaining_tasks,
+            batch_completed_key=child_keys.batch_completed,
+            parent_pending_child_task_results_key=(
+                parent_keys.pending_child_task_results
+            ),
+            parent_pending_child_wait_ids_key=parent_keys.pending_child_wait_ids,
+            task_id=child_id,
+            action="complete",
+            updated_task_payload_json=json.dumps({"query": "child query", "turn": 1}),
+            metrics_ttl=3600,
+            pending_sentinel=PENDING_SENTINEL,
+            current_turn=1,
+            pending_tool_call_ids_json=None,
+            pending_child_task_ids_json=None,
+            final_output_json=json.dumps({"result": "late write"}),
+        )
+
+        stored_result = await redis_client.hget(
+            parent_keys.pending_child_task_results,
+            child_id,
+        )
+        assert stored_result == PENDING_SENTINEL
+
+    async def test_child_completion_does_not_write_when_child_not_in_wait_set(
+        self,
+        redis_client: redis.Redis,
+        test_namespace: str,
+        test_owner_id: str,
+    ) -> None:
+        """Child completion should not add entries for non-awaited child IDs."""
+        completion_script = await create_task_completion_script(redis_client)
+        parent_id = str(uuid.uuid4())
+        child_id = str(uuid.uuid4())
+        tracked_child_id = str(uuid.uuid4())
+        parent_agent = "parent_agent"
+        child_agent = "child_agent"
+        parent_keys = RedisKeys.format(
+            namespace=test_namespace,
+            task_id=parent_id,
+            agent=parent_agent,
+        )
+        child_keys = RedisKeys.format(
+            namespace=test_namespace,
+            task_id=child_id,
+            agent=child_agent,
+        )
+
+        await self._setup_pending_parent(
+            redis_client,
+            parent_keys,
+            parent_id,
+            parent_agent,
+            test_owner_id,
+            [tracked_child_id],
+        )
+        await self._setup_processing_child(
+            redis_client,
+            child_keys,
+            child_id,
+            child_agent,
+            test_owner_id,
+            parent_id,
+        )
+
+        await completion_script.execute(
+            queue_main_key=child_keys.queue_main,
+            queue_completions_key=child_keys.queue_completions,
+            queue_failed_key=child_keys.queue_failed,
+            queue_backoff_key=child_keys.queue_backoff,
+            queue_orphaned_key=child_keys.queue_orphaned,
+            queue_pending_key=child_keys.queue_pending,
+            task_statuses_key=child_keys.task_status,
+            task_agents_key=child_keys.task_agent,
+            task_payloads_key=child_keys.task_payload,
+            task_pickups_key=child_keys.task_pickups,
+            task_retries_key=child_keys.task_retries,
+            task_metas_key=child_keys.task_meta,
+            processing_heartbeats_key=child_keys.processing_heartbeats,
+            pending_tool_results_key=child_keys.pending_tool_results,
+            pending_child_task_results_key=child_keys.pending_child_task_results,
+            agent_metrics_bucket_key=child_keys.agent_metrics_bucket,
+            global_metrics_bucket_key=child_keys.global_metrics_bucket,
+            batch_meta_key=child_keys.batch_meta,
+            batch_progress_key=child_keys.batch_progress,
+            batch_remaining_tasks_key=child_keys.batch_remaining_tasks,
+            batch_completed_key=child_keys.batch_completed,
+            parent_pending_child_task_results_key=(
+                parent_keys.pending_child_task_results
+            ),
+            parent_pending_child_wait_ids_key=parent_keys.pending_child_wait_ids,
+            task_id=child_id,
+            action="complete",
+            updated_task_payload_json=json.dumps({"query": "child query", "turn": 1}),
+            metrics_ttl=3600,
+            pending_sentinel=PENDING_SENTINEL,
+            current_turn=1,
+            pending_tool_call_ids_json=None,
+            pending_child_task_ids_json=None,
+            final_output_json=json.dumps({"result": "unexpected"}),
+        )
+
+        tracked_result = await redis_client.hget(
+            parent_keys.pending_child_task_results,
+            tracked_child_id,
+        )
+        untracked_result = await redis_client.hget(
+            parent_keys.pending_child_task_results,
+            child_id,
+        )
+        assert tracked_result == PENDING_SENTINEL
+        assert untracked_result is None
 
     async def _setup_pending_parent(
         self,
@@ -603,6 +789,7 @@ class TestChildCompletion:
             await redis_client.hset(
                 keys.pending_child_task_results, child_id, PENDING_SENTINEL
             )
+            await redis_client.sadd(keys.pending_child_wait_ids, child_id)
 
         # Add to pending queue
         await redis_client.zadd(keys.queue_pending, {task_id: time.time()})
@@ -674,6 +861,7 @@ class TestNestedChildTasks:
         await redis_client.hset(
             gp_keys.pending_child_task_results, parent_id, PENDING_SENTINEL
         )
+        await redis_client.sadd(gp_keys.pending_child_wait_ids, parent_id)
 
         # Setup parent waiting for child
         await self._setup_task(
@@ -688,6 +876,7 @@ class TestNestedChildTasks:
         await redis_client.hset(
             p_keys.pending_child_task_results, child_id, PENDING_SENTINEL
         )
+        await redis_client.sadd(p_keys.pending_child_wait_ids, child_id)
 
         # Setup child as processing
         await self._setup_task(
@@ -725,6 +914,7 @@ class TestNestedChildTasks:
             batch_remaining_tasks_key=c_keys.batch_remaining_tasks,
             batch_completed_key=c_keys.batch_completed,
             parent_pending_child_task_results_key=p_keys.pending_child_task_results,
+            parent_pending_child_wait_ids_key=p_keys.pending_child_wait_ids,
             task_id=child_id,
             action="complete",
             updated_task_payload_json=json.dumps({"query": "child"}),
@@ -792,6 +982,7 @@ class TestNestedChildTasks:
             parent_pending_child_task_results_key=(
                 gp_keys.pending_child_task_results
             ),
+            parent_pending_child_wait_ids_key=gp_keys.pending_child_wait_ids,
             task_id=parent_id,
             action="complete",
             updated_task_payload_json=json.dumps({"query": "parent"}),

@@ -1,3 +1,14 @@
+--[[
+-- Apply steering messages to an existing task payload.
+--
+-- Steering message IDs and payload updates are handled atomically so messages
+-- are consumed exactly once while avoiding partial updates.
+--
+-- State transitions:
+-- - no task status transition for valid tasks (payload update only)
+-- - missing task data -> orphaned queue marker
+-- - corrupted task data -> no transition (fails as corrupted)
+]]--
 local queue_orphaned_key = KEYS[1]
 local task_statuses_key = KEYS[2]
 local task_agents_key = KEYS[3]

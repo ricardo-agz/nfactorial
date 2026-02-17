@@ -358,6 +358,24 @@ Example progress event:
 }
 ```
 
+`task_resumed`: A terminal task was resumed as a new task (new task ID).
+
+```python
+{
+    "event_type": "task_resumed",
+    "task_id": "new-task-789",
+    "owner_id": "user-456",
+    "agent_name": "my_agent",
+    "timestamp": "2024-01-01T12:03:00Z",
+    "data": {
+        "source_task_id": "old-task-123",
+        "resumed_task_id": "new-task-789",
+        "idempotent_replay": False,
+        "idempotency_key": "resume:old-task-123:revision-1"
+    }
+}
+```
+
 ### Steering Events
 
 #### `run_steering_applied`: Steering messages have been successfully applied to a task

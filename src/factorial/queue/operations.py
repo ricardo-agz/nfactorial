@@ -16,7 +16,7 @@ from openai.types.chat.chat_completion_message_function_tool_call import (
 )
 
 from factorial.agent import BaseAgent, ExecutionContext
-from factorial.context import execution_context
+from factorial.context import VerificationState, execution_context
 from factorial.events import AgentEvent, BatchEvent, EventPublisher
 from factorial.exceptions import (
     HookAlreadyResolvedError,
@@ -46,7 +46,9 @@ from factorial.queue.lua import (
     create_child_task_completion_script,
     create_enqueue_batch_script,
     create_enqueue_task_script,
+    create_hook_resolve_script,
     create_hook_wake_script,
+    create_resume_enqueue_script,
 )
 from factorial.queue.task import (
     Batch,
@@ -60,13 +62,136 @@ from factorial.queue.task import (
     get_task_status,
 )
 from factorial.tools import _ToolResultInternal
-from factorial.utils import decode, is_valid_task_id
+from factorial.utils import decode, is_valid_task_id, serialize_data
 
 logger = get_logger(__name__)
+
+_ENQUEUE_IDEMPOTENCY_TTL_S = 60 * 60 * 24
+_RESUME_IDEMPOTENCY_TTL_S = 60 * 60 * 24
+_NAMESPACE_ROOT = uuid.uuid5(uuid.NAMESPACE_DNS, "factorial.sh")
+_ENQUEUE_NAMESPACE_ROOT = uuid.uuid5(_NAMESPACE_ROOT, "enqueue")
+_ENQUEUE_TASK_NAMESPACE = uuid.uuid5(_ENQUEUE_NAMESPACE_ROOT, "task-id.v1")
+_ENQUEUE_BATCH_NAMESPACE = uuid.uuid5(_ENQUEUE_NAMESPACE_ROOT, "batch-id.v1")
+_ENQUEUE_BATCH_TASK_NAMESPACE = uuid.uuid5(
+    _ENQUEUE_NAMESPACE_ROOT,
+    "batch-task-id.v1",
+)
+_RESUME_NAMESPACE_ROOT = uuid.uuid5(_NAMESPACE_ROOT, "resume.task")
+_RESUME_TASK_NAMESPACE = uuid.uuid5(_RESUME_NAMESPACE_ROOT, "task-id.v1")
 
 
 def _hash_hook_token(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def _resume_request_hash(*, messages: list[dict[str, Any]]) -> str:
+    messages_json = json.dumps(
+        serialize_data(messages),
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(messages_json.encode("utf-8")).hexdigest()
+
+
+def _hook_resolution_request_hash(*, payload: Any) -> str:
+    payload_json = json.dumps(
+        serialize_data(payload),
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload_json.encode("utf-8")).hexdigest()
+
+
+def _enqueue_request_hash(*, agent_name: str, task: Task[Any]) -> str:
+    payload = (
+        serialize_data(task.payload.to_dict())
+        if task.payload is not None
+        else {}
+    )
+    request_envelope = {
+        "agent_name": agent_name,
+        "owner_id": task.metadata.owner_id,
+        "parent_id": task.metadata.parent_id,
+        "resumed_from_task_id": task.metadata.resumed_from_task_id,
+        "batch_id": task.metadata.batch_id,
+        "max_turns": task.metadata.max_turns,
+        "payload": payload,
+    }
+    request_json = json.dumps(
+        request_envelope,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(request_json.encode("utf-8")).hexdigest()
+
+
+def _batch_enqueue_request_hash(
+    *,
+    agent_name: str,
+    owner_id: str,
+    parent_id: str | None,
+    payloads: list[ContextType],
+    task_ids: list[str] | None,
+    batch_id: str | None,
+) -> str:
+    request_envelope = {
+        "agent_name": agent_name,
+        "owner_id": owner_id,
+        "parent_id": parent_id,
+        "payloads": [serialize_data(payload.to_dict()) for payload in payloads],
+        "task_ids": task_ids,
+        "batch_id": batch_id,
+    }
+    request_json = json.dumps(
+        request_envelope,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(request_json.encode("utf-8")).hexdigest()
+
+
+def _deterministic_enqueued_task_id(
+    *,
+    owner_id: str,
+    agent_name: str,
+    idempotency_key: str,
+    request_hash: str,
+) -> str:
+    seed = f"{owner_id}:{agent_name}:{idempotency_key}:{request_hash}"
+    return str(uuid.uuid5(_ENQUEUE_TASK_NAMESPACE, seed))
+
+
+def _deterministic_enqueued_batch_id(
+    *,
+    owner_id: str,
+    agent_name: str,
+    idempotency_key: str,
+    request_hash: str,
+) -> str:
+    seed = f"{owner_id}:{agent_name}:{idempotency_key}:{request_hash}"
+    return str(uuid.uuid5(_ENQUEUE_BATCH_NAMESPACE, seed))
+
+
+def _deterministic_enqueued_batch_task_id(
+    *,
+    owner_id: str,
+    agent_name: str,
+    idempotency_key: str,
+    request_hash: str,
+    input_index: int,
+) -> str:
+    seed = f"{owner_id}:{agent_name}:{idempotency_key}:{request_hash}:{input_index}"
+    return str(uuid.uuid5(_ENQUEUE_BATCH_TASK_NAMESPACE, seed))
+
+
+def _deterministic_resumed_task_id(
+    *,
+    source_task_id: str,
+    idempotency_key: str,
+    request_hash: str,
+) -> str:
+    seed = f"{source_task_id}:{idempotency_key}:{request_hash}"
+    return str(uuid.uuid5(_RESUME_TASK_NAMESPACE, seed))
 
 
 def _is_terminal_status(task_status: TaskStatus) -> bool:
@@ -700,135 +825,217 @@ async def resolve_hook(
     ):
         raise HookTokenValidationError(hook_id)
 
+    hook_resolution_key: str | None = None
+    hook_request_hash: str | None = None
+    hook_resolve_script = None
+    hook_resolution_claimed = False
+    hook_resolution_finalized = False
     if idempotency_key:
-        idem_key = keys.hook_idempotency(hook_id, idempotency_key)
-        existing_idem = await redis_client.get(idem_key)  # type: ignore[assignment]
-        if existing_idem:
-            idem_data = json.loads(decode(existing_idem))
+        hook_resolution_key = keys.hook_resolution(hook_id, idempotency_key)
+        hook_request_hash = _hook_resolution_request_hash(payload=payload)
+        hook_resolve_script = await create_hook_resolve_script(redis_client)
+        hook_resolution_ttl_s = max(1, int(hook_record.expires_at - time.time()))
+        claim_result = await hook_resolve_script.claim(
+            hook_resolution_key=hook_resolution_key,
+            request_hash=hook_request_hash,
+            ttl_seconds=hook_resolution_ttl_s,
+            hook_id=hook_id,
+            task_id=task_id,
+            tool_call_id=tool_call_id,
+        )
+        if claim_result.decision == "conflict":
+            raise ValueError(
+                "resolve_hook idempotency_key conflict: key was reused "
+                "with a different request payload."
+            )
+        if claim_result.decision == "replay":
             return HookResolutionResult(
                 hook_id=hook_id,
                 task_id=task_id,
                 tool_call_id=tool_call_id,
                 status="idempotent",
-                task_resumed=bool(idem_data.get("task_resumed", False)),
+                task_resumed=bool(claim_result.task_resumed),
+            )
+        if claim_result.decision == "pending":
+            replay_lookup_delays_s = (0.02, 0.05, 0.1, 0.2, 0.4, 0.8, 1.6)
+            for idx, delay_s in enumerate(replay_lookup_delays_s):
+                await asyncio.sleep(delay_s)
+                hook_resolution_ttl_s = max(
+                    1, int(hook_record.expires_at - time.time())
+                )
+                claim_result = await hook_resolve_script.claim(
+                    hook_resolution_key=hook_resolution_key,
+                    request_hash=hook_request_hash,
+                    ttl_seconds=hook_resolution_ttl_s,
+                    hook_id=hook_id,
+                    task_id=task_id,
+                    tool_call_id=tool_call_id,
+                )
+                if claim_result.decision == "conflict":
+                    raise ValueError(
+                        "resolve_hook idempotency_key conflict: key was reused "
+                        "with a different request payload."
+                    )
+                if claim_result.decision == "replay":
+                    return HookResolutionResult(
+                        hook_id=hook_id,
+                        task_id=task_id,
+                        tool_call_id=tool_call_id,
+                        status="idempotent",
+                        task_resumed=bool(claim_result.task_resumed),
+                    )
+                if claim_result.decision == "claimed":
+                    hook_resolution_claimed = True
+                    break
+                if idx == len(replay_lookup_delays_s) - 1:
+                    raise RuntimeError(
+                        "resolve_hook idempotent replay is still being "
+                        "materialized. Retry shortly."
+                    )
+        elif claim_result.decision == "claimed":
+            hook_resolution_claimed = True
+
+    try:
+        already_resolved = hook_record.status == "resolved"
+        if hook_record.status == "expired":
+            raise HookExpiredError(hook_id)
+        if hook_record.status == "failed":
+            raise HookAlreadyResolvedError(hook_id)
+
+        if not already_resolved:
+            hook_record.status = "resolved"
+            hook_record.resolved_at = now
+            hook_record.payload = payload
+
+            await redis_client.hset(  # type: ignore[misc]
+                keys.hooks_index, hook_id, hook_record.to_json()
+            )
+            await redis_client.zrem(keys.hooks_expiring, hook_id)
+        elif hook_record.payload is None:
+            # Recovery path: persist payload if the first attempt marked resolved
+            # but crashed before storing the payload/session updates.
+            hook_record.payload = payload
+            hook_record.resolved_at = hook_record.resolved_at or now
+            await redis_client.hset(  # type: ignore[misc]
+                keys.hooks_index, hook_id, hook_record.to_json()
             )
 
-    already_resolved = hook_record.status == "resolved"
-    if hook_record.status == "expired":
-        raise HookExpiredError(hook_id)
-    if hook_record.status == "failed":
-        raise HookAlreadyResolvedError(hook_id)
-
-    if not already_resolved:
-        hook_record.status = "resolved"
-        hook_record.resolved_at = now
-        hook_record.payload = payload
-
-        await redis_client.hset(  # type: ignore[misc]
-            keys.hooks_index, hook_id, hook_record.to_json()
+        resolved_payload = hook_record.payload
+        task_keys = RedisKeys.format(
+            namespace=namespace,
+            task_id=task_id,
+            agent=hook_record.agent_name,
+            owner_id=hook_record.owner_id,
         )
-        await redis_client.zrem(keys.hooks_expiring, hook_id)
-    elif hook_record.payload is None:
-        # Recovery path: persist payload if the first attempt marked resolved
-        # but crashed before storing the payload/session updates.
-        hook_record.payload = payload
-        hook_record.resolved_at = hook_record.resolved_at or now
-        await redis_client.hset(  # type: ignore[misc]
-            keys.hooks_index, hook_id, hook_record.to_json()
-        )
+        task_resumed = False
+        if not hook_record.session_id:
+            raise ValueError(
+                "resolve_hook requires a hook session. "
+                "Legacy non-session hook completion paths are no longer supported."
+            )
+        if not hook_record.hook_param_name:
+            raise ValueError(
+                f"Hook '{hook_id}' is missing hook_param_name linkage metadata."
+            )
 
-    resolved_payload = hook_record.payload
-    task_keys = RedisKeys.format(
-        namespace=namespace,
-        task_id=task_id,
-        agent=hook_record.agent_name,
-        owner_id=hook_record.owner_id,
-    )
-    task_resumed = False
-    if not hook_record.session_id:
-        raise ValueError(
-            "resolve_hook requires a hook session. "
-            "Legacy non-session hook completion paths are no longer supported."
-        )
-    if not hook_record.hook_param_name:
-        raise ValueError(
-            f"Hook '{hook_id}' is missing hook_param_name linkage metadata."
-        )
-
-    session = await _load_hook_session(
-        redis_client,
-        keys=task_keys,
-        session_id=hook_record.session_id,
-    )
-    if session is None:
-        raise ValueError(
-            f"Hook session '{hook_record.session_id}' was not found for "
-            f"hook '{hook_id}'."
-        )
-    if session.status == "expired":
-        raise HookExpiredError(hook_id)
-    if session.status in {"completed", "failed"}:
-        raise HookAlreadyResolvedError(hook_id)
-
-    if hook_record.hook_param_name not in session.nodes:
-        raise ValueError(
-            f"Hook parameter '{hook_record.hook_param_name}' was not found in "
-            f"session '{session.session_id}'."
-        )
-
-    node = session.nodes[hook_record.hook_param_name]
-    if node.status in {"expired", "failed"}:
-        raise HookExpiredError(hook_id)
-    if node.status != "resolved":
-        node.status = "resolved"
-        node.payload = resolved_payload
-        node.resolved_at = hook_record.resolved_at or now
-        node.hook_id = hook_record.hook_id
-        session.updated_at = now
-        await _save_hook_session(
-            redis_client=redis_client,
+        session = await _load_hook_session(
+            redis_client,
             keys=task_keys,
-            session=session,
+            session_id=hook_record.session_id,
         )
+        if session is None:
+            raise ValueError(
+                f"Hook session '{hook_record.session_id}' was not found for "
+                f"hook '{hook_id}'."
+            )
+        if session.status == "expired":
+            raise HookExpiredError(hook_id)
+        if session.status in {"completed", "failed"}:
+            raise HookAlreadyResolvedError(hook_id)
 
-    if not any(current.status == "requested" for current in session.nodes.values()):
-        wake_script = await create_hook_wake_script(redis_client)
-        task_resumed, _ = await wake_script.execute(
-            queue_main_key=task_keys.queue_main,
-            queue_pending_key=task_keys.queue_pending,
-            queue_orphaned_key=task_keys.queue_orphaned,
-            task_statuses_key=task_keys.task_status,
-            task_agents_key=task_keys.task_agent,
-            task_payloads_key=task_keys.task_payload,
-            task_pickups_key=task_keys.task_pickups,
-            task_retries_key=task_keys.task_retries,
-            task_metas_key=task_keys.task_meta,
-            hook_runtime_ready_key=task_keys.hook_runtime_ready,
+        if hook_record.hook_param_name not in session.nodes:
+            raise ValueError(
+                f"Hook parameter '{hook_record.hook_param_name}' was not found in "
+                f"session '{session.session_id}'."
+            )
+
+        node = session.nodes[hook_record.hook_param_name]
+        if node.status in {"expired", "failed"}:
+            raise HookExpiredError(hook_id)
+        if node.status != "resolved":
+            node.status = "resolved"
+            node.payload = resolved_payload
+            node.resolved_at = hook_record.resolved_at or now
+            node.hook_id = hook_record.hook_id
+            session.updated_at = now
+            await _save_hook_session(
+                redis_client=redis_client,
+                keys=task_keys,
+                session=session,
+            )
+
+        if not any(current.status == "requested" for current in session.nodes.values()):
+            wake_script = await create_hook_wake_script(redis_client)
+            task_resumed, _ = await wake_script.execute(
+                queue_main_key=task_keys.queue_main,
+                queue_pending_key=task_keys.queue_pending,
+                queue_orphaned_key=task_keys.queue_orphaned,
+                task_statuses_key=task_keys.task_status,
+                task_agents_key=task_keys.task_agent,
+                task_payloads_key=task_keys.task_payload,
+                task_pickups_key=task_keys.task_pickups,
+                task_retries_key=task_keys.task_retries,
+                task_metas_key=task_keys.task_meta,
+                hook_runtime_ready_key=task_keys.hook_runtime_ready,
+                task_id=task_id,
+                tool_call_id=tool_call_id,
+                session_id=session.session_id,
+            )
+
+        if (
+            hook_resolution_key is not None
+            and hook_request_hash is not None
+            and hook_resolve_script is not None
+        ):
+            hook_resolution_ttl_s = max(1, int(hook_record.expires_at - time.time()))
+            finalize_result = await hook_resolve_script.finalize(
+                hook_resolution_key=hook_resolution_key,
+                request_hash=hook_request_hash,
+                ttl_seconds=hook_resolution_ttl_s,
+                hook_id=hook_id,
+                task_id=task_id,
+                tool_call_id=tool_call_id,
+                task_resumed=task_resumed,
+            )
+            if finalize_result.decision == "conflict":
+                raise ValueError(
+                    "resolve_hook idempotency_key conflict: key was reused "
+                    "with a different request payload."
+                )
+            hook_resolution_finalized = True
+
+        return HookResolutionResult(
+            hook_id=hook_id,
             task_id=task_id,
             tool_call_id=tool_call_id,
-            session_id=session.session_id,
+            status="resolved",
+            task_resumed=task_resumed,
         )
-
-    if idempotency_key:
-        idem_key = keys.hook_idempotency(hook_id, idempotency_key)
-        ttl_s = max(1, int(hook_record.expires_at - now))
-        idem_value = {
-            "hook_id": hook_id,
-            "task_id": task_id,
-            "tool_call_id": tool_call_id,
-            "task_resumed": task_resumed,
-        }
-        await redis_client.set(  # type: ignore[arg-type]
-            idem_key, json.dumps(idem_value, default=str), ex=ttl_s
-        )
-
-    return HookResolutionResult(
-        hook_id=hook_id,
-        task_id=task_id,
-        tool_call_id=tool_call_id,
-        status="resolved",
-        task_resumed=task_resumed,
-    )
+    except Exception:
+        if (
+            hook_resolution_key is not None
+            and hook_resolution_claimed
+            and not hook_resolution_finalized
+        ):
+            try:
+                await redis_client.delete(hook_resolution_key)
+            except Exception as cleanup_exc:
+                logger.warning(
+                    "resolve_hook failed to clear idempotency claim for hook %s",
+                    hook_id,
+                    exc_info=cleanup_exc,
+                )
+        raise
 
 
 async def rotate_hook_token(
@@ -987,14 +1194,43 @@ async def enqueue_task(
     namespace: str,
     agent: BaseAgent[Any],
     task: Task[ContextType],
+    idempotency_key: str | None = None,
 ) -> str:
+    normalized_idempotency_key: str | None = None
+    if idempotency_key is not None:
+        if not isinstance(idempotency_key, str) or not idempotency_key.strip():
+            raise ValueError(
+                "enqueue_task idempotency_key must be a non-empty string when provided"
+            )
+        normalized_idempotency_key = idempotency_key.strip()
+
+    enqueue_request_hash = _enqueue_request_hash(
+        agent_name=agent.name,
+        task=task,
+    )
+    idempotency_enabled = normalized_idempotency_key is not None
+    enqueue_idem_storage_key = ""
+    if normalized_idempotency_key is not None:
+        root_keys = RedisKeys.format(namespace=namespace)
+        enqueue_idem_storage_key = root_keys.enqueue_idempotency(
+            task.metadata.owner_id,
+            agent.name,
+            normalized_idempotency_key,
+        )
+        task.id = _deterministic_enqueued_task_id(
+            owner_id=task.metadata.owner_id,
+            agent_name=agent.name,
+            idempotency_key=normalized_idempotency_key,
+            request_hash=enqueue_request_hash,
+        )
+
     keys = RedisKeys.format(namespace=namespace, agent=agent.name)
 
     if not is_valid_task_id(task.id):
         raise InvalidTaskIdError(task.id)
 
     enqueue_script = await create_enqueue_task_script(redis_client)
-    await enqueue_script.execute(
+    enqueue_result = await enqueue_script.execute(
         agent_queue_key=keys.queue_main,
         task_statuses_key=keys.task_status,
         task_agents_key=keys.task_agent,
@@ -1008,9 +1244,190 @@ async def enqueue_task(
         task_pickups=0,
         task_retries=0,
         task_meta_json=task.metadata.to_json(),
+        enqueue_idempotency_key=enqueue_idem_storage_key,
+        request_hash=enqueue_request_hash,
+        ttl_seconds=_ENQUEUE_IDEMPOTENCY_TTL_S,
+        idempotency_enabled=idempotency_enabled,
+    )
+    if enqueue_result.decision == "conflict":
+        raise ValueError(
+            "enqueue_task idempotency_key conflict: key was reused "
+            "with a different request payload."
+        )
+
+    task.id = enqueue_result.task_id
+    return task.id
+
+
+async def resume_task(
+    redis_client: redis.Redis,
+    namespace: str,
+    task_id: str,
+    agent: BaseAgent[Any],
+    messages: list[dict[str, Any]],
+    idempotency_key: str | None = None,
+) -> Task[Any]:
+    """Resume a terminal task as a new queued task.
+
+    This operation clones the source task context, appends `messages`, resets
+    run-scoped state, and enqueues a brand new task ID.
+    """
+
+    if not isinstance(messages, list):
+        raise TypeError("resume_task messages must be a list of dict objects")
+
+    normalized_idempotency_key: str | None = None
+    if idempotency_key is not None:
+        if not isinstance(idempotency_key, str) or not idempotency_key.strip():
+            raise ValueError(
+                "resume_task idempotency_key must be a non-empty string when provided"
+            )
+        normalized_idempotency_key = idempotency_key.strip()
+
+    normalized_messages: list[dict[str, Any]] = []
+    for message in messages:
+        if not isinstance(message, dict):
+            raise TypeError("resume_task messages must be a list of dict objects")
+        normalized_messages.append(dict(message))
+
+    source_task_data = await get_task_data(redis_client, namespace, task_id)
+    source_status = TaskStatus(source_task_data["status"])
+    if not _is_terminal_status(source_status):
+        raise ValueError(
+            "resume_task requires the source task to be terminal "
+            "(completed, failed, or cancelled)"
+        )
+
+    source_agent_name = source_task_data["agent"]
+    if source_agent_name != agent.name:
+        raise ValueError(
+            "resume_task source task belongs to a different agent. "
+            f"Expected '{agent.name}', got '{source_agent_name}'."
+        )
+
+    source_task = Task.from_dict(
+        source_task_data,
+        context_class=agent.context_class,
+    )  # type: ignore[arg-type]
+    root_keys = RedisKeys.format(namespace=namespace)
+    resume_request_hash = _resume_request_hash(messages=normalized_messages)
+
+    idempotency_enabled = normalized_idempotency_key is not None
+    deterministic_resumed_task_id: str | None = None
+    resume_idem_storage_key = ""
+    if normalized_idempotency_key is not None:
+        deterministic_resumed_task_id = _deterministic_resumed_task_id(
+            source_task_id=task_id,
+            idempotency_key=normalized_idempotency_key,
+            request_hash=resume_request_hash,
+        )
+        resume_idem_storage_key = root_keys.resume_idempotency(
+            task_id,
+            normalized_idempotency_key,
+        )
+
+    resumed_payload = agent.context_class.from_dict(source_task.payload.to_dict())
+
+    existing_messages = (
+        list(resumed_payload.messages)
+        if isinstance(getattr(resumed_payload, "messages", None), list)
+        else []
+    )
+    resumed_payload.messages = [*existing_messages, *normalized_messages]
+    resumed_payload.turn = 0
+    resumed_payload.output = None
+    resumed_payload.attempt = 0
+    resumed_payload.verification = VerificationState()
+
+    resumed_task: Task[Any] = Task.create(
+        owner_id=source_task.metadata.owner_id,
+        agent=agent.name,
+        payload=resumed_payload,
+        max_turns=agent.max_turns,
+    )
+    if deterministic_resumed_task_id is not None:
+        resumed_task.id = deterministic_resumed_task_id
+
+    # Keep operational parent linkage while adding revision lineage.
+    resumed_task.metadata.parent_id = source_task.metadata.parent_id
+    resumed_task.metadata.resumed_from_task_id = source_task.id
+
+    task_keys = RedisKeys.format(namespace=namespace, agent=agent.name)
+    resume_enqueue_script = await create_resume_enqueue_script(redis_client)
+    resume_result = await resume_enqueue_script.execute(
+        agent_queue_key=task_keys.queue_main,
+        task_statuses_key=task_keys.task_status,
+        task_agents_key=task_keys.task_agent,
+        task_payloads_key=task_keys.task_payload,
+        task_pickups_key=task_keys.task_pickups,
+        task_retries_key=task_keys.task_retries,
+        task_metas_key=task_keys.task_meta,
+        resume_idempotency_key=resume_idem_storage_key,
+        task_id=resumed_task.id,
+        task_agent=agent.name,
+        task_payload_json=(
+            resumed_task.payload.to_json() if resumed_task.payload else "{}"
+        ),
+        task_pickups=resumed_task.pickups,
+        task_retries=resumed_task.retries,
+        task_meta_json=resumed_task.metadata.to_json(),
+        request_hash=resume_request_hash,
+        source_task_id=task_id,
+        ttl_seconds=_RESUME_IDEMPOTENCY_TTL_S,
+        idempotency_enabled=idempotency_enabled,
     )
 
-    return task.id
+    if resume_result.decision == "conflict":
+        raise ValueError(
+            "resume_task idempotency_key conflict: key was reused "
+            "with a different request payload."
+        )
+    if resume_result.decision == "replay":
+        existing_task_data = await get_task_data(
+            redis_client,
+            namespace,
+            resume_result.resumed_task_id,
+        )
+        return Task.from_dict(
+            existing_task_data,
+            context_class=agent.context_class,
+        )  # type: ignore[arg-type]
+
+    resumed_task.id = resume_result.resumed_task_id
+
+    try:
+        updates_channel = RedisKeys.for_owner(
+            namespace=namespace,
+            owner_id=source_task.metadata.owner_id,
+        ).updates_channel
+        event_publisher = EventPublisher(
+            redis_client=redis_client,
+            channel=updates_channel,
+        )
+        event_data: dict[str, Any] = {
+            "source_task_id": task_id,
+            "resumed_task_id": resumed_task.id,
+            "idempotent_replay": False,
+        }
+        if normalized_idempotency_key is not None:
+            event_data["idempotency_key"] = normalized_idempotency_key
+        await event_publisher.publish_event(
+            AgentEvent(
+                event_type="task_resumed",
+                task_id=resumed_task.id,
+                owner_id=source_task.metadata.owner_id,
+                agent_name=agent.name,
+                data=event_data,
+            )
+        )
+    except Exception as exc:
+        logger.error(
+            "Failed to publish task_resumed event for source task %s",
+            task_id,
+            exc_info=exc,
+        )
+
+    return resumed_task
 
 
 async def create_batch_and_enqueue(
@@ -1022,14 +1439,21 @@ async def create_batch_and_enqueue(
     parent_id: str | None = None,
     task_ids: list[str] | None = None,
     batch_id: str | None = None,
+    idempotency_key: str | None = None,
 ) -> Batch:
     """Atomically enqueue a batch of tasks via batch_enqueue.lua.
 
     Returns the *batch_id* created.
     """
-    if batch_id is None:
-        batch_id = str(uuid.uuid4())
-    created_at = time.time()
+    normalized_idempotency_key: str | None = None
+    if idempotency_key is not None:
+        if not isinstance(idempotency_key, str) or not idempotency_key.strip():
+            raise ValueError(
+                "create_batch_and_enqueue idempotency_key must be a non-empty "
+                "string when provided"
+            )
+        normalized_idempotency_key = idempotency_key.strip()
+
     if task_ids is not None:
         if len(task_ids) != len(payloads):
             raise ValueError(
@@ -1037,6 +1461,48 @@ async def create_batch_and_enqueue(
             )
         if len(set(task_ids)) != len(task_ids):
             raise ValueError("create_batch_and_enqueue task_ids must be unique")
+
+    batch_enqueue_request_hash = _batch_enqueue_request_hash(
+        agent_name=agent.name,
+        owner_id=owner_id,
+        parent_id=parent_id,
+        payloads=payloads,
+        task_ids=task_ids,
+        batch_id=batch_id,
+    )
+
+    idempotency_enabled = normalized_idempotency_key is not None
+    batch_idem_storage_key = ""
+    if normalized_idempotency_key is not None:
+        root_keys = RedisKeys.format(namespace=namespace)
+        batch_idem_storage_key = root_keys.batch_enqueue_idempotency(
+            owner_id,
+            agent.name,
+            normalized_idempotency_key,
+        )
+
+        if task_ids is None:
+            task_ids = [
+                _deterministic_enqueued_batch_task_id(
+                    owner_id=owner_id,
+                    agent_name=agent.name,
+                    idempotency_key=normalized_idempotency_key,
+                    request_hash=batch_enqueue_request_hash,
+                    input_index=index,
+                )
+                for index, _ in enumerate(payloads)
+            ]
+        if batch_id is None:
+            batch_id = _deterministic_enqueued_batch_id(
+                owner_id=owner_id,
+                agent_name=agent.name,
+                idempotency_key=normalized_idempotency_key,
+                request_hash=batch_enqueue_request_hash,
+            )
+
+    if batch_id is None:
+        batch_id = str(uuid.uuid4())
+    created_at = time.time()
 
     task_objs: list[Task[ContextType]] = []
     for index, payload in enumerate(payloads):
@@ -1100,16 +1566,34 @@ async def create_batch_and_enqueue(
         batch_meta_json=json.dumps(batch_meta),
         batch_remaining_tasks_key=keys.batch_remaining_tasks,
         batch_progress_key=keys.batch_progress,
+        batch_enqueue_idempotency_key=batch_idem_storage_key,
+        request_hash=batch_enqueue_request_hash,
+        ttl_seconds=_ENQUEUE_IDEMPOTENCY_TTL_S,
+        idempotency_enabled=idempotency_enabled,
     )
+    if result.decision == "conflict":
+        raise ValueError(
+            "create_batch_and_enqueue idempotency_key conflict: key "
+            "was reused with a different request payload."
+        )
+    if result.decision == "replay":
+        return await get_batch_data(
+            redis_client=redis_client,
+            namespace=namespace,
+            batch_id=result.batch_id,
+        )
+
+    batch_id = result.batch_id
     task_ids = result.task_ids
 
-    return Batch(
+    batch = Batch(
         id=batch_id,
         metadata=BatchMetadata.from_dict(batch_meta),
         task_ids=task_ids,
         remaining_task_ids=task_ids,
         progress=0.0,
     )
+    return batch
 
 
 async def cancel_batch(

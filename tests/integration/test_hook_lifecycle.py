@@ -520,6 +520,62 @@ class TestHookResolutionFlow:
         keys = RedisKeys.format(namespace=test_namespace, agent=test_agent.name)
         assert await redis_client.llen(keys.queue_main) == 1
 
+    async def test_resolve_hook_idempotency_rejects_conflicting_payload(
+        self,
+        redis_client: redis.Redis,
+        test_namespace: str,
+        test_agent: SimpleTestAgent,
+        sample_task,
+        pickup_script,
+        completion_script,
+    ) -> None:
+        tool_call_id = "tool_call_approval_conflict"
+        task_id = await self._setup_pending_tool_task(
+            redis_client,
+            test_namespace,
+            test_agent,
+            sample_task,
+            pickup_script,
+            completion_script,
+            tool_call_id,
+        )
+        pending = _make_pending_hook(
+            task_id=task_id,
+            owner_id=sample_task.metadata.owner_id,
+            agent_name=test_agent.name,
+            tool_call_id=tool_call_id,
+        )
+        await self._persist_requested_hook_session(
+            redis_client=redis_client,
+            namespace=test_namespace,
+            task_id=task_id,
+            owner_id=sample_task.metadata.owner_id,
+            agent_name=test_agent.name,
+            tool_call_id=tool_call_id,
+            requested_nodes=[
+                ("approval", pending, (), "requires", pending.hook_type.__name__)
+            ],
+        )
+
+        await resolve_hook(
+            redis_client=redis_client,
+            namespace=test_namespace,
+            hook_id=pending.hook_id,
+            payload={"approved": True},
+            token=pending.token,
+            idempotency_key="evt-approval-conflict-1",
+        )
+
+        with pytest.raises(ValueError, match="idempotency_key conflict"):
+            await resolve_hook(
+                redis_client=redis_client,
+                namespace=test_namespace,
+                hook_id=pending.hook_id,
+                payload={"approved": False},
+                token=pending.token,
+                idempotency_key="evt-approval-conflict-1",
+            )
+
     async def test_resolve_hook_recovers_from_partial_resolve_write(
         self,
         redis_client: redis.Redis,

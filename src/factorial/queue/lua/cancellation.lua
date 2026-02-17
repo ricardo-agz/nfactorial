@@ -1,3 +1,17 @@
+--[[
+-- Cancel a single task across all queue states.
+--
+-- Cancellation may arrive while a task is queued, running, parked, or waiting
+-- on tools/children. This script performs required cleanup and transition in
+-- one atomic operation.
+--
+-- State transitions:
+-- - pending_tool_results | pending_child_tasks | backoff | paused -> cancelled
+-- - queued | active | processing -> no immediate status change; task is added
+--   to pending_cancellations for worker-side cancellation
+-- - missing task data -> orphaned queue marker
+-- - completed | failed | cancelled -> no transition (already terminal)
+]]--
 local queue_cancelled_key = KEYS[1]
 local queue_backoff_key = KEYS[2]
 local queue_orphaned_key = KEYS[3]

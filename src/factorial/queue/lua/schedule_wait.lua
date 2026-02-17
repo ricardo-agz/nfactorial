@@ -1,3 +1,14 @@
+--[[
+-- Park a task until a future wake timestamp.
+--
+-- Wait operations atomically remove processing heartbeat, persist wait metadata,
+-- and move eligible tasks into the scheduled queue.
+--
+-- State transitions:
+-- - processing | active -> paused (and ZADD to scheduled queue)
+-- - missing task data -> orphaned queue marker
+-- - invalid status or malformed wake timestamp -> no transition
+]]--
 local queue_scheduled_key = KEYS[1]
 local queue_pending_key = KEYS[2]
 local queue_orphaned_key = KEYS[3]

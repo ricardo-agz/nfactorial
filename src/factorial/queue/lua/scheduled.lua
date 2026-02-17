@@ -1,3 +1,14 @@
+--[[
+-- Wake paused tasks whose scheduled wait time has arrived.
+--
+-- Scheduled recovery atomically drains ready entries from the scheduled ZSET,
+-- clears wait metadata, and requeues only tasks that are still paused.
+--
+-- State transitions:
+-- - paused -> active (and LPUSH to main queue)
+-- - missing task data -> orphaned queue marker
+-- - any other status -> no transition (entry is consumed from scheduled queue)
+]]--
 local queue_scheduled_key = KEYS[1]
 local queue_main_key = KEYS[2]
 local queue_orphaned_key = KEYS[3]

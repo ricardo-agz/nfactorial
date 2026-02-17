@@ -449,6 +449,9 @@ class ScriptRunner:
             parent_pending_child_task_results_key=parent_keys.pending_child_task_results
             if parent_keys
             else None,
+            parent_pending_child_wait_ids_key=parent_keys.pending_child_wait_ids
+            if parent_keys
+            else None,
             pending_tool_call_ids_json=json.dumps(pending_tool_call_ids)
             if pending_tool_call_ids
             else None,

@@ -1,3 +1,14 @@
+--[[
+-- Recover tasks whose backoff delay has elapsed.
+--
+-- Workers need one atomic pass that drains due entries from the backoff ZSET
+-- and re-queues only tasks that are still truly in backoff.
+--
+-- State transitions:
+-- - backoff -> active (and LPUSH to main queue)
+-- - missing task data -> orphaned queue marker
+-- - any other status -> no transition (entry is simply cleaned from backoff queue)
+]]--
 local queue_backoff_key = KEYS[1]
 local queue_main_key = KEYS[2]
 local queue_orphaned_key = KEYS[3]

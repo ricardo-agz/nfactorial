@@ -241,8 +241,8 @@ This document tracks implementation progress, decisions, and user feedback for t
     - control plane now performs state transition + atomic wake signaling only
     - worker now owns request-next-stage and execute-final-continuation runtime behavior
   - Added atomic wake path for hook sessions:
-    - new Lua script `src/factorial/queue/lua/hook_wake.lua`
-    - new loader API `create_hook_wake_script(...)`
+    - new Lua script `src/factorial/queue/lua/scripts/hook_wake.lua`
+    - new typed wrapper API `create_hook_wake_script(...)`
     - new per-task key `hook_runtime_ready` to persist worker tick intents
     - wake script atomically:
       - records wake intent

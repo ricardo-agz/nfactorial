@@ -8,7 +8,12 @@ from typing import Any, cast
 
 import pytest
 
-from factorial.context import AgentContext, ExecutionContext, execution_context
+from factorial.context import (
+    AgentContext,
+    ExecutionContext,
+    SubagentsExecutionNamespace,
+    execution_context,
+)
 from factorial.events import EventPublisher
 from factorial.subagents import JobRef, subagents
 
@@ -49,7 +54,9 @@ async def test_spawn_enqueues_children_and_returns_job_refs() -> None:
         retries=0,
         iterations=0,
         events=cast(EventPublisher, _NoopEvents()),
-        enqueue_child_task=_enqueue_child_task,
+        subagents=SubagentsExecutionNamespace(
+            enqueue_callback=_enqueue_child_task,
+        ),
     )
     token = execution_context.set(ctx)
     try:
@@ -99,7 +106,9 @@ async def test_run_returns_wait_jobs_instruction() -> None:
         retries=0,
         iterations=0,
         events=cast(EventPublisher, _NoopEvents()),
-        enqueue_child_task=_enqueue_child_task,
+        subagents=SubagentsExecutionNamespace(
+            enqueue_callback=_enqueue_child_task,
+        ),
     )
     token = execution_context.set(ctx)
     try:
@@ -136,7 +145,9 @@ async def test_spawn_is_deterministic_for_repeated_call_with_same_key() -> None:
         retries=0,
         iterations=2,
         events=cast(EventPublisher, _NoopEvents()),
-        enqueue_child_task=_enqueue_child_task,
+        subagents=SubagentsExecutionNamespace(
+            enqueue_callback=_enqueue_child_task,
+        ),
     )
     token = execution_context.set(ctx)
     try:
@@ -172,7 +183,9 @@ async def test_spawn_requires_non_empty_key() -> None:
         retries=0,
         iterations=0,
         events=cast(EventPublisher, _NoopEvents()),
-        enqueue_child_task=_enqueue_child_task,
+        subagents=SubagentsExecutionNamespace(
+            enqueue_callback=_enqueue_child_task,
+        ),
     )
     token = execution_context.set(ctx)
     try:
@@ -202,7 +215,9 @@ async def test_spawn_strips_key_before_persisting_job_refs() -> None:
         retries=0,
         iterations=0,
         events=cast(EventPublisher, _NoopEvents()),
-        enqueue_child_task=_enqueue_child_task,
+        subagents=SubagentsExecutionNamespace(
+            enqueue_callback=_enqueue_child_task,
+        ),
     )
     token = execution_context.set(ctx)
     try:
@@ -252,7 +267,9 @@ async def test_spawn_rejects_inputs_that_cannot_be_coerced_to_agent_context() ->
         retries=0,
         iterations=0,
         events=cast(EventPublisher, _NoopEvents()),
-        enqueue_child_task=_enqueue_child_task,
+        subagents=SubagentsExecutionNamespace(
+            enqueue_callback=_enqueue_child_task,
+        ),
     )
     token = execution_context.set(ctx)
     try:
@@ -281,7 +298,9 @@ async def test_spawn_rejects_agent_with_invalid_context_class() -> None:
         retries=0,
         iterations=0,
         events=cast(EventPublisher, _NoopEvents()),
-        enqueue_child_task=_enqueue_child_task,
+        subagents=SubagentsExecutionNamespace(
+            enqueue_callback=_enqueue_child_task,
+        ),
     )
     token = execution_context.set(ctx)
     try:
@@ -318,7 +337,9 @@ async def test_spawn_uses_batch_enqueue_with_deterministic_ids() -> None:
         retries=0,
         iterations=0,
         events=cast(EventPublisher, _NoopEvents()),
-        enqueue_batch=_enqueue_batch,
+        subagents=SubagentsExecutionNamespace(
+            enqueue_batch_callback=_enqueue_batch,
+        ),
     )
     token = execution_context.set(ctx)
     try:
@@ -341,4 +362,49 @@ async def test_spawn_uses_batch_enqueue_with_deterministic_ids() -> None:
     assert seen_task_ids[0] == seen_task_ids[1]
     assert [job.task_id for job in first] == seen_task_ids[0]
     assert [job.task_id for job in second] == seen_task_ids[1]
+
+
+@pytest.mark.asyncio
+async def test_execution_context_subagents_namespace_routes_callbacks() -> None:
+    async def _enqueue_child_task(
+        _agent: Any,
+        _payload: Any,
+        task_id: str | None,
+    ) -> str:
+        return task_id or "generated-child"
+
+    async def _enqueue_batch(
+        _agent: Any,
+        _payloads: list[Any],
+        task_ids: list[str] | None,
+        _batch_id: str | None,
+    ) -> Any:
+        return SimpleNamespace(task_ids=task_ids or [])
+
+    ctx = ExecutionContext(
+        task_id="parent-1",
+        owner_id="owner-1",
+        retries=0,
+        iterations=0,
+        events=cast(EventPublisher, _NoopEvents()),
+        subagents=SubagentsExecutionNamespace(
+            enqueue_callback=_enqueue_child_task,
+            enqueue_batch_callback=_enqueue_batch,
+        ),
+    )
+
+    child_task_id = await ctx.subagents.enqueue(
+        _DummyChildAgent(),
+        AgentContext(query="q1"),
+        task_id="child-1",
+    )
+    batch = await ctx.subagents.enqueue_batch(
+        _DummyChildAgent(),
+        [AgentContext(query="q1"), AgentContext(query="q2")],
+        task_ids=["child-1", "child-2"],
+        batch_id="batch-1",
+    )
+
+    assert child_task_id == "child-1"
+    assert batch.task_ids == ["child-1", "child-2"]
 

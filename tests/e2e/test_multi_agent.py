@@ -114,7 +114,7 @@ class ChildSpawningAgent(BaseAgent[OrchestratorContext]):
             for i in range(self.num_children):
                 # In real usage, we'd have access to the child agent
                 # For testing, we'll return pending_child_task_ids directly
-                if ctx.enqueue_child_task:
+                if ctx.subagents.enqueue_callback:
                     child_ids.append(f"child_{i}_{uuid.uuid4().hex[:8]}")
 
             agent_ctx.child_task_ids = child_ids
@@ -194,7 +194,7 @@ class HandoffAgent(BaseAgent[AgentContext]):
         if self.handoff_to and agent_ctx.turn >= self.turns_before_handoff:
             # Create a child task for the handoff agent
             ctx = ExecutionContext.current()
-            if ctx.enqueue_child_task:
+            if ctx.subagents.enqueue_callback:
                 child_id = f"handoff_{uuid.uuid4().hex[:8]}"
                 return TurnCompletion(
                     is_done=False,
@@ -612,6 +612,7 @@ class TestParentChildAgentFlow:
                 parent_pending_child_task_results_key=(
                     parent_keys.pending_child_task_results
                 ),
+                parent_pending_child_wait_ids_key=parent_keys.pending_child_wait_ids,
                 pending_tool_call_ids_json=None,
                 pending_child_task_ids_json=None,
                 final_output_json=json.dumps(child_output),
@@ -795,6 +796,7 @@ class TestMultiAgentConcurrency:
                 parent_pending_child_task_results_key=(
                     p_keys.pending_child_task_results
                 ),
+                parent_pending_child_wait_ids_key=p_keys.pending_child_wait_ids,
                 pending_tool_call_ids_json=None,
                 pending_child_task_ids_json=None,
                 final_output_json=json.dumps({"value": value}),

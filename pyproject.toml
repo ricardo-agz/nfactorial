@@ -62,7 +62,7 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 factorial = [
-    "queue/lua/*.lua",
+    "queue/lua/scripts/*.lua",
     "dashboard/*.html",
     "dashboard/*.js",
     "dashboard/assets/*",

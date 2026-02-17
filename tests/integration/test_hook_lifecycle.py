@@ -14,7 +14,11 @@ from openai.types.chat.chat_completion_message_function_tool_call import (
 )
 
 from factorial import Agent, AgentContext, hook, tool
-from factorial.context import ExecutionContext, execution_context
+from factorial.context import (
+    ExecutionContext,
+    HooksExecutionNamespace,
+    execution_context,
+)
 from factorial.exceptions import HookExpiredError, HookTokenValidationError
 from factorial.hooks import (
     Hook,
@@ -1086,11 +1090,13 @@ class TestHookResolutionFlow:
             retries=0,
             iterations=0,
             events=_NoopEvents(),  # type: ignore[arg-type]
-            persist_hook_runtime=lambda payload: persist_hook_runtime_payload(
-                redis_client=redis_client,
-                namespace=test_namespace,
-                task_id=task_id,
-                runtime_payload=payload,
+            hooks=HooksExecutionNamespace(
+                persist_runtime_callback=lambda payload: persist_hook_runtime_payload(
+                    redis_client=redis_client,
+                    namespace=test_namespace,
+                    task_id=task_id,
+                    runtime_payload=payload,
+                ),
             ),
         )
         token = execution_context.set(exec_ctx)
@@ -1190,11 +1196,13 @@ class TestHookResolutionFlow:
             retries=picked_task.retries,
             iterations=picked_task.payload.turn,
             events=_NoopEvents(),  # type: ignore[arg-type]
-            persist_hook_runtime=lambda payload: persist_hook_runtime_payload(
-                redis_client=redis_client,
-                namespace=test_namespace,
-                task_id=task_id,
-                runtime_payload=payload,
+            hooks=HooksExecutionNamespace(
+                persist_runtime_callback=lambda payload: persist_hook_runtime_payload(
+                    redis_client=redis_client,
+                    namespace=test_namespace,
+                    task_id=task_id,
+                    runtime_payload=payload,
+                ),
             ),
         )
         tick_1 = await process_hook_runtime_wake_requests(
@@ -1300,11 +1308,13 @@ class TestHookResolutionFlow:
             retries=picked_task.retries,
             iterations=picked_task.payload.turn,
             events=_NoopEvents(),  # type: ignore[arg-type]
-            persist_hook_runtime=lambda payload: persist_hook_runtime_payload(
-                redis_client=redis_client,
-                namespace=test_namespace,
-                task_id=task_id,
-                runtime_payload=payload,
+            hooks=HooksExecutionNamespace(
+                persist_runtime_callback=lambda payload: persist_hook_runtime_payload(
+                    redis_client=redis_client,
+                    namespace=test_namespace,
+                    task_id=task_id,
+                    runtime_payload=payload,
+                ),
             ),
         )
         tick_2 = await process_hook_runtime_wake_requests(
@@ -1593,11 +1603,13 @@ class TestHookResolutionFlow:
             retries=0,
             iterations=0,
             events=_NoopEvents(),  # type: ignore[arg-type]
-            persist_hook_runtime=lambda payload: persist_hook_runtime_payload(
-                redis_client=redis_client,
-                namespace=test_namespace,
-                task_id=task_id,
-                runtime_payload=payload,
+            hooks=HooksExecutionNamespace(
+                persist_runtime_callback=lambda payload: persist_hook_runtime_payload(
+                    redis_client=redis_client,
+                    namespace=test_namespace,
+                    task_id=task_id,
+                    runtime_payload=payload,
+                ),
             ),
         )
         token = execution_context.set(exec_ctx)

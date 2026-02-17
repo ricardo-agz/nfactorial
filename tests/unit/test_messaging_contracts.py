@@ -40,7 +40,7 @@ async def test_groups_create_normalizes_members() -> None:
         return {"team_id": "team-1", "group_name": group_name}
 
     ctx = _base_ctx()
-    ctx.messaging_create_group = _create_group
+    ctx.messaging.groups.create_callback = _create_group
     token = execution_context.set(ctx)
     try:
         group = await messaging.groups.create(
@@ -80,7 +80,7 @@ async def test_group_handle_send_uses_group_callback() -> None:
         }
 
     ctx = _base_ctx()
-    ctx.messaging_send_group = _send_group
+    ctx.messaging.groups.send_callback = _send_group
     token = execution_context.set(ctx)
     try:
         report = await MessagingGroupHandle(name="research", team_id="team-1").send(
@@ -125,7 +125,7 @@ async def test_direct_send_accepts_jobref_like_target() -> None:
         }
 
     ctx = _base_ctx()
-    ctx.messaging_send_direct = _send_direct
+    ctx.messaging.send_callback = _send_direct
     token = execution_context.set(ctx)
     try:
         report = await messaging.send(
@@ -142,6 +142,52 @@ async def test_direct_send_accepts_jobref_like_target() -> None:
         "metadata": {"reason": "coordination"},
     }
     assert report.delivered_task_ids == ["task-x"]
+
+
+@pytest.mark.asyncio
+async def test_execution_context_messaging_namespace_routes_callbacks() -> None:
+    async def _list_groups() -> list[dict[str, Any]]:
+        return [{"team_id": "team-1", "group_name": "research"}]
+
+    async def _send_group(
+        group_name: str,
+        content: str,
+        metadata: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        return {
+            "thread_message_id": "group-1",
+            "global_message_id": "global-1",
+            "delivered_task_ids": [group_name, content],
+            "skipped_inactive_task_ids": [],
+            "failed_task_ids": [],
+            "metadata": metadata,
+        }
+
+    async def _send_direct(
+        to_task_id: str,
+        _content: str,
+        _metadata: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        return {
+            "thread_message_id": "direct-1",
+            "global_message_id": "global-2",
+            "delivered_task_ids": [to_task_id],
+            "skipped_inactive_task_ids": [],
+            "failed_task_ids": [],
+        }
+
+    ctx = _base_ctx()
+    ctx.messaging.groups.list_callback = _list_groups
+    ctx.messaging.groups.send_callback = _send_group
+    ctx.messaging.send_callback = _send_direct
+
+    groups = await ctx.messaging.groups.list()
+    group_report = await ctx.messaging.groups.send("research", "kickoff")
+    direct_report = await ctx.messaging.send("task-z", "ping")
+
+    assert groups == [{"team_id": "team-1", "group_name": "research"}]
+    assert group_report["thread_message_id"] == "group-1"
+    assert direct_report["delivered_task_ids"] == ["task-z"]
 
 
 @pytest.mark.asyncio

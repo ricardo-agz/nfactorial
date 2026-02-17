@@ -251,7 +251,9 @@ async def test_direct_send_rejects_cross_team_messages(
         owner_id=test_owner_id,
         query="outsider",
     )
-    assert (sender.metadata.team_id or sender.id) != (outsider.metadata.team_id or outsider.id)
+    assert (sender.metadata.team_id or sender.id) != (
+        outsider.metadata.team_id or outsider.id
+    )
 
     with pytest.raises(MessagingScopeError):
         await messaging_send_direct(

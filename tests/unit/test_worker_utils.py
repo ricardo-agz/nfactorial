@@ -11,8 +11,8 @@ from factorial.exceptions import (
 )
 from factorial.queue.worker import (
     CompletionAction,
-    _steering_message_sort_key,
     classify_failure,
+    steering_message_sort_key,
 )
 
 
@@ -188,7 +188,7 @@ class TestSteeringOrdering:
             "1699999999999_99",
             "1700000000001_1",
         ]
-        sorted_ids = sorted(message_ids, key=_steering_message_sort_key)
+        sorted_ids = sorted(message_ids, key=steering_message_sort_key)
         assert sorted_ids == [
             "1699999999999_99",
             "1700000000000_2",
@@ -202,7 +202,7 @@ class TestSteeringOrdering:
             "1700000000000_x",
             "1700000000000_1",
         ]
-        sorted_ids = sorted(message_ids, key=_steering_message_sort_key)
+        sorted_ids = sorted(message_ids, key=steering_message_sort_key)
         assert sorted_ids == [
             "bad",
             "1700000000000_x",

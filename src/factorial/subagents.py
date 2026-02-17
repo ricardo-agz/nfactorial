@@ -163,14 +163,14 @@ class SubagentsNamespace:
         ]
 
         task_ids: list[str]
-        if execution_ctx.enqueue_batch is not None:
+        if execution_ctx.subagents.has_enqueue_batch:
             batch_id = _deterministic_spawn_batch_id(
                 parent_task_id=execution_ctx.task_id,
                 key=normalized_key,
                 agent_name=agent_name,
                 task_ids=deterministic_task_ids,
             )
-            batch = await execution_ctx.spawn_child_tasks(
+            batch = await execution_ctx.subagents.enqueue_batch(
                 agent,
                 coerced_inputs,
                 task_ids=deterministic_task_ids,
@@ -181,7 +181,7 @@ class SubagentsNamespace:
             task_ids = []
             for index, payload in enumerate(coerced_inputs):
                 task_ids.append(
-                    await execution_ctx.spawn_child_task(
+                    await execution_ctx.subagents.enqueue(
                         agent,
                         payload,
                         task_id=deterministic_task_ids[index],

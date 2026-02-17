@@ -223,7 +223,11 @@ async def test_steer_task_wakes_activity_wait_task(
         agent=agent,
         task=task,
     )
-    task_keys = RedisKeys.format(namespace=test_namespace, agent=agent.name, task_id=task_id)
+    task_keys = RedisKeys.format(
+        namespace=test_namespace,
+        agent=agent.name,
+        task_id=task_id,
+    )
     await _set_task_status(
         redis_client=redis_client,
         keys=task_keys,
@@ -712,7 +716,11 @@ async def test_cancellation_clears_activity_wait_state(
         task=task,
     )
 
-    task_keys = RedisKeys.format(namespace=test_namespace, agent=agent.name, task_id=task.id)
+    task_keys = RedisKeys.format(
+        namespace=test_namespace,
+        agent=agent.name,
+        task_id=task.id,
+    )
     await redis_client.delete(task_keys.queue_main)
     await _set_task_status(
         redis_client=redis_client,

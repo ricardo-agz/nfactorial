@@ -1,11 +1,10 @@
 from __future__ import annotations
 
+import builtins
 from dataclasses import dataclass
-from typing import Any, TypeVar, cast
+from typing import Any, cast
 
 from factorial.context import ExecutionContext
-
-CallbackT = TypeVar("CallbackT")
 
 
 @dataclass(frozen=True)
@@ -26,12 +25,6 @@ def _current_execution_context() -> ExecutionContext:
         raise RuntimeError(
             "messaging can only be used during active task execution"
         ) from exc
-
-
-def _require_callback(name: str, callback: CallbackT | None) -> CallbackT:
-    if callback is None:
-        raise RuntimeError(f"{name} is not configured for this execution context")
-    return callback
 
 
 def _normalize_group_name(group_name: str) -> str:
@@ -114,11 +107,10 @@ class MessagingGroupHandle:
 
     async def add_members(self, members: list[Any]) -> list[str]:
         ctx = _current_execution_context()
-        callback = _require_callback(
-            "messaging_add_group_members",
-            ctx.messaging_add_group_members,
+        return await ctx.messaging.groups.add_members(
+            self.name,
+            _coerce_member_task_ids(members),
         )
-        return await callback(self.name, _coerce_member_task_ids(members))
 
 
 class MessagingGroupsNamespace:
@@ -131,11 +123,7 @@ class MessagingGroupsNamespace:
         members: list[Any] | None = None,
     ) -> MessagingGroupHandle:
         ctx = _current_execution_context()
-        callback = _require_callback(
-            "messaging_create_group",
-            ctx.messaging_create_group,
-        )
-        data = await callback(
+        data = await ctx.messaging.groups.create(
             _normalize_group_name(group_name),
             _coerce_member_task_ids(members),
         )
@@ -146,11 +134,7 @@ class MessagingGroupsNamespace:
 
     async def get(self, group_name: str) -> MessagingGroupHandle:
         ctx = _current_execution_context()
-        callback = _require_callback(
-            "messaging_get_group",
-            ctx.messaging_get_group,
-        )
-        data = await callback(_normalize_group_name(group_name))
+        data = await ctx.messaging.groups.get(_normalize_group_name(group_name))
         return MessagingGroupHandle(
             name=str(data["group_name"]),
             team_id=str(data["team_id"]),
@@ -158,11 +142,7 @@ class MessagingGroupsNamespace:
 
     async def list(self) -> list[MessagingGroupHandle]:
         ctx = _current_execution_context()
-        callback = _require_callback(
-            "messaging_list_groups",
-            ctx.messaging_list_groups,
-        )
-        results = await callback()
+        results = await ctx.messaging.groups.list()
         return [
             MessagingGroupHandle(
                 name=str(entry["group_name"]),
@@ -171,13 +151,11 @@ class MessagingGroupsNamespace:
             for entry in results
         ]
 
-    async def find(self, group_name: str) -> list[MessagingGroupHandle]:
+    async def find(
+        self, group_name: str
+    ) -> builtins.list[MessagingGroupHandle]:
         ctx = _current_execution_context()
-        callback = _require_callback(
-            "messaging_find_groups",
-            ctx.messaging_find_groups,
-        )
-        results = await callback(_normalize_group_name(group_name))
+        results = await ctx.messaging.groups.find(_normalize_group_name(group_name))
         return [
             MessagingGroupHandle(
                 name=str(entry["group_name"]),
@@ -194,24 +172,18 @@ class MessagingGroupsNamespace:
         metadata: dict[str, Any] | None = None,
     ) -> MessageDeliveryReport:
         ctx = _current_execution_context()
-        callback = _require_callback(
-            "messaging_send_group",
-            ctx.messaging_send_group,
-        )
-        result = await callback(
+        result = await ctx.messaging.groups.send(
             _normalize_group_name(group_name),
             _normalize_content(content),
             _coerce_metadata(metadata),
         )
         return _delivery_from_dict(result)
 
-    async def add_members(self, group_name: str, members: list[Any]) -> list[str]:
+    async def add_members(
+        self, group_name: str, members: builtins.list[Any]
+    ) -> builtins.list[str]:
         ctx = _current_execution_context()
-        callback = _require_callback(
-            "messaging_add_group_members",
-            ctx.messaging_add_group_members,
-        )
-        return await callback(
+        return await ctx.messaging.groups.add_members(
             _normalize_group_name(group_name),
             _coerce_member_task_ids(members),
         )
@@ -231,11 +203,7 @@ class MessagingNamespace:
         metadata: dict[str, Any] | None = None,
     ) -> MessageDeliveryReport:
         ctx = _current_execution_context()
-        callback = _require_callback(
-            "messaging_send_direct",
-            ctx.messaging_send_direct,
-        )
-        result = await callback(
+        result = await ctx.messaging.send(
             _coerce_task_id(to_task_id),
             _normalize_content(content),
             _coerce_metadata(metadata),

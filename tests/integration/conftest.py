@@ -25,9 +25,11 @@ from factorial.queue.lua import (
     StaleRecoveryScript,
     StaleRecoveryScriptResult,
     TaskCompletionScript,
+    TaskCompletionScriptResult,
     TaskExpirationScript,
     TaskExpirationScriptResult,
     TaskSteeringScript,
+    TaskSteeringScriptResult,
     ToolCompletionScript,
     WaitScheduleScript,
     create_backoff_recovery_script,
@@ -43,10 +45,6 @@ from factorial.queue.lua import (
     create_task_steering_script,
     create_tool_completion_script,
     create_wait_schedule_script,
-)
-from factorial.queue.lua._loader import (
-    TaskCompletionScriptResult,
-    TaskSteeringScriptResult,
 )
 from factorial.queue.operations import enqueue_task
 from factorial.queue.task import Task, TaskStatus

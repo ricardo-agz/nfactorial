@@ -41,7 +41,7 @@ In practice, this lets you easily build agents much like you would with another 
 * **Agent-lifecycle hooks**: Easily inject logic to run before/after each turn or run, on completion, failure, or cancellation. 
 * **In-flight agent task management**: Cancel or steer (inject in-flight messages) ongoing agent runs.
 * **Observability**: Built-in metrics dashboard to visualize active agents and workers and track succesful completions, errors, and other agent states.
-* **Deferred tools**: Easily implement tools that pause the agent execution until completion, such as those that require completion via a webhook or require user approval before the agent can continue.
+* **Hooks and wait orchestration**: Pause execution for external approvals via hooks, schedule time-based waits, and block on spawned subagent jobs.
 
 ## Quick Example
 

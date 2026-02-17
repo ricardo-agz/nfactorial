@@ -13,7 +13,7 @@ import json
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, cast
 
 import pytest
 import redis.asyncio as redis
@@ -33,6 +33,11 @@ from factorial.queue.operations import (
 )
 from factorial.queue.task import Task, TaskStatus, get_task_data, get_task_status
 from factorial.queue.worker import process_task
+
+
+async def _await_redis(call: object) -> Any:
+    return await cast(Any, call)
+
 
 # =============================================================================
 # Multi-Agent Test Contexts
@@ -443,8 +448,8 @@ class TestParentChildAgentFlow:
         task_keys = RedisKeys.format(
             namespace=test_namespace, task_id=task.id, agent=orchestrator.name
         )
-        pending_children = await redis_client.hgetall(
-            task_keys.pending_child_task_results
+        pending_children = await _await_redis(
+            redis_client.hgetall(task_keys.pending_child_task_results)
         )
         assert len(pending_children) == 2  # 2 children spawned
 
@@ -471,59 +476,90 @@ class TestParentChildAgentFlow:
         )
 
         # Setup parent waiting for children
-        await redis_client.hset(
-            parent_keys.task_status, parent_id, "pending_child_tasks"
+        await _await_redis(
+            redis_client.hset(parent_keys.task_status, parent_id, "pending_child_tasks")
         )
-        await redis_client.hset(parent_keys.task_agent, parent_id, parent_agent)
-        await redis_client.hset(
-            parent_keys.task_payload,
-            parent_id,
-            json.dumps({
-                "query": "parent task",
-                "turn": 1,
-                "child_task_ids": child_ids,
-            }),
+        await _await_redis(
+            redis_client.hset(parent_keys.task_agent, parent_id, parent_agent)
         )
-        await redis_client.hset(parent_keys.task_pickups, parent_id, 1)
-        await redis_client.hset(parent_keys.task_retries, parent_id, 0)
-        await redis_client.hset(
-            parent_keys.task_meta,
-            parent_id,
-            json.dumps({
-                "owner_id": test_owner_id,
-                "created_at": time.time(),
-            }),
+        await _await_redis(
+            redis_client.hset(
+                parent_keys.task_payload,
+                parent_id,
+                json.dumps({
+                    "query": "parent task",
+                    "turn": 1,
+                    "child_task_ids": child_ids,
+                }),
+            )
+        )
+        await _await_redis(
+            redis_client.hset(parent_keys.task_pickups, parent_id, "1")
+        )
+        await _await_redis(
+            redis_client.hset(parent_keys.task_retries, parent_id, "0")
+        )
+        await _await_redis(
+            redis_client.hset(
+                parent_keys.task_meta,
+                parent_id,
+                json.dumps({
+                    "owner_id": test_owner_id,
+                    "created_at": time.time(),
+                }),
+            )
         )
 
         # Track pending children
         for child_id in child_ids:
-            await redis_client.hset(
-                parent_keys.pending_child_task_results, child_id, PENDING_SENTINEL
+            await _await_redis(
+                redis_client.hset(
+                    parent_keys.pending_child_task_results,
+                    child_id,
+                    PENDING_SENTINEL,
+                )
+            )
+            await _await_redis(
+                redis_client.sadd(parent_keys.pending_child_wait_ids, child_id)
             )
 
-        await redis_client.zadd(parent_keys.queue_pending, {parent_id: time.time()})
+        await _await_redis(
+            redis_client.zadd(parent_keys.queue_pending, {parent_id: time.time()})
+        )
 
         # Setup children in processing state
         for i, (child_id, child_keys) in enumerate(
             [(child_ids[0], child1_keys), (child_ids[1], child2_keys)]
         ):
-            await redis_client.hset(child_keys.task_status, child_id, "processing")
-            await redis_client.hset(child_keys.task_agent, child_id, child_agent)
-            await redis_client.hset(
-                child_keys.task_payload,
-                child_id,
-                json.dumps({"query": f"child task {i}", "turn": 1}),
+            await _await_redis(
+                redis_client.hset(child_keys.task_status, child_id, "processing")
             )
-            await redis_client.hset(child_keys.task_pickups, child_id, 1)
-            await redis_client.hset(child_keys.task_retries, child_id, 0)
-            await redis_client.hset(
-                child_keys.task_meta,
-                child_id,
-                json.dumps({
-                    "owner_id": test_owner_id,
-                    "parent_id": parent_id,
-                    "created_at": time.time(),
-                }),
+            await _await_redis(
+                redis_client.hset(child_keys.task_agent, child_id, child_agent)
+            )
+            await _await_redis(
+                redis_client.hset(
+                    child_keys.task_payload,
+                    child_id,
+                    json.dumps({"query": f"child task {i}", "turn": 1}),
+                )
+            )
+            await _await_redis(
+                redis_client.hset(child_keys.task_pickups, child_id, "1")
+            )
+            await _await_redis(
+                redis_client.hset(child_keys.task_retries, child_id, "0")
+            )
+            await _await_redis(
+                redis_client.hset(
+                    child_keys.task_meta,
+                    child_id,
+                    json.dumps({
+                        "owner_id": test_owner_id,
+                        "parent_id": parent_id,
+                        "created_at": time.time(),
+                    }),
+                )
             )
 
         # Create agents
@@ -602,7 +638,9 @@ class TestParentChildAgentFlow:
         assert parent_status == TaskStatus.ACTIVE
 
         # Verify parent is back in queue
-        queue_contents = await redis_client.lrange(parent_keys.queue_main, 0, -1)
+        queue_contents = await _await_redis(
+            redis_client.lrange(parent_keys.queue_main, 0, -1)
+        )
         assert parent_id in queue_contents
 
 
@@ -644,28 +682,45 @@ class TestMultiAgentConcurrency:
             (parent1_id, parent1_keys, child1_id),
             (parent2_id, parent2_keys, child2_id),
         ]:
-            await redis_client.hset(
-                parent_keys_obj.task_status, parent_id, "pending_child_tasks"
+            await _await_redis(
+                redis_client.hset(
+                    parent_keys_obj.task_status,
+                    parent_id,
+                    "pending_child_tasks",
+                )
             )
-            await redis_client.hset(
-                parent_keys_obj.task_agent, parent_id, parent_agent
+            await _await_redis(
+                redis_client.hset(parent_keys_obj.task_agent, parent_id, parent_agent)
             )
-            await redis_client.hset(
-                parent_keys_obj.task_payload,
-                parent_id,
-                json.dumps({"query": f"parent {parent_id[:8]}"}),
+            await _await_redis(
+                redis_client.hset(
+                    parent_keys_obj.task_payload,
+                    parent_id,
+                    json.dumps({"query": f"parent {parent_id[:8]}"}),
+                )
             )
-            await redis_client.hset(parent_keys_obj.task_pickups, parent_id, 1)
-            await redis_client.hset(parent_keys_obj.task_retries, parent_id, 0)
-            await redis_client.hset(
-                parent_keys_obj.task_meta,
-                parent_id,
-                json.dumps({"owner_id": test_owner_id}),
+            await _await_redis(
+                redis_client.hset(parent_keys_obj.task_pickups, parent_id, "1")
             )
-            await redis_client.hset(
-                parent_keys_obj.pending_child_task_results,
-                child_id,
-                PENDING_SENTINEL,
+            await _await_redis(
+                redis_client.hset(parent_keys_obj.task_retries, parent_id, "0")
+            )
+            await _await_redis(
+                redis_client.hset(
+                    parent_keys_obj.task_meta,
+                    parent_id,
+                    json.dumps({"owner_id": test_owner_id}),
+                )
+            )
+            await _await_redis(
+                redis_client.hset(
+                    parent_keys_obj.pending_child_task_results,
+                    child_id,
+                    PENDING_SENTINEL,
+                )
+            )
+            await _await_redis(
+                redis_client.sadd(parent_keys_obj.pending_child_wait_ids, child_id)
             )
 
         # Setup both children
@@ -673,21 +728,31 @@ class TestMultiAgentConcurrency:
             (child1_id, child1_keys, parent1_id),
             (child2_id, child2_keys, parent2_id),
         ]:
-            await redis_client.hset(
-                child_keys_obj.task_status, child_id, "processing"
+            await _await_redis(
+                redis_client.hset(child_keys_obj.task_status, child_id, "processing")
             )
-            await redis_client.hset(child_keys_obj.task_agent, child_id, child_agent)
-            await redis_client.hset(
-                child_keys_obj.task_payload,
-                child_id,
-                json.dumps({"query": f"child {child_id[:8]}"}),
+            await _await_redis(
+                redis_client.hset(child_keys_obj.task_agent, child_id, child_agent)
             )
-            await redis_client.hset(child_keys_obj.task_pickups, child_id, 1)
-            await redis_client.hset(child_keys_obj.task_retries, child_id, 0)
-            await redis_client.hset(
-                child_keys_obj.task_meta,
-                child_id,
-                json.dumps({"owner_id": test_owner_id, "parent_id": parent_id}),
+            await _await_redis(
+                redis_client.hset(
+                    child_keys_obj.task_payload,
+                    child_id,
+                    json.dumps({"query": f"child {child_id[:8]}"}),
+                )
+            )
+            await _await_redis(
+                redis_client.hset(child_keys_obj.task_pickups, child_id, "1")
+            )
+            await _await_redis(
+                redis_client.hset(child_keys_obj.task_retries, child_id, "0")
+            )
+            await _await_redis(
+                redis_client.hset(
+                    child_keys_obj.task_meta,
+                    child_id,
+                    json.dumps({"owner_id": test_owner_id, "parent_id": parent_id}),
+                )
             )
 
         completion_script = await create_task_completion_script(redis_client)
@@ -747,22 +812,22 @@ class TestMultiAgentConcurrency:
         assert status2 == TaskStatus.COMPLETED
 
         # Verify correct results are in correct parents
-        parent1_result = await redis_client.hget(
-            parent1_keys.pending_child_task_results, child1_id
+        parent1_result = await _await_redis(
+            redis_client.hget(parent1_keys.pending_child_task_results, child1_id)
         )
-        parent2_result = await redis_client.hget(
-            parent2_keys.pending_child_task_results, child2_id
+        parent2_result = await _await_redis(
+            redis_client.hget(parent2_keys.pending_child_task_results, child2_id)
         )
 
         assert json.loads(str(parent1_result)) == {"value": 100}
         assert json.loads(str(parent2_result)) == {"value": 200}
 
         # Verify no cross-contamination
-        cross1 = await redis_client.hget(
-            parent1_keys.pending_child_task_results, child2_id
+        cross1 = await _await_redis(
+            redis_client.hget(parent1_keys.pending_child_task_results, child2_id)
         )
-        cross2 = await redis_client.hget(
-            parent2_keys.pending_child_task_results, child1_id
+        cross2 = await _await_redis(
+            redis_client.hget(parent2_keys.pending_child_task_results, child1_id)
         )
         assert cross1 is None
         assert cross2 is None
@@ -807,8 +872,12 @@ class TestAgentRegistration:
         await enqueue_task(redis_client, test_namespace, second_worker_agent, task2)
 
         # Verify tasks are in correct queues
-        agent1_queue = await redis_client.lrange(agent1_keys.queue_main, 0, -1)
-        agent2_queue = await redis_client.lrange(agent2_keys.queue_main, 0, -1)
+        agent1_queue = await _await_redis(
+            redis_client.lrange(agent1_keys.queue_main, 0, -1)
+        )
+        agent2_queue = await _await_redis(
+            redis_client.lrange(agent2_keys.queue_main, 0, -1)
+        )
 
         assert task1.id in agent1_queue
         assert task2.id in agent2_queue

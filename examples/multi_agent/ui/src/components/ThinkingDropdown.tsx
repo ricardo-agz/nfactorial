@@ -10,6 +10,32 @@ interface ThinkingDropdownProps {
   researchProgress?: number;
 }
 
+const extractResearchTaskIds = (researchResult: any): string[] => {
+  if (Array.isArray(researchResult)) {
+    return Array.from(
+      new Set(researchResult.filter((id: any): id is string => typeof id === 'string' && id.length > 0)),
+    );
+  }
+
+  if (!researchResult || typeof researchResult !== 'object') return [];
+
+  const idsFromChildTaskIds = Array.isArray(researchResult.child_task_ids)
+    ? researchResult.child_task_ids.filter((id: any): id is string => typeof id === 'string' && id.length > 0)
+    : [];
+
+  if (idsFromChildTaskIds.length) {
+    return Array.from(new Set(idsFromChildTaskIds));
+  }
+
+  const idsFromJobRefs = Array.isArray(researchResult.job_refs)
+    ? researchResult.job_refs
+        .map((job: any) => (typeof job?.task_id === 'string' ? job.task_id : null))
+        .filter((id: string | null): id is string => Boolean(id))
+    : [];
+
+  return Array.from(new Set(idsFromJobRefs));
+};
+
 export const ThinkingDropdown: React.FC<ThinkingDropdownProps> = ({
   thinking,
   subAgentProgress,
@@ -211,15 +237,24 @@ export const ThinkingDropdown: React.FC<ThinkingDropdownProps> = ({
 
                   {call.status === 'completed' && call.result && (
                     <div>
-                      {call.tool_name === 'research' && Array.isArray(call.result) && subAgentProgress ? (
-                        <SubAgentCarousel
-                          taskIds={call.result as string[]}
-                          progressMap={subAgentProgress}
-                          progressPercent={researchProgress}
-                        />
-                      ) : (
-                        <ToolResultDisplay name={call.tool_name} result={call.result} />
-                      )}
+                      {(() => {
+                        const researchTaskIds =
+                          call.tool_name === 'research'
+                            ? extractResearchTaskIds(call.result)
+                            : [];
+
+                        if (call.tool_name === 'research' && researchTaskIds.length && subAgentProgress) {
+                          return (
+                            <SubAgentCarousel
+                              taskIds={researchTaskIds}
+                              progressMap={subAgentProgress}
+                              progressPercent={researchProgress}
+                            />
+                          );
+                        }
+
+                        return <ToolResultDisplay name={call.tool_name} result={call.result} />;
+                      })()}
                     </div>
                   )}
 

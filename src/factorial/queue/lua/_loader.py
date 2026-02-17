@@ -1,7 +1,7 @@
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, TypeVar, cast
+from typing import Any, Literal, TypeVar, cast
 
 import redis.asyncio as redis
 from redis.commands.core import AsyncScript
@@ -277,7 +277,9 @@ class TaskCompletionScript(AsyncScript):
     * KEYS[19] = pending_child_task_results_key (str)
     * KEYS[20] = agent_metrics_bucket_key (str)
     * KEYS[21] = global_metrics_bucket_key (str)
-    * KEYS[22] = parent_pending_child_task_results_key (str | None)
+    * KEYS[22] = pending_child_wait_ids_key (str)
+    * KEYS[23] = parent_pending_child_task_results_key (str | None)
+    * KEYS[24] = parent_pending_child_wait_ids_key (str | None)
 
     Args:
     * ARGV[1] = task_id (str)
@@ -321,7 +323,9 @@ class TaskCompletionScript(AsyncScript):
         metrics_ttl: int,
         pending_sentinel: str,
         current_turn: int,
+        pending_child_wait_ids_key: str | None = None,
         parent_pending_child_task_results_key: str | None = None,
+        parent_pending_child_wait_ids_key: str | None = None,
         pending_tool_call_ids_json: str | None = None,
         pending_child_task_ids_json: str | None = None,
         final_output_json: str | None = None,
@@ -348,11 +352,12 @@ class TaskCompletionScript(AsyncScript):
             pending_child_task_results_key,
             agent_metrics_bucket_key,
             global_metrics_bucket_key,
+            pending_child_wait_ids_key or "",
+            parent_pending_child_task_results_key or "",
+            parent_pending_child_wait_ids_key or "",
         ]
-        if parent_pending_child_task_results_key:
-            keys.append(parent_pending_child_task_results_key)
 
-        result: tuple[bool, bool] = await super().__call__(  # type: ignore
+        result: tuple[bool, bool] = await super().__call__(
             keys=keys,
             args=[
                 task_id,
@@ -436,7 +441,7 @@ class StaleRecoveryScript(AsyncScript):
         max_retries: int,
         metrics_ttl: int,
     ) -> StaleRecoveryScriptResult:
-        result: tuple[int, int, list[tuple[str, str]]] = await super().__call__(  # type: ignore
+        result: tuple[int, int, list[tuple[str, str]]] = await super().__call__(
             keys=[
                 queue_main_key,
                 queue_failed_key,
@@ -530,7 +535,7 @@ class TaskExpirationScript(AsyncScript):
         cancelled_cutoff_timestamp: float,
         max_cleanup_batch: int,
     ) -> TaskExpirationScriptResult:
-        result: tuple[int, int, int, list[tuple[str, str]]] = await super().__call__(  # type: ignore
+        result: tuple[int, int, int, list[tuple[str, str]]] = await super().__call__(
             keys=[
                 queue_completions_key,
                 queue_failed_key,
@@ -638,6 +643,199 @@ async def create_tool_completion_script(
     return get_cached_script(redis_client, "tool_completion", ToolCompletionScript)
 
 
+class HookWakeScript(AsyncScript):
+    """
+    Atomically mark a hook runtime wake request and wake a pending task.
+
+    Keys:
+    * KEYS[1] = queue_main_key (str)
+    * KEYS[2] = queue_pending_key (str)
+    * KEYS[3] = queue_orphaned_key (str)
+    * KEYS[4] = task_statuses_key (str)
+    * KEYS[5] = task_agents_key (str)
+    * KEYS[6] = task_payloads_key (str)
+    * KEYS[7] = task_pickups_key (str)
+    * KEYS[8] = task_retries_key (str)
+    * KEYS[9] = task_metas_key (str)
+    * KEYS[10] = hook_runtime_ready_key (str)
+
+    Args:
+    * ARGV[1] = task_id (str)
+    * ARGV[2] = tool_call_id (str)
+    * ARGV[3] = session_id (str)
+    """
+
+    async def execute(
+        self,
+        *,
+        queue_main_key: str,
+        queue_pending_key: str,
+        queue_orphaned_key: str,
+        task_statuses_key: str,
+        task_agents_key: str,
+        task_payloads_key: str,
+        task_pickups_key: str,
+        task_retries_key: str,
+        task_metas_key: str,
+        hook_runtime_ready_key: str,
+        task_id: str,
+        tool_call_id: str,
+        session_id: str,
+    ) -> tuple[bool, str]:
+        result: tuple[int, str] = await super().__call__(  # type: ignore
+            keys=[
+                queue_main_key,
+                queue_pending_key,
+                queue_orphaned_key,
+                task_statuses_key,
+                task_agents_key,
+                task_payloads_key,
+                task_pickups_key,
+                task_retries_key,
+                task_metas_key,
+                hook_runtime_ready_key,
+            ],
+            args=[
+                task_id,
+                tool_call_id,
+                session_id,
+            ],
+        )
+        return (bool(result[0]), decode(result[1]))
+
+
+async def create_hook_wake_script(
+    redis_client: redis.Redis,
+) -> HookWakeScript:
+    """Create atomic hook wake script."""
+    return get_cached_script(redis_client, "hook_wake", HookWakeScript)
+
+
+@dataclass
+class HookResolveScriptResult:
+    decision: Literal["claimed", "pending", "replay", "conflict", "resolved"]
+    task_resumed: bool | None
+    request_hash: str
+
+
+class HookResolveScript(AsyncScript):
+    """
+    Claim/finalize resolve-hook request state.
+
+    Keys:
+    * KEYS[1] = hook_resolution_key (str)
+
+    Args:
+    * ARGV[1] = mode ("claim" | "finalize")
+    * ARGV[2] = request_hash (str)
+    * ARGV[3] = ttl_seconds (int)
+    * ARGV[4] = hook_id (str)
+    * ARGV[5] = task_id (str)
+    * ARGV[6] = tool_call_id (str)
+    * ARGV[7] = task_resumed_flag ("1" | "0" | "")
+    """
+
+    @staticmethod
+    def _decode_task_resumed_flag(flag: str) -> bool | None:
+        if flag == "1":
+            return True
+        if flag == "0":
+            return False
+        return None
+
+    @staticmethod
+    def _encode_task_resumed_flag(task_resumed: bool | None) -> str:
+        if task_resumed is True:
+            return "1"
+        if task_resumed is False:
+            return "0"
+        return ""
+
+    async def _execute(
+        self,
+        *,
+        mode: Literal["claim", "finalize"],
+        hook_resolution_key: str,
+        request_hash: str,
+        ttl_seconds: int,
+        hook_id: str,
+        task_id: str,
+        tool_call_id: str,
+        task_resumed: bool | None = None,
+    ) -> HookResolveScriptResult:
+        result: tuple[str | bytes, str | bytes, str | bytes] = await super().__call__(  # type: ignore
+            keys=[hook_resolution_key],
+            args=[
+                mode,
+                request_hash,
+                ttl_seconds,
+                hook_id,
+                task_id,
+                tool_call_id,
+                self._encode_task_resumed_flag(task_resumed),
+            ],
+        )
+        decision = decode(result[0])
+        if decision not in {"claimed", "pending", "replay", "conflict", "resolved"}:
+            raise ValueError(
+                "hook_resolve script returned unexpected decision "
+                f"'{decision}'"
+            )
+        return HookResolveScriptResult(
+            decision=decision,  # type: ignore[arg-type]
+            task_resumed=self._decode_task_resumed_flag(decode(result[1])),
+            request_hash=decode(result[2]),
+        )
+
+    async def claim(
+        self,
+        *,
+        hook_resolution_key: str,
+        request_hash: str,
+        ttl_seconds: int,
+        hook_id: str,
+        task_id: str,
+        tool_call_id: str,
+    ) -> HookResolveScriptResult:
+        return await self._execute(
+            mode="claim",
+            hook_resolution_key=hook_resolution_key,
+            request_hash=request_hash,
+            ttl_seconds=ttl_seconds,
+            hook_id=hook_id,
+            task_id=task_id,
+            tool_call_id=tool_call_id,
+        )
+
+    async def finalize(
+        self,
+        *,
+        hook_resolution_key: str,
+        request_hash: str,
+        ttl_seconds: int,
+        hook_id: str,
+        task_id: str,
+        tool_call_id: str,
+        task_resumed: bool,
+    ) -> HookResolveScriptResult:
+        return await self._execute(
+            mode="finalize",
+            hook_resolution_key=hook_resolution_key,
+            request_hash=request_hash,
+            ttl_seconds=ttl_seconds,
+            hook_id=hook_id,
+            task_id=task_id,
+            tool_call_id=tool_call_id,
+            task_resumed=task_resumed,
+        )
+
+
+async def create_hook_resolve_script(
+    redis_client: redis.Redis,
+) -> HookResolveScript:
+    return get_cached_script(redis_client, "hook_resolve", HookResolveScript)
+
+
 class ChildTaskCompletionScript(AsyncScript):
     """
     Simple atomic script to move completed task back to queue and cleanup
@@ -647,12 +845,13 @@ class ChildTaskCompletionScript(AsyncScript):
     * KEYS[2] = queue_orphaned_key (str)
     * KEYS[3] = queue_pending_key (str)
     * KEYS[4] = pending_child_task_results_key (str)
-    * KEYS[5] = task_statuses_key (str)
-    * KEYS[6] = task_agents_key (str)
-    * KEYS[7] = task_payloads_key (str)
-    * KEYS[8] = task_pickups_key (str)
-    * KEYS[9] = task_retries_key (str)
-    * KEYS[10] = task_metas_key (str)
+    * KEYS[5] = pending_child_wait_ids_key (str)
+    * KEYS[6] = task_statuses_key (str)
+    * KEYS[7] = task_agents_key (str)
+    * KEYS[8] = task_payloads_key (str)
+    * KEYS[9] = task_pickups_key (str)
+    * KEYS[10] = task_retries_key (str)
+    * KEYS[11] = task_metas_key (str)
 
     Args:
     * ARGV[1] = task_id (str)
@@ -674,13 +873,15 @@ class ChildTaskCompletionScript(AsyncScript):
         task_metas_key: str,
         task_id: str,
         updated_task_context_json: str,
+        pending_child_wait_ids_key: str | None = None,
     ) -> tuple[bool, str]:
-        result: tuple[int, str] = await super().__call__(  # type: ignore
+        result: tuple[int, str] = await super().__call__(
             keys=[
                 queue_main_key,
                 queue_orphaned_key,
                 queue_pending_key,
                 pending_child_task_results_key,
+                pending_child_wait_ids_key or "",
                 task_statuses_key,
                 task_agents_key,
                 task_payloads_key,
@@ -707,6 +908,13 @@ async def create_child_task_completion_script(
     )
 
 
+@dataclass
+class EnqueueTaskScriptResult:
+    decision: Literal["enqueued", "replay", "conflict"]
+    task_id: str
+    request_hash: str
+
+
 class EnqueueTaskScript(AsyncScript):
     """
     Creates a script for enqueuing a task
@@ -719,6 +927,7 @@ class EnqueueTaskScript(AsyncScript):
     * KEYS[5] = task_pickups_key (str)
     * KEYS[6] = task_retries_key (str)
     * KEYS[7] = task_metas_key (str)
+    * KEYS[8] = enqueue_idempotency_key (str | empty)
 
     Args:
     * ARGV[1] = task_id (str)
@@ -727,6 +936,9 @@ class EnqueueTaskScript(AsyncScript):
     * ARGV[4] = task_pickups (int)
     * ARGV[5] = task_retries (int)
     * ARGV[6] = task_meta_json (str)
+    * ARGV[7] = request_hash (str)
+    * ARGV[8] = ttl_seconds (int)
+    * ARGV[9] = idempotency_enabled ("1" | "0")
     """
 
     async def execute(
@@ -745,8 +957,12 @@ class EnqueueTaskScript(AsyncScript):
         task_pickups: int,
         task_retries: int,
         task_meta_json: str,
-    ) -> bool:
-        return await super().__call__(  # type: ignore
+        enqueue_idempotency_key: str = "",
+        request_hash: str = "",
+        ttl_seconds: int = 1,
+        idempotency_enabled: bool = False,
+    ) -> EnqueueTaskScriptResult:
+        result: tuple[str | bytes, str | bytes, str | bytes] = await super().__call__(  # type: ignore
             keys=[
                 agent_queue_key,
                 task_statuses_key,
@@ -755,6 +971,7 @@ class EnqueueTaskScript(AsyncScript):
                 task_pickups_key,
                 task_retries_key,
                 task_metas_key,
+                enqueue_idempotency_key,
             ],
             args=[
                 task_id,
@@ -763,7 +980,21 @@ class EnqueueTaskScript(AsyncScript):
                 task_pickups,
                 task_retries,
                 task_meta_json,
+                request_hash,
+                ttl_seconds,
+                "1" if idempotency_enabled else "0",
             ],
+        )
+        decision = decode(result[0])
+        if decision not in {"enqueued", "replay", "conflict"}:
+            raise ValueError(
+                "enqueue script returned unexpected decision "
+                f"'{decision}'"
+            )
+        return EnqueueTaskScriptResult(
+            decision=decision,  # type: ignore[arg-type]
+            task_id=decode(result[1]),
+            request_hash=decode(result[2]),
         )
 
 
@@ -772,6 +1003,189 @@ async def create_enqueue_task_script(redis_client: redis.Redis) -> EnqueueTaskSc
     Creates a script for enqueuing a task
     """
     return get_cached_script(redis_client, "enqueue", EnqueueTaskScript)
+
+
+@dataclass
+class ResumeEnqueueScriptResult:
+    decision: Literal["enqueued", "replay", "conflict"]
+    resumed_task_id: str
+    request_hash: str
+
+
+class ResumeEnqueueScript(AsyncScript):
+    """
+    Atomically enqueue a resumed task and resolve idempotency.
+
+    Keys:
+    * KEYS[1] = agent_queue_key (str)
+    * KEYS[2] = task_statuses_key (str)
+    * KEYS[3] = task_agents_key (str)
+    * KEYS[4] = task_payloads_key (str)
+    * KEYS[5] = task_pickups_key (str)
+    * KEYS[6] = task_retries_key (str)
+    * KEYS[7] = task_metas_key (str)
+    * KEYS[8] = resume_idempotency_key (str | empty)
+
+    Args:
+    * ARGV[1] = task_id (str)
+    * ARGV[2] = task_agent (str)
+    * ARGV[3] = task_payload_json (str)
+    * ARGV[4] = task_pickups (int)
+    * ARGV[5] = task_retries (int)
+    * ARGV[6] = task_meta_json (str)
+    * ARGV[7] = request_hash (str)
+    * ARGV[8] = source_task_id (str)
+    * ARGV[9] = ttl_seconds (int)
+    * ARGV[10] = idempotency_enabled ("1" | "0")
+    """
+
+    async def execute(
+        self,
+        *,
+        agent_queue_key: str,
+        task_statuses_key: str,
+        task_agents_key: str,
+        task_payloads_key: str,
+        task_pickups_key: str,
+        task_retries_key: str,
+        task_metas_key: str,
+        resume_idempotency_key: str,
+        task_id: str,
+        task_agent: str,
+        task_payload_json: str,
+        task_pickups: int,
+        task_retries: int,
+        task_meta_json: str,
+        request_hash: str,
+        source_task_id: str,
+        ttl_seconds: int,
+        idempotency_enabled: bool,
+    ) -> ResumeEnqueueScriptResult:
+        result: tuple[str | bytes, str | bytes, str | bytes] = await super().__call__(  # type: ignore
+            keys=[
+                agent_queue_key,
+                task_statuses_key,
+                task_agents_key,
+                task_payloads_key,
+                task_pickups_key,
+                task_retries_key,
+                task_metas_key,
+                resume_idempotency_key,
+            ],
+            args=[
+                task_id,
+                task_agent,
+                task_payload_json,
+                task_pickups,
+                task_retries,
+                task_meta_json,
+                request_hash,
+                source_task_id,
+                ttl_seconds,
+                "1" if idempotency_enabled else "0",
+            ],
+        )
+        decision = decode(result[0])
+        if decision not in {"enqueued", "replay", "conflict"}:
+            raise ValueError(
+                "resume_enqueue script returned unexpected decision "
+                f"'{decision}'"
+            )
+        return ResumeEnqueueScriptResult(
+            decision=decision,  # type: ignore[arg-type]
+            resumed_task_id=decode(result[1]),
+            request_hash=decode(result[2]),
+        )
+
+
+async def create_resume_enqueue_script(
+    redis_client: redis.Redis,
+) -> ResumeEnqueueScript:
+    return get_cached_script(
+        redis_client,
+        "resume_enqueue",
+        ResumeEnqueueScript,
+    )
+
+
+@dataclass
+class WaitScheduleScriptResult:
+    success: bool
+    message: str
+
+
+class WaitScheduleScript(AsyncScript):
+    """
+    Atomically park a task in paused/scheduled wait state.
+
+    Keys:
+    * KEYS[1] = queue_scheduled_key (str)
+    * KEYS[2] = queue_pending_key (str)
+    * KEYS[3] = queue_orphaned_key (str)
+    * KEYS[4] = processing_heartbeats_key (str)
+    * KEYS[5] = task_statuses_key (str)
+    * KEYS[6] = task_agents_key (str)
+    * KEYS[7] = task_payloads_key (str)
+    * KEYS[8] = task_pickups_key (str)
+    * KEYS[9] = task_retries_key (str)
+    * KEYS[10] = task_metas_key (str)
+    * KEYS[11] = scheduled_wait_meta_key (str)
+
+    Args:
+    * ARGV[1] = task_id (str)
+    * ARGV[2] = updated_task_payload_json (str)
+    * ARGV[3] = wake_timestamp (float)
+    * ARGV[4] = wait_metadata_json (str)
+    """
+
+    async def execute(
+        self,
+        *,
+        queue_scheduled_key: str,
+        queue_pending_key: str,
+        queue_orphaned_key: str,
+        processing_heartbeats_key: str,
+        task_statuses_key: str,
+        task_agents_key: str,
+        task_payloads_key: str,
+        task_pickups_key: str,
+        task_retries_key: str,
+        task_metas_key: str,
+        scheduled_wait_meta_key: str,
+        task_id: str,
+        updated_task_payload_json: str,
+        wake_timestamp: float,
+        wait_metadata_json: str,
+    ) -> WaitScheduleScriptResult:
+        result: tuple[bool, str | bytes] = await super().__call__(  # type: ignore
+            keys=[
+                queue_scheduled_key,
+                queue_pending_key,
+                queue_orphaned_key,
+                processing_heartbeats_key,
+                task_statuses_key,
+                task_agents_key,
+                task_payloads_key,
+                task_pickups_key,
+                task_retries_key,
+                task_metas_key,
+                scheduled_wait_meta_key,
+            ],
+            args=[
+                task_id,
+                updated_task_payload_json,
+                wake_timestamp,
+                wait_metadata_json,
+            ],
+        )
+        return WaitScheduleScriptResult(
+            success=bool(result[0]),
+            message=decode(result[1]),
+        )
+
+
+async def create_wait_schedule_script(redis_client: redis.Redis) -> WaitScheduleScript:
+    return get_cached_script(redis_client, "schedule_wait", WaitScheduleScript)
 
 
 class BackoffRecoveryScript(AsyncScript):
@@ -833,6 +1247,65 @@ async def create_backoff_recovery_script(
     return get_cached_script(redis_client, "backoff", BackoffRecoveryScript)
 
 
+class ScheduledRecoveryScript(AsyncScript):
+    """
+    Handles recovering tasks from scheduled wait queue.
+
+    Keys:
+    * KEYS[1] = queue_scheduled_key (str)
+    * KEYS[2] = queue_main_key (str)
+    * KEYS[3] = queue_orphaned_key (str)
+    * KEYS[4] = task_statuses_key (str)
+    * KEYS[5] = task_agents_key (str)
+    * KEYS[6] = task_payloads_key (str)
+    * KEYS[7] = task_pickups_key (str)
+    * KEYS[8] = task_retries_key (str)
+    * KEYS[9] = task_metas_key (str)
+    * KEYS[10] = scheduled_wait_meta_key (str)
+
+    Args:
+    * ARGV[1] = max_batch_size (int)
+    """
+
+    async def execute(
+        self,
+        *,
+        queue_scheduled_key: str,
+        queue_main_key: str,
+        queue_orphaned_key: str,
+        task_statuses_key: str,
+        task_agents_key: str,
+        task_payloads_key: str,
+        task_pickups_key: str,
+        task_retries_key: str,
+        task_metas_key: str,
+        scheduled_wait_meta_key: str,
+        max_batch_size: int,
+    ) -> list[str]:
+        res: list[str | bytes] = await super().__call__(  # type: ignore
+            keys=[
+                queue_scheduled_key,
+                queue_main_key,
+                queue_orphaned_key,
+                task_statuses_key,
+                task_agents_key,
+                task_payloads_key,
+                task_pickups_key,
+                task_retries_key,
+                task_metas_key,
+                scheduled_wait_meta_key,
+            ],
+            args=[max_batch_size],
+        )
+        return [decode(id) for id in res]
+
+
+async def create_scheduled_recovery_script(
+    redis_client: redis.Redis,
+) -> ScheduledRecoveryScript:
+    return get_cached_script(redis_client, "scheduled", ScheduledRecoveryScript)
+
+
 @dataclass
 class CancelTaskScriptResult:
     """Result of the cancel task script"""
@@ -863,6 +1336,9 @@ class CancelTaskScript(AsyncScript):
     * KEYS[13] = pending_child_task_results_key (str)
     * KEYS[14] = agent_metrics_bucket_key (str)
     * KEYS[15] = global_metrics_bucket_key (str)
+    * KEYS[16] = queue_scheduled_key (str, optional)
+    * KEYS[17] = scheduled_wait_meta_key (str, optional)
+    * KEYS[18] = pending_child_wait_ids_key (str, optional)
 
     Args:
     * ARGV[1] = task_id (str)
@@ -889,6 +1365,9 @@ class CancelTaskScript(AsyncScript):
         global_metrics_bucket_key: str,
         task_id: str,
         metrics_ttl: int,
+        queue_scheduled_key: str | None = None,
+        scheduled_wait_meta_key: str | None = None,
+        pending_child_wait_ids_key: str | None = None,
     ) -> CancelTaskScriptResult:
         result: tuple[bool, str | None, str, str | None] = await super().__call__(  # type: ignore
             keys=[
@@ -907,6 +1386,9 @@ class CancelTaskScript(AsyncScript):
                 pending_child_task_results_key,
                 agent_metrics_bucket_key,
                 global_metrics_bucket_key,
+                queue_scheduled_key or "",
+                scheduled_wait_meta_key or "",
+                pending_child_wait_ids_key or "",
             ],
             args=[
                 task_id,
@@ -933,7 +1415,10 @@ async def create_cancel_task_script(
 
 @dataclass
 class EnqueueBatchScriptResult:
+    decision: Literal["enqueued", "replay", "conflict"]
+    batch_id: str
     task_ids: list[str]
+    request_hash: str
 
 
 class EnqueueBatchScript(AsyncScript):
@@ -960,8 +1445,13 @@ class EnqueueBatchScript(AsyncScript):
         batch_meta_json: str,
         batch_remaining_tasks_key: str,
         batch_progress_key: str,
+        batch_enqueue_idempotency_key: str = "",
+        request_hash: str = "",
+        ttl_seconds: int = 1,
+        idempotency_enabled: bool = False,
     ) -> EnqueueBatchScriptResult:
-        res: str = await super().__call__(  # type: ignore
+        res: tuple[str | bytes, str | bytes, str | bytes, str | bytes] = (
+            await super().__call__(  # type: ignore
             keys=[
                 agent_queue_key,
                 task_statuses_key,
@@ -974,6 +1464,7 @@ class EnqueueBatchScript(AsyncScript):
                 batch_meta_key,
                 batch_remaining_tasks_key,
                 batch_progress_key,
+                batch_enqueue_idempotency_key,
             ],
             args=[
                 batch_id,
@@ -983,9 +1474,24 @@ class EnqueueBatchScript(AsyncScript):
                 tasks_json,
                 base_task_meta_json,
                 batch_meta_json,
+                request_hash,
+                ttl_seconds,
+                "1" if idempotency_enabled else "0",
             ],
+            )
         )
-        return EnqueueBatchScriptResult(task_ids=json.loads(decode(res)))
+        decision = decode(res[0])
+        if decision not in {"enqueued", "replay", "conflict"}:
+            raise ValueError(
+                "enqueue_batch script returned unexpected decision "
+                f"'{decision}'"
+            )
+        return EnqueueBatchScriptResult(
+            decision=decision,  # type: ignore[arg-type]
+            batch_id=decode(res[1]),
+            task_ids=json.loads(decode(res[2])),
+            request_hash=decode(res[3]),
+        )
 
 
 async def create_enqueue_batch_script(redis_client: redis.Redis) -> EnqueueBatchScript:

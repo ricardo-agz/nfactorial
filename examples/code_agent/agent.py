@@ -1,17 +1,22 @@
 import os
-from typing import Any
+from typing import Annotated, Any
 
 from dotenv import load_dotenv
+from pydantic import BaseModel
 
 from factorial import (
     AgentContext,
     AgentWorkerConfig,
     BaseAgent,
-    ExecutionContext,
+    Hidden,
+    Hook,
+    HookRequestContext,
     ModelSettings,
     Orchestrator,
-    deferred_result,
-    fireworks_kimi_k2,
+    PendingHook,
+    ai_gateway,
+    gpt_41,
+    hook,
 )
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -29,13 +34,20 @@ def think(thoughts: str) -> str:
     return thoughts
 
 
+class EditResult(BaseModel):
+    summary: str
+    new_code: Annotated[str, Hidden]
+    old_text: Annotated[str, Hidden]
+    new_text: Annotated[str, Hidden]
+
+
 def edit_code(
     find: str,
     find_start_line: int,
     find_end_line: int,
     replace: str,
     agent_ctx: IdeAgentContext,
-) -> tuple[str, dict[str, Any]]:
+) -> EditResult:
     """
     Edit code in a file
 
@@ -53,10 +65,9 @@ def edit_code(
 
     # Validate line numbers
     if start_idx < 0 or end_idx >= len(lines) or start_idx > end_idx:
-        return "Error: Invalid line numbers", {
-            "error": "Line numbers out of range or invalid",
-            "total_lines": len(lines),
-        }
+        raise ValueError(
+            f"Line numbers out of range or invalid (total lines: {len(lines)})"
+        )
 
     # Extract the text from the specified lines
     existing_text = "\n".join(lines[start_idx : end_idx + 1])
@@ -64,12 +75,9 @@ def edit_code(
     # Check if the find text matches what's at those line numbers
     if find not in existing_text:
         line_range = f"{find_start_line}-{find_end_line}"
-        return (
-            f"Error: Text '{find}' not found at lines {line_range}",
-            {
-                "error": "Find text not found at specified lines",
-                "existing_text": existing_text,
-            },
+        raise ValueError(
+            f"Text '{find}' not found at lines {line_range}. "
+            f"Existing text: {existing_text}"
         )
 
     # Perform the replacement
@@ -82,36 +90,126 @@ def edit_code(
     agent_ctx.code = "\n".join(new_lines)
 
     line_range = f"{find_start_line}-{find_end_line}"
-    return (
-        f"Code successfully edited: replaced '{find}' with '{replace}' "
-        f"at lines {line_range}",
-        {
-            "find": find,
-            "find_start_line": find_start_line,
-            "find_end_line": find_end_line,
-            "replace": replace,
-            "old_text": existing_text,
-            "new_text": new_text,
-            "new_code": agent_ctx.code,
-        },
+    return EditResult(
+        summary=(
+            f"Code successfully edited: replaced '{find}' with '{replace}' "
+            f"at lines {line_range}"
+        ),
+        new_code=agent_ctx.code,
+        old_text=existing_text,
+        new_text=new_text,
     )
 
 
-@deferred_result(timeout=300.0)  # 5-minute timeout waiting for user decision
-def request_code_execution(
-    response_on_reject: str, agent_ctx: AgentContext, execution_ctx: ExecutionContext
-) -> None:
+async def execute_code(code: str) -> dict[str, Any]:
+    """Execute JavaScript in Vercel Sandbox."""
+    from vercel.sandbox import AsyncSandbox as Sandbox  # type: ignore[import-not-found]
+
+    runtime = "node22"
+    timeout_ms = 120_000
+
+    async with await Sandbox.create(timeout=timeout_ms, runtime=runtime) as sandbox:
+        await sandbox.write_files(
+            [
+                {
+                    "path": "main.js",
+                    "content": code.encode("utf-8"),
+                }
+            ]
+        )
+
+        command = await sandbox.run_command_detached(
+            "bash",
+            [
+                "-lc",
+                f"cd {sandbox.sandbox.cwd} && node main.js",
+            ],
+        )
+
+        stdout_parts: list[str] = []
+        stderr_parts: list[str] = []
+        async for line in command.logs():
+            if line.stream == "stdout":
+                stdout_parts.append(line.data)
+            elif line.stream == "stderr":
+                stderr_parts.append(line.data)
+
+        done = await command.wait()
+
+    return {
+        "runtime": runtime,
+        "timeout_ms": timeout_ms,
+        "exit_code": done.exit_code,
+        "stdout": "".join(stdout_parts).strip(),
+        "stderr": "".join(stderr_parts).strip(),
+    }
+
+
+class CodeExecutionApproval(Hook):
+    approved: bool
+
+
+def request_code_execution_approval(
+    ctx: HookRequestContext,
+) -> PendingHook[CodeExecutionApproval]:
+    return CodeExecutionApproval.pending(
+        ctx=ctx,
+        title="Approve server-side code execution (Vercel Sandbox)",
+        timeout_s=300.0,
+    )
+
+
+class CodeExecutionResult(BaseModel):
+    summary: str
+    approved: bool
+    executed: bool
+    exit_code: Annotated[int | None, Hidden] = None
+    stdout: Annotated[str | None, Hidden] = None
+    stderr: Annotated[str | None, Hidden] = None
+    runtime: Annotated[str | None, Hidden] = None
+
+
+async def request_code_execution(
+    approval: Annotated[
+        CodeExecutionApproval,
+        hook.requires(request_code_execution_approval),
+    ],
+    agent_ctx: IdeAgentContext,
+) -> CodeExecutionResult:
     """
     Request the code to be run.
 
     The user must approve this request before the code is run.
-
-    Parameters
-    ----------
-    response_on_reject : str
-        A message the agent should send if the user rejects the request.
     """
-    pass
+    if not approval.approved:
+        return CodeExecutionResult(
+            summary="User rejected the code execution request.",
+            approved=False,
+            executed=False,
+        )
+
+    execution = await execute_code(agent_ctx.code)
+    success = execution["exit_code"] == 0
+
+    if success:
+        stdout = execution["stdout"] or "Code executed successfully (no output)."
+        message = f"Code execution succeeded.\n{stdout}"
+    else:
+        stderr = execution["stderr"] or "No stderr output."
+        message = (
+            "Code execution failed "
+            f"(exit code {execution['exit_code']}).\n{stderr}"
+        )
+
+    return CodeExecutionResult(
+        summary=message,
+        approved=True,
+        executed=True,
+        exit_code=execution["exit_code"],
+        stdout=execution.get("stdout"),
+        stderr=execution.get("stderr"),
+        runtime=execution.get("runtime"),
+    )
 
 
 instructions = """\
@@ -147,7 +245,7 @@ class IDEAgent(BaseAgent[IdeAgentContext]):
             context_class=IdeAgentContext,
             instructions=instructions,
             tools=[think, edit_code, request_code_execution],
-            model=fireworks_kimi_k2,
+            model=ai_gateway(gpt_41),
             model_settings=ModelSettings(
                 temperature=0.1,
             ),

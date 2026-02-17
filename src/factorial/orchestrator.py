@@ -4,7 +4,7 @@ import signal
 from collections.abc import AsyncGenerator, AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 import httpx
 import redis.asyncio as redis
@@ -13,6 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from factorial.agent import BaseAgent
 from factorial.context import ContextType
+from factorial.hooks import HookResolutionResult, PendingHook
 from factorial.llms import MultiClient
 from factorial.logging import get_logger
 from factorial.queue import Task, maintenance_loop, worker_loop
@@ -20,6 +21,9 @@ from factorial.queue.keys import RedisKeys
 from factorial.utils import to_snake_case
 
 logger = get_logger(__name__)
+
+if TYPE_CHECKING:
+    from factorial.queue.task import Batch
 
 
 @dataclass
@@ -466,27 +470,128 @@ class Orchestrator:
         agent: BaseAgent[Any],
         payload: ContextType,
         owner_id: str,
+        idempotency_key: str | None = None,
     ) -> Task[ContextType]:
         """Create a task with the correct context type for this agent"""
         task = Task.create(owner_id=owner_id, agent=agent.name, payload=payload)
-        await self.enqueue_task(agent, task)
+        task.id = await self.enqueue_task(
+            agent,
+            task,
+            idempotency_key=idempotency_key,
+        )
         return task
 
     async def enqueue_task(
         self,
         agent: BaseAgent[Any],
         task: Task[ContextType],
-    ) -> None:
+        idempotency_key: str | None = None,
+    ) -> str:
         """Enqueue a task using the control plane's configuration"""
         from factorial.queue import enqueue_task as q_enqueue_task
 
         redis_client = await self.get_redis_client()
         try:
-            await q_enqueue_task(
+            return await q_enqueue_task(
                 redis_client=redis_client,
                 namespace=self.namespace,
                 agent=agent,
                 task=task,
+                idempotency_key=idempotency_key,
+            )
+        finally:
+            await redis_client.close()
+
+    async def enqueue_batch(
+        self,
+        agent: BaseAgent[Any],
+        tasks: list[Task[ContextType]],
+        idempotency_key: str | None = None,
+    ) -> "Batch":
+        """Create and enqueue a batch using task objects."""
+        from factorial.queue import (
+            create_batch_and_enqueue as q_create_batch_and_enqueue,
+        )
+
+        if not tasks:
+            raise ValueError("enqueue_batch requires at least one task")
+
+        task_agents = {task.agent for task in tasks}
+        if task_agents != {agent.name}:
+            raise ValueError(
+                "enqueue_batch requires all tasks to match the provided agent"
+            )
+
+        owner_ids = {task.metadata.owner_id for task in tasks}
+        if len(owner_ids) != 1:
+            raise ValueError(
+                "enqueue_batch requires all tasks to have the same owner_id"
+            )
+
+        parent_ids = {task.metadata.parent_id for task in tasks}
+        if len(parent_ids) != 1:
+            raise ValueError(
+                "enqueue_batch requires all tasks to have the same parent_id"
+            )
+
+        payloads = [task.payload for task in tasks]
+        owner_id = tasks[0].metadata.owner_id
+        parent_id = tasks[0].metadata.parent_id
+
+        task_ids: list[str] | None = None
+        if idempotency_key is None:
+            # Preserve caller-provided task ids for non-idempotent batches.
+            task_ids = [task.id for task in tasks]
+
+        redis_client = await self.get_redis_client()
+        try:
+            return await q_create_batch_and_enqueue(
+                redis_client=redis_client,
+                namespace=self.namespace,
+                agent=agent,
+                payloads=payloads,
+                owner_id=owner_id,
+                parent_id=parent_id,
+                task_ids=task_ids,
+                idempotency_key=idempotency_key,
+            )
+        finally:
+            await redis_client.close()
+
+    async def resume_task(
+        self,
+        task_id: str,
+        messages: list[dict[str, Any]],
+        idempotency_key: str | None = None,
+    ) -> Task[Any]:
+        """Resume a terminal task as a new queued task."""
+        from factorial.queue import (
+            get_task_data as q_get_task_data,
+            resume_task as q_resume_task,
+        )
+
+        redis_client = await self.get_redis_client()
+        try:
+            source_task_data = await q_get_task_data(
+                redis_client=redis_client,
+                namespace=self.namespace,
+                task_id=task_id,
+            )
+            source_agent_name = source_task_data["agent"]
+            source_agent = self.agents_by_name.get(source_agent_name)
+            if source_agent is None:
+                raise ValueError(
+                    f"Task {task_id} belongs to unregistered agent "
+                    f"'{source_agent_name}'. Register the agent before resuming."
+                )
+
+            return await q_resume_task(
+                redis_client=redis_client,
+                namespace=self.namespace,
+                task_id=task_id,
+                agent=source_agent,
+                messages=messages,
+                idempotency_key=idempotency_key,
             )
         finally:
             await redis_client.close()
@@ -529,38 +634,82 @@ class Orchestrator:
         finally:
             await redis_client.close()
 
-    async def complete_deferred_tool(
+    async def register_pending_hook(
         self,
+        *,
         task_id: str,
         tool_call_id: str,
-        result: Any,
+        pending_hook: PendingHook[Any],
+        tool_name: str,
+        hook_param_name: str,
+        session_id: str,
+        mode: Literal["requires", "awaits"] = "requires",
+        tool_args: dict[str, Any] | None = None,
+        depends_on: tuple[str, ...] | None = None,
+        hook_type_name: str | None = None,
     ) -> bool:
-        """Complete a deferred tool call
-
-        Args:
-            task_id: The ID of the task containing the deferred tool
-            tool_call_id: The ID of the specific tool call to complete
-            result: The result to provide for the tool call
-
-        Returns:
-            bool: True if the tool was completed successfully, False otherwise
-
-        Raises:
-            TaskNotFoundError: If the task doesn't exist
-            InactiveTaskError: If the task is not active (completed, failed,
-                or cancelled)
-        """
-        from factorial.queue import complete_deferred_tool as q_complete_deferred_tool
+        """Register a pending hook ticket for a task/tool call."""
+        from factorial.queue import register_pending_hook as q_register_pending_hook
 
         redis_client = await self.get_redis_client()
         try:
-            return await q_complete_deferred_tool(
+            return await q_register_pending_hook(
                 redis_client=redis_client,
                 namespace=self.namespace,
-                agents_by_name=self.agents_by_name,
                 task_id=task_id,
                 tool_call_id=tool_call_id,
-                result=result,
+                pending_hook=pending_hook,
+                mode=mode,
+                session_id=session_id,
+                tool_name=tool_name,
+                tool_args=tool_args,
+                hook_param_name=hook_param_name,
+                depends_on=depends_on,
+                hook_type_name=hook_type_name,
+            )
+        finally:
+            await redis_client.close()
+
+    async def resolve_hook(
+        self,
+        *,
+        hook_id: str,
+        payload: Any,
+        token: str,
+        idempotency_key: str | None = None,
+    ) -> HookResolutionResult:
+        """Resolve a hook by id using token-authenticated payload."""
+        from factorial.queue import resolve_hook as q_resolve_hook
+
+        redis_client = await self.get_redis_client()
+        try:
+            return await q_resolve_hook(
+                redis_client=redis_client,
+                namespace=self.namespace,
+                hook_id=hook_id,
+                payload=payload,
+                token=token,
+                idempotency_key=idempotency_key,
+            )
+        finally:
+            await redis_client.close()
+
+    async def rotate_hook_token(
+        self,
+        *,
+        hook_id: str,
+        revoke_previous: bool = True,
+    ) -> str:
+        """Rotate token for a pending hook."""
+        from factorial.queue import rotate_hook_token as q_rotate_hook_token
+
+        redis_client = await self.get_redis_client()
+        try:
+            return await q_rotate_hook_token(
+                redis_client=redis_client,
+                namespace=self.namespace,
+                hook_id=hook_id,
+                revoke_previous=revoke_previous,
             )
         finally:
             await redis_client.close()

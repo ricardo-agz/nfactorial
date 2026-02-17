@@ -7,8 +7,23 @@ from factorial.agent import (
     publish_progress,
     retry,
 )
-from factorial.context import AgentContext, ContextType, ExecutionContext
+from factorial.context import (
+    AgentContext,
+    ContextType,
+    ExecutionContext,
+    VerificationState,
+)
 from factorial.events import AgentEvent, EventPublisher, QueueEvent
+from factorial.exceptions import FatalAgentError, VerificationRejected
+from factorial.hooks import (
+    Hook,
+    HookDependency,
+    HookRequestBuilder,
+    HookRequestContext,
+    HookResolutionResult,
+    PendingHook,
+    hook,
+)
 from factorial.llms import (
     MODELS,
     Model,
@@ -55,26 +70,26 @@ from factorial.orchestrator import (
     TaskTTLConfig,
 )
 from factorial.queue.task import Task, TaskStatus
+from factorial.subagents import JobRef, SubagentsNamespace, subagents
 from factorial.tools import (
-    FunctionTool,
-    FunctionToolAction,
-    FunctionToolActionResult,
-    deferred_result,
-    function_tool,
+    Hidden,
+    ToolDefinition,
+    tool,
 )
+from factorial.waits import WaitInstruction, WaitNamespace, wait
 
 __all__ = [
     "BaseAgent",
     "Agent",
     "AgentContext",
     "ExecutionContext",
+    "VerificationState",
     "ModelSettings",
     "ResolvedModelSettings",
     "TurnCompletion",
-    "FunctionTool",
-    "FunctionToolAction",
-    "FunctionToolActionResult",
-    "function_tool",
+    "Hidden",
+    "ToolDefinition",
+    "tool",
     "publish_progress",
     "retry",
     "Orchestrator",
@@ -86,12 +101,26 @@ __all__ = [
     "ContextType",
     "Task",
     "TaskStatus",
+    "JobRef",
+    "SubagentsNamespace",
+    "subagents",
     "AgentEvent",
     "QueueEvent",
     "EventPublisher",
+    "FatalAgentError",
+    "VerificationRejected",
+    "Hook",
+    "PendingHook",
+    "HookRequestContext",
+    "HookRequestBuilder",
+    "HookDependency",
+    "HookResolutionResult",
+    "hook",
+    "WaitInstruction",
+    "WaitNamespace",
+    "wait",
     "Model",
     "MultiClient",
-    "deferred_result",
     # Provider wrapper
     "ai_gateway",
     # OpenAI models

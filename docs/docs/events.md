@@ -166,6 +166,73 @@ Published when an agent produces its final output.
 }
 ```
 
+### Verification Events
+
+These events are emitted only when an agent is configured with `verifier=...`.
+
+#### `verification_passed`
+
+Published when verifier validation succeeds and the run is allowed to complete.
+
+```python
+{
+    "event_type": "verification_passed",
+    "task_id": "task-123",
+    "owner_id": "user-456",
+    "agent_name": "my_agent",
+    "turn": 3,
+    "timestamp": "2024-01-01T12:04:45Z",
+    "data": {
+        "attempts_used": 1,
+        "max_attempts": 3,
+    },
+}
+```
+
+#### `verification_rejected`
+
+Published when verifier validation rejects output and asks the model to revise.
+
+```python
+{
+    "event_type": "verification_rejected",
+    "task_id": "task-123",
+    "owner_id": "user-456",
+    "agent_name": "my_agent",
+    "turn": 3,
+    "timestamp": "2024-01-01T12:04:45Z",
+    "data": {
+        "attempts_used": 1,
+        "max_attempts": 3,
+        "attempt_counted": True,
+        "message": "Score below acceptance threshold",
+        "code": "score_low",
+        "metadata": {"score": 72, "minimum": 80},
+    },
+}
+```
+
+#### `verification_exhausted`
+
+Published when `verifier_max_attempts` is reached and the task is about to fail.
+
+```python
+{
+    "event_type": "verification_exhausted",
+    "task_id": "task-123",
+    "owner_id": "user-456",
+    "agent_name": "my_agent",
+    "turn": 5,
+    "timestamp": "2024-01-01T12:05:00Z",
+    "data": {
+        "attempts_used": 3,
+        "max_attempts": 3,
+        "message": "Score below acceptance threshold",
+        "code": "score_low",
+    },
+}
+```
+
 ### Agent Progress Events
 
 Progress events are automatically published for key agent operations and follow the pattern `progress_update_{operation}_{status}`:
@@ -279,7 +346,7 @@ Example progress event:
 }
 ```
 
-`task_pending_tool_call_results`: Task is waiting for deferred tools to complete and has been put in an idle state
+`task_pending_tool_call_results`: Task is waiting for pending tool call resolution (including hook-based approvals) and has been moved to the idle queue.
 
 ```python
 {
@@ -288,6 +355,24 @@ Example progress event:
     "owner_id": "user-456",
     "agent_name": "my_agent",
     "timestamp": "2024-01-01T12:02:30Z"
+}
+```
+
+`task_resumed`: A terminal task was resumed as a new task (new task ID).
+
+```python
+{
+    "event_type": "task_resumed",
+    "task_id": "new-task-789",
+    "owner_id": "user-456",
+    "agent_name": "my_agent",
+    "timestamp": "2024-01-01T12:03:00Z",
+    "data": {
+        "source_task_id": "old-task-123",
+        "resumed_task_id": "new-task-789",
+        "idempotent_replay": False,
+        "idempotency_key": "resume:old-task-123:revision-1"
+    }
 }
 ```
 

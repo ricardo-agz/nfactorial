@@ -58,4 +58,4 @@ class EventPublisher:
         self.channel = channel
 
     async def publish_event(self, event: BaseEvent) -> None:
-        await self.redis_client.publish(self.channel, event.to_json())  # type: ignore
+        await self.redis_client.publish(self.channel, event.to_json())

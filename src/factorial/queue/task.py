@@ -35,6 +35,7 @@ class TaskStatus(str, Enum):
 class TaskMetadata:
     owner_id: str
     parent_id: str | None = None
+    resumed_from_task_id: str | None = None
     batch_id: str | None = None
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     max_turns: int | None = None
@@ -43,6 +44,7 @@ class TaskMetadata:
         return {
             "owner_id": self.owner_id,
             "parent_id": self.parent_id,
+            "resumed_from_task_id": self.resumed_from_task_id,
             "batch_id": self.batch_id,
             "created_at": self.created_at.timestamp(),
             "max_turns": self.max_turns,

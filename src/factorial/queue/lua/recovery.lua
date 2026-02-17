@@ -1,3 +1,15 @@
+--[[
+-- Recover stale processing tasks whose heartbeat timed out.
+--
+-- Maintenance workers need an atomic recovery pass that removes stale heartbeat
+-- entries and either retries work or marks it failed based on retry budget.
+--
+-- State transitions:
+-- - processing with retries < max_retries -> active (and LPUSH to main queue)
+-- - processing with retries >= max_retries -> failed (moved to failed queue)
+-- - missing task data -> orphaned queue marker
+-- - corrupted task data -> no transition (recorded for diagnostics)
+]]--
 local queue_main_key = KEYS[1]
 local queue_failed_key = KEYS[2]
 local queue_orphaned_key = KEYS[3]

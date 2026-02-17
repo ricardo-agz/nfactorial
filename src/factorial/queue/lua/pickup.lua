@@ -1,3 +1,15 @@
+--[[
+-- Pop tasks from the main queue and stage them for worker processing.
+--
+-- Worker pickup atomically handles cancellation races, heartbeat placement,
+-- pickup counters, and orphan/corruption detection while filling a batch.
+--
+-- State transitions:
+-- - queued | active -> processing (heartbeat set, pickups incremented)
+-- - task listed in pending_cancellations -> cancelled (moved to cancelled queue)
+-- - missing task data -> orphaned queue marker
+-- - corrupted task data -> skipped and reported as corrupted
+]]--
 local queue_main_key = KEYS[1]
 local queue_cancelled_key = KEYS[2]
 local queue_orphaned_key = KEYS[3]

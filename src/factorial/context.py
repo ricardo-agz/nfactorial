@@ -3,7 +3,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, TypeVar
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from factorial.events import EventPublisher
 
@@ -27,11 +27,19 @@ class ExecutionContext:
     events: EventPublisher
     # Lightweight async callback injected by the orchestrator/worker that can be
     # used to enqueue child tasks.  It should accept the child agent instance
-    # and its payload, and return the **task_id** of the newly created task.
-    enqueue_child_task: Callable[["BaseAgent[Any]", Any], Awaitable[str]] | None = None
-    enqueue_batch: (
-        Callable[["BaseAgent[Any]", list[Any]], Awaitable["Batch"]] | None
+    # and its payload, plus an optional deterministic task_id, and return the
+    # **task_id** of the newly created task.
+    enqueue_child_task: (
+        Callable[["BaseAgent[Any]", Any, str | None], Awaitable[str]] | None
     ) = None
+    enqueue_batch: (
+        Callable[
+            ["BaseAgent[Any]", list[Any], list[str] | None, str | None],
+            Awaitable["Batch"],
+        ]
+        | None
+    ) = None
+    persist_hook_runtime: Callable[[dict[str, Any]], Awaitable[None]] | None = None
 
     @classmethod
     def current(cls) -> "ExecutionContext":
@@ -42,6 +50,8 @@ class ExecutionContext:
         self,
         agent: "BaseAgent[ContextType]",
         payload: "ContextType",
+        *,
+        task_id: str | None = None,
     ) -> str:
         """Enqueue a child task for *agent* with *payload*.
 
@@ -56,12 +66,15 @@ class ExecutionContext:
                 "enqueue_child_task is not configured for this execution context"
             )
 
-        return await self.enqueue_child_task(agent, payload)
+        return await self.enqueue_child_task(agent, payload, task_id)
 
     async def spawn_child_tasks(
         self,
         agent: "BaseAgent[ContextType]",
         payloads: list["ContextType"],
+        *,
+        task_ids: list[str] | None = None,
+        batch_id: str | None = None,
     ) -> "Batch":
         """Spawn multiple child tasks in a batch.
 
@@ -75,7 +88,21 @@ class ExecutionContext:
                 "enqueue_batch is not configured for this execution context"
             )
 
-        return await self.enqueue_batch(agent, payloads)
+        return await self.enqueue_batch(agent, payloads, task_ids, batch_id)
+
+    async def persist_hook_session(self, runtime_payload: dict[str, Any]) -> None:
+        """Persist hook-session runtime metadata for staged continuation."""
+        if self.persist_hook_runtime is None:
+            raise RuntimeError(
+                "persist_hook_runtime is not configured for this execution context"
+            )
+        await self.persist_hook_runtime(runtime_payload)
+
+
+class VerificationState(BaseModel):
+    attempts_used: int = 0
+    last_candidate_hash: str | None = None
+    last_outcome: str | None = None
 
 
 class AgentContext(BaseModel):
@@ -94,6 +121,7 @@ class AgentContext(BaseModel):
     turn: int = 0
     output: Any = None
     attempt: int = 0
+    verification: VerificationState = Field(default_factory=VerificationState)
 
     class Config:
         extra = "allow"  # Users can add extra fields

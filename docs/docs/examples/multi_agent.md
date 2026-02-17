@@ -1,6 +1,6 @@
 # Multi-Agent Research
 
-A complex research agent that can search the web and spin up multiple independent research sub-agents. 
+A complex research agent that can search the web and spin up multiple independent research sub-agents.
 
 ![Dashboard](../../static/img/multi-agent-progress.png)
 
@@ -10,8 +10,10 @@ A complex research agent that can search the web and spin up multiple independen
 
 ```python
 import os
+from typing import Annotated, Any
 from dotenv import load_dotenv
-from factorial import Agent, AgentContext, gpt_41
+from pydantic import BaseModel
+from factorial import Agent, AgentContext, Hidden, ai_gateway, gpt_41
 from exa_py import Exa
 
 
@@ -19,7 +21,12 @@ load_dotenv()
 exa = Exa(api_key=os.getenv("EXA_API_KEY"))
 
 
-def search(query: str) -> tuple[str, list[dict[str, Any]]]:
+class SearchResult(BaseModel):
+    summary: str
+    results: Annotated[list[dict[str, Any]], Hidden]
+
+
+def search(query: str) -> SearchResult:
     """Search the web for information"""
     result = exa.search_and_contents(
         query=query, num_results=10, text={"max_characters": 500}
@@ -29,16 +36,18 @@ def search(query: str) -> tuple[str, list[dict[str, Any]]]:
         for r in result.results
     ]
 
-    return str(result), data
+    return SearchResult(summary=str(result), results=data)
 
 basic_agent = Agent(
     instructions="You are a helpful assistant. Always start by making a plan.",
     tools=[search],
-    model=gpt_41,
+    model=ai_gateway(gpt_41),
 )
 ```
 
 The agent now has the ability to search the web.
+This example routes model calls through Vercel AI Gateway, so set
+`AI_GATEWAY_API_KEY` in your environment before running it.
 
 ## 2. Register the runner
 
@@ -48,7 +57,7 @@ The agent now has the ability to search the web.
 from factorial import Orchestrator, AgentWorkerConfig
 from agent import basic_agent
 
-orchestrator = Orchestrator(openai_api_key=os.getenv("OPENAI_API_KEY"))
+orchestrator = Orchestrator()
 
 orchestrator.register_runner(
     agent=basic_agent,
@@ -61,14 +70,14 @@ if __name__ == "__main__":
 
 `register_runner` spins up a pool of workers that pull tasks from Redis and drive the agent.
 
-## 3. Forking tools: spawn independent child tasks
+## 3. Subagents: spawn independent child tasks
 
-Let's say we want to give our agent the ability to spin up multiple independent research subagents and wait for their results. We can do so by creating a new tool that spawns multiple child tasks using the `@forking_tool`.
+Let's say we want to give our agent the ability to spin up multiple independent research subagents and wait for their results. In v2, use `subagents.spawn(...)` and `wait.jobs(...)`.
 
 First, create the research subagent:
 
 ```python
-from factorial import BaseModel
+from factorial import BaseModel, ai_gateway, gpt_41_mini
 
 class SubAgentOutput(BaseModel):
     findings: list[str]
@@ -76,10 +85,32 @@ class SubAgentOutput(BaseModel):
 search_agent = Agent(
     name="research_subagent",
     description="Research Sub-Agent",
-    model=gpt_41_mini,
+    model=ai_gateway(gpt_41_mini),
     instructions="You are an intelligent research assistant.",
     tools=[plan, reflect, search],
     output_type=SubAgentOutput,
+)
+```
+
+You can optionally add output verification to force revisions until results meet your bar:
+
+```python
+from factorial import VerificationRejected
+
+def verify_subagent_output(output: SubAgentOutput) -> SubAgentOutput:
+    if len(output.findings) < 3:
+        raise VerificationRejected(
+            message="Provide at least 3 findings from different sources.",
+            code="not_enough_findings",
+            metadata={"minimum": 3, "actual": len(output.findings)},
+        )
+    return output
+
+search_agent = Agent(
+    ...,
+    output_type=SubAgentOutput,
+    verifier=verify_subagent_output,
+    verifier_max_attempts=3,
 )
 ```
 
@@ -92,40 +123,39 @@ orchestrator.register_runner(
 )
 ```
 
-Now create the forking tool that spawns child tasks:
+Now create a tool that spawns child tasks and blocks on their completion:
 
 ```python
-from factorial.tools import forking_tool
-from factorial.context import ExecutionContext
+from factorial import WaitInstruction, subagents, tool, wait
 
-@forking_tool(timeout=600)
+@tool
 async def research(
     queries: list[str],
     agent_ctx: AgentContext,
-    execution_ctx: ExecutionContext,
-) -> list[str]:
-    """Spawn child search tasks for each query."""
-    
-    # Create payloads for each child task
+) -> WaitInstruction:
+    """Spawn child search tasks for each query and wait for completion."""
+
     payloads = [AgentContext(query=q) for q in queries]
-    
-    # Spawn child tasks and get their IDs
-    child_ids = await execution_ctx.spawn_child_tasks(search_agent, payloads)
-    
-    return child_ids
+    jobs = await subagents.spawn(
+        agent=search_agent,
+        inputs=payloads,
+        key="research",
+    )
+    return wait.jobs(jobs, data="Waiting for research subagents")
 ```
 
 **Key points:**
 
-- `@forking_tool(timeout=600)` marks the tool as one that spawns child tasks
-- The tool MUST return the list of the child task ids for the parent agent to wait and listen for their completion.
-- The parent task pauses until all child tasks complete
-- Child results get automatically formatted and added to the conversation
+- `subagents.spawn(...)` is imperative fan-out (non-blocking by itself)
+- `wait.jobs(...)` is declarative join (blocks until child jobs complete)
+- The parent task pauses until all requested child jobs complete
+- Child results are automatically injected back into the parent context flow
 
 When the agent calls this tool, it:
+
 1. Creates child tasks for each query
-2. Returns the child task IDs
-3. Pauses execution of the parent agent
+2. Returns a wait instruction for those jobs
+3. Pauses execution of the parent task
 4. Resumes when all children complete, with results in the conversation
 
 ## 4. Expose an API & WebSocket
@@ -162,15 +192,15 @@ class EnqueueRequest(BaseModel):
 
 @app.post("/api/enqueue")
 async def enqueue(request: EnqueueRequest):
-    task = basic_agent.create_task(
-        owner_id=request.user_id,
-        payload=AgentContext(
-            messages=request.message_history,
-            query=request.query,
-        ),
+    payload = AgentContext(
+        messages=request.message_history,
+        query=request.query,
     )
-
-    await orchestrator.enqueue_task(agent=basic_agent, task=task)
+    task = await orchestrator.create_agent_task(
+        agent=basic_agent,
+        owner_id=request.user_id,
+        payload=payload,
+    )
     return {"task_id": task.id}
 
 

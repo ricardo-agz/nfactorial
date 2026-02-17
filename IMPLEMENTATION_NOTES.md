@@ -1,0 +1,493 @@
+# nfactorial API Redesign - Implementation Notes
+
+This document tracks implementation progress, decisions, and user feedback for the multi-phase API redesign proposed in `NEW_DESIGN.md`.
+
+## Purpose
+
+- Keep a running log of what was implemented and why
+- Track what is working, what is not, and what needs follow-up
+- Capture user preferences/feedback during iteration
+
+## User Preferences and Feedback
+
+- 2026-02-15: User approved the phased migration plan.
+- 2026-02-15: User requested we start with Phase 0.
+- 2026-02-15: User requested a persistent root-level markdown tracker for progress and notes.
+- 2026-02-15: User requested old tool interfaces remain compatibility-only while all new/internal paths use canonical `tool` + `ToolResult` APIs.
+- 2026-02-15: User requested high-signal tests only (avoid low-value/bloat assertions).
+
+## Phase Tracker
+
+- [~] Phase 0 - Safety net and compatibility lock (unit lock complete, more integration/e2e guardrails pending)
+- [x] Phase 1 - Public API scaffolding (`tool`, `hook`, `wait`)
+- [x] Phase 2 - Signature compiler and dependency inference
+- [x] Phase 3 - Hook persistence and control-plane resolution APIs
+- [x] Phase 4 - Worker hook runtime and staged continuation
+- [x] Phase 5 - Wait helpers (`sleep`, `cron`, `subagents.spawn` + `wait.jobs`)
+- [ ] Phase 6 - Managed endpoints, docs, migration utilities
+
+## Progress Log
+
+### 2026-02-15
+
+- Completed deep review of:
+  - runtime (`agent`, `orchestrator`, `queue`, `lua`)
+  - current public DX and examples
+  - unit/integration/e2e test coverage
+  - full proposal in `NEW_DESIGN.md`
+- Confirmed current pending/resume machinery is a strong base for hook sessions.
+- Started Phase 0 implementation:
+  - creating regression tests for current tool/deferred/forking behavior
+  - no production runtime behavior changes planned in this phase
+- Added Phase 0 regression test file:
+  - `tests/unit/test_tools_phase0_regression.py`
+  - Covers:
+    - `function_tool` schema/description behavior
+    - strict schema behavior for optional params
+    - context param exclusion in tool schema
+    - `convert_tools_list` mixed inputs
+    - `forking_tool` wrappers
+    - `Agent.tool_action` deferred and forking semantics
+    - invalid forking child ID validation
+- Validation status:
+  - lints: clean for new files
+  - syntax: `python -m py_compile tests/unit/test_tools_phase0_regression.py` passed
+  - unit tests:
+    - command: `source .venv/bin/activate && pytest tests/unit/test_tools_phase0_regression.py -q`
+    - result: `10 passed`
+  - noted environment detail:
+    - in this environment, direct `pytest` from project `.venv` works reliably
+    - `uv run` may fail under sandbox/cache permission constraints
+- Started and completed Phase 1 scaffolding (no runtime semantics changes yet):
+  - Added `src/factorial/hooks.py`:
+    - `Hook`
+    - `PendingHook[T]`
+    - `HookRequestContext`
+    - `HookDependency`
+    - `hook.requires(...)` and `hook.awaits(...)`
+  - Added `src/factorial/waits.py`:
+    - `WaitInstruction`
+    - `wait.sleep(...)`
+    - `wait.cron(...)`
+    - child wait helper (later replaced by `wait.jobs(...)`)
+  - Extended `src/factorial/tools.py`:
+    - `ToolResult`
+    - `ToolNamespace`
+    - `tool(...)` decorator alias + `tool.ok/fail/error`
+  - Updated `src/factorial/__init__.py` exports for new API surface.
+  - Added `tests/unit/test_phase1_api_scaffolding.py`:
+    - namespace decorator behavior
+    - tool result constructors
+    - typed hook pending ticket helpers
+    - hook dependency metadata
+    - wait instruction builders
+- Refined `src/factorial/tools.py` toward new-primary API style:
+  - `ToolResult` is now the canonical result model
+  - legacy `FunctionToolActionResult` kept as a compatibility alias to `ToolResult`
+  - introduced canonical `ToolAction*` type aliases with legacy aliases preserved
+  - `function_tool` now explicitly documented/implemented as a legacy alias path
+  - conversion helpers now route callable conversion through the primary `tool(...)` interface
+- Further canonicalization pass for tool internals:
+  - introduced canonical `ToolDefinition` class
+  - `FunctionTool` is now a compatibility alias (`FunctionTool = ToolDefinition`)
+  - internal factory and conversion paths now construct/use `ToolDefinition`, not `FunctionTool`
+  - `function_tool(...)` now emits a `DeprecationWarning` and remains compatibility-only
+  - `agent.py` internal typing switched to canonical names (`ToolDefinition`, `ToolResult`)
+  - removed remaining old-path typing/wording references in `tools.py` internals
+- Current unit validation after Phase 1:
+  - command:
+    - `source .venv/bin/activate && pytest tests/unit/test_tools_phase0_regression.py tests/unit/test_phase1_api_scaffolding.py -q`
+  - result: `16 passed`
+- Started and completed Phase 2 compiler/inference work:
+  - Expanded `src/factorial/hooks.py` with compiler/runtime metadata:
+    - `HookNodeSpec` and `HookExecutionPlan`
+    - `compile_hook_plan(...)`
+    - compile-time error types:
+      - `HookCompilationError`
+      - `HookDependencyResolutionError`
+      - `HookTypeMismatchError`
+      - `HookDependencyCycleError`
+  - Compiler behavior now validates and infers:
+    - hook parameters declared as `Annotated[HookType, hook.requires/awaits(...)]`
+    - request-builder injections from:
+      - `ctx: HookRequestContext`
+      - tool args by name
+      - previously resolved hook payload params by name
+      - optional/defaulted request-builder params
+    - type compatibility for referenced hook params
+    - request-builder return annotation compatibility with `PendingHook[...]`
+    - cycle detection and deterministic staged ordering
+  - Wired compiler into canonical tool registration path in `src/factorial/tools.py`:
+    - `ToolDefinition` now carries optional `hook_plan`
+    - `_tool_factory(...)` now compiles hook plans at registration time (fail-fast startup behavior)
+    - `_function_to_json_schema(...)` now excludes hook payload params from exposed tool JSON schema
+  - Added unit tests in `tests/unit/test_phase2_hook_compiler.py` covering:
+    - dependency inference and stage ordering
+    - parallel stage grouping for independent hooks
+    - hook param exclusion from JSON schema
+    - unresolved dependency failures
+    - type-only reference failures (enforce name-based hook wiring)
+    - reference type mismatch failures
+    - request-builder return type mismatch failures
+    - cycle detection failures
+    - optional/default dependency allowance
+- Current unit validation after Phase 2:
+  - command:
+    - `source .venv/bin/activate && pytest tests/unit/test_tools_phase0_regression.py tests/unit/test_phase1_api_scaffolding.py tests/unit/test_phase2_hook_compiler.py -q`
+  - result: `25 passed`
+- Started and completed Phase 3 hook persistence/control-plane foundation:
+  - Added new hook control-plane exceptions in `src/factorial/exceptions.py`:
+    - `HookNotFoundError`
+    - `HookTokenValidationError`
+    - `HookExpiredError`
+    - `HookAlreadyResolvedError`
+  - Added `HookResolutionResult` in `src/factorial/hooks.py`.
+  - Extended queue operations in `src/factorial/queue/operations.py` with:
+    - `register_pending_hook(...)`
+    - `resolve_hook(...)`
+    - `rotate_hook_token(...)`
+  - Persistence/runtime details now implemented:
+    - hook records stored under namespace-scoped hook index
+    - per-task hook index and expiry zset bookkeeping
+    - token hashing via SHA-256 (plaintext token never persisted)
+    - token validation with constant-time comparison
+    - idempotency key handling for repeated external callbacks
+    - resolved payload persistence and wake/requeue integration with pending tool state
+  - Added orchestrator wrappers in `src/factorial/orchestrator.py`:
+    - `Orchestrator.register_pending_hook(...)`
+    - `Orchestrator.resolve_hook(...)`
+    - `Orchestrator.rotate_hook_token(...)`
+  - Export updates:
+    - `factorial.queue` now exports hook control-plane queue ops
+    - package root export includes `HookResolutionResult`
+  - Added integration tests in `tests/integration/test_hook_lifecycle.py` covering:
+    - hook registration + persisted token hash behavior
+    - valid token resolution and task requeue
+    - invalid token rejection
+    - idempotent replay behavior
+    - token rotation with previous-token invalidation
+- Current validation after Phase 3:
+  - command:
+    - `source .venv/bin/activate && pytest tests/unit tests/integration/test_pending.py tests/integration/test_hook_lifecycle.py -q`
+  - result: `100 passed`
+- Follow-up hardening focused on state-machine/Lua interaction quality:
+  - Completed a queue/Lua transition audit for hook flow and confirmed:
+    - hook path reuses existing `pending_tool_results` + `queue_pending` + `tool_completion.lua`
+    - no new task statuses introduced in this phase
+  - Added runtime guard in `register_pending_hook(...)`:
+    - registration now requires task status in `processing | pending_tool_results`
+    - supports first-stage hook registration during tool execution while still blocking terminal/invalid states
+  - Updated hook resolution wake logic for multi-hook tool calls:
+    - `resolve_hook(...)` now checks all hooks linked to the same `task_id + tool_call_id`
+    - task wake/requeue only happens when all such hooks are resolved
+    - prevents premature resume when a single tool call has multiple hook dependencies
+  - Added high-signal integration assertions (no string-bloat checks):
+    - successful hook resolve must:
+      - move task from `queue_pending` to `queue_main`
+      - set status to `active`
+      - delete `pending_tool_results` hash
+      - persist resolved hook payload and remove hook from expiry zset
+    - idempotent replay must not create duplicate requeue
+    - expired hook resolve must not requeue task and must keep task parked
+    - registration from non-pending states must fail fast
+    - multi-hook same-tool-call must not resume on first hook resolution
+  - Added naming-alignment comments only (no risky state renames yet):
+    - `queue_pending` documented as parked queue for external tool/hook/child waits
+    - `pending_tool_results` documented as including hook-backed deferred completions
+    - `completion.lua` comment clarifies pending branch trigger is `pending_*_ids_json` presence, not action string
+- Current validation after follow-up hardening:
+  - command:
+    - `source .venv/bin/activate && pytest tests/unit tests/integration/test_pending.py tests/integration/test_hook_lifecycle.py -q`
+  - result: `79 passed`
+- Started Phase 4 staged hook runtime implementation:
+  - Added persisted session runtime types in `src/factorial/hooks.py`:
+    - `HookSessionNode`
+    - `HookSessionRecord`
+    - `build_request_builder_kwargs(...)` runtime DI helper
+  - Extended hook record shape (`HookRecord`) to carry runtime linkage metadata:
+    - `tool_name`, `tool_args`
+    - `hook_param_name`, `depends_on`
+    - `session_id` used for DAG session correlation
+  - Added session keys in `src/factorial/queue/keys.py`:
+    - `hook_sessions`
+    - `hook_session_by_tool_call`
+    - `hook_sessions_by_task`
+  - Added execution-context callback path for runtime persistence:
+    - `ExecutionContext.persist_hook_runtime`
+    - `ExecutionContext.persist_hook_session(...)`
+    - worker now wires callback to `persist_hook_runtime_payload(...)`
+  - Implemented hook-enabled tool first-pass behavior in `BaseAgent.tool_action(...)`:
+    - when a tool has `hook_plan` and no hook payloads are present:
+      - build and persist a hook session
+      - request first stage hooks
+      - register pending hook records
+      - return pending tool result to park task
+    - when hook payloads are present, continuation executes normal tool body
+  - Implemented staged resolution flow in `resolve_hook(...)`:
+    - resolve current node + persist payload
+    - request next ready stage when dependencies become satisfied
+    - execute final tool continuation only after all session nodes resolve
+    - complete tool slot via existing pending-tool wake/requeue primitives
+  - Added high-signal integration coverage in `tests/integration/test_hook_lifecycle.py`:
+    - `test_dag_stage_progression_and_final_continuation`
+    - validates stage-1 request, stage-2 unlock, final continuation execution, and proper task wake/requeue
+- Current validation after Phase 4 increment:
+  - command:
+    - `source .venv/bin/activate && pytest tests/unit/test_phase1_api_scaffolding.py tests/unit/test_phase2_hook_compiler.py tests/unit/test_tools_phase0_regression.py tests/integration/test_hook_lifecycle.py`
+  - result: `34 passed`
+- Completed Phase 4 robustness hardening after deep state-machine/Lua audit:
+  - Key architectural correction:
+    - moved DAG stage progression and tool continuation execution out of control-plane `resolve_hook(...)`
+    - control plane now performs state transition + atomic wake signaling only
+    - worker now owns request-next-stage and execute-final-continuation runtime behavior
+  - Added atomic wake path for hook sessions:
+    - new Lua script `src/factorial/queue/lua/hook_wake.lua`
+    - new loader API `create_hook_wake_script(...)`
+    - new per-task key `hook_runtime_ready` to persist worker tick intents
+    - wake script atomically:
+      - records wake intent
+      - transitions task `pending_tool_results -> active`
+      - moves task from `queue_pending -> queue_main`
+  - Strengthened hook-session persistence robustness:
+    - `persist_hook_runtime_payload(...)` now persists session + initial hook records in one Redis transaction
+    - avoids split-brain windows between session metadata and hook registry entries
+    - idempotent replay guard on `hook_session_by_tool_call`
+  - Added worker runtime hook tick engine:
+    - `process_hook_runtime_wake_requests(...)` in queue ops
+    - worker now processes hook wake requests before calling `agent.execute(...)`
+    - worker behavior on wake:
+      - request next stage when dependencies are ready, then re-park task atomically via existing completion Lua path
+      - execute final tool continuation only when all session nodes are resolved
+      - apply deferred tool result into task context, then continue normal turn execution
+  - Added idempotency hardening for callbacks:
+    - deterministic hook session id derived from `(task_id, tool_call_id, tool_name)` in `BaseAgent.tool_action(...)`
+    - deterministic hook ids per node (`{session_id}:{param_name}`) to improve replay safety
+    - `resolve_hook(...)` now supports idempotent replay with idempotency keys even if hook is already resolved, and can still emit wake intent
+  - Updated high-signal integration coverage:
+    - `test_dag_stage_progression_and_final_continuation` now validates true worker-plane progression:
+      - resolve stage 1 -> atomic wake
+      - worker tick requests stage 2 -> re-park
+      - resolve stage 2 -> atomic wake
+      - worker tick executes final continuation and yields completed tool result
+- Current validation after Phase 4 completion:
+  - command:
+    - `source .venv/bin/activate && pytest`
+  - result: `179 passed`
+- Legacy pending-tool path sunset cleanup (post-Phase 4):
+  - Removed the legacy deferred-tool decorator and runtime handling from public/core APIs.
+  - Removed control-plane deferred completion API surface and fallback non-session completion branch.
+  - `resolve_hook(...)` now requires session-backed hook records; non-session legacy completion is rejected.
+  - Updated regression and integration tests to cover session-backed hook behavior only.
+  - Migrated `examples/code_agent` runtime usage to hook-based approval + `resolve_hook` endpoint.
+- Current validation after legacy-path removal:
+  - command:
+    - `source .venv/bin/activate && pytest`
+  - result: `177 passed`
+- Example runtime upgrade (`examples/code_agent`):
+  - `request_code_execution` now executes code server-side in Vercel Sandbox.
+  - UI no longer executes code in-browser; it resolves hook approvals via `/api/resolve_hook`.
+  - Hook pending metadata (`requested_hooks`) is now included in pending tool progress output so the example UI can drive approval/rejection flows.
+  - Added `vercel-sandbox` dependency and Docker env passthrough for Vercel credentials.
+- Current validation after example/runtime update:
+  - command:
+    - `source .venv/bin/activate && pytest`
+  - result: `177 passed`
+- Hook robustness hardening pass (post-audit):
+  - Added explicit hook timeout maintenance sweep:
+    - `expire_pending_hooks(...)` scans `hooks_expiring`, marks hook/session nodes expired, and wakes parked tasks so workers can unblock them.
+    - maintenance loop now calls the sweep each interval.
+  - Removed deadlock-prone resolve behavior:
+    - `resolve_hook(...)` no longer hard-fails on already-resolved records before attempting session repair.
+    - supports crash-recovery replay where hook record may be resolved before session node/wake updates.
+    - removed unused `agents_by_name` parameter from queue-level `resolve_hook(...)`.
+  - Hardened worker hook tick terminal/error handling:
+    - detects invalid/missing session and missing hook plan states.
+    - converts those states into deterministic completion errors and clears pending sentinels instead of silently re-parking forever.
+    - centralizes pending runtime cleanup via helper utilities for readability/maintainability.
+  - Preserved continuation result semantics:
+    - hook continuation now returns full `ToolResult` (not just `output_data`).
+    - worker now handles pending child task IDs emitted by hook continuations and parks to `pending_child_tasks` when needed.
+    - fixed `Agent.tool_action(...)` to preserve explicit `ToolResult.pending_child_task_ids` instead of overwriting them.
+  - Added high-signal regression coverage:
+    - `test_resolve_hook_recovers_from_partial_resolve_write`
+    - `test_process_hook_runtime_missing_plan_unblocks_pending_tool`
+    - `test_expire_pending_hooks_wakes_and_unblocks_expired_session`
+    - `test_process_task_parks_child_results_from_hook_continuation`
+- Current validation after robustness hardening:
+  - command:
+    - `source .venv/bin/activate && pytest`
+  - result: `181 passed`
+- Started Phase 5 wait-runtime implementation:
+  - Added time-wait queue/state primitives:
+    - new Redis keys:
+      - `queue_scheduled` (agent-scoped zset)
+      - `scheduled_wait_meta` (namespace-scoped hash: `task_id -> wait metadata json`)
+    - new Lua scripts:
+      - `schedule_wait.lua` for atomic transition `processing -> paused + scheduled`
+      - `scheduled.lua` for atomic due-task recovery `paused -> active + main queue`
+    - maintenance loop now recovers due scheduled waits each interval.
+  - Worker runtime now executes wait semantics directly:
+    - `wait.sleep(...)`:
+      - parks task as `paused`
+      - stores wake timestamp in `queue_scheduled`
+      - preserves retry/backoff semantics (no retry counter mutation)
+    - `wait.cron(...)`:
+      - computes next wake timestamp with timezone-aware cron helper
+      - parks in the same `paused + scheduled` path
+    - child-join waits (`subagents.run(...)` / `wait.jobs(...)`):
+      - enqueues child tasks through worker-managed parent linkage
+      - parks parent via existing `pending_child_tasks` path with sentinel contract
+  - Cancellation path hardened for scheduled waits:
+    - `cancellation.lua` now clears scheduled queue + wait metadata.
+    - `paused` tasks are cancelled immediately (same behavior class as `backoff`/parked states).
+  - API/runtime ergonomics updates:
+    - `wait.cron(..., tz="UTC")` alias supported in addition to `timezone=...`.
+    - direct tool returns of `WaitInstruction` now produce readable tool-result text in `Agent.tool_action(...)`.
+  - Added high-signal Phase 5 tests:
+    - unit:
+      - `tests/unit/test_waits_phase5.py`
+      - validates cron next-run computation + timezone behavior and wait API aliases
+    - integration:
+      - `tests/integration/test_wait_runtime.py`
+      - validates worker parking to `paused/scheduled`, child wait/join semantics, scheduled recovery, and paused-task cancellation cleanup
+  - Regression confidence checks run against touched paths:
+    - `tests/integration/test_recovery.py`
+    - `tests/integration/test_cancellation.py`
+    - `tests/e2e/test_worker_flow.py`
+- Current validation after Phase 5 implementation slice:
+  - command:
+    - `source .venv/bin/activate && pytest tests/unit/test_waits_phase5.py tests/integration/test_wait_runtime.py tests/integration/test_recovery.py tests/integration/test_cancellation.py tests/e2e/test_worker_flow.py`
+  - result: `37 passed`
+  - full-suite command:
+    - `source .venv/bin/activate && pytest`
+  - full-suite result: `190 passed`
+- Phase 5 DX refactor (imperative subagents + explicit wait join):
+  - Added new imperative subagent namespace:
+    - `subagents.spawn(agent=..., inputs=..., key=...) -> list[JobRef]`
+    - `subagents.run(...)` sugar for spawn + blocking wait
+  - Added explicit join primitive:
+    - `wait.jobs(job_refs)` parks parent until referenced child jobs resolve
+  - removed the unshipped child-wait alias, so canonical API is now only:
+    - imperative `subagents.spawn(...)` / `subagents.run(...)`
+    - explicit blocking join via `wait.jobs(...)`
+  - Removed child wait timeout from wait instruction/API surface for subagent waits.
+  - Runtime safety hardening for imperative spawn then wait:
+    - `completion.lua` now uses `HSETNX` for pending child sentinel slots so already-written child outputs are never overwritten.
+    - worker now attempts immediate parent resume after parking on child waits to avoid deadlocks when all child outputs are already present.
+  - Added tests for new model:
+    - `tests/unit/test_subagents_phase5.py` (spawn/run semantics)
+    - expanded `tests/unit/test_waits_phase5.py` (`wait.jobs` validation)
+    - expanded `tests/integration/test_wait_runtime.py` for:
+      - mixed-agent `subagents.spawn(...)` + `wait.jobs(...)`
+      - non-blocking spawn (no wait)
+      - sentinel-preservation race contract
+- Current validation after DX refactor:
+  - full-suite command:
+    - `source .venv/bin/activate && pytest`
+  - full-suite result: `196 passed`
+- Phase 5 production hardening completion:
+  - Added spawn idempotency contract:
+    - `subagents.spawn(...)` now requires a non-empty logical `key`.
+    - child task IDs are deterministic from `(parent_task_id, key, agent_name, input_index, payload_hash)`.
+    - `enqueue.lua` is idempotent by `task_id` (duplicate enqueue attempts no-op safely).
+    - `JobRef.key` remains metadata-only (grouping/debugging), not a server-side result-ingestion partition key.
+  - Tightened wait join correctness:
+    - `wait.jobs(...)` now requires each `JobRef` to carry a non-empty `parent_task_id` when called inside an active parent execution context.
+    - cross-parent joins fail fast with explicit errors.
+  - Hardened pending-child resolution with explicit wait-set tracking:
+    - new key: `pending_child_wait_ids` tracks only the child IDs for the current blocking join.
+    - `completion.lua` stores the active wait-set on park.
+    - `resume_if_no_remaining_child_tasks(...)` now evaluates only the active wait-set, not the entire accumulated parent child-result hash.
+    - `child_completion.lua` and `cancellation.lua` now clean up only the active wait-set keys/results.
+  - Added crash-window mitigation:
+    - worker fast-path continues immediately when all requested child results are already materialized (no unnecessary park).
+    - worker now commits parent continuation before deleting fast-path child result slots, preventing data-loss deadlocks if continuation commit fails.
+    - maintenance loop now includes pending-child recovery sweep, so parents can still resume if a worker crashes between park and immediate resume.
+  - Restored scalable spawn throughput while preserving idempotency:
+    - `subagents.spawn(...)` now uses batched enqueue when worker batch callback is available.
+    - deterministic child IDs are passed into batch enqueue (`create_batch_and_enqueue(..., task_ids=..., batch_id=...)`).
+    - `enqueue_batch.lua` now mirrors enqueue idempotency semantics by skipping enqueue/mutation for existing task IDs.
+    - deterministic batch IDs avoid duplicate batch-record churn across parent retries for the same logical spawn key.
+    - `enqueue_batch.lua` now preserves existing batch bookkeeping (`batch_remaining_tasks`, `batch_progress`) on deterministic retry, so completed-child progress is never reset by replayed spawn calls.
+  - Transition safety hardening:
+    - worker `complete(...)` now fails fast on rejected Lua completion transitions (no silent `success=False` continuation).
+  - Added/updated high-signal tests:
+    - `tests/unit/test_subagents_phase5.py`:
+      - deterministic spawn IDs and required key contract
+    - `tests/unit/test_waits_phase5.py`:
+      - strict `wait.jobs` parent binding validation
+    - `tests/integration/test_wait_runtime.py`:
+      - retry-idempotent spawn behavior (no duplicate child queue entries)
+      - wait-set persistence assertions for parked child joins
+      - fast-path continuation failure regression guard (child results are preserved when continue transition is rejected)
+    - `tests/integration/test_enqueue.py`:
+      - deterministic batch retry preserves existing remaining-task bookkeeping
+  - Current validation after production hardening:
+    - `pytest tests/unit/test_subagents_phase5.py tests/unit/test_waits_phase5.py tests/integration/test_wait_runtime.py`
+      - result: `19 passed`
+    - `pytest tests/integration/test_completion.py tests/integration/test_cancellation.py tests/integration/test_pending.py tests/integration/test_parent_child.py tests/integration/test_batch_children.py`
+      - result: `40 passed`
+    - `pytest tests/unit/test_phase1_api_scaffolding.py`
+      - result: `6 passed`
+    - `pytest`
+      - result: `203 passed`
+- Test-suite re-organization and quality pass (Phase 1-5 coverage):
+  - Replaced phase-numbered unit modules with capability-based modules:
+    - `tests/unit/test_tool_contracts.py`
+    - `tests/unit/test_hook_api_contracts.py`
+    - `tests/unit/test_hook_dependency_compiler.py`
+    - `tests/unit/test_wait_contracts.py`
+    - `tests/unit/test_subagent_contracts.py`
+  - Added explicit edge-case coverage beyond original phase tests:
+    - wait API:
+      - empty-job rejection
+      - deterministic dedupe/order preservation for `wait.jobs(...)`
+      - model-dump job ref support
+      - timezone alias conflict validation for `wait.cron(...)`
+    - subagents API:
+      - empty-input no-op semantics
+      - key normalization behavior
+      - invalid input type rejection
+      - invalid child-agent context_class rejection
+    - hook control plane:
+      - token-rotation semantics when `revoke_previous=False`
+  - Consolidated integration coverage into directly collected, capability-named
+    scenario modules:
+    - `tests/integration/test_hook_lifecycle.py`
+    - `tests/integration/test_wait_runtime.py`
+  - Retained legacy phase integration modules as non-collected scenario sources
+    (set `__test__ = False`) and re-exported their scenarios from the new modules:
+    - `tests/integration/test_hooks_phase3.py`
+    - `tests/integration/test_waits_phase5.py`
+  - Current validation after suite re-organization:
+    - `pytest`
+      - result: `215 passed`
+- Docs and examples migration to v2 API:
+  - Updated runtime example to canonical subagent orchestration:
+    - `examples/multi_agent/agent.py`
+      - replaced `function_tool` + `forking_tool` + `ExecutionContext.spawn_child_tasks`
+        with `@tool` + `subagents.spawn(...)` + `return wait.jobs(...)`
+  - Updated docs to remove deprecated API patterns and reflect v2 semantics:
+    - `docs/docs/tools.md`
+    - `docs/docs/intro.md`
+    - `docs/docs/agents.md`
+    - `docs/docs/events.md`
+    - `docs/docs/examples/multi_agent.md`
+    - `docs/docs/examples/code_agent.md`
+  - Current validation after docs/examples migration:
+    - `pytest`
+      - result: `224 passed`
+
+## Decisions
+
+- Preserve existing queue/Lua reliability semantics and build hook runtime on top.
+- Treat tests as the migration contract before introducing runtime changes.
+- For iterative testing, use project virtualenv activation + `pytest` directly.
+
+## Open Questions (Tracking)
+
+- Managed vs BYO endpoint defaults in docs and examples.
+
+## Next Step
+
+- Start Phase 6: managed endpoints, migration utilities, and final docs/examples polish.

@@ -14,7 +14,7 @@ TASK_PAYLOAD = "{namespace}:tasks:payload"
 TASK_PICKUPS = "{namespace}:tasks:pickups"
 # HASH: task_id -> num retries (int)
 TASK_RETRIES = "{namespace}:tasks:retries"
-# HASH: task_id -> {created_at, owner_id, parent_id, batch_id}
+# HASH: task_id -> {created_at, owner_id, parent_id, resumed_from_task_id, batch_id}
 TASK_META = "{namespace}:tasks:meta"
 # HASH: task_id -> {current_turn: int, max_turns: int | None, progress: float}
 TASK_PROGRESS = "{namespace}:tasks:progress"
@@ -33,8 +33,11 @@ QUEUE_CANCELLED = "{namespace}:queue:{agent}:cancelled"
 QUEUE_BACKOFF = "{namespace}:queue:{agent}:backoff"
 # ZSET: task_id -> timestamp of orphaned task
 QUEUE_ORPHANED = "{namespace}:queue:{agent}:orphaned"
-# ZSET: task_id -> timestamp of when task was marked as pending (tools, children)
+# ZSET: task_id -> timestamp of when task was parked pending
+#       external tool/hook completions or child task results
 QUEUE_PENDING = "{namespace}:queue:{agent}:pending"
+# ZSET: task_id -> wake timestamp for time waits (sleep/cron)
+QUEUE_SCHEDULED = "{namespace}:queue:{agent}:scheduled"
 
 # ===== ACTIVE TASK PROCESSING =====
 # ZSET: task_id -> timestamp of last heartbeat
@@ -48,9 +51,40 @@ TASK_STEERING = "{namespace}:steer:{task_id}:messages"
 
 # ===== PENDING TASK STATE MANAGEMENT =====
 # HASH: tool_call_id -> result_json or <|PENDING|>
+#       used for deferred tool completions, including hook-backed flows
 PENDING_TOOL_RESULTS = "{namespace}:pending:{task_id}:tools"
 # HASH: child_task_id -> result_json or <|PENDING|>
 PENDING_CHILD_TASK_RESULTS = "{namespace}:pending:{task_id}:children"
+# SET: child_task_id values currently being awaited by the parent task
+PENDING_CHILD_WAIT_IDS = "{namespace}:pending:{task_id}:children_wait_ids"
+# HASH: task_id -> scheduled wait metadata JSON
+SCHEDULED_WAIT_META = "{namespace}:scheduled:wait_meta"
+
+# ===== HOOK STATE MANAGEMENT =====
+# HASH: hook_id -> hook_record_json
+HOOKS_INDEX = "{namespace}:hooks:index"
+# SET: hook_ids for a task
+HOOKS_BY_TASK = "{namespace}:hooks:by_task:{task_id}"
+# ZSET: hook_id -> expiry timestamp
+HOOKS_EXPIRING = "{namespace}:hooks:expiring"
+# STRING: idempotency envelope for repeated hook callbacks
+HOOK_IDEMPOTENCY = "{namespace}:hooks:idem:{hook_id}:{idempotency_key}"
+# STRING: idempotency envelope for repeated resume_task callbacks
+RESUME_IDEMPOTENCY = "{namespace}:resume:idem:{source_task_id}:{idempotency_key}"
+# STRING: idempotency envelope for repeated enqueue_task requests
+ENQUEUE_IDEMPOTENCY = "{namespace}:enqueue:idem:{owner_id}:{agent}:{idempotency_key}"
+# STRING: idempotency envelope for repeated create_batch_and_enqueue requests
+BATCH_ENQUEUE_IDEMPOTENCY = (
+    "{namespace}:enqueue_batch:idem:{owner_id}:{agent}:{idempotency_key}"
+)
+# HASH: session_id -> hook_session_json
+HOOK_SESSIONS = "{namespace}:hooks:sessions"
+# HASH: tool_call_id -> session_id (task scoped)
+HOOK_SESSION_BY_TOOL_CALL = "{namespace}:hooks:session_by_tool_call:{task_id}"
+# SET: session ids for a task
+HOOK_SESSIONS_BY_TASK = "{namespace}:hooks:sessions_by_task:{task_id}"
+# HASH: tool_call_id -> session_id marked ready for worker tick
+HOOK_RUNTIME_READY = "{namespace}:hooks:runtime_ready:{task_id}"
 
 # ===== COMMUNICATION =====
 # PUBSUB: real-time updates to task owners
@@ -94,6 +128,15 @@ class RedisKeys:
     _task_retries: str
     _task_meta: str
     _task_cancellations: str
+    # Hook keys (namespace scoped)
+    _hooks_index: str
+    _hooks_expiring: str
+    _hook_idempotency: str
+    _resume_idempotency: str
+    _enqueue_idempotency: str
+    _batch_enqueue_idempotency: str
+    _hook_sessions: str
+    _scheduled_wait_meta: str
     # Batch keys
     _batch_tasks: str
     _batch_remaining_tasks: str
@@ -108,6 +151,7 @@ class RedisKeys:
     _queue_failed: str | None = None
     _queue_orphaned: str | None = None
     _queue_pending: str | None = None
+    _queue_scheduled: str | None = None
     _queue_cancelled: str | None = None
     _processing_heartbeats: str | None = None
 
@@ -119,6 +163,11 @@ class RedisKeys:
     _task_steering: str | None = None
     _pending_tool_results: str | None = None
     _pending_child_task_results: str | None = None
+    _pending_child_wait_ids: str | None = None
+    _hooks_by_task: str | None = None
+    _hook_session_by_tool_call: str | None = None
+    _hook_sessions_by_task: str | None = None
+    _hook_runtime_ready: str | None = None
 
     # Owner-scoped keys (present when owner_id provided)
     _updates_channel: str | None = None
@@ -157,6 +206,69 @@ class RedisKeys:
     def task_cancellations(self) -> str:
         """{namespace}:cancel:pending"""
         return self._task_cancellations
+
+    @property
+    def hooks_index(self) -> str:
+        """{namespace}:hooks:index"""
+        return self._hooks_index
+
+    @property
+    def hooks_expiring(self) -> str:
+        """{namespace}:hooks:expiring"""
+        return self._hooks_expiring
+
+    def hook_resolution(self, hook_id: str, request_key: str) -> str:
+        """{namespace}:hooks:idem:{hook_id}:{request_key}"""
+        return self._hook_idempotency.format(
+            hook_id=hook_id, idempotency_key=request_key
+        )
+
+    def hook_idempotency(self, hook_id: str, idempotency_key: str) -> str:
+        """Backward-compatible alias for hook_resolution()."""
+        return self.hook_resolution(hook_id=hook_id, request_key=idempotency_key)
+
+    def resume_idempotency(self, source_task_id: str, idempotency_key: str) -> str:
+        """{namespace}:resume:idem:{source_task_id}:{idempotency_key}"""
+        return self._resume_idempotency.format(
+            source_task_id=source_task_id,
+            idempotency_key=idempotency_key,
+        )
+
+    def enqueue_idempotency(
+        self,
+        owner_id: str,
+        agent_name: str,
+        idempotency_key: str,
+    ) -> str:
+        """{namespace}:enqueue:idem:{owner_id}:{agent}:{idempotency_key}"""
+        return self._enqueue_idempotency.format(
+            owner_id=owner_id,
+            agent=agent_name,
+            idempotency_key=idempotency_key,
+        )
+
+    def batch_enqueue_idempotency(
+        self,
+        owner_id: str,
+        agent_name: str,
+        idempotency_key: str,
+    ) -> str:
+        """{namespace}:enqueue_batch:idem:{owner_id}:{agent}:{idempotency_key}"""
+        return self._batch_enqueue_idempotency.format(
+            owner_id=owner_id,
+            agent=agent_name,
+            idempotency_key=idempotency_key,
+        )
+
+    @property
+    def hook_sessions(self) -> str:
+        """{namespace}:hooks:sessions"""
+        return self._hook_sessions
+
+    @property
+    def scheduled_wait_meta(self) -> str:
+        """{namespace}:scheduled:wait_meta"""
+        return self._scheduled_wait_meta
 
     @property
     def batch_completed(self) -> str:
@@ -244,6 +356,16 @@ class RedisKeys:
         return self._queue_pending
 
     @property
+    def queue_scheduled(self) -> str:
+        """{namespace}:queue:{agent}:scheduled"""
+        if self._queue_scheduled is None:
+            raise ValueError(
+                "queue_scheduled is not available - "
+                "agent was not provided during RedisKeys.format()"
+            )
+        return self._queue_scheduled
+
+    @property
     def queue_cancelled(self) -> str:
         """{namespace}:queue:{agent}:cancelled"""
         if self._queue_cancelled is None:
@@ -314,6 +436,56 @@ class RedisKeys:
         return self._pending_child_task_results
 
     @property
+    def pending_child_wait_ids(self) -> str:
+        """{namespace}:pending:{task_id}:children_wait_ids"""
+        if self._pending_child_wait_ids is None:
+            raise ValueError(
+                "pending_child_wait_ids is not available - "
+                "task_id was not provided during RedisKeys.format()"
+            )
+        return self._pending_child_wait_ids
+
+    @property
+    def hooks_by_task(self) -> str:
+        """{namespace}:hooks:by_task:{task_id}"""
+        if self._hooks_by_task is None:
+            raise ValueError(
+                "hooks_by_task is not available - "
+                "task_id was not provided during RedisKeys.format()"
+            )
+        return self._hooks_by_task
+
+    @property
+    def hook_session_by_tool_call(self) -> str:
+        """{namespace}:hooks:session_by_tool_call:{task_id}"""
+        if self._hook_session_by_tool_call is None:
+            raise ValueError(
+                "hook_session_by_tool_call is not available - "
+                "task_id was not provided during RedisKeys.format()"
+            )
+        return self._hook_session_by_tool_call
+
+    @property
+    def hook_sessions_by_task(self) -> str:
+        """{namespace}:hooks:sessions_by_task:{task_id}"""
+        if self._hook_sessions_by_task is None:
+            raise ValueError(
+                "hook_sessions_by_task is not available - "
+                "task_id was not provided during RedisKeys.format()"
+            )
+        return self._hook_sessions_by_task
+
+    @property
+    def hook_runtime_ready(self) -> str:
+        """{namespace}:hooks:runtime_ready:{task_id}"""
+        if self._hook_runtime_ready is None:
+            raise ValueError(
+                "hook_runtime_ready is not available - "
+                "task_id was not provided during RedisKeys.format()"
+            )
+        return self._hook_runtime_ready
+
+    @property
     def updates_channel(self) -> str:
         """{namespace}:updates:{owner_id}"""
         if self._updates_channel is None:
@@ -352,6 +524,32 @@ class RedisKeys:
             _task_retries=TASK_RETRIES.format(namespace=namespace),
             _task_meta=TASK_META.format(namespace=namespace),
             _task_cancellations=TASK_CANCELLATIONS.format(namespace=namespace),
+            _hooks_index=HOOKS_INDEX.format(namespace=namespace),
+            _hooks_expiring=HOOKS_EXPIRING.format(namespace=namespace),
+            _hook_idempotency=HOOK_IDEMPOTENCY.format(
+                namespace=namespace,
+                hook_id="{hook_id}",
+                idempotency_key="{idempotency_key}",
+            ),
+            _resume_idempotency=RESUME_IDEMPOTENCY.format(
+                namespace=namespace,
+                source_task_id="{source_task_id}",
+                idempotency_key="{idempotency_key}",
+            ),
+            _enqueue_idempotency=ENQUEUE_IDEMPOTENCY.format(
+                namespace=namespace,
+                owner_id="{owner_id}",
+                agent="{agent}",
+                idempotency_key="{idempotency_key}",
+            ),
+            _batch_enqueue_idempotency=BATCH_ENQUEUE_IDEMPOTENCY.format(
+                namespace=namespace,
+                owner_id="{owner_id}",
+                agent="{agent}",
+                idempotency_key="{idempotency_key}",
+            ),
+            _hook_sessions=HOOK_SESSIONS.format(namespace=namespace),
+            _scheduled_wait_meta=SCHEDULED_WAIT_META.format(namespace=namespace),
             # Agent-scoped keys
             _queue_main=QUEUE_MAIN.format(namespace=namespace, agent=agent)
             if agent
@@ -371,6 +569,9 @@ class RedisKeys:
             if agent
             else None,
             _queue_pending=QUEUE_PENDING.format(namespace=namespace, agent=agent)
+            if agent
+            else None,
+            _queue_scheduled=QUEUE_SCHEDULED.format(namespace=namespace, agent=agent)
             if agent
             else None,
             _queue_cancelled=QUEUE_CANCELLED.format(namespace=namespace, agent=agent)
@@ -405,6 +606,31 @@ class RedisKeys:
             else None,
             _pending_child_task_results=PENDING_CHILD_TASK_RESULTS.format(
                 namespace=namespace, task_id=task_id
+            )
+            if task_id
+            else None,
+            _pending_child_wait_ids=PENDING_CHILD_WAIT_IDS.format(
+                namespace=namespace,
+                task_id=task_id,
+            )
+            if task_id
+            else None,
+            _hooks_by_task=HOOKS_BY_TASK.format(namespace=namespace, task_id=task_id)
+            if task_id
+            else None,
+            _hook_session_by_tool_call=HOOK_SESSION_BY_TOOL_CALL.format(
+                namespace=namespace, task_id=task_id
+            )
+            if task_id
+            else None,
+            _hook_sessions_by_task=HOOK_SESSIONS_BY_TASK.format(
+                namespace=namespace, task_id=task_id
+            )
+            if task_id
+            else None,
+            _hook_runtime_ready=HOOK_RUNTIME_READY.format(
+                namespace=namespace,
+                task_id=task_id,
             )
             if task_id
             else None,

@@ -1305,10 +1305,11 @@ async def resume_task(
             f"Expected '{agent.name}', got '{source_agent_name}'."
         )
 
-    source_task = Task.from_dict(
+    context_class = cast(Any, agent.context_class)
+    source_task: Task[Any] = Task.from_dict(
         source_task_data,
-        context_class=agent.context_class,
-    )  # type: ignore[arg-type]
+        context_class=context_class,
+    )
     root_keys = RedisKeys.format(namespace=namespace)
     resume_request_hash = _resume_request_hash(messages=normalized_messages)
 
@@ -1326,7 +1327,7 @@ async def resume_task(
             normalized_idempotency_key,
         )
 
-    resumed_payload = agent.context_class.from_dict(source_task.payload.to_dict())
+    resumed_payload = context_class.from_dict(source_task.payload.to_dict())
 
     existing_messages = (
         list(resumed_payload.messages)
@@ -1390,8 +1391,8 @@ async def resume_task(
         )
         return Task.from_dict(
             existing_task_data,
-            context_class=agent.context_class,
-        )  # type: ignore[arg-type]
+            context_class=context_class,
+        )
 
     resumed_task.id = resume_result.resumed_task_id
 

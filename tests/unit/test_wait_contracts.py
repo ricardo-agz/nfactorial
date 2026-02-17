@@ -56,11 +56,13 @@ def test_next_cron_wake_timestamp_rejects_invalid_expression() -> None:
 def test_wait_namespace_exposes_jobs_not_children() -> None:
     assert hasattr(wait, "jobs")
     assert not hasattr(wait, "children")
+    assert hasattr(wait, "activity")
 
 
 def test_wait_namespace_builders_return_serializable_instructions() -> None:
     sleep_wait = wait.sleep(12.5, data="retry shortly")
     cron_wait = wait.cron("0 * * * *", timezone="UTC", data="hourly sync")
+    activity_wait = wait.activity(data={"reason": "awaiting activity"})
     jobs_wait = wait.jobs(
         [
             {
@@ -83,6 +85,10 @@ def test_wait_namespace_builders_return_serializable_instructions() -> None:
     assert cron_wait.cron == "0 * * * *"
     assert cron_wait.timezone == "UTC"
     assert cron_wait.data == "hourly sync"
+
+    assert isinstance(activity_wait, WaitInstruction)
+    assert activity_wait.kind == "activity"
+    assert activity_wait.data == {"reason": "awaiting activity"}
 
     assert isinstance(jobs_wait, WaitInstruction)
     assert jobs_wait.kind == "jobs"

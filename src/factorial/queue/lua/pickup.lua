@@ -23,6 +23,11 @@ local task_cancellations_key = KEYS[10]
 local processing_heartbeats_key = KEYS[11]
 local agent_metrics_bucket_key = KEYS[12]
 local global_metrics_bucket_key = KEYS[13]
+local activity_wait_meta_key = KEYS[14]
+local queue_pending_key_template = KEYS[15]
+local queue_main_key_template = KEYS[16]
+local task_steering_key_template = KEYS[17]
+local message_seq_key = KEYS[18]
 
 local batch_size = tonumber(ARGV[1])
 local metrics_ttl = tonumber(ARGV[2])
@@ -72,6 +77,33 @@ for i = 1, attempts do
                 { agent_metrics_bucket_key, global_metrics_bucket_key },
                 { 'cancelled', meta_json, metrics_ttl }
             )
+
+            if activity_wait_meta_key and activity_wait_meta_key ~= ""
+                and queue_pending_key_template and queue_pending_key_template ~= ""
+                and queue_main_key_template and queue_main_key_template ~= ""
+                and task_steering_key_template and task_steering_key_template ~= ""
+                and message_seq_key and message_seq_key ~= ""
+            then
+                local meta = cjson.decode(meta_json)
+                local parent_task_id = meta.parent_id
+                if parent_task_id and parent_task_id ~= cjson.null then
+                    wake_parent_on_child_terminal(
+                        {
+                            task_statuses_key,
+                            task_agents_key,
+                            queue_main_key_template,
+                            queue_pending_key_template,
+                            activity_wait_meta_key,
+                            task_steering_key_template,
+                            message_seq_key,
+                        },
+                        {
+                            parent_task_id,
+                            task_id,
+                        }
+                    )
+                end
+            end
 
             table.insert(tasks_to_cancel_ids, task_id)
         else

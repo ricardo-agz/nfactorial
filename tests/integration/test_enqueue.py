@@ -99,8 +99,32 @@ class TestEnqueueTask:
         task_data = await get_task_data(redis_client, test_namespace, task_id)
 
         assert task_data["metadata"]["owner_id"] == test_owner_id
+        assert task_data["metadata"]["team_id"] == task_id
         assert task_data["pickups"] == 0
         assert task_data["retries"] == 0
+
+    async def test_enqueue_preserves_explicit_team_id(
+        self,
+        redis_client: redis.Redis,
+        test_namespace: str,
+        test_agent: SimpleTestAgent,
+        test_owner_id: str,
+    ) -> None:
+        explicit_team_id = str(uuid.uuid4())
+        task = Task.create(
+            owner_id=test_owner_id,
+            agent=test_agent.name,
+            payload=AgentContext(query="explicit team"),
+        )
+        task.metadata.team_id = explicit_team_id
+        task_id = await enqueue_task(
+            redis_client=redis_client,
+            namespace=test_namespace,
+            agent=test_agent,
+            task=task,
+        )
+        task_data = await get_task_data(redis_client, test_namespace, task_id)
+        assert task_data["metadata"]["team_id"] == explicit_team_id
 
     async def test_enqueue_multiple_tasks(
         self,
@@ -335,6 +359,7 @@ class TestEnqueueBatch:
             redis_client, test_namespace, batch.task_ids[0]
         )
         assert task_data["metadata"]["batch_id"] == batch.id
+        assert task_data["metadata"]["team_id"] == batch.id
 
     async def test_batch_with_parent_id(
         self,

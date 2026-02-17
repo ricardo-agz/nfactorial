@@ -1,5 +1,5 @@
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal, TypeVar, cast
 
@@ -117,6 +117,11 @@ class BatchPickupScript(AsyncScript):
         global_metrics_bucket_key: str,
         batch_size: int,
         metrics_ttl: int,
+        activity_wait_meta_key: str = "",
+        queue_pending_key_template: str = "",
+        queue_main_key_template: str = "",
+        task_steering_key_template: str = "",
+        message_seq_key: str = "",
     ) -> BatchPickupScriptResult:
         result: tuple[
             list[str], list[str], list[str], list[str]
@@ -135,6 +140,11 @@ class BatchPickupScript(AsyncScript):
                 processing_heartbeats_key,
                 agent_metrics_bucket_key,
                 global_metrics_bucket_key,
+                activity_wait_meta_key,
+                queue_pending_key_template,
+                queue_main_key_template,
+                task_steering_key_template,
+                message_seq_key,
             ],
             args=[
                 batch_size,
@@ -244,6 +254,71 @@ async def create_task_steering_script(redis_client: redis.Redis) -> TaskSteering
 
 
 @dataclass
+class SteeringEnqueueScriptResult:
+    success: bool
+    status: str
+    woken: bool
+
+
+class SteeringEnqueueScript(AsyncScript):
+    """Atomically enqueue steering messages and wake activity-waiting tasks."""
+
+    async def execute(
+        self,
+        *,
+        queue_main_key: str,
+        queue_orphaned_key: str,
+        queue_pending_key: str,
+        task_statuses_key: str,
+        task_agents_key: str,
+        task_payloads_key: str,
+        task_pickups_key: str,
+        task_retries_key: str,
+        task_metas_key: str,
+        steering_messages_key: str,
+        activity_wait_meta_key: str,
+        message_seq_key: str,
+        task_id: str,
+        messages_json: str,
+    ) -> SteeringEnqueueScriptResult:
+        result: tuple[bool, str | bytes, int] = await super().__call__(  # type: ignore
+            keys=[
+                queue_main_key,
+                queue_orphaned_key,
+                queue_pending_key,
+                task_statuses_key,
+                task_agents_key,
+                task_payloads_key,
+                task_pickups_key,
+                task_retries_key,
+                task_metas_key,
+                steering_messages_key,
+                activity_wait_meta_key,
+                message_seq_key,
+            ],
+            args=[
+                task_id,
+                messages_json,
+            ],
+        )
+        return SteeringEnqueueScriptResult(
+            success=bool(result[0]),
+            status=decode(result[1]),
+            woken=bool(result[2]),
+        )
+
+
+async def create_steering_enqueue_script(
+    redis_client: redis.Redis,
+) -> SteeringEnqueueScript:
+    return get_cached_script(
+        redis_client,
+        "steering_enqueue",
+        SteeringEnqueueScript,
+    )
+
+
+@dataclass
 class TaskCompletionScriptResult:
     """Result of the task completion script"""
 
@@ -329,6 +404,11 @@ class TaskCompletionScript(AsyncScript):
         pending_tool_call_ids_json: str | None = None,
         pending_child_task_ids_json: str | None = None,
         final_output_json: str | None = None,
+        activity_wait_meta_key: str = "",
+        task_steering_key_template: str = "",
+        message_seq_key: str = "",
+        queue_main_key_template: str = "",
+        queue_pending_key_template: str = "",
     ) -> TaskCompletionScriptResult:
         keys = [
             queue_main_key,
@@ -355,6 +435,11 @@ class TaskCompletionScript(AsyncScript):
             pending_child_wait_ids_key or "",
             parent_pending_child_task_results_key or "",
             parent_pending_child_wait_ids_key or "",
+            activity_wait_meta_key or "",
+            task_steering_key_template or "",
+            message_seq_key or "",
+            queue_main_key_template or "",
+            queue_pending_key_template or "",
         ]
 
         result: tuple[bool, bool] = await super().__call__(
@@ -958,6 +1043,7 @@ class EnqueueTaskScript(AsyncScript):
         task_retries: int,
         task_meta_json: str,
         enqueue_idempotency_key: str = "",
+        task_children_key_template: str = "",
         request_hash: str = "",
         ttl_seconds: int = 1,
         idempotency_enabled: bool = False,
@@ -972,6 +1058,7 @@ class EnqueueTaskScript(AsyncScript):
                 task_retries_key,
                 task_metas_key,
                 enqueue_idempotency_key,
+                task_children_key_template,
             ],
             args=[
                 task_id,
@@ -1060,6 +1147,7 @@ class ResumeEnqueueScript(AsyncScript):
         source_task_id: str,
         ttl_seconds: int,
         idempotency_enabled: bool,
+        task_children_key_template: str = "",
     ) -> ResumeEnqueueScriptResult:
         result: tuple[str | bytes, str | bytes, str | bytes] = await super().__call__(  # type: ignore
             keys=[
@@ -1071,6 +1159,7 @@ class ResumeEnqueueScript(AsyncScript):
                 task_retries_key,
                 task_metas_key,
                 resume_idempotency_key,
+                task_children_key_template,
             ],
             args=[
                 task_id,
@@ -1106,6 +1195,73 @@ async def create_resume_enqueue_script(
         "resume_enqueue",
         ResumeEnqueueScript,
     )
+
+
+@dataclass
+class ActivityWaitScriptResult:
+    success: bool
+    message: str
+    parent_woken: bool
+
+
+class ActivityWaitScript(AsyncScript):
+    """Atomically park a task waiting for external activity."""
+
+    async def execute(
+        self,
+        *,
+        queue_pending_key: str,
+        queue_orphaned_key: str,
+        processing_heartbeats_key: str,
+        task_statuses_key: str,
+        task_agents_key: str,
+        task_payloads_key: str,
+        task_pickups_key: str,
+        task_retries_key: str,
+        task_metas_key: str,
+        activity_wait_meta_key: str,
+        message_seq_key: str,
+        task_id: str,
+        updated_task_payload_json: str,
+        wait_metadata_json: str,
+        task_steering_key_template: str,
+        task_children_key_template: str,
+        queue_main_key_template: str,
+        queue_pending_key_template: str,
+    ) -> ActivityWaitScriptResult:
+        result: tuple[bool, str | bytes, int] = await super().__call__(  # type: ignore
+            keys=[
+                queue_pending_key,
+                queue_orphaned_key,
+                processing_heartbeats_key,
+                task_statuses_key,
+                task_agents_key,
+                task_payloads_key,
+                task_pickups_key,
+                task_retries_key,
+                task_metas_key,
+                activity_wait_meta_key,
+                message_seq_key,
+            ],
+            args=[
+                task_id,
+                updated_task_payload_json,
+                wait_metadata_json,
+                task_steering_key_template,
+                task_children_key_template,
+                queue_main_key_template,
+                queue_pending_key_template,
+            ],
+        )
+        return ActivityWaitScriptResult(
+            success=bool(result[0]),
+            message=decode(result[1]),
+            parent_woken=bool(result[2]),
+        )
+
+
+async def create_activity_wait_script(redis_client: redis.Redis) -> ActivityWaitScript:
+    return get_cached_script(redis_client, "activity_wait", ActivityWaitScript)
 
 
 @dataclass
@@ -1368,6 +1524,11 @@ class CancelTaskScript(AsyncScript):
         queue_scheduled_key: str | None = None,
         scheduled_wait_meta_key: str | None = None,
         pending_child_wait_ids_key: str | None = None,
+        activity_wait_meta_key: str | None = None,
+        queue_main_key_template: str | None = None,
+        queue_pending_key_template: str | None = None,
+        task_steering_key_template: str | None = None,
+        message_seq_key: str | None = None,
     ) -> CancelTaskScriptResult:
         result: tuple[bool, str | None, str, str | None] = await super().__call__(  # type: ignore
             keys=[
@@ -1389,6 +1550,11 @@ class CancelTaskScript(AsyncScript):
                 queue_scheduled_key or "",
                 scheduled_wait_meta_key or "",
                 pending_child_wait_ids_key or "",
+                activity_wait_meta_key or "",
+                queue_main_key_template or "",
+                queue_pending_key_template or "",
+                task_steering_key_template or "",
+                message_seq_key or "",
             ],
             args=[
                 task_id,
@@ -1446,6 +1612,7 @@ class EnqueueBatchScript(AsyncScript):
         batch_remaining_tasks_key: str,
         batch_progress_key: str,
         batch_enqueue_idempotency_key: str = "",
+        task_children_key_template: str = "",
         request_hash: str = "",
         ttl_seconds: int = 1,
         idempotency_enabled: bool = False,
@@ -1465,6 +1632,7 @@ class EnqueueBatchScript(AsyncScript):
                 batch_remaining_tasks_key,
                 batch_progress_key,
                 batch_enqueue_idempotency_key,
+                task_children_key_template,
             ],
             args=[
                 batch_id,
@@ -1496,3 +1664,291 @@ class EnqueueBatchScript(AsyncScript):
 
 async def create_enqueue_batch_script(redis_client: redis.Redis) -> EnqueueBatchScript:
     return get_cached_script(redis_client, "enqueue_batch", EnqueueBatchScript)
+
+
+@dataclass
+class MessagingGroupMutationScriptResult:
+    decision: str
+    member_task_ids: list[str] = field(default_factory=list)
+    detail: str | None = None
+    extra: str | None = None
+
+
+class MessagingGroupCreateScript(AsyncScript):
+    """Atomically create a team-scoped messaging group."""
+
+    async def execute(
+        self,
+        *,
+        task_metas_key: str,
+        group_meta_key: str,
+        group_members_key: str,
+        team_tasks_key: str,
+        sender_task_id: str,
+        team_id: str,
+        group_name: str,
+        group_meta_json: str,
+        member_task_ids_json: str,
+        groups_by_task_key_template: str,
+    ) -> MessagingGroupMutationScriptResult:
+        result: list[str | bytes] = await super().__call__(  # type: ignore
+            keys=[
+                task_metas_key,
+                group_meta_key,
+                group_members_key,
+                team_tasks_key,
+            ],
+            args=[
+                sender_task_id,
+                team_id,
+                group_name,
+                group_meta_json,
+                member_task_ids_json,
+                groups_by_task_key_template,
+            ],
+        )
+        decision = decode(result[0]) if result else "error"
+        member_task_ids: list[str] = []
+        if len(result) > 1:
+            candidate = decode(result[1])
+            if candidate.startswith("["):
+                member_task_ids = cast(list[str], json.loads(candidate))
+        detail = decode(result[1]) if len(result) > 1 and not member_task_ids else None
+        extra = decode(result[2]) if len(result) > 2 else None
+        return MessagingGroupMutationScriptResult(
+            decision=decision,
+            member_task_ids=member_task_ids,
+            detail=detail,
+            extra=extra,
+        )
+
+
+async def create_messaging_group_create_script(
+    redis_client: redis.Redis,
+) -> MessagingGroupCreateScript:
+    return get_cached_script(
+        redis_client,
+        "messaging_group_create",
+        MessagingGroupCreateScript,
+    )
+
+
+class MessagingGroupAddMembersScript(AsyncScript):
+    """Atomically add members to an existing team-scoped messaging group."""
+
+    async def execute(
+        self,
+        *,
+        task_metas_key: str,
+        group_meta_key: str,
+        group_members_key: str,
+        team_tasks_key: str,
+        sender_task_id: str,
+        team_id: str,
+        group_name: str,
+        member_task_ids_json: str,
+        groups_by_task_key_template: str,
+    ) -> MessagingGroupMutationScriptResult:
+        result: list[str | bytes] = await super().__call__(  # type: ignore
+            keys=[
+                task_metas_key,
+                group_meta_key,
+                group_members_key,
+                team_tasks_key,
+            ],
+            args=[
+                sender_task_id,
+                team_id,
+                group_name,
+                member_task_ids_json,
+                groups_by_task_key_template,
+            ],
+        )
+        decision = decode(result[0]) if result else "error"
+        member_task_ids: list[str] = []
+        if len(result) > 1:
+            candidate = decode(result[1])
+            if candidate.startswith("["):
+                member_task_ids = cast(list[str], json.loads(candidate))
+        detail = decode(result[1]) if len(result) > 1 and not member_task_ids else None
+        extra = decode(result[2]) if len(result) > 2 else None
+        return MessagingGroupMutationScriptResult(
+            decision=decision,
+            member_task_ids=member_task_ids,
+            detail=detail,
+            extra=extra,
+        )
+
+
+async def create_messaging_group_add_members_script(
+    redis_client: redis.Redis,
+) -> MessagingGroupAddMembersScript:
+    return get_cached_script(
+        redis_client,
+        "messaging_group_add_members",
+        MessagingGroupAddMembersScript,
+    )
+
+
+@dataclass
+class MessagingSendScriptResult:
+    decision: str
+    thread_message_id: str | None = None
+    global_message_id: str | None = None
+    delivered_task_ids: list[str] = field(default_factory=list)
+    skipped_inactive_task_ids: list[str] = field(default_factory=list)
+    failed_task_ids: list[str] = field(default_factory=list)
+    detail: str | None = None
+    extra: str | None = None
+
+
+class MessagingGroupSendScript(AsyncScript):
+    """Atomically send a team-scoped group message with steering fanout."""
+
+    async def execute(
+        self,
+        *,
+        task_statuses_key: str,
+        task_agents_key: str,
+        task_metas_key: str,
+        group_meta_key: str,
+        group_members_key: str,
+        thread_history_key: str,
+        global_history_key: str,
+        message_seq_key: str,
+        activity_wait_meta_key: str,
+        team_tasks_key: str,
+        sender_task_id: str,
+        team_id: str,
+        group_name: str,
+        content: str,
+        metadata_json: str,
+        steering_key_template: str,
+        history_maxlen: int,
+        queue_main_key_template: str,
+        queue_pending_key_template: str,
+        groups_by_task_key_template: str,
+    ) -> MessagingSendScriptResult:
+        result: list[str | bytes] = await super().__call__(  # type: ignore
+            keys=[
+                task_statuses_key,
+                task_agents_key,
+                task_metas_key,
+                group_meta_key,
+                group_members_key,
+                thread_history_key,
+                global_history_key,
+                message_seq_key,
+                activity_wait_meta_key,
+                team_tasks_key,
+            ],
+            args=[
+                sender_task_id,
+                team_id,
+                group_name,
+                content,
+                metadata_json,
+                steering_key_template,
+                history_maxlen,
+                queue_main_key_template,
+                queue_pending_key_template,
+                groups_by_task_key_template,
+            ],
+        )
+        decision = decode(result[0]) if result else "error"
+        if decision != "sent":
+            return MessagingSendScriptResult(
+                decision=decision,
+                detail=decode(result[1]) if len(result) > 1 else None,
+                extra=decode(result[2]) if len(result) > 2 else None,
+            )
+        return MessagingSendScriptResult(
+            decision=decision,
+            thread_message_id=decode(result[1]) if len(result) > 1 else None,
+            global_message_id=decode(result[2]) if len(result) > 2 else None,
+            delivered_task_ids=cast(list[str], json.loads(decode(result[3]))),
+            skipped_inactive_task_ids=cast(list[str], json.loads(decode(result[4]))),
+            failed_task_ids=cast(list[str], json.loads(decode(result[5]))),
+        )
+
+
+async def create_messaging_group_send_script(
+    redis_client: redis.Redis,
+) -> MessagingGroupSendScript:
+    return get_cached_script(
+        redis_client,
+        "messaging_group_send",
+        MessagingGroupSendScript,
+    )
+
+
+class MessagingDirectSendScript(AsyncScript):
+    """Atomically send a direct task-to-task message with steering fanout."""
+
+    async def execute(
+        self,
+        *,
+        task_statuses_key: str,
+        task_agents_key: str,
+        task_metas_key: str,
+        thread_history_key: str,
+        global_history_key: str,
+        message_seq_key: str,
+        activity_wait_meta_key: str,
+        sender_task_id: str,
+        to_task_id: str,
+        team_id: str,
+        content: str,
+        metadata_json: str,
+        steering_key_template: str,
+        history_maxlen: int,
+        queue_main_key_template: str,
+        queue_pending_key_template: str,
+    ) -> MessagingSendScriptResult:
+        result: list[str | bytes] = await super().__call__(  # type: ignore
+            keys=[
+                task_statuses_key,
+                task_agents_key,
+                task_metas_key,
+                thread_history_key,
+                global_history_key,
+                message_seq_key,
+                activity_wait_meta_key,
+            ],
+            args=[
+                sender_task_id,
+                to_task_id,
+                team_id,
+                content,
+                metadata_json,
+                steering_key_template,
+                history_maxlen,
+                queue_main_key_template,
+                queue_pending_key_template,
+            ],
+        )
+        decision = decode(result[0]) if result else "error"
+        if decision != "sent":
+            return MessagingSendScriptResult(
+                decision=decision,
+                detail=decode(result[1]) if len(result) > 1 else None,
+                extra=decode(result[2]) if len(result) > 2 else None,
+            )
+        return MessagingSendScriptResult(
+            decision=decision,
+            thread_message_id=decode(result[1]) if len(result) > 1 else None,
+            global_message_id=decode(result[2]) if len(result) > 2 else None,
+            delivered_task_ids=cast(list[str], json.loads(decode(result[3]))),
+            skipped_inactive_task_ids=cast(list[str], json.loads(decode(result[4]))),
+            failed_task_ids=cast(list[str], json.loads(decode(result[5]))),
+        )
+
+
+async def create_messaging_direct_send_script(
+    redis_client: redis.Redis,
+) -> MessagingDirectSendScript:
+    return get_cached_script(
+        redis_client,
+        "messaging_direct_send",
+        MessagingDirectSendScript,
+    )

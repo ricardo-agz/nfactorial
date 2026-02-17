@@ -9,7 +9,11 @@ from factorial.exceptions import (
     RateLimitError,
     RetryableError,
 )
-from factorial.queue.worker import CompletionAction, classify_failure
+from factorial.queue.worker import (
+    CompletionAction,
+    _steering_message_sort_key,
+    classify_failure,
+)
 
 
 class TestCompletionAction:
@@ -172,3 +176,35 @@ class TestClassifyFailure:
         action3, output3 = classify_failure(exc, retries=5, max_retries=3)
         assert action3 == CompletionAction.FAIL
         assert output3 is not None
+
+
+class TestSteeringOrdering:
+    """Tests for steering message ordering helpers."""
+
+    def test_steering_sort_key_orders_by_timestamp_then_sequence(self) -> None:
+        message_ids = [
+            "1700000000000_12",
+            "1700000000000_2",
+            "1699999999999_99",
+            "1700000000001_1",
+        ]
+        sorted_ids = sorted(message_ids, key=_steering_message_sort_key)
+        assert sorted_ids == [
+            "1699999999999_99",
+            "1700000000000_2",
+            "1700000000000_12",
+            "1700000000001_1",
+        ]
+
+    def test_steering_sort_key_handles_nonstandard_ids(self) -> None:
+        message_ids = [
+            "bad",
+            "1700000000000_x",
+            "1700000000000_1",
+        ]
+        sorted_ids = sorted(message_ids, key=_steering_message_sort_key)
+        assert sorted_ids == [
+            "bad",
+            "1700000000000_x",
+            "1700000000000_1",
+        ]

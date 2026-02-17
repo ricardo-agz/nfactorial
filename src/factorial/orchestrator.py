@@ -533,10 +533,16 @@ class Orchestrator:
             raise ValueError(
                 "enqueue_batch requires all tasks to have the same parent_id"
             )
+        team_ids = {task.metadata.team_id for task in tasks}
+        if len(team_ids) != 1:
+            raise ValueError(
+                "enqueue_batch requires all tasks to have the same team_id"
+            )
 
         payloads = [task.payload for task in tasks]
         owner_id = tasks[0].metadata.owner_id
         parent_id = tasks[0].metadata.parent_id
+        team_id = tasks[0].metadata.team_id
 
         task_ids: list[str] | None = None
         if idempotency_key is None:
@@ -552,6 +558,7 @@ class Orchestrator:
                 payloads=payloads,
                 owner_id=owner_id,
                 parent_id=parent_id,
+                team_id=team_id,
                 task_ids=task_ids,
                 idempotency_key=idempotency_key,
             )

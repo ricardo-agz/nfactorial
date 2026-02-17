@@ -38,6 +38,11 @@ local global_metrics_bucket_key      = KEYS[21]
 local pending_child_wait_ids_key     = KEYS[22]
 local parent_pending_child_tasks_key = KEYS[23]
 local parent_pending_child_wait_ids_key = KEYS[24]
+local activity_wait_meta_key         = KEYS[25]
+local task_steering_key_template     = KEYS[26]
+local message_seq_key                = KEYS[27]
+local queue_main_key_template        = KEYS[28]
+local queue_pending_key_template     = KEYS[29]
 
 local task_id                        = ARGV[1]
 local action                         = ARGV[2] -- complete, continue, retry, backoff, fail, pending_tool_call_results, pending_child_task_results
@@ -126,6 +131,42 @@ local function persist_parent_child_result_if_waiting(child_id, output_json)
     if should_write_parent_child_result(parent_task_id, child_id) then
         redis.call('HSET', parent_pending_child_tasks_key, child_id, output_json)
     end
+end
+
+local function wake_parent_if_waiting_activity(child_id)
+    if not parent_task_id or parent_task_id == cjson.null then
+        return false
+    end
+    if not activity_wait_meta_key or activity_wait_meta_key == "" then
+        return false
+    end
+    if not task_steering_key_template or task_steering_key_template == "" then
+        return false
+    end
+    if not message_seq_key or message_seq_key == "" then
+        return false
+    end
+    if not queue_main_key_template or queue_main_key_template == "" then
+        return false
+    end
+    if not queue_pending_key_template or queue_pending_key_template == "" then
+        return false
+    end
+    return wake_parent_on_child_terminal(
+        {
+            task_statuses_key,
+            task_agents_key,
+            queue_main_key_template,
+            queue_pending_key_template,
+            activity_wait_meta_key,
+            task_steering_key_template,
+            message_seq_key,
+        },
+        {
+            parent_task_id,
+            child_id,
+        }
+    )
 end
 
 local function transition_to_pending_tool_results()
@@ -305,6 +346,7 @@ if action == ACTION_COMPLETE then
     -- If the task is a child task, update parent pending results only when the
     -- parent is still actively waiting on this child ID.
     persist_parent_child_result_if_waiting(task_id, final_output_json)
+    wake_parent_if_waiting_activity(task_id)
 
     local batch_completed = update_batch_progress(task_id, meta, current_turn, STATUS_COMPLETED)
 
@@ -375,6 +417,7 @@ elseif action == ACTION_FAIL then
     -- If the task is a child task, update parent pending results only when the
     -- parent is still actively waiting on this child ID.
     persist_parent_child_result_if_waiting(task_id, final_output_json)
+    wake_parent_if_waiting_activity(task_id)
 
     local batch_completed = update_batch_progress(task_id, meta, current_turn, STATUS_FAILED)
     return { true, batch_completed }

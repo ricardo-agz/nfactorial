@@ -125,6 +125,44 @@ class FatalAgentError(Exception):
     pass
 
 
+class MessagingError(Exception):
+    """Base exception for messaging subsystem errors."""
+
+
+class MessagingGroupNotFoundError(MessagingError):
+    """Raised when a team-scoped messaging group cannot be found."""
+
+    def __init__(self, group_name: str, team_id: str):
+        self.group_name = group_name
+        self.team_id = team_id
+        super().__init__(
+            f"Messaging group '{group_name}' not found in team '{team_id}'"
+        )
+
+
+class MessagingGroupAlreadyExistsError(MessagingError):
+    """Raised when creating a team-scoped group that already exists."""
+
+    def __init__(self, group_name: str, team_id: str):
+        self.group_name = group_name
+        self.team_id = team_id
+        super().__init__(
+            f"Messaging group '{group_name}' already exists in team '{team_id}'"
+        )
+
+
+class MessagingPermissionError(MessagingError):
+    """Raised when the caller lacks permission for a messaging operation."""
+
+
+class MessagingScopeError(MessagingError):
+    """Raised when an operation crosses team scope boundaries."""
+
+
+class MessagingInvalidRecipientError(MessagingError):
+    """Raised when a provided recipient task is invalid or unavailable."""
+
+
 RETRYABLE_EXCEPTIONS = (
     OpenAIBadRequestError,
     OpenAIAuthenticationError,
@@ -158,4 +196,10 @@ __all__ = [
     "FatalAgentError",
     "InvalidLLMResponseError",
     "VerificationRejected",
+    "MessagingError",
+    "MessagingGroupNotFoundError",
+    "MessagingGroupAlreadyExistsError",
+    "MessagingPermissionError",
+    "MessagingScopeError",
+    "MessagingInvalidRecipientError",
 ]

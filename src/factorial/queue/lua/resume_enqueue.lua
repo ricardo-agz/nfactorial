@@ -18,6 +18,7 @@ local task_pickups_key = KEYS[5]
 local task_retries_key = KEYS[6]
 local task_metas_key = KEYS[7]
 local resume_idempotency_key = KEYS[8]
+local task_children_key_template = KEYS[9]
 
 local task_id = ARGV[1]
 local task_agent = ARGV[2]
@@ -29,9 +30,26 @@ local request_hash = ARGV[7]
 local source_task_id = ARGV[8]
 local ttl_seconds = tonumber(ARGV[9]) or 0
 local idempotency_enabled = ARGV[10] == "1"
+local task_meta = cjson.decode(task_meta_json)
+local parent_task_id = task_meta.parent_id
 
 if ttl_seconds < 1 then
     ttl_seconds = 1
+end
+
+local function register_parent_child_link(child_task_id)
+    if not parent_task_id or parent_task_id == cjson.null or parent_task_id == "" then
+        return
+    end
+    if not task_children_key_template or task_children_key_template == "" then
+        return
+    end
+    local task_children_key = string.gsub(
+        task_children_key_template,
+        "{parent_task_id}",
+        parent_task_id
+    )
+    redis.call('SADD', task_children_key, child_task_id)
 end
 
 local function enqueue_task_if_missing()
@@ -47,6 +65,7 @@ local function enqueue_task_if_missing()
     redis.call('HSET', task_pickups_key, task_id, task_pickups)
     redis.call('HSET', task_retries_key, task_id, task_retries)
     redis.call('HSET', task_metas_key, task_id, task_meta_json)
+    register_parent_child_link(task_id)
     return true
 end
 

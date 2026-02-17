@@ -34,6 +34,7 @@ class TaskStatus(str, Enum):
 @dataclass
 class TaskMetadata:
     owner_id: str
+    team_id: str | None = None
     parent_id: str | None = None
     resumed_from_task_id: str | None = None
     batch_id: str | None = None
@@ -43,6 +44,7 @@ class TaskMetadata:
     def to_dict(self) -> dict[str, Any]:
         return {
             "owner_id": self.owner_id,
+            "team_id": self.team_id,
             "parent_id": self.parent_id,
             "resumed_from_task_id": self.resumed_from_task_id,
             "batch_id": self.batch_id,
@@ -52,10 +54,11 @@ class TaskMetadata:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "TaskMetadata":
-        data["created_at"] = datetime.fromtimestamp(
-            float(data["created_at"]), tz=timezone.utc
+        normalized = dict(data)
+        normalized["created_at"] = datetime.fromtimestamp(
+            float(normalized["created_at"]), tz=timezone.utc
         )
-        return cls(**data)
+        return cls(**normalized)
 
     def to_json(self) -> str:
         return json.dumps(self.to_dict())
@@ -83,6 +86,7 @@ class Task(Generic[ContextType]):
         payload: ContextType,
         batch_id: str | None = None,
         max_turns: int | None = None,
+        team_id: str | None = None,
     ) -> "Task[ContextType]":
         return Task(
             status=TaskStatus.QUEUED,
@@ -90,6 +94,7 @@ class Task(Generic[ContextType]):
             payload=payload,
             metadata=TaskMetadata(
                 owner_id=owner_id,
+                team_id=team_id,
                 batch_id=batch_id,
                 max_turns=max_turns,
             ),
@@ -117,6 +122,8 @@ class Task(Generic[ContextType]):
     ) -> "Task[ContextType]":
         status = TaskStatus(data["status"])
         metadata = TaskMetadata.from_dict(data["metadata"])
+        if metadata.team_id is None:
+            metadata.team_id = str(data["id"])
 
         payload: ContextType
         if data["payload"]:
@@ -146,6 +153,14 @@ class Task(Generic[ContextType]):
     ) -> "Task[ContextType]":
         data = json.loads(decode(json_str))
         return cls.from_dict(data, context_class)
+
+
+def effective_team_id(*, task_id: str, metadata: dict[str, Any]) -> str:
+    """Resolve a task's effective team id with legacy fallback semantics."""
+    raw_team_id = metadata.get("team_id")
+    if isinstance(raw_team_id, str) and raw_team_id:
+        return raw_team_id
+    return task_id
 
 
 async def get_task_data(

@@ -40,6 +40,23 @@ class ExecutionContext:
         | None
     ) = None
     persist_hook_runtime: Callable[[dict[str, Any]], Awaitable[None]] | None = None
+    messaging_create_group: (
+        Callable[[str, list[str] | None], Awaitable[dict[str, Any]]] | None
+    ) = None
+    messaging_get_group: Callable[[str], Awaitable[dict[str, Any]]] | None = None
+    messaging_list_groups: Callable[[], Awaitable[list[dict[str, Any]]]] | None = None
+    messaging_find_groups: (
+        Callable[[str], Awaitable[list[dict[str, Any]]]] | None
+    ) = None
+    messaging_add_group_members: (
+        Callable[[str, list[str]], Awaitable[list[str]]] | None
+    ) = None
+    messaging_send_group: (
+        Callable[[str, str, dict[str, Any] | None], Awaitable[dict[str, Any]]] | None
+    ) = None
+    messaging_send_direct: (
+        Callable[[str, str, dict[str, Any] | None], Awaitable[dict[str, Any]]] | None
+    ) = None
 
     @classmethod
     def current(cls) -> "ExecutionContext":

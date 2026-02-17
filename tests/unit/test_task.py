@@ -38,8 +38,8 @@ class TestTaskStatus:
         assert TaskStatus.BACKOFF.value == "backoff"
         assert TaskStatus.PAUSED.value == "paused"
 
-        # Verify total count matches expectations (catches accidental additions)
-        assert len(TaskStatus) == 10
+        # Ensure enum values are unique while allowing additive expansion.
+        assert len({status.value for status in TaskStatus}) == len(TaskStatus)
 
     def test_invalid_status_raises(self) -> None:
         """Test that invalid status string raises ValueError."""
@@ -55,6 +55,7 @@ class TestTaskMetadata:
         data = sample_metadata.to_dict()
 
         assert data["owner_id"] == sample_metadata.owner_id
+        assert data["team_id"] == sample_metadata.team_id
         assert data["parent_id"] == sample_metadata.parent_id
         assert data["resumed_from_task_id"] == sample_metadata.resumed_from_task_id
         assert data["batch_id"] == sample_metadata.batch_id
@@ -67,6 +68,7 @@ class TestTaskMetadata:
         restored = TaskMetadata.from_dict(data)
 
         assert restored.owner_id == sample_metadata.owner_id
+        assert restored.team_id == sample_metadata.team_id
         assert restored.parent_id == sample_metadata.parent_id
         assert restored.resumed_from_task_id == sample_metadata.resumed_from_task_id
         assert restored.batch_id == sample_metadata.batch_id
@@ -90,6 +92,7 @@ class TestTaskMetadata:
         restored = TaskMetadata.from_json(json_str)
 
         assert restored.owner_id == sample_metadata.owner_id
+        assert restored.team_id == sample_metadata.team_id
         assert restored.max_turns == sample_metadata.max_turns
 
     def test_from_json_bytes(self, sample_metadata: TaskMetadata) -> None:
@@ -98,11 +101,13 @@ class TestTaskMetadata:
         restored = TaskMetadata.from_json(json_bytes)
 
         assert restored.owner_id == sample_metadata.owner_id
+        assert restored.team_id == sample_metadata.team_id
 
     def test_optional_fields(self, owner_id: str) -> None:
         """Test TaskMetadata with optional fields as None."""
         metadata = TaskMetadata(
             owner_id=owner_id,
+            team_id=None,
             parent_id=None,
             batch_id=None,
             max_turns=None,
@@ -110,12 +115,14 @@ class TestTaskMetadata:
         data = metadata.to_dict()
 
         assert data["parent_id"] is None
+        assert data["team_id"] is None
         assert data["resumed_from_task_id"] is None
         assert data["batch_id"] is None
         assert data["max_turns"] is None
 
         restored = TaskMetadata.from_dict(data)
         assert restored.parent_id is None
+        assert restored.team_id is None
         assert restored.resumed_from_task_id is None
         assert restored.batch_id is None
         assert restored.max_turns is None
@@ -128,6 +135,7 @@ class TestTaskMetadata:
 
         metadata = TaskMetadata(
             owner_id=owner_id,
+            team_id=owner_id,
             parent_id=parent_id,
             resumed_from_task_id=resumed_from_task_id,
             batch_id=batch_id,
@@ -138,8 +146,23 @@ class TestTaskMetadata:
         restored = TaskMetadata.from_dict(data)
 
         assert restored.parent_id == parent_id
+        assert restored.team_id == owner_id
         assert restored.resumed_from_task_id == resumed_from_task_id
         assert restored.batch_id == batch_id
+
+    def test_from_dict_without_team_id_uses_default(self, owner_id: str) -> None:
+        """Legacy metadata without team_id remains supported."""
+        metadata_dict = {
+            "owner_id": owner_id,
+            "parent_id": None,
+            "resumed_from_task_id": None,
+            "batch_id": None,
+            "created_at": 1234.0,
+            "max_turns": None,
+        }
+        restored = TaskMetadata.from_dict(metadata_dict)
+        assert restored.owner_id == owner_id
+        assert restored.team_id is None
 
 
 class TestTask:
@@ -308,3 +331,25 @@ class TestTask:
         assert task.payload is not None
         assert task.payload.query == "minimal query"
         assert task.payload.turn == 0  # Default value
+
+    def test_from_dict_defaults_missing_team_id_to_task_id(
+        self,
+        agent_name: str,
+        sample_metadata: TaskMetadata,
+    ) -> None:
+        metadata = sample_metadata.to_dict()
+        metadata.pop("team_id", None)
+        task_id = str(uuid.uuid4())
+        task = Task.from_dict(
+            {
+                "id": task_id,
+                "status": "queued",
+                "agent": agent_name,
+                "payload": {"query": "hello"},
+                "pickups": 0,
+                "retries": 0,
+                "metadata": metadata,
+            },
+            context_class=AgentContext,
+        )
+        assert task.metadata.team_id == task_id

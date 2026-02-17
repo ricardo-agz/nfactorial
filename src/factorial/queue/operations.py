@@ -25,6 +25,11 @@ from factorial.exceptions import (
     HookTokenValidationError,
     InactiveTaskError,
     InvalidTaskIdError,
+    MessagingGroupAlreadyExistsError,
+    MessagingGroupNotFoundError,
+    MessagingInvalidRecipientError,
+    MessagingPermissionError,
+    MessagingScopeError,
     TaskNotFoundError,
 )
 from factorial.hooks import (
@@ -42,13 +47,21 @@ from factorial.queue.lua import (
     BatchPickupScriptResult,
     CancelTaskScriptResult,
     EnqueueBatchScript,
+    MessagingGroupMutationScriptResult,
+    MessagingSendScriptResult,
+    SteeringEnqueueScriptResult,
     create_cancel_task_script,
     create_child_task_completion_script,
     create_enqueue_batch_script,
     create_enqueue_task_script,
     create_hook_resolve_script,
     create_hook_wake_script,
+    create_messaging_direct_send_script,
+    create_messaging_group_add_members_script,
+    create_messaging_group_create_script,
+    create_messaging_group_send_script,
     create_resume_enqueue_script,
+    create_steering_enqueue_script,
 )
 from factorial.queue.task import (
     Batch,
@@ -56,10 +69,10 @@ from factorial.queue.task import (
     ContextType,
     Task,
     TaskStatus,
+    effective_team_id,
     get_batch_data,
     get_task_agent,
     get_task_data,
-    get_task_status,
 )
 from factorial.tools import _ToolResultInternal
 from factorial.utils import decode, is_valid_task_id, serialize_data
@@ -68,6 +81,7 @@ logger = get_logger(__name__)
 
 _ENQUEUE_IDEMPOTENCY_TTL_S = 60 * 60 * 24
 _RESUME_IDEMPOTENCY_TTL_S = 60 * 60 * 24
+_MESSAGING_HISTORY_MAXLEN = 20_000
 _NAMESPACE_ROOT = uuid.uuid5(uuid.NAMESPACE_DNS, "factorial.sh")
 _ENQUEUE_NAMESPACE_ROOT = uuid.uuid5(_NAMESPACE_ROOT, "enqueue")
 _ENQUEUE_TASK_NAMESPACE = uuid.uuid5(_ENQUEUE_NAMESPACE_ROOT, "task-id.v1")
@@ -111,6 +125,7 @@ def _enqueue_request_hash(*, agent_name: str, task: Task[Any]) -> str:
     request_envelope = {
         "agent_name": agent_name,
         "owner_id": task.metadata.owner_id,
+        "team_id": task.metadata.team_id,
         "parent_id": task.metadata.parent_id,
         "resumed_from_task_id": task.metadata.resumed_from_task_id,
         "batch_id": task.metadata.batch_id,
@@ -130,6 +145,7 @@ def _batch_enqueue_request_hash(
     agent_name: str,
     owner_id: str,
     parent_id: str | None,
+    team_id: str | None,
     payloads: list[ContextType],
     task_ids: list[str] | None,
     batch_id: str | None,
@@ -137,6 +153,7 @@ def _batch_enqueue_request_hash(
     request_envelope = {
         "agent_name": agent_name,
         "owner_id": owner_id,
+        "team_id": team_id,
         "parent_id": parent_id,
         "payloads": [serialize_data(payload.to_dict()) for payload in payloads],
         "task_ids": task_ids,
@@ -200,6 +217,18 @@ def _is_terminal_status(task_status: TaskStatus) -> bool:
         TaskStatus.FAILED,
         TaskStatus.CANCELLED,
     ]
+
+
+def _normalize_group_name(group_name: str) -> str:
+    if not isinstance(group_name, str) or not group_name.strip():
+        raise ValueError("group_name must be a non-empty string")
+    return group_name.strip()
+
+
+def _resolve_task_team_id(task_data: dict[str, Any]) -> str:
+    task_id = str(task_data["id"])
+    metadata = cast(dict[str, Any], task_data["metadata"])
+    return effective_team_id(task_id=task_id, metadata=metadata)
 
 
 async def _load_hook_session(
@@ -1224,6 +1253,9 @@ async def enqueue_task(
             request_hash=enqueue_request_hash,
         )
 
+    if not isinstance(task.metadata.team_id, str) or not task.metadata.team_id:
+        task.metadata.team_id = task.id
+
     keys = RedisKeys.format(namespace=namespace, agent=agent.name)
 
     if not is_valid_task_id(task.id):
@@ -1245,6 +1277,7 @@ async def enqueue_task(
         task_retries=0,
         task_meta_json=task.metadata.to_json(),
         enqueue_idempotency_key=enqueue_idem_storage_key,
+        task_children_key_template=keys.task_children("{parent_task_id}"),
         request_hash=enqueue_request_hash,
         ttl_seconds=_ENQUEUE_IDEMPOTENCY_TTL_S,
         idempotency_enabled=idempotency_enabled,
@@ -1352,6 +1385,7 @@ async def resume_task(
     # Keep operational parent linkage while adding revision lineage.
     resumed_task.metadata.parent_id = source_task.metadata.parent_id
     resumed_task.metadata.resumed_from_task_id = source_task.id
+    resumed_task.metadata.team_id = source_task.metadata.team_id or source_task.id
 
     task_keys = RedisKeys.format(namespace=namespace, agent=agent.name)
     resume_enqueue_script = await create_resume_enqueue_script(redis_client)
@@ -1372,6 +1406,7 @@ async def resume_task(
         task_pickups=resumed_task.pickups,
         task_retries=resumed_task.retries,
         task_meta_json=resumed_task.metadata.to_json(),
+        task_children_key_template=task_keys.task_children("{parent_task_id}"),
         request_hash=resume_request_hash,
         source_task_id=task_id,
         ttl_seconds=_RESUME_IDEMPOTENCY_TTL_S,
@@ -1438,6 +1473,7 @@ async def create_batch_and_enqueue(
     payloads: list[ContextType],
     owner_id: str,
     parent_id: str | None = None,
+    team_id: str | None = None,
     task_ids: list[str] | None = None,
     batch_id: str | None = None,
     idempotency_key: str | None = None,
@@ -1467,6 +1503,7 @@ async def create_batch_and_enqueue(
         agent_name=agent.name,
         owner_id=owner_id,
         parent_id=parent_id,
+        team_id=team_id,
         payloads=payloads,
         task_ids=task_ids,
         batch_id=batch_id,
@@ -1503,6 +1540,8 @@ async def create_batch_and_enqueue(
 
     if batch_id is None:
         batch_id = str(uuid.uuid4())
+    if not isinstance(team_id, str) or not team_id:
+        team_id = batch_id
     created_at = time.time()
 
     task_objs: list[Task[ContextType]] = []
@@ -1514,6 +1553,7 @@ async def create_batch_and_enqueue(
             t.id = task_ids[index]
         if parent_id is not None:
             t.metadata.parent_id = parent_id
+        t.metadata.team_id = team_id
         if not is_valid_task_id(t.id):
             raise InvalidTaskIdError(t.id)
         task_objs.append(t)
@@ -1528,6 +1568,7 @@ async def create_batch_and_enqueue(
 
     base_task_meta = {
         "owner_id": owner_id,
+        "team_id": team_id,
         "parent_id": parent_id,
         "batch_id": batch_id,
         "created_at": created_at,
@@ -1568,6 +1609,7 @@ async def create_batch_and_enqueue(
         batch_remaining_tasks_key=keys.batch_remaining_tasks,
         batch_progress_key=keys.batch_progress,
         batch_enqueue_idempotency_key=batch_idem_storage_key,
+        task_children_key_template=keys.task_children("{parent_task_id}"),
         request_hash=batch_enqueue_request_hash,
         ttl_seconds=_ENQUEUE_IDEMPOTENCY_TTL_S,
         idempotency_enabled=idempotency_enabled,
@@ -1595,6 +1637,524 @@ async def create_batch_and_enqueue(
         progress=0.0,
     )
     return batch
+
+
+def _group_thread_id(*, team_id: str, group_name: str) -> str:
+    return f"group:{team_id}:{group_name}"
+
+
+def _direct_thread_id(*, team_id: str, sender_task_id: str, to_task_id: str) -> str:
+    left, right = sorted([sender_task_id, to_task_id])
+    return f"dm:{team_id}:{left}:{right}"
+
+
+def _decode_group_meta(
+    *,
+    raw_meta: str | bytes | None,
+    group_name: str,
+    team_id: str,
+) -> dict[str, Any]:
+    if raw_meta is None:
+        raise MessagingGroupNotFoundError(group_name, team_id)
+    decoded = json.loads(decode(raw_meta))
+    return cast(dict[str, Any], decoded)
+
+
+async def _publish_messaging_event(
+    *,
+    redis_client: redis.Redis,
+    namespace: str,
+    owner_id: str,
+    task_id: str,
+    agent_name: str,
+    event_type: str,
+    data: dict[str, Any],
+) -> None:
+    try:
+        keys = RedisKeys.format(namespace=namespace, owner_id=owner_id)
+        await EventPublisher(
+            redis_client=redis_client,
+            channel=keys.updates_channel,
+        ).publish_event(
+            AgentEvent(
+                event_type=event_type,
+                task_id=task_id,
+                owner_id=owner_id,
+                agent_name=agent_name,
+                data=data,
+            )
+        )
+    except Exception as exc:  # pragma: no cover - best-effort observability path
+        logger.error(
+            "Failed to publish messaging event %s for task %s",
+            event_type,
+            task_id,
+            exc_info=exc,
+        )
+
+
+async def messaging_groups_create(
+    *,
+    redis_client: redis.Redis,
+    namespace: str,
+    sender_task_id: str,
+    group_name: str,
+    member_task_ids: list[str] | None = None,
+) -> dict[str, Any]:
+    normalized_group_name = _normalize_group_name(group_name)
+    sender_task_data = await get_task_data(redis_client, namespace, sender_task_id)
+    sender_team_id = _resolve_task_team_id(sender_task_data)
+    sender_owner_id = str(sender_task_data["metadata"]["owner_id"])
+    sender_agent_name = str(sender_task_data["agent"])
+
+    keys = RedisKeys.format(namespace=namespace)
+    group_meta_key = keys.messaging_group_meta(sender_team_id)
+    group_members_key = keys.messaging_group_members(
+        sender_team_id,
+        normalized_group_name,
+    )
+    team_tasks_key = keys.messaging_team_tasks(sender_team_id)
+
+    script = await create_messaging_group_create_script(redis_client)
+    result: MessagingGroupMutationScriptResult = await script.execute(
+        task_metas_key=keys.task_meta,
+        group_meta_key=group_meta_key,
+        group_members_key=group_members_key,
+        team_tasks_key=team_tasks_key,
+        sender_task_id=sender_task_id,
+        team_id=sender_team_id,
+        group_name=normalized_group_name,
+        group_meta_json=json.dumps(
+            {
+                "group_name": normalized_group_name,
+                "team_id": sender_team_id,
+                "created_at": time.time(),
+                "created_by_task_id": sender_task_id,
+            },
+            sort_keys=True,
+        ),
+        member_task_ids_json=json.dumps(member_task_ids or []),
+        groups_by_task_key_template=keys.messaging_groups_by_task("{task_id}"),
+    )
+
+    if result.decision == "exists":
+        raise MessagingGroupAlreadyExistsError(normalized_group_name, sender_team_id)
+    if result.decision == "sender_not_found":
+        raise TaskNotFoundError(sender_task_id)
+    if result.decision == "scope_mismatch":
+        raise MessagingScopeError(
+            "Sender task scope does not match team_id for group creation."
+        )
+    if result.decision == "member_not_found":
+        raise MessagingInvalidRecipientError(
+            f"Member task '{result.detail}' was not found"
+        )
+    if result.decision == "member_scope_mismatch":
+        raise MessagingScopeError(
+            f"Member task '{result.detail}' does not belong to sender team"
+        )
+    if result.decision == "invalid_group_name":
+        raise ValueError("group_name must be a non-empty string")
+    if result.decision != "created":
+        raise RuntimeError(
+            f"Unexpected messaging_group_create decision '{result.decision}'"
+        )
+
+    payload = {
+        "team_id": sender_team_id,
+        "group_name": normalized_group_name,
+        "member_task_ids": result.member_task_ids,
+    }
+    await _publish_messaging_event(
+        redis_client=redis_client,
+        namespace=namespace,
+        owner_id=sender_owner_id,
+        task_id=sender_task_id,
+        agent_name=sender_agent_name,
+        event_type="messaging_group_created",
+        data=payload,
+    )
+    return payload
+
+
+async def messaging_groups_get(
+    *,
+    redis_client: redis.Redis,
+    namespace: str,
+    sender_task_id: str,
+    group_name: str,
+) -> dict[str, Any]:
+    normalized_group_name = _normalize_group_name(group_name)
+    sender_task_data = await get_task_data(redis_client, namespace, sender_task_id)
+    sender_team_id = _resolve_task_team_id(sender_task_data)
+
+    keys = RedisKeys.format(namespace=namespace)
+    group_meta_key = keys.messaging_group_meta(sender_team_id)
+    group_members_key = keys.messaging_group_members(
+        sender_team_id,
+        normalized_group_name,
+    )
+    groups_by_task_key = keys.messaging_groups_by_task(sender_task_id)
+
+    raw_meta = await redis_client.hget(group_meta_key, normalized_group_name)  # type: ignore[misc]
+    group_meta = _decode_group_meta(
+        raw_meta=raw_meta,
+        group_name=normalized_group_name,
+        team_id=sender_team_id,
+    )
+    is_member = bool(
+        await redis_client.sismember(groups_by_task_key, normalized_group_name)  # type: ignore[misc]
+    )
+    if not is_member:
+        raise MessagingPermissionError(
+            f"Task {sender_task_id} is not a member of group '{normalized_group_name}'"
+        )
+    members_raw = cast(
+        set[str | bytes],
+        await redis_client.smembers(group_members_key),  # type: ignore[misc]
+    )
+    member_task_ids = sorted(decode(member_id) for member_id in members_raw)
+    return {
+        "team_id": sender_team_id,
+        "group_name": normalized_group_name,
+        "member_task_ids": member_task_ids,
+        "created_at": group_meta.get("created_at"),
+        "created_by_task_id": group_meta.get("created_by_task_id"),
+    }
+
+
+async def messaging_groups_list(
+    *,
+    redis_client: redis.Redis,
+    namespace: str,
+    sender_task_id: str,
+) -> list[dict[str, Any]]:
+    sender_task_data = await get_task_data(redis_client, namespace, sender_task_id)
+    sender_team_id = _resolve_task_team_id(sender_task_data)
+    keys = RedisKeys.format(namespace=namespace)
+    groups_by_task_key = keys.messaging_groups_by_task(sender_task_id)
+    group_names_raw = cast(
+        set[str | bytes],
+        await redis_client.smembers(groups_by_task_key),  # type: ignore[misc]
+    )
+    group_names = sorted(decode(name) for name in group_names_raw)
+    if not group_names:
+        return []
+
+    group_meta_key = keys.messaging_group_meta(sender_team_id)
+    raw_meta_values = cast(
+        list[str | bytes | None],
+        await redis_client.hmget(group_meta_key, group_names),  # type: ignore[arg-type,misc]
+    )
+    results: list[dict[str, Any]] = []
+    for name, raw_meta in zip(group_names, raw_meta_values, strict=True):
+        if raw_meta is None:
+            continue
+        meta = cast(dict[str, Any], json.loads(decode(raw_meta)))
+        results.append(
+            {
+                "team_id": sender_team_id,
+                "group_name": name,
+                "created_at": meta.get("created_at"),
+                "created_by_task_id": meta.get("created_by_task_id"),
+            }
+        )
+    return results
+
+
+async def messaging_groups_find(
+    *,
+    redis_client: redis.Redis,
+    namespace: str,
+    sender_task_id: str,
+    group_name: str,
+) -> list[dict[str, Any]]:
+    normalized_group_name = _normalize_group_name(group_name)
+    groups = await messaging_groups_list(
+        redis_client=redis_client,
+        namespace=namespace,
+        sender_task_id=sender_task_id,
+    )
+    return [group for group in groups if group["group_name"] == normalized_group_name]
+
+
+async def messaging_groups_add_members(
+    *,
+    redis_client: redis.Redis,
+    namespace: str,
+    sender_task_id: str,
+    group_name: str,
+    member_task_ids: list[str],
+) -> list[str]:
+    normalized_group_name = _normalize_group_name(group_name)
+    sender_task_data = await get_task_data(redis_client, namespace, sender_task_id)
+    sender_team_id = _resolve_task_team_id(sender_task_data)
+    sender_owner_id = str(sender_task_data["metadata"]["owner_id"])
+    sender_agent_name = str(sender_task_data["agent"])
+
+    keys = RedisKeys.format(namespace=namespace)
+    group_meta_key = keys.messaging_group_meta(sender_team_id)
+    group_members_key = keys.messaging_group_members(
+        sender_team_id,
+        normalized_group_name,
+    )
+    team_tasks_key = keys.messaging_team_tasks(sender_team_id)
+
+    script = await create_messaging_group_add_members_script(redis_client)
+    result: MessagingGroupMutationScriptResult = await script.execute(
+        task_metas_key=keys.task_meta,
+        group_meta_key=group_meta_key,
+        group_members_key=group_members_key,
+        team_tasks_key=team_tasks_key,
+        sender_task_id=sender_task_id,
+        team_id=sender_team_id,
+        group_name=normalized_group_name,
+        member_task_ids_json=json.dumps(member_task_ids),
+        groups_by_task_key_template=keys.messaging_groups_by_task("{task_id}"),
+    )
+
+    if result.decision == "group_not_found":
+        raise MessagingGroupNotFoundError(normalized_group_name, sender_team_id)
+    if result.decision == "sender_not_found":
+        raise TaskNotFoundError(sender_task_id)
+    if result.decision == "sender_not_member":
+        raise MessagingPermissionError(
+            f"Task {sender_task_id} is not a member of group '{normalized_group_name}'"
+        )
+    if result.decision == "scope_mismatch":
+        raise MessagingScopeError("Sender task scope mismatch")
+    if result.decision == "member_not_found":
+        raise MessagingInvalidRecipientError(
+            f"Member task '{result.detail}' was not found"
+        )
+    if result.decision == "member_scope_mismatch":
+        raise MessagingScopeError(
+            f"Member task '{result.detail}' does not belong to sender team"
+        )
+    if result.decision != "updated":
+        raise RuntimeError(
+            f"Unexpected messaging_group_add_members decision '{result.decision}'"
+        )
+
+    await _publish_messaging_event(
+        redis_client=redis_client,
+        namespace=namespace,
+        owner_id=sender_owner_id,
+        task_id=sender_task_id,
+        agent_name=sender_agent_name,
+        event_type="messaging_group_members_added",
+        data={
+            "team_id": sender_team_id,
+            "group_name": normalized_group_name,
+            "added_member_task_ids": result.member_task_ids,
+        },
+    )
+    return result.member_task_ids
+
+
+async def messaging_groups_send(
+    *,
+    redis_client: redis.Redis,
+    namespace: str,
+    sender_task_id: str,
+    group_name: str,
+    content: str,
+    metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    normalized_group_name = _normalize_group_name(group_name)
+    sender_task_data = await get_task_data(redis_client, namespace, sender_task_id)
+    sender_team_id = _resolve_task_team_id(sender_task_data)
+    sender_owner_id = str(sender_task_data["metadata"]["owner_id"])
+    sender_agent_name = str(sender_task_data["agent"])
+
+    keys = RedisKeys.format(namespace=namespace)
+    group_meta_key = keys.messaging_group_meta(sender_team_id)
+    group_members_key = keys.messaging_group_members(
+        sender_team_id,
+        normalized_group_name,
+    )
+    thread_id = _group_thread_id(
+        team_id=sender_team_id,
+        group_name=normalized_group_name,
+    )
+    script = await create_messaging_group_send_script(redis_client)
+    steering_key_template = RedisKeys.format(
+        namespace=namespace,
+        task_id="{task_id}",
+    ).task_steering
+    agent_queue_key_template = RedisKeys.format(
+        namespace=namespace,
+        agent="{agent}",
+    )
+    result: MessagingSendScriptResult = await script.execute(
+        task_statuses_key=keys.task_status,
+        task_agents_key=keys.task_agent,
+        task_metas_key=keys.task_meta,
+        group_meta_key=group_meta_key,
+        group_members_key=group_members_key,
+        thread_history_key=keys.messaging_thread_history(thread_id),
+        global_history_key=keys.messaging_history_global,
+        message_seq_key=keys.messaging_message_seq,
+        activity_wait_meta_key=keys.activity_wait_meta,
+        team_tasks_key=keys.messaging_team_tasks(sender_team_id),
+        sender_task_id=sender_task_id,
+        team_id=sender_team_id,
+        group_name=normalized_group_name,
+        content=content,
+        metadata_json=json.dumps(serialize_data(metadata or {}), sort_keys=True),
+        steering_key_template=steering_key_template,
+        history_maxlen=_MESSAGING_HISTORY_MAXLEN,
+        queue_main_key_template=agent_queue_key_template.queue_main,
+        queue_pending_key_template=agent_queue_key_template.queue_pending,
+        groups_by_task_key_template=keys.messaging_groups_by_task("{task_id}"),
+    )
+
+    if result.decision == "group_not_found":
+        raise MessagingGroupNotFoundError(normalized_group_name, sender_team_id)
+    if result.decision == "sender_not_found":
+        raise TaskNotFoundError(sender_task_id)
+    if result.decision == "sender_not_member":
+        raise MessagingPermissionError(
+            f"Task {sender_task_id} is not a member of group '{normalized_group_name}'"
+        )
+    if result.decision == "scope_mismatch":
+        raise MessagingScopeError("Sender task scope mismatch")
+    if result.decision != "sent":
+        raise RuntimeError(
+            f"Unexpected messaging_group_send decision '{result.decision}'"
+        )
+
+    report = {
+        "thread_message_id": result.thread_message_id,
+        "global_message_id": result.global_message_id,
+        "delivered_task_ids": result.delivered_task_ids,
+        "skipped_inactive_task_ids": result.skipped_inactive_task_ids,
+        "failed_task_ids": result.failed_task_ids,
+    }
+    await _publish_messaging_event(
+        redis_client=redis_client,
+        namespace=namespace,
+        owner_id=sender_owner_id,
+        task_id=sender_task_id,
+        agent_name=sender_agent_name,
+        event_type="messaging_group_message_sent",
+        data={
+            "team_id": sender_team_id,
+            "group_name": normalized_group_name,
+            **report,
+        },
+    )
+    if result.skipped_inactive_task_ids or result.failed_task_ids:
+        await _publish_messaging_event(
+            redis_client=redis_client,
+            namespace=namespace,
+            owner_id=sender_owner_id,
+            task_id=sender_task_id,
+            agent_name=sender_agent_name,
+            event_type="messaging_delivery_partial",
+            data={
+                "team_id": sender_team_id,
+                "group_name": normalized_group_name,
+                **report,
+            },
+        )
+    return report
+
+
+async def messaging_send_direct(
+    *,
+    redis_client: redis.Redis,
+    namespace: str,
+    sender_task_id: str,
+    to_task_id: str,
+    content: str,
+    metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    sender_task_data = await get_task_data(redis_client, namespace, sender_task_id)
+    sender_team_id = _resolve_task_team_id(sender_task_data)
+    sender_owner_id = str(sender_task_data["metadata"]["owner_id"])
+    sender_agent_name = str(sender_task_data["agent"])
+    keys = RedisKeys.format(namespace=namespace)
+
+    thread_id = _direct_thread_id(
+        team_id=sender_team_id,
+        sender_task_id=sender_task_id,
+        to_task_id=to_task_id,
+    )
+    script = await create_messaging_direct_send_script(redis_client)
+    steering_key_template = RedisKeys.format(
+        namespace=namespace,
+        task_id="{task_id}",
+    ).task_steering
+    agent_queue_key_template = RedisKeys.format(
+        namespace=namespace,
+        agent="{agent}",
+    )
+    result: MessagingSendScriptResult = await script.execute(
+        task_statuses_key=keys.task_status,
+        task_agents_key=keys.task_agent,
+        task_metas_key=keys.task_meta,
+        thread_history_key=keys.messaging_thread_history(thread_id),
+        global_history_key=keys.messaging_history_global,
+        message_seq_key=keys.messaging_message_seq,
+        activity_wait_meta_key=keys.activity_wait_meta,
+        sender_task_id=sender_task_id,
+        to_task_id=to_task_id,
+        team_id=sender_team_id,
+        content=content,
+        metadata_json=json.dumps(serialize_data(metadata or {}), sort_keys=True),
+        steering_key_template=steering_key_template,
+        history_maxlen=_MESSAGING_HISTORY_MAXLEN,
+        queue_main_key_template=agent_queue_key_template.queue_main,
+        queue_pending_key_template=agent_queue_key_template.queue_pending,
+    )
+
+    if result.decision == "sender_not_found":
+        raise TaskNotFoundError(sender_task_id)
+    if result.decision == "recipient_not_found":
+        raise MessagingInvalidRecipientError(f"Recipient task '{to_task_id}' not found")
+    if result.decision in {"scope_mismatch", "recipient_scope_mismatch"}:
+        raise MessagingScopeError("Direct message crosses team scope")
+    if result.decision != "sent":
+        raise RuntimeError(
+            f"Unexpected messaging_direct_send decision '{result.decision}'"
+        )
+
+    report = {
+        "thread_message_id": result.thread_message_id,
+        "global_message_id": result.global_message_id,
+        "delivered_task_ids": result.delivered_task_ids,
+        "skipped_inactive_task_ids": result.skipped_inactive_task_ids,
+        "failed_task_ids": result.failed_task_ids,
+    }
+    await _publish_messaging_event(
+        redis_client=redis_client,
+        namespace=namespace,
+        owner_id=sender_owner_id,
+        task_id=sender_task_id,
+        agent_name=sender_agent_name,
+        event_type="messaging_direct_message_sent",
+        data={
+            "team_id": sender_team_id,
+            "to_task_id": to_task_id,
+            **report,
+        },
+    )
+    if result.skipped_inactive_task_ids or result.failed_task_ids:
+        await _publish_messaging_event(
+            redis_client=redis_client,
+            namespace=namespace,
+            owner_id=sender_owner_id,
+            task_id=sender_task_id,
+            agent_name=sender_agent_name,
+            event_type="messaging_delivery_partial",
+            data={
+                "team_id": sender_team_id,
+                "to_task_id": to_task_id,
+                **report,
+            },
+        )
+    return report
 
 
 async def cancel_batch(
@@ -1680,6 +2240,14 @@ async def cancel_task(
         agent=agent_name,
         task_id=task_id,
     )
+    steering_template = RedisKeys.format(
+        namespace=namespace,
+        task_id="{task_id}",
+    ).task_steering
+    agent_queue_templates = RedisKeys.format(
+        namespace=namespace,
+        agent="{agent}",
+    )
 
     cancel_script = await create_cancel_task_script(redis_client)
     result: CancelTaskScriptResult = await cancel_script.execute(
@@ -1703,6 +2271,11 @@ async def cancel_task(
         queue_scheduled_key=keys.queue_scheduled,
         scheduled_wait_meta_key=keys.scheduled_wait_meta,
         pending_child_wait_ids_key=keys.pending_child_wait_ids,
+        activity_wait_meta_key=keys.activity_wait_meta,
+        queue_main_key_template=agent_queue_templates.queue_main,
+        queue_pending_key_template=agent_queue_templates.queue_pending,
+        task_steering_key_template=steering_template,
+        message_seq_key=keys.messaging_message_seq,
     )
 
     if not result.success:
@@ -1735,18 +2308,47 @@ async def steer_task(
     task_id: str,
     messages: list[dict[str, Any]],
 ) -> None:
-    """Steer a task"""
-    task_status = await get_task_status(redis_client, namespace, task_id)
-    if task_status in [TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED]:
-        raise InactiveTaskError(task_id)
+    """Steer a task and wake activity waits atomically."""
+    if not isinstance(messages, list):
+        raise TypeError("steer_task messages must be a list of dict objects")
+    normalized_messages: list[dict[str, Any]] = []
+    for message in messages:
+        if not isinstance(message, dict):
+            raise TypeError("steer_task messages must be a list of dict objects")
+        normalized_messages.append(dict(message))
 
-    keys = RedisKeys.format(namespace=namespace, task_id=task_id)
-    # message id format: {timestamp_ms}_{random_hex} e.g. 1717234200000_a3f4b5c6
-    message_mapping = {
-        f"{int(time.time() * 1000)}_{secrets.token_hex(3)}": json.dumps(message)
-        for message in messages
-    }
-    await redis_client.hset(keys.task_steering, mapping=message_mapping)  # type: ignore
+    agent_name = await get_task_agent(redis_client, namespace, task_id)
+    keys = RedisKeys.format(namespace=namespace, agent=agent_name, task_id=task_id)
+    root_keys = RedisKeys.format(namespace=namespace)
+    script = await create_steering_enqueue_script(redis_client)
+    result: SteeringEnqueueScriptResult = await script.execute(
+        queue_main_key=keys.queue_main,
+        queue_orphaned_key=keys.queue_orphaned,
+        queue_pending_key=keys.queue_pending,
+        task_statuses_key=keys.task_status,
+        task_agents_key=keys.task_agent,
+        task_payloads_key=keys.task_payload,
+        task_pickups_key=keys.task_pickups,
+        task_retries_key=keys.task_retries,
+        task_metas_key=keys.task_meta,
+        steering_messages_key=keys.task_steering,
+        activity_wait_meta_key=root_keys.activity_wait_meta,
+        message_seq_key=root_keys.messaging_message_seq,
+        task_id=task_id,
+        messages_json=json.dumps(
+            [json.dumps(serialize_data(message)) for message in normalized_messages]
+        ),
+    )
+    if not result.success:
+        if result.status == "missing":
+            raise TaskNotFoundError(task_id)
+        if result.status == "inactive":
+            raise InactiveTaskError(task_id)
+        if result.status == "corrupted":
+            raise RuntimeError(f"Task {task_id} data is corrupted")
+        raise RuntimeError(
+            f"steer_task failed with unexpected status '{result.status}'"
+        )
 
 
 async def resume_if_no_remaining_child_tasks(
@@ -1916,6 +2518,14 @@ async def get_task_batch(
         namespace=namespace,
         agent=agent.name,
     )
+    agent_queue_templates = RedisKeys.format(
+        namespace=namespace,
+        agent="{agent}",
+    )
+    steering_template = RedisKeys.format(
+        namespace=namespace,
+        task_id="{task_id}",
+    ).task_steering
 
     try:
         result: BatchPickupScriptResult = await batch_script.execute(
@@ -1934,6 +2544,11 @@ async def get_task_batch(
             global_metrics_bucket_key=keys.global_metrics_bucket,
             batch_size=batch_size,
             metrics_ttl=metrics_ttl,
+            activity_wait_meta_key=keys.activity_wait_meta,
+            queue_pending_key_template=agent_queue_templates.queue_pending,
+            queue_main_key_template=agent_queue_templates.queue_main,
+            task_steering_key_template=steering_template,
+            message_seq_key=keys.messaging_message_seq,
         )
         if result.orphaned_task_ids:
             logger.warning(

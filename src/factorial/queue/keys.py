@@ -14,8 +14,12 @@ TASK_PAYLOAD = "{namespace}:tasks:payload"
 TASK_PICKUPS = "{namespace}:tasks:pickups"
 # HASH: task_id -> num retries (int)
 TASK_RETRIES = "{namespace}:tasks:retries"
-# HASH: task_id -> {created_at, owner_id, parent_id, resumed_from_task_id, batch_id}
+# HASH: task_id -> {
+#   created_at, owner_id, team_id, parent_id, resumed_from_task_id, batch_id
+# }
 TASK_META = "{namespace}:tasks:meta"
+# SET: child task_ids by parent task id
+TASK_CHILDREN = "{namespace}:tasks:children:{parent_task_id}"
 # HASH: task_id -> {current_turn: int, max_turns: int | None, progress: float}
 TASK_PROGRESS = "{namespace}:tasks:progress"
 
@@ -59,6 +63,8 @@ PENDING_CHILD_TASK_RESULTS = "{namespace}:pending:{task_id}:children"
 PENDING_CHILD_WAIT_IDS = "{namespace}:pending:{task_id}:children_wait_ids"
 # HASH: task_id -> scheduled wait metadata JSON
 SCHEDULED_WAIT_META = "{namespace}:scheduled:wait_meta"
+# HASH: task_id -> activity wait metadata JSON
+ACTIVITY_WAIT_META = "{namespace}:wait:activity:meta"
 
 # ===== HOOK STATE MANAGEMENT =====
 # HASH: hook_id -> hook_record_json
@@ -89,6 +95,22 @@ HOOK_RUNTIME_READY = "{namespace}:hooks:runtime_ready:{task_id}"
 # ===== COMMUNICATION =====
 # PUBSUB: real-time updates to task owners
 UPDATES_CHANNEL = "{namespace}:updates:{owner_id}"
+
+# ===== MESSAGING =====
+# HASH: group_name -> group_metadata_json (team scoped)
+MESSAGING_GROUP_META = "{namespace}:messaging:groups:{team_id}:meta"
+# SET: task_ids in a group (team scoped)
+MESSAGING_GROUP_MEMBERS = "{namespace}:messaging:groups:{team_id}:{group_name}:members"
+# SET: group refs (team_id:group_name) for a task
+MESSAGING_GROUPS_BY_TASK = "{namespace}:messaging:groups:by_task:{task_id}"
+# SET: task_ids currently known in a team
+MESSAGING_TEAM_TASKS = "{namespace}:messaging:teams:{team_id}:tasks"
+# STREAM: thread history entries
+MESSAGING_THREAD_HISTORY = "{namespace}:messaging:thread:{thread_id}:history"
+# STREAM: global messaging timeline
+MESSAGING_HISTORY_GLOBAL = "{namespace}:messaging:history"
+# COUNTER: monotonically increasing sequence for message IDs
+MESSAGING_MESSAGE_SEQ = "{namespace}:messaging:seq"
 
 # ===== METRICS =====
 # Rolling (fixed-memory) metrics ring buffers.
@@ -127,6 +149,7 @@ class RedisKeys:
     _task_pickups: str
     _task_retries: str
     _task_meta: str
+    _task_children: str
     _task_cancellations: str
     # Hook keys (namespace scoped)
     _hooks_index: str
@@ -137,12 +160,21 @@ class RedisKeys:
     _batch_enqueue_idempotency: str
     _hook_sessions: str
     _scheduled_wait_meta: str
+    _activity_wait_meta: str
     # Batch keys
     _batch_tasks: str
     _batch_remaining_tasks: str
     _batch_progress: str
     _batch_completed: str
     _batch_meta: str
+    # Messaging keys (namespace scoped)
+    _messaging_group_meta: str
+    _messaging_group_members: str
+    _messaging_groups_by_task: str
+    _messaging_team_tasks: str
+    _messaging_thread_history: str
+    _messaging_history_global: str
+    _messaging_message_seq: str
 
     # Defaults after
     _queue_main: str | None = None
@@ -201,6 +233,10 @@ class RedisKeys:
     def task_meta(self) -> str:
         """{namespace}:tasks:meta"""
         return self._task_meta
+
+    def task_children(self, parent_task_id: str) -> str:
+        """{namespace}:tasks:children:{parent_task_id}"""
+        return self._task_children.format(parent_task_id=parent_task_id)
 
     @property
     def task_cancellations(self) -> str:
@@ -271,6 +307,11 @@ class RedisKeys:
         return self._scheduled_wait_meta
 
     @property
+    def activity_wait_meta(self) -> str:
+        """{namespace}:wait:activity:meta"""
+        return self._activity_wait_meta
+
+    @property
     def batch_completed(self) -> str:
         """{namespace}:batches:completed"""
         return self._batch_completed
@@ -294,6 +335,39 @@ class RedisKeys:
     def batch_progress(self) -> str:
         """{namespace}:batches:progress"""
         return self._batch_progress
+
+    def messaging_group_meta(self, team_id: str) -> str:
+        """{namespace}:messaging:groups:{team_id}:meta"""
+        return self._messaging_group_meta.format(team_id=team_id)
+
+    def messaging_group_members(self, team_id: str, group_name: str) -> str:
+        """{namespace}:messaging:groups:{team_id}:{group_name}:members"""
+        return self._messaging_group_members.format(
+            team_id=team_id,
+            group_name=group_name,
+        )
+
+    def messaging_groups_by_task(self, task_id: str) -> str:
+        """{namespace}:messaging:groups:by_task:{task_id}"""
+        return self._messaging_groups_by_task.format(task_id=task_id)
+
+    def messaging_team_tasks(self, team_id: str) -> str:
+        """{namespace}:messaging:teams:{team_id}:tasks"""
+        return self._messaging_team_tasks.format(team_id=team_id)
+
+    def messaging_thread_history(self, thread_id: str) -> str:
+        """{namespace}:messaging:thread:{thread_id}:history"""
+        return self._messaging_thread_history.format(thread_id=thread_id)
+
+    @property
+    def messaging_history_global(self) -> str:
+        """{namespace}:messaging:history"""
+        return self._messaging_history_global
+
+    @property
+    def messaging_message_seq(self) -> str:
+        """{namespace}:messaging:seq"""
+        return self._messaging_message_seq
 
     @property
     def queue_main(self) -> str:
@@ -523,6 +597,10 @@ class RedisKeys:
             _task_pickups=TASK_PICKUPS.format(namespace=namespace),
             _task_retries=TASK_RETRIES.format(namespace=namespace),
             _task_meta=TASK_META.format(namespace=namespace),
+            _task_children=TASK_CHILDREN.format(
+                namespace=namespace,
+                parent_task_id="{parent_task_id}",
+            ),
             _task_cancellations=TASK_CANCELLATIONS.format(namespace=namespace),
             _hooks_index=HOOKS_INDEX.format(namespace=namespace),
             _hooks_expiring=HOOKS_EXPIRING.format(namespace=namespace),
@@ -550,6 +628,30 @@ class RedisKeys:
             ),
             _hook_sessions=HOOK_SESSIONS.format(namespace=namespace),
             _scheduled_wait_meta=SCHEDULED_WAIT_META.format(namespace=namespace),
+            _activity_wait_meta=ACTIVITY_WAIT_META.format(namespace=namespace),
+            _messaging_group_meta=MESSAGING_GROUP_META.format(
+                namespace=namespace,
+                team_id="{team_id}",
+            ),
+            _messaging_group_members=MESSAGING_GROUP_MEMBERS.format(
+                namespace=namespace,
+                team_id="{team_id}",
+                group_name="{group_name}",
+            ),
+            _messaging_groups_by_task=MESSAGING_GROUPS_BY_TASK.format(
+                namespace=namespace,
+                task_id="{task_id}",
+            ),
+            _messaging_team_tasks=MESSAGING_TEAM_TASKS.format(
+                namespace=namespace,
+                team_id="{team_id}",
+            ),
+            _messaging_thread_history=MESSAGING_THREAD_HISTORY.format(
+                namespace=namespace,
+                thread_id="{thread_id}",
+            ),
+            _messaging_history_global=MESSAGING_HISTORY_GLOBAL.format(namespace=namespace),
+            _messaging_message_seq=MESSAGING_MESSAGE_SEQ.format(namespace=namespace),
             # Agent-scoped keys
             _queue_main=QUEUE_MAIN.format(namespace=namespace, agent=agent)
             if agent

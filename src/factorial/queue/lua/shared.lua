@@ -167,3 +167,282 @@ local function inc_metrics(keys, args)
 
     return true
 end
+
+
+local function _format_template_key(template, token, value)
+    return string.gsub(template, token, value)
+end
+
+
+local function _append_steering_message(task_steering_key, message_content, message_seq_key)
+    local time_result = redis.call('TIME')
+    local timestamp_ms = math.floor(
+        tonumber(time_result[1]) * 1000 + (tonumber(time_result[2]) / 1000)
+    )
+    local seq = redis.call('INCR', message_seq_key)
+    local message_id = tostring(timestamp_ms) .. "_" .. tostring(seq)
+    redis.call(
+        'HSET',
+        task_steering_key,
+        message_id,
+        cjson.encode({ role = "user", content = message_content })
+    )
+    return message_id
+end
+
+
+--[[
+---------------------------------------------------------------------
+Wake a paused(activity) task and optionally enqueue a synthetic steering message.
+
+Usage:
+wake_task_if_waiting_activity(
+    {
+        task_statuses_key,
+        task_agents_key,
+        queue_main_key_template,
+        queue_pending_key_template,
+        activity_wait_meta_key,
+        task_steering_key_template,
+        message_seq_key,
+    },
+    {
+        task_id,
+        message_content, -- optional, empty string to skip synthetic steering append
+    }
+)
+
+Returns:
+true when the task was woken, false otherwise.
+---------------------------------------------------------------------
+]] --
+local function wake_task_if_waiting_activity(keys, args)
+    local task_statuses_key = keys[1]
+    local task_agents_key = keys[2]
+    local queue_main_key_template = keys[3]
+    local queue_pending_key_template = keys[4]
+    local activity_wait_meta_key = keys[5]
+    local task_steering_key_template = keys[6]
+    local message_seq_key = keys[7]
+
+    local task_id = args[1]
+    local message_content = args[2] or ""
+
+    local task_status = redis.call('HGET', task_statuses_key, task_id)
+    if task_status ~= "paused" then
+        return false
+    end
+
+    if redis.call('HEXISTS', activity_wait_meta_key, task_id) ~= 1 then
+        return false
+    end
+
+    local task_agent = redis.call('HGET', task_agents_key, task_id)
+    if not task_agent then
+        return false
+    end
+    local queue_main_key = _format_template_key(
+        queue_main_key_template,
+        "{agent}",
+        task_agent
+    )
+    local queue_pending_key = _format_template_key(
+        queue_pending_key_template,
+        "{agent}",
+        task_agent
+    )
+
+    if message_content ~= "" then
+        local task_steering_key = _format_template_key(
+            task_steering_key_template,
+            "{task_id}",
+            task_id
+        )
+        _append_steering_message(task_steering_key, message_content, message_seq_key)
+    end
+
+    redis.call('HSET', task_statuses_key, task_id, "active")
+    redis.call('HDEL', activity_wait_meta_key, task_id)
+    redis.call('ZREM', queue_pending_key, task_id)
+    redis.call('LPUSH', queue_main_key, task_id)
+
+    return true
+end
+
+
+--[[
+---------------------------------------------------------------------
+Wake a parent waiting on activity when its direct subtree is quiescent.
+
+Direct children are considered quiescent when they are terminal or paused(activity).
+Paused(sleep/cron) counts as busy (self-waking, not deadlocked).
+
+Usage:
+maybe_wake_parent_on_subtree_idle(
+    {
+        task_statuses_key,
+        task_agents_key,
+        queue_main_key_template,
+        queue_pending_key_template,
+        activity_wait_meta_key,
+        task_steering_key_template,
+        message_seq_key,
+        task_children_key_template,
+    },
+    {
+        parent_task_id,
+        source_task_id,
+    }
+)
+
+Returns:
+true when parent was woken, false otherwise.
+---------------------------------------------------------------------
+]] --
+local function maybe_wake_parent_on_subtree_idle(keys, args)
+    local task_statuses_key = keys[1]
+    local task_agents_key = keys[2]
+    local queue_main_key_template = keys[3]
+    local queue_pending_key_template = keys[4]
+    local activity_wait_meta_key = keys[5]
+    local task_steering_key_template = keys[6]
+    local message_seq_key = keys[7]
+    local task_children_key_template = keys[8]
+
+    local parent_task_id = args[1]
+    local source_task_id = args[2] or ""
+    if not parent_task_id or parent_task_id == "" or parent_task_id == cjson.null then
+        return false
+    end
+
+    if redis.call('HGET', task_statuses_key, parent_task_id) ~= "paused" then
+        return false
+    end
+    if redis.call('HEXISTS', activity_wait_meta_key, parent_task_id) ~= 1 then
+        return false
+    end
+
+    local children_key = _format_template_key(
+        task_children_key_template,
+        "{parent_task_id}",
+        parent_task_id
+    )
+    local child_task_ids = redis.call('SMEMBERS', children_key)
+    if #child_task_ids == 0 then
+        return false
+    end
+
+    local has_activity_wait_child = false
+    for _, child_task_id in ipairs(child_task_ids) do
+        local child_status = redis.call('HGET', task_statuses_key, child_task_id)
+
+        if child_status == "queued"
+            or child_status == "active"
+            or child_status == "processing"
+            or child_status == "backoff"
+            or child_status == "pending_tool_results"
+            or child_status == "pending_child_tasks"
+        then
+            return false
+        elseif child_status == "paused" then
+            if redis.call('HEXISTS', activity_wait_meta_key, child_task_id) == 1 then
+                has_activity_wait_child = true
+            else
+                -- paused(sleep/cron) is still runnable via timer and not quiescent
+                return false
+            end
+        elseif child_status == "completed"
+            or child_status == "failed"
+            or child_status == "cancelled"
+            or not child_status
+        then
+            -- terminal/missing children are quiescent for subtree-idle purposes
+        else
+            return false
+        end
+    end
+
+    if not has_activity_wait_child then
+        return false
+    end
+
+    local content = "<system_activity kind='subtree_idle' source_task_id='"
+        .. tostring(source_task_id)
+        .. "'></system_activity>"
+    return wake_task_if_waiting_activity(
+        {
+            task_statuses_key,
+            task_agents_key,
+            queue_main_key_template,
+            queue_pending_key_template,
+            activity_wait_meta_key,
+            task_steering_key_template,
+            message_seq_key,
+        },
+        {
+            parent_task_id,
+            content,
+        }
+    )
+end
+
+
+--[[
+---------------------------------------------------------------------
+Wake a parent waiting on activity when a direct child reaches terminal state.
+
+Usage:
+wake_parent_on_child_terminal(
+    {
+        task_statuses_key,
+        task_agents_key,
+        queue_main_key_template,
+        queue_pending_key_template,
+        activity_wait_meta_key,
+        task_steering_key_template,
+        message_seq_key,
+    },
+    {
+        parent_task_id,
+        child_task_id,
+    }
+)
+
+Returns:
+true when parent was woken, false otherwise.
+---------------------------------------------------------------------
+]] --
+local function wake_parent_on_child_terminal(keys, args)
+    local task_statuses_key = keys[1]
+    local task_agents_key = keys[2]
+    local queue_main_key_template = keys[3]
+    local queue_pending_key_template = keys[4]
+    local activity_wait_meta_key = keys[5]
+    local task_steering_key_template = keys[6]
+    local message_seq_key = keys[7]
+
+    local parent_task_id = args[1]
+    local child_task_id = args[2] or ""
+    if not parent_task_id or parent_task_id == "" or parent_task_id == cjson.null then
+        return false
+    end
+
+    local content = "<system_activity kind='child_terminal' child_task_id='"
+        .. tostring(child_task_id)
+        .. "'></system_activity>"
+    return wake_task_if_waiting_activity(
+        {
+            task_statuses_key,
+            task_agents_key,
+            queue_main_key_template,
+            queue_pending_key_template,
+            activity_wait_meta_key,
+            task_steering_key_template,
+            message_seq_key,
+        },
+        {
+            parent_task_id,
+            content,
+        }
+    )
+end

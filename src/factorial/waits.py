@@ -12,7 +12,7 @@ from factorial.context import ExecutionContext
 class WaitInstruction:
     """Serializable wait intent used by the namespace-style API."""
 
-    kind: Literal["sleep", "cron", "jobs"]
+    kind: Literal["sleep", "cron", "jobs", "activity"]
     data: Any = None
     sleep_s: float | None = None
     cron: str | None = None
@@ -225,6 +225,9 @@ class WaitNamespace:
             job_refs=serialized_refs,
             data=data,
         )
+
+    def activity(self, *, data: Any = None) -> WaitInstruction:
+        return WaitInstruction(kind="activity", data=data)
 
 
 wait = WaitNamespace()

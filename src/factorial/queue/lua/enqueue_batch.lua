@@ -29,6 +29,7 @@
 --   [10] batch_remaining_tasks_key       (HASH)  batch_id -> remaining task_ids json
 --   [11] batch_progress_key              (HASH)  batch_id -> progress number
 --   [12] batch_enqueue_idempotency_key   (STRING, optional)
+--   [13] task_children_key_template      (STRING key template)
 --
 -- ARGV
 --   [1] batch_id
@@ -68,6 +69,9 @@ local batch_meta_key            = KEYS[9]
 local batch_remaining_tasks_key = KEYS[10]
 local batch_progress_key        = KEYS[11]
 local batch_enqueue_idempotency_key = KEYS[12]
+local task_children_key_template = KEYS[13]
+local base_task_meta = cjson.decode(base_task_meta_json)
+local parent_task_id = base_task_meta.parent_id
 
 if ttl_seconds < 1 then
     ttl_seconds = 1
@@ -121,6 +125,21 @@ end
 local batch_preexisting = redis.call('HEXISTS', batch_meta_key, batch_id) == 1
 local task_ids = {}
 
+local function register_parent_child_link(child_task_id)
+    if not parent_task_id or parent_task_id == cjson.null or parent_task_id == "" then
+        return
+    end
+    if not task_children_key_template or task_children_key_template == "" then
+        return
+    end
+    local task_children_key = string.gsub(
+        task_children_key_template,
+        "{parent_task_id}",
+        parent_task_id
+    )
+    redis.call('SADD', task_children_key, child_task_id)
+end
+
 for i = 1, #tasks_json do
     local task         = tasks_json[i]
     local task_id      = task["id"]
@@ -138,6 +157,7 @@ for i = 1, #tasks_json do
         redis.call('HSET', task_pickups_key, task_id, 0)
         redis.call('HSET', task_retries_key, task_id, 0)
         redis.call('HSET', task_metas_key, task_id, base_task_meta_json)
+        register_parent_child_link(task_id)
     end
 
     table.insert(task_ids, task_id)

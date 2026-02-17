@@ -18,9 +18,11 @@ from factorial.exceptions import RETRYABLE_EXCEPTIONS, FatalAgentError
 from factorial.logging import colored, get_logger
 from factorial.queue.keys import PENDING_SENTINEL, RedisKeys
 from factorial.queue.lua import (
+    ActivityWaitScript,
     TaskCompletionScript,
     TaskSteeringScript,
     WaitScheduleScript,
+    create_activity_wait_script,
     create_batch_pickup_script,
     create_task_completion_script,
     create_task_steering_script,
@@ -30,6 +32,13 @@ from factorial.queue.operations import (
     create_batch_and_enqueue,
     enqueue_task,
     get_task_batch,
+    messaging_groups_add_members,
+    messaging_groups_create,
+    messaging_groups_find,
+    messaging_groups_get,
+    messaging_groups_list,
+    messaging_groups_send,
+    messaging_send_direct,
     persist_hook_runtime_payload,
     process_cancelled_tasks,
     process_hook_runtime_wake_requests,
@@ -131,6 +140,20 @@ async def heartbeat_context(
             await hb_task
 
 
+def _steering_message_sort_key(message_id: str) -> tuple[int, int, str]:
+    """Sort by timestamp_ms, then sequence for deterministic steering order."""
+    ts_part, sep, seq_part = message_id.partition("_")
+    try:
+        timestamp_ms = int(ts_part)
+    except ValueError:
+        timestamp_ms = 0
+    try:
+        sequence = int(seq_part) if sep else 0
+    except ValueError:
+        sequence = 0
+    return (timestamp_ms, sequence, message_id)
+
+
 async def apply_steering_if_available(
     *,
     redis_client: redis.Redis,
@@ -156,15 +179,11 @@ async def apply_steering_if_available(
     if not steering_messages_data:
         return task
 
-    # Sort messages by their stream ID timestamp prefix so they are applied in
-    # deterministic order.
-    def _extract_ts(message_tuple: tuple[str, dict[str, Any]]) -> int:
-        try:
-            return int(message_tuple[0].split("_")[0])
-        except (ValueError, IndexError):
-            return 0
-
-    steering_messages_data.sort(key=_extract_ts)
+    # Sort by message-id timestamp and sequence to preserve enqueue order even
+    # when multiple steering messages share the same millisecond timestamp.
+    steering_messages_data.sort(
+        key=lambda message_tuple: _steering_message_sort_key(message_tuple[0])
+    )
     steering_messages = [msg for _, msg in steering_messages_data]
     steering_message_ids = [mid for mid, _ in steering_messages_data]
 
@@ -179,7 +198,7 @@ async def apply_steering_if_available(
     keys = RedisKeys.format(namespace=namespace, agent=agent.name, task_id=task.id)
 
     try:
-        await steering_script.execute(
+        steering_result = await steering_script.execute(
             queue_orphaned_key=keys.queue_orphaned,
             task_statuses_key=keys.task_status,
             task_agents_key=keys.task_agent,
@@ -192,6 +211,11 @@ async def apply_steering_if_available(
             steering_message_ids=steering_message_ids,
             updated_task_payload_json=steered_task.payload.to_json(),
         )
+        if not steering_result.success:
+            raise RuntimeError(
+                f"Task steering update failed for task {task.id}: "
+                f"{steering_result.status}"
+            )
 
         await event_publisher.publish_event(
             AgentEvent(
@@ -273,6 +297,7 @@ async def process_task(
     task_timeout: int,
     metrics_retention_duration: int,
     wait_schedule_script: WaitScheduleScript | None = None,
+    activity_wait_script: ActivityWaitScript | None = None,
 ) -> None:
     """Process a single task"""
     # logger.info(f"▶️  Task started   {colored(f'[{task_id}]', 'dim')}")
@@ -310,6 +335,8 @@ async def process_task(
     )
     if wait_schedule_script is None:
         wait_schedule_script = await create_wait_schedule_script(redis_client)
+    if activity_wait_script is None:
+        activity_wait_script = await create_activity_wait_script(redis_client)
 
     async def complete(
         action: CompletionAction,
@@ -340,6 +367,20 @@ async def process_task(
                 batch_progress_key=keys.batch_progress,
                 batch_remaining_tasks_key=keys.batch_remaining_tasks,
                 batch_completed_key=keys.batch_completed,
+                activity_wait_meta_key=keys.activity_wait_meta,
+                task_steering_key_template=RedisKeys.format(
+                    namespace=namespace,
+                    task_id="{task_id}",
+                ).task_steering,
+                message_seq_key=keys.messaging_message_seq,
+                queue_main_key_template=RedisKeys.format(
+                    namespace=namespace,
+                    agent="{agent}",
+                ).queue_main,
+                queue_pending_key_template=RedisKeys.format(
+                    namespace=namespace,
+                    agent="{agent}",
+                ).queue_pending,
                 current_turn=task.payload.turn,
                 pending_child_wait_ids_key=keys.pending_child_wait_ids,
                 parent_pending_child_task_results_key=parent_keys.pending_child_task_results
@@ -422,6 +463,54 @@ async def process_task(
         if not schedule_result.success:
             raise RuntimeError(
                 f"Failed to schedule wait for task {task.id}: {schedule_result.message}"
+            )
+
+    async def park_activity_wait(
+        *,
+        source_tool_call_ids: list[str],
+        data: Any = None,
+    ) -> None:
+        assert activity_wait_script is not None
+        steering_key_template = RedisKeys.format(
+            namespace=namespace,
+            task_id="{task_id}",
+        ).task_steering
+        wait_metadata = {
+            "kind": "activity",
+            "source_tool_call_ids": source_tool_call_ids,
+        }
+        if data is not None:
+            wait_metadata["data"] = serialize_data(data)
+        wait_result = await activity_wait_script.execute(
+            queue_pending_key=keys.queue_pending,
+            queue_orphaned_key=keys.queue_orphaned,
+            processing_heartbeats_key=keys.processing_heartbeats,
+            task_statuses_key=keys.task_status,
+            task_agents_key=keys.task_agent,
+            task_payloads_key=keys.task_payload,
+            task_pickups_key=keys.task_pickups,
+            task_retries_key=keys.task_retries,
+            task_metas_key=keys.task_meta,
+            activity_wait_meta_key=keys.activity_wait_meta,
+            message_seq_key=keys.messaging_message_seq,
+            task_id=task.id,
+            updated_task_payload_json=task.payload.to_json(),
+            wait_metadata_json=json.dumps(wait_metadata),
+            task_steering_key_template=steering_key_template,
+            task_children_key_template=keys.task_children("{parent_task_id}"),
+            queue_main_key_template=RedisKeys.format(
+                namespace=namespace,
+                agent="{agent}",
+            ).queue_main,
+            queue_pending_key_template=RedisKeys.format(
+                namespace=namespace,
+                agent="{agent}",
+            ).queue_pending,
+        )
+        if not wait_result.success:
+            raise RuntimeError(
+                f"Failed to park activity wait for task {task.id}: "
+                f"{wait_result.message}"
             )
 
     async def park_or_resume_child_wait(
@@ -540,6 +629,7 @@ async def process_task(
             child_task.id = task_id
 
         child_task.metadata.parent_id = task.id  # Link parent
+        child_task.metadata.team_id = task.metadata.team_id or task.id
 
         await enqueue_task(
             redis_client=redis_client,
@@ -564,6 +654,7 @@ async def process_task(
             payloads=payloads,
             owner_id=task.metadata.owner_id,
             parent_id=task.id,
+            team_id=task.metadata.team_id or task.id,
             task_ids=task_ids,
             batch_id=batch_id,
         )
@@ -596,6 +687,81 @@ async def process_task(
             runtime_payload=runtime_payload,
         )
 
+    async def _messaging_create_group(
+        group_name: str,
+        member_task_ids: list[str] | None,
+    ) -> dict[str, Any]:
+        return await messaging_groups_create(
+            redis_client=redis_client,
+            namespace=namespace,
+            sender_task_id=task.id,
+            group_name=group_name,
+            member_task_ids=member_task_ids,
+        )
+
+    async def _messaging_get_group(group_name: str) -> dict[str, Any]:
+        return await messaging_groups_get(
+            redis_client=redis_client,
+            namespace=namespace,
+            sender_task_id=task.id,
+            group_name=group_name,
+        )
+
+    async def _messaging_list_groups() -> list[dict[str, Any]]:
+        return await messaging_groups_list(
+            redis_client=redis_client,
+            namespace=namespace,
+            sender_task_id=task.id,
+        )
+
+    async def _messaging_find_groups(group_name: str) -> list[dict[str, Any]]:
+        return await messaging_groups_find(
+            redis_client=redis_client,
+            namespace=namespace,
+            sender_task_id=task.id,
+            group_name=group_name,
+        )
+
+    async def _messaging_add_group_members(
+        group_name: str,
+        member_task_ids: list[str],
+    ) -> list[str]:
+        return await messaging_groups_add_members(
+            redis_client=redis_client,
+            namespace=namespace,
+            sender_task_id=task.id,
+            group_name=group_name,
+            member_task_ids=member_task_ids,
+        )
+
+    async def _messaging_send_group(
+        group_name: str,
+        content: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        return await messaging_groups_send(
+            redis_client=redis_client,
+            namespace=namespace,
+            sender_task_id=task.id,
+            group_name=group_name,
+            content=content,
+            metadata=metadata,
+        )
+
+    async def _messaging_send_direct(
+        to_task_id: str,
+        content: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        return await messaging_send_direct(
+            redis_client=redis_client,
+            namespace=namespace,
+            sender_task_id=task.id,
+            to_task_id=to_task_id,
+            content=content,
+            metadata=metadata,
+        )
+
     task_failed = False
     final_action: CompletionAction | None = (
         None  # records the action taken on completion when failing
@@ -618,6 +784,13 @@ async def process_task(
                 enqueue_child_task=_enqueue_child_task,
                 enqueue_batch=_enqueue_batch,
                 persist_hook_runtime=_persist_hook_runtime,
+                messaging_create_group=_messaging_create_group,
+                messaging_get_group=_messaging_get_group,
+                messaging_list_groups=_messaging_list_groups,
+                messaging_find_groups=_messaging_find_groups,
+                messaging_add_group_members=_messaging_add_group_members,
+                messaging_send_group=_messaging_send_group,
+                messaging_send_direct=_messaging_send_direct,
             )
 
             if task.payload.turn == 0 and task.retries == 0:
@@ -773,6 +946,30 @@ async def process_task(
                     await park_or_resume_child_wait(
                         child_task_ids=child_task_ids,
                         event_data=serialize_data(turn_completion),
+                    )
+                    return
+
+                if wait_kind == "activity":
+                    wait_data: Any = None
+                    for _, wait_instruction in wait_instructions:
+                        if wait_data is None and wait_instruction.data is not None:
+                            wait_data = wait_instruction.data
+                    await park_activity_wait(
+                        source_tool_call_ids=source_tool_call_ids,
+                        data=wait_data,
+                    )
+                    await event_publisher.publish_event(
+                        AgentEvent(
+                            event_type="task_activity_waiting",
+                            task_id=task.id,
+                            owner_id=task.metadata.owner_id,
+                            agent_name=agent.name,
+                            turn=task.payload.turn,
+                            data={
+                                "wait_kind": "activity",
+                                "source_tool_call_ids": source_tool_call_ids,
+                            },
+                        )
                     )
                     return
 
@@ -1058,6 +1255,7 @@ async def worker_loop(
     completion_script = await create_task_completion_script(redis_client)
     steering_script = await create_task_steering_script(redis_client)
     wait_schedule_script = await create_wait_schedule_script(redis_client)
+    activity_wait_script = await create_activity_wait_script(redis_client)
 
     logger.info(f"Worker {worker_id} started")
     current_tasks: list[asyncio.Task[Any]] = []
@@ -1108,6 +1306,7 @@ async def worker_loop(
                             task_timeout=task_timeout,
                             metrics_retention_duration=metrics_retention_duration,
                             wait_schedule_script=wait_schedule_script,
+                            activity_wait_script=activity_wait_script,
                         )
                     )
                     for task_id in tasks_to_process_ids

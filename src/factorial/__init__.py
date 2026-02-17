@@ -61,6 +61,13 @@ from factorial.llms import (
     o3,
     o4_mini,
 )
+from factorial.messaging import (
+    MessageDeliveryReport,
+    MessagingGroupHandle,
+    MessagingGroupsNamespace,
+    MessagingNamespace,
+    messaging,
+)
 from factorial.orchestrator import (
     AgentWorkerConfig,
     MaintenanceWorkerConfig,
@@ -104,6 +111,11 @@ __all__ = [
     "JobRef",
     "SubagentsNamespace",
     "subagents",
+    "MessageDeliveryReport",
+    "MessagingGroupHandle",
+    "MessagingGroupsNamespace",
+    "MessagingNamespace",
+    "messaging",
     "AgentEvent",
     "QueueEvent",
     "EventPublisher",

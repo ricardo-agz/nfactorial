@@ -30,6 +30,11 @@ local global_metrics_bucket_key = KEYS[15]
 local queue_scheduled_key = KEYS[16]
 local scheduled_wait_meta_key = KEYS[17]
 local pending_child_wait_ids_key = KEYS[18]
+local activity_wait_meta_key = KEYS[19]
+local queue_main_key_template = KEYS[20]
+local queue_pending_key_template = KEYS[21]
+local task_steering_key_template = KEYS[22]
+local message_seq_key = KEYS[23]
 
 local task_id = ARGV[1]
 local metrics_ttl = tonumber(ARGV[2])
@@ -61,6 +66,43 @@ local pickups = task_result.pickups
 local retries = task_result.retries
 local meta = cjson.decode(meta_json)
 local owner_id = meta.owner_id
+local parent_task_id = meta.parent_id
+
+local function wake_parent_if_waiting_activity()
+    if not parent_task_id or parent_task_id == cjson.null then
+        return false
+    end
+    if not activity_wait_meta_key or activity_wait_meta_key == "" then
+        return false
+    end
+    if not queue_main_key_template or queue_main_key_template == "" then
+        return false
+    end
+    if not queue_pending_key_template or queue_pending_key_template == "" then
+        return false
+    end
+    if not task_steering_key_template or task_steering_key_template == "" then
+        return false
+    end
+    if not message_seq_key or message_seq_key == "" then
+        return false
+    end
+    return wake_parent_on_child_terminal(
+        {
+            task_statuses_key,
+            task_agents_key,
+            queue_main_key_template,
+            queue_pending_key_template,
+            activity_wait_meta_key,
+            task_steering_key_template,
+            message_seq_key,
+        },
+        {
+            parent_task_id,
+            task_id,
+        }
+    )
+end
 
 -- If parked or in backoff or pending tool results, always delete & remove (safe even if not present)
 redis.call('DEL', pending_tool_results_key)
@@ -71,6 +113,9 @@ if queue_scheduled_key and queue_scheduled_key ~= "" then
 end
 if scheduled_wait_meta_key and scheduled_wait_meta_key ~= "" then
     redis.call('HDEL', scheduled_wait_meta_key, task_id)
+end
+if activity_wait_meta_key and activity_wait_meta_key ~= "" then
+    redis.call('HDEL', activity_wait_meta_key, task_id)
 end
 
 if status == "pending_tool_results" or status == "pending_child_tasks" then
@@ -104,6 +149,7 @@ if status == "pending_tool_results" or status == "pending_child_tasks" then
         { agent_metrics_bucket_key, global_metrics_bucket_key },
         { 'cancelled', meta_json, metrics_ttl }
     )
+    wake_parent_if_waiting_activity()
 
     return { true, status, "Task cancelled", owner_id or "" }
 elseif status == "backoff" or status == "paused" then
@@ -116,6 +162,7 @@ elseif status == "backoff" or status == "paused" then
         { agent_metrics_bucket_key, global_metrics_bucket_key },
         { 'cancelled', meta_json, metrics_ttl }
     )
+    wake_parent_if_waiting_activity()
 
     return { true, status, "Task cancelled", owner_id or "" }
 else

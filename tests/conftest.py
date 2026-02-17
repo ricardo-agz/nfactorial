@@ -50,6 +50,7 @@ def sample_metadata(owner_id: str) -> TaskMetadata:
     """Create sample task metadata for testing."""
     return TaskMetadata(
         owner_id=owner_id,
+        team_id=owner_id,
         parent_id=None,
         batch_id=None,
         created_at=datetime.now(timezone.utc),

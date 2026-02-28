@@ -1,4 +1,4 @@
-FROM python:3.11-slim
+FROM python:3.11-slim AS base
 
 WORKDIR /app
 
@@ -19,8 +19,18 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy example code
 COPY examples/multi_agent/ ./
 
+FROM base AS agent
+
+# Expose the observability port
+EXPOSE 8081
+
+# Run the agent
+CMD ["python", "orchestrator.py"]
+
+FROM base AS server
+
 # Expose the server port
 EXPOSE 8000
 
 # Run the server
-CMD ["python", "server.py"] 
+CMD ["python", "server.py"]

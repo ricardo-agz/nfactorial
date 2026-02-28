@@ -92,6 +92,7 @@ class MessagingGroupHandle:
 
     name: str
     team_id: str
+    member_task_ids: list[str] | None = None
 
     async def send(
         self,
@@ -120,7 +121,7 @@ class MessagingGroupsNamespace:
         self,
         group_name: str,
         *,
-        members: list[Any] | None = None,
+        members: builtins.list[Any] | None = None,
     ) -> MessagingGroupHandle:
         ctx = _current_execution_context()
         data = await ctx.messaging.groups.create(
@@ -138,9 +139,10 @@ class MessagingGroupsNamespace:
         return MessagingGroupHandle(
             name=str(data["group_name"]),
             team_id=str(data["team_id"]),
+            member_task_ids=list(cast(list[str], data.get("member_task_ids", []))),
         )
 
-    async def list(self) -> list[MessagingGroupHandle]:
+    async def list(self) -> builtins.list[MessagingGroupHandle]:
         ctx = _current_execution_context()
         results = await ctx.messaging.groups.list()
         return [

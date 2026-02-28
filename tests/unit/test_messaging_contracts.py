@@ -60,6 +60,31 @@ async def test_groups_create_normalizes_members() -> None:
 
 
 @pytest.mark.asyncio
+async def test_groups_get_exposes_member_task_ids() -> None:
+    async def _get_group(group_name: str) -> dict[str, Any]:
+        return {
+            "team_id": "team-1",
+            "group_name": group_name,
+            "member_task_ids": ["task-a", "task-b"],
+        }
+
+    ctx = _base_ctx()
+    ctx.messaging.groups.get_callback = _get_group
+    token = execution_context.set(ctx)
+    try:
+        group = await messaging.groups.get("research")
+    finally:
+        execution_context.reset(token)
+
+    assert group == MessagingGroupHandle(
+        name="research",
+        team_id="team-1",
+        member_task_ids=["task-a", "task-b"],
+    )
+    assert group.member_task_ids == ["task-a", "task-b"]
+
+
+@pytest.mark.asyncio
 async def test_group_handle_send_uses_group_callback() -> None:
     captured: dict[str, Any] = {}
 

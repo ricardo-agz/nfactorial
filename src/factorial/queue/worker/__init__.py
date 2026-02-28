@@ -4,8 +4,18 @@ from .common import (
     classify_failure,
     steering_message_sort_key,
 )
-from .loop import worker_loop
-from .processor import process_task
+
+
+def process_task(*args, **kwargs):  # type: ignore[no-untyped-def]
+    from .processor import process_task as _process_task
+
+    return _process_task(*args, **kwargs)
+
+
+def worker_loop(*args, **kwargs):  # type: ignore[no-untyped-def]
+    from .loop import worker_loop as _worker_loop
+
+    return _worker_loop(*args, **kwargs)
 
 __all__ = [
     "CompletionAction",

@@ -77,6 +77,14 @@ from factorial.orchestrator import (
     TaskTTLConfig,
 )
 from factorial.queue.task import Task, TaskStatus
+from factorial.runtimes.vercel import (
+    VercelRuntimeSettings,
+    configure_orchestrator,
+    configure_orchestrator_for_vercel,
+    create_vercel_apps,
+    create_worker,
+    trigger_maintenance_once,
+)
 from factorial.subagents import JobRef, SubagentsNamespace, subagents
 from factorial.tools import (
     Hidden,
@@ -105,6 +113,12 @@ __all__ = [
     "TaskTTLConfig",
     "ObservabilityConfig",
     "MetricsTimelineConfig",
+    "VercelRuntimeSettings",
+    "configure_orchestrator",
+    "configure_orchestrator_for_vercel",
+    "create_worker",
+    "trigger_maintenance_once",
+    "create_vercel_apps",
     "ContextType",
     "Task",
     "TaskStatus",

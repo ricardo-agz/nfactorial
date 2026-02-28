@@ -6,6 +6,7 @@ from typing import Any
 import redis.asyncio as redis
 
 from factorial.agent import BaseAgent
+from factorial.engine import MaintenanceTickContext, maintenance_tick
 from factorial.logging import colored, get_logger
 from factorial.queue.keys import RedisKeys
 from factorial.queue.lua import (
@@ -15,12 +16,8 @@ from factorial.queue.lua import (
     TaskExpirationScript,
     TaskExpirationScriptResult,
     create_backoff_recovery_script,
-    create_scheduled_recovery_script,
-    create_stale_recovery_script,
-    create_task_expiration_script,
 )
 from factorial.queue.operations import (
-    expire_pending_hooks,
     resume_if_no_remaining_child_tasks,
 )
 from factorial.queue.task import TaskStatus
@@ -337,9 +334,17 @@ async def maintenance_loop(
 ) -> None:
     """Background maintenance worker to recover stale tasks and clean up."""
     redis_client = redis.Redis(connection_pool=redis_pool, decode_responses=True)
-    recovery_script = await create_stale_recovery_script(redis_client)
-    task_expiration_script = await create_task_expiration_script(redis_client)
-    scheduled_recovery_script = await create_scheduled_recovery_script(redis_client)
+    tick_context = await MaintenanceTickContext.create(
+        redis_client=redis_client,
+        namespace=namespace,
+        agent=agent,
+        heartbeat_timeout=heartbeat_timeout,
+        max_retries=max_retries,
+        batch_size=batch_size,
+        task_ttl_config=task_ttl_config,
+        max_cleanup_batch=max_cleanup_batch,
+        metrics_retention_duration=metrics_retention_duration,
+    )
 
     logger.info(
         f"Maintenance worker started (checking every {interval}s for "
@@ -349,65 +354,9 @@ async def maintenance_loop(
     try:
         while not shutdown_event.is_set():
             try:
-                await recover_stale_tasks(
-                    recovery_script=recovery_script,
-                    agent=agent,
-                    heartbeat_timeout=heartbeat_timeout,
-                    max_retries=max_retries,
-                    batch_size=batch_size,
-                    metrics_retention_duration=metrics_retention_duration,
-                    namespace=namespace,
-                )
-
-                # Recover tasks from backoff queue
-                await recover_backoff_tasks(
-                    redis_client=redis_client,
-                    agent=agent,
-                    batch_size=batch_size,
-                    namespace=namespace,
-                )
-
-                # Recover tasks whose time-based wait has elapsed.
-                await recover_scheduled_tasks(
-                    scheduled_recovery_script=scheduled_recovery_script,
-                    agent=agent,
-                    batch_size=batch_size,
-                    namespace=namespace,
-                )
-
-                await recover_ready_pending_child_tasks(
-                    redis_client=redis_client,
-                    agent=agent,
-                    batch_size=batch_size,
-                    namespace=namespace,
-                )
-
-                # Expire timed-out hook waits and wake affected tasks so workers
-                # can clear parked states deterministically.
-                expired_hooks = await expire_pending_hooks(
-                    redis_client=redis_client,
-                    namespace=namespace,
-                    max_cleanup_batch=max_cleanup_batch,
-                )
-                if expired_hooks > 0:
-                    logger.info(f"⏰ Expired {expired_hooks} pending hooks")
-
-                # Then, remove expired tasks
-                await remove_expired_tasks(
-                    task_expiration_script=task_expiration_script,
-                    agent=agent,
-                    task_ttl_config=task_ttl_config,
-                    max_cleanup_batch=max_cleanup_batch,
-                    namespace=namespace,
-                )
-
-                # Finally, clean up finished batches older than completed_ttl
-                await cleanup_finished_batches(
-                    redis_client=redis_client,
-                    namespace=namespace,
-                    completed_ttl=task_ttl_config.completed_ttl,
-                    max_cleanup_batch=max_cleanup_batch,
-                )
+                tick_result = await maintenance_tick(tick_context)
+                if tick_result.expired_hooks > 0:
+                    logger.info(f"⏰ Expired {tick_result.expired_hooks} pending hooks")
 
                 # Wait before next check, but allow early exit on shutdown
                 try:

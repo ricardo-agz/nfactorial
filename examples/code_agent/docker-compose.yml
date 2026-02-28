@@ -10,7 +10,8 @@ services:
   agent:
     build:
       context: ../../
-      dockerfile: examples/code_agent/Dockerfile.agent
+      dockerfile: examples/code_agent/Dockerfile
+      target: agent
     environment:
       - OPENAI_API_KEY=${OPENAI_API_KEY}
       - XAI_API_KEY=${XAI_API_KEY}
@@ -36,7 +37,8 @@ services:
   server:
     build:
       context: ../../
-      dockerfile: examples/code_agent/Dockerfile.server
+      dockerfile: examples/code_agent/Dockerfile
+      target: server
     environment:
       - REDIS_HOST=redis
       - OPENAI_API_KEY=${OPENAI_API_KEY}

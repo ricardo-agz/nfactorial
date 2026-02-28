@@ -1,0 +1,232 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>nfactorial Vercel Runtime Chat</title>
+    <style>
+      body {
+        font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+        margin: 0;
+        padding: 16px;
+        background: #0b1020;
+        color: #e5e7eb;
+      }
+      .card {
+        background: #111827;
+        border: 1px solid #374151;
+        border-radius: 10px;
+        padding: 12px;
+        margin-bottom: 12px;
+      }
+      .row {
+        display: flex;
+        gap: 8px;
+        flex-wrap: wrap;
+        align-items: center;
+      }
+      input,
+      button {
+        border-radius: 8px;
+        border: 1px solid #4b5563;
+        padding: 8px 10px;
+        background: #0f172a;
+        color: #e5e7eb;
+      }
+      input[type="text"] {
+        min-width: 280px;
+      }
+      button {
+        cursor: pointer;
+      }
+      .log {
+        height: 320px;
+        overflow: auto;
+        white-space: pre-wrap;
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+        font-size: 12px;
+        background: #030712;
+        border: 1px solid #374151;
+        border-radius: 8px;
+        padding: 10px;
+      }
+      .muted {
+        color: #9ca3af;
+        font-size: 12px;
+      }
+      .ok {
+        color: #10b981;
+      }
+      .warn {
+        color: #f59e0b;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="card">
+      <h2>nfactorial chat demo</h2>
+      <p class="muted">
+        Sends prompts to <code>assistant_agent</code>, streams owner events, and polls task state.
+      </p>
+      <div class="row">
+        <label for="ownerId">Owner ID</label>
+        <input id="ownerId" type="text" />
+        <button id="connectBtn">Connect events</button>
+        <span id="streamState" class="muted">disconnected</span>
+      </div>
+      <div class="row" style="margin-top: 8px">
+        <input id="queryInput" type="text" placeholder="Ask something, e.g. 'What's weather in Paris?'" />
+        <button id="sendBtn">Send</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="row">
+        <strong>Task updates</strong>
+      </div>
+      <div id="taskLog" class="log"></div>
+    </div>
+
+    <div class="card">
+      <div class="row">
+        <strong>Event stream</strong>
+      </div>
+      <div id="eventLog" class="log"></div>
+    </div>
+
+    <script>
+      const ownerIdInput = document.getElementById("ownerId");
+      const queryInput = document.getElementById("queryInput");
+      const connectBtn = document.getElementById("connectBtn");
+      const sendBtn = document.getElementById("sendBtn");
+      const streamState = document.getElementById("streamState");
+      const eventLog = document.getElementById("eventLog");
+      const taskLog = document.getElementById("taskLog");
+
+      const terminalStatuses = new Set(["completed", "failed", "cancelled"]);
+      let eventSource = null;
+      let apiPrefix = "/orchestrator";
+
+      function now() {
+        return new Date().toISOString().slice(11, 23);
+      }
+
+      function appendLine(el, text) {
+        el.textContent += `[${now()}] ${text}\n`;
+        el.scrollTop = el.scrollHeight;
+      }
+
+      function getOwnerId() {
+        const value = ownerIdInput.value.trim();
+        return value || "chat-demo-owner";
+      }
+
+      function saveOwnerId() {
+        const ownerId = getOwnerId();
+        ownerIdInput.value = ownerId;
+        window.localStorage.setItem("nfactorial-owner-id", ownerId);
+        return ownerId;
+      }
+
+      async function connectEvents() {
+        const ownerId = saveOwnerId();
+        if (eventSource) {
+          eventSource.close();
+        }
+        eventSource = new EventSource(`/chat/events/${encodeURIComponent(ownerId)}`);
+        streamState.textContent = "connecting...";
+        streamState.className = "muted";
+
+        eventSource.onopen = () => {
+          streamState.textContent = "connected";
+          streamState.className = "ok";
+          appendLine(eventLog, "SSE connected");
+        };
+
+        eventSource.onmessage = (event) => {
+          appendLine(eventLog, event.data);
+        };
+
+        eventSource.onerror = () => {
+          streamState.textContent = "reconnecting...";
+          streamState.className = "warn";
+        };
+      }
+
+      async function fetchTask(taskId) {
+        const response = await fetch(
+          `${apiPrefix}/api/tasks/${encodeURIComponent(taskId)}`
+        );
+        if (!response.ok) {
+          throw new Error(`Task lookup failed (${response.status})`);
+        }
+        return await response.json();
+      }
+
+      async function pollTaskUntilTerminal(taskId) {
+        for (let i = 0; i < 120; i += 1) {
+          const taskData = await fetchTask(taskId);
+          const status = String(taskData.status || "unknown");
+          appendLine(
+            taskLog,
+            `task=${taskId} status=${status} retries=${taskData.retries ?? "?"}`
+          );
+          if (terminalStatuses.has(status)) {
+            appendLine(taskLog, `task=${taskId} final_output=${JSON.stringify(taskData.output)}`);
+            return;
+          }
+          await new Promise((resolve) => setTimeout(resolve, 1000));
+        }
+        appendLine(taskLog, `task=${taskId} did not reach terminal state before timeout`);
+      }
+
+      async function sendPrompt() {
+        const query = queryInput.value.trim();
+        if (!query) {
+          return;
+        }
+        const ownerId = saveOwnerId();
+        const response = await fetch(`${apiPrefix}/api/enqueue`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            agent_name: "assistant_agent",
+            owner_id: ownerId,
+            payload: { query },
+          }),
+        });
+        if (!response.ok) {
+          const body = await response.text();
+          appendLine(taskLog, `enqueue failed (${response.status}): ${body}`);
+          return;
+        }
+        const data = await response.json();
+        const taskId = data.task_id;
+        appendLine(taskLog, `enqueued task=${taskId}`);
+        queryInput.value = "";
+        void pollTaskUntilTerminal(taskId);
+      }
+
+      ownerIdInput.value =
+        window.localStorage.getItem("nfactorial-owner-id") || "chat-demo-owner";
+
+      fetch("/chat/config")
+        .then((response) => response.json())
+        .then((config) => {
+          if (typeof config.api_prefix === "string" && config.api_prefix) {
+            apiPrefix = config.api_prefix;
+          }
+        })
+        .catch(() => {});
+      connectBtn.addEventListener("click", () => void connectEvents());
+      sendBtn.addEventListener("click", () => void sendPrompt());
+      queryInput.addEventListener("keydown", (event) => {
+        if (event.key === "Enter") {
+          event.preventDefault();
+          void sendPrompt();
+        }
+      });
+      void connectEvents();
+    </script>
+  </body>
+</html>

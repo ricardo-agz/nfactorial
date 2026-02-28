@@ -2,9 +2,10 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 import redis.asyncio as redis
-from agent import basic_agent, orchestrator
+from agent import basic_agent
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from orchestrator import orchestrator
 from pydantic import BaseModel
 from redis.asyncio.client import PubSub, Redis as RedisType
 from starlette.websockets import WebSocket, WebSocketDisconnect

@@ -45,7 +45,7 @@ npm install
 redis-server
 
 # 5. Run components (separate terminals):
-python agent.py    # Agent workers
+python orchestrator.py    # Agent workers
 python server.py   # API server  
 cd ui && npm run dev  # UI
 ```

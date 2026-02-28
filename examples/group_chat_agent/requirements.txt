@@ -1,0 +1,9 @@
+python-dotenv==1.0.0
+pydantic
+openai>=2.0.0
+redis==6.1.0
+fastapi==0.115.12
+uvicorn[standard]==0.34.2
+websockets==15.0.1
+vercel-workers
+

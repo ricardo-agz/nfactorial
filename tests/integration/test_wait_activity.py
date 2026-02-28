@@ -618,6 +618,112 @@ async def test_root_activity_wait_self_wakes_when_children_already_waiting(
 
 
 @pytest.mark.asyncio
+async def test_root_activity_wait_self_wakes_when_children_already_terminal(
+    redis_client: redis.Redis,
+    test_namespace: str,
+    test_owner_id: str,
+) -> None:
+    team_id = "team-root-self-wake-terminal"
+    root_agent = SimpleTestAgent(name="root_wait_activity_terminal_agent")
+    child_agent = SimpleTestAgent(name="child_wait_activity_terminal_agent")
+
+    root_task = Task.create(
+        owner_id=test_owner_id,
+        agent=root_agent.name,
+        payload=AgentContext(query="root"),
+        team_id=team_id,
+    )
+    child_one = Task.create(
+        owner_id=test_owner_id,
+        agent=child_agent.name,
+        payload=AgentContext(query="child-1"),
+        team_id=team_id,
+    )
+    child_two = Task.create(
+        owner_id=test_owner_id,
+        agent=child_agent.name,
+        payload=AgentContext(query="child-2"),
+        team_id=team_id,
+    )
+    child_one.metadata.parent_id = root_task.id
+    child_two.metadata.parent_id = root_task.id
+
+    await enqueue_task(
+        redis_client=redis_client,
+        namespace=test_namespace,
+        agent=root_agent,
+        task=root_task,
+    )
+    await enqueue_task(
+        redis_client=redis_client,
+        namespace=test_namespace,
+        agent=child_agent,
+        task=child_one,
+    )
+    await enqueue_task(
+        redis_client=redis_client,
+        namespace=test_namespace,
+        agent=child_agent,
+        task=child_two,
+    )
+
+    root_keys = RedisKeys.format(
+        namespace=test_namespace,
+        agent=root_agent.name,
+        task_id=root_task.id,
+    )
+    child_one_keys = RedisKeys.format(
+        namespace=test_namespace,
+        agent=child_agent.name,
+        task_id=child_one.id,
+    )
+    child_two_keys = RedisKeys.format(
+        namespace=test_namespace,
+        agent=child_agent.name,
+        task_id=child_two.id,
+    )
+
+    await redis_client.delete(root_keys.queue_main)
+    await redis_client.delete(child_one_keys.queue_main)
+
+    await _set_task_status(
+        redis_client=redis_client,
+        keys=root_keys,
+        task=root_task,
+        status=TaskStatus.ACTIVE,
+    )
+    await _set_task_status(
+        redis_client=redis_client,
+        keys=child_one_keys,
+        task=child_one,
+        status=TaskStatus.COMPLETED,
+    )
+    await _set_task_status(
+        redis_client=redis_client,
+        keys=child_two_keys,
+        task=child_two,
+        status=TaskStatus.FAILED,
+    )
+
+    activity_wait_script = await create_activity_wait_script(redis_client)
+    await _park_activity_wait(
+        redis_client=redis_client,
+        namespace=test_namespace,
+        script=activity_wait_script,
+        task=root_task,
+    )
+
+    root_status = await get_task_status(redis_client, test_namespace, root_task.id)
+    assert root_status == TaskStatus.ACTIVE
+    queued_root_ids = await redis_client.lrange(root_keys.queue_main, 0, -1)
+    assert root_task.id in queued_root_ids
+    pending_score = await redis_client.zscore(root_keys.queue_pending, root_task.id)
+    assert pending_score is None
+    root_steering_messages = await redis_client.hvals(root_keys.task_steering)
+    assert any("subtree_idle" in str(msg) for msg in root_steering_messages)
+
+
+@pytest.mark.asyncio
 async def test_group_message_wakes_activity_waiting_member(
     redis_client: redis.Redis,
     test_namespace: str,

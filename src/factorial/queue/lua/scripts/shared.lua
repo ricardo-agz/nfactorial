@@ -332,7 +332,6 @@ local function maybe_wake_parent_on_subtree_idle(keys, args)
         return false
     end
 
-    local has_activity_wait_child = false
     for _, child_task_id in ipairs(child_task_ids) do
         local child_status = redis.call('HGET', task_statuses_key, child_task_id)
 
@@ -346,7 +345,7 @@ local function maybe_wake_parent_on_subtree_idle(keys, args)
             return false
         elseif child_status == "paused" then
             if redis.call('HEXISTS', activity_wait_meta_key, child_task_id) == 1 then
-                has_activity_wait_child = true
+                -- child is paused(activity) and quiescent for subtree-idle checks
             else
                 -- paused(sleep/cron) is still runnable via timer and not quiescent
                 return false
@@ -360,10 +359,6 @@ local function maybe_wake_parent_on_subtree_idle(keys, args)
         else
             return false
         end
-    end
-
-    if not has_activity_wait_child then
-        return false
     end
 
     local content = "<system_activity kind='subtree_idle' source_task_id='"

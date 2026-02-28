@@ -1,5 +1,5 @@
 import json
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
@@ -14,7 +14,7 @@ logger = get_logger(__name__)
 class BaseEvent:
     event_type: str
     task_id: str | None = None
-    timestamp: datetime = datetime.now(timezone.utc)
+    timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     owner_id: str | None = None
     metadata: dict[str, Any] | None = None
 

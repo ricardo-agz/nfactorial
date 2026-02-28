@@ -34,6 +34,48 @@ from factorial.utils import decode, serialize_data
 
 logger = get_logger(__name__)
 
+
+_TERMINAL_CHILD_STATUSES = {
+    TaskStatus.COMPLETED.value,
+    TaskStatus.FAILED.value,
+    TaskStatus.CANCELLED.value,
+}
+
+
+def _synthesize_quiescent_child_result(
+    *,
+    child_task_id: str,
+    child_status: str | None,
+    is_activity_wait: bool,
+) -> dict[str, Any]:
+    """Build a synthetic child result when a wait-set is quiescent but unresolved."""
+    if is_activity_wait:
+        return {
+            "task_id": child_task_id,
+            "status": TaskStatus.PAUSED.value,
+            "wait_kind": "activity",
+            "reason": "child_waiting_for_activity",
+            "synthetic": True,
+        }
+
+    if child_status in _TERMINAL_CHILD_STATUSES:
+        return {
+            "task_id": child_task_id,
+            "status": child_status,
+            "result_missing": True,
+            "reason": "child_terminal_without_parent_result",
+            "synthetic": True,
+        }
+
+    return {
+        "task_id": child_task_id,
+        "status": child_status or "unknown",
+        "result_missing": True,
+        "reason": "child_unresolved_quiescent_state",
+        "synthetic": True,
+    }
+
+
 async def cancel_batch(
     redis_client: redis.Redis,
     namespace: str,
@@ -79,8 +121,8 @@ async def cancel_batch(
     batch.metadata.status = "cancelled"
 
     pipe = redis_client.pipeline(transaction=True)
-    pipe.hset(keys.batch_meta, batch_id, batch.metadata.to_json())  # type: ignore[arg-type]
-    pipe.zadd(keys.batch_completed, {batch_id: time.time()})  # type: ignore[arg-type]
+    pipe.hset(keys.batch_meta, batch_id, batch.metadata.to_json())
+    pipe.zadd(keys.batch_completed, {batch_id: time.time()})
     await pipe.execute()
 
     owner_id = batch.metadata.owner_id
@@ -211,7 +253,7 @@ async def resume_if_no_remaining_child_tasks(
     keys = RedisKeys.format(namespace=namespace, task_id=task_id, agent=agent_name)
 
     try:
-        task: Task = Task.from_dict(task_data, context_class=agent.context_class)  # type: ignore
+        task: Task = Task.from_dict(task_data, context_class=agent.context_class)
     except Exception as e:
         logger.error(
             f"Failed to process task {task_id}: Task data is invalid", exc_info=e
@@ -233,13 +275,54 @@ async def resume_if_no_remaining_child_tasks(
     )
 
     completed_results: list[tuple[str, Any]] = []
+    unresolved_child_ids: list[str] = []
     for child_task_id, result_json in zip(wait_child_ids, result_values, strict=True):
         if result_json is None:
-            return False
+            unresolved_child_ids.append(child_task_id)
+            continue
         result_str = decode(result_json)
         if result_str == PENDING_SENTINEL:
-            return False
+            unresolved_child_ids.append(child_task_id)
+            continue
         completed_results.append((child_task_id, json.loads(result_str)))
+
+    if unresolved_child_ids:
+        unresolved_status_values = cast(
+            list[str | bytes | None],
+            await redis_client.hmget(keys.task_status, unresolved_child_ids),  # type: ignore[arg-type,misc]
+        )
+        unresolved_activity_values = cast(
+            list[str | bytes | None],
+            await redis_client.hmget(keys.activity_wait_meta, unresolved_child_ids),  # type: ignore[arg-type,misc]
+        )
+
+        synthesized_results: list[tuple[str, Any]] = []
+        for child_task_id, status_raw, activity_wait_raw in zip(
+            unresolved_child_ids,
+            unresolved_status_values,
+            unresolved_activity_values,
+            strict=True,
+        ):
+            child_status = decode(status_raw) if status_raw is not None else None
+            is_activity_wait = child_status == TaskStatus.PAUSED.value and (
+                activity_wait_raw is not None
+            )
+            is_terminal = child_status in _TERMINAL_CHILD_STATUSES
+            if not (is_activity_wait or is_terminal):
+                return False
+
+            synthesized_results.append(
+                (
+                    child_task_id,
+                    _synthesize_quiescent_child_result(
+                        child_task_id=child_task_id,
+                        child_status=child_status,
+                        is_activity_wait=is_activity_wait,
+                    ),
+                )
+            )
+
+        completed_results.extend(synthesized_results)
 
     # Update the task context with the completed results
     updated_context = agent.process_child_task_results(

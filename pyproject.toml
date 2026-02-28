@@ -44,6 +44,9 @@ dev = [
 cli = [
     "inquirer>=3.2.4",
 ]
+vercel = [
+    "vercel-workers",
+]
 
 [project.scripts]
 nfactorial = "factorial.cli.main:cli"

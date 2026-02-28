@@ -6,13 +6,11 @@ from pydantic import BaseModel
 
 from factorial import (
     AgentContext,
-    AgentWorkerConfig,
     BaseAgent,
     Hidden,
     Hook,
     HookRequestContext,
     ModelSettings,
-    Orchestrator,
     PendingHook,
     ai_gateway,
     gpt_41,
@@ -281,21 +279,3 @@ class IDEAgent(BaseAgent[IdeAgentContext]):
 
 
 ide_agent = IDEAgent()
-
-orchestrator = Orchestrator(
-    redis_host=os.getenv("REDIS_HOST", "localhost"),
-    openai_api_key=os.getenv("OPENAI_API_KEY"),
-)
-
-orchestrator.register_runner(
-    agent=ide_agent,
-    agent_worker_config=AgentWorkerConfig(
-        workers=20,
-        batch_size=15,
-        max_retries=5,
-    ),
-)
-
-
-if __name__ == "__main__":
-    orchestrator.run()

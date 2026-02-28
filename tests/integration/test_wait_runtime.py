@@ -908,6 +908,114 @@ async def test_wait_jobs_fast_path_preserves_results_when_continue_rejected(
 
 
 @pytest.mark.asyncio
+async def test_wait_jobs_quiescent_children_auto_resume_parent(
+    redis_client: redis.Redis,
+    test_namespace: str,
+    test_owner_id: str,
+    pickup_script: BatchPickupScript,
+    completion_script: TaskCompletionScript,
+    steering_script: TaskSteeringScript,
+) -> None:
+    child_task_ids = [
+        "quiescent-terminal-child",
+        "quiescent-activity-child",
+        "quiescent-failed-child",
+    ]
+    parent_agent = _WaitReadyJobsAgent(
+        child_task_ids=child_task_ids,
+        name="wait_quiescent_jobs_parent",
+    )
+    parent_keys = RedisKeys.format(namespace=test_namespace, agent=parent_agent.name)
+    root_keys = RedisKeys.format(namespace=test_namespace)
+    parent_task = Task.create(
+        owner_id=test_owner_id,
+        agent=parent_agent.name,
+        payload=AgentContext(query="wait on quiescent jobs"),
+    )
+    parent_task_id = await enqueue_task(
+        redis_client=redis_client,
+        namespace=test_namespace,
+        agent=parent_agent,
+        task=parent_task,
+    )
+    picked = await _pickup_single_task(
+        redis_client=redis_client,
+        keys=parent_keys,
+        pickup_script=pickup_script,
+    )
+    assert picked == [parent_task_id]
+
+    await cast(
+        Any,
+        redis_client.hset(
+            root_keys.task_status,
+            child_task_ids[0],
+            TaskStatus.COMPLETED.value,
+        ),
+    )
+    await cast(
+        Any,
+        redis_client.hset(
+            root_keys.task_status,
+            child_task_ids[1],
+            TaskStatus.PAUSED.value,
+        ),
+    )
+    await cast(
+        Any,
+        redis_client.hset(
+            root_keys.activity_wait_meta,
+            child_task_ids[1],
+            json.dumps({"kind": "activity"}),
+        ),
+    )
+    await cast(
+        Any,
+        redis_client.hset(
+            root_keys.task_status,
+            child_task_ids[2],
+            TaskStatus.FAILED.value,
+        ),
+    )
+
+    await process_task(
+        redis_client=redis_client,
+        namespace=test_namespace,
+        task_id=parent_task_id,
+        completion_script=completion_script,
+        steering_script=steering_script,
+        agent=parent_agent,
+        agents_by_name={parent_agent.name: parent_agent},
+        max_retries=3,
+        heartbeat_interval=30,
+        task_timeout=30,
+        metrics_retention_duration=3600,
+    )
+
+    assert (
+        await get_task_status(redis_client, test_namespace, parent_task_id)
+        == TaskStatus.ACTIVE
+    )
+    queued_parent_ids = cast(
+        list[str],
+        await cast(Any, redis_client.lrange(parent_keys.queue_main, 0, -1)),
+    )
+    assert parent_task_id in queued_parent_ids
+    assert await cast(Any, redis_client.zscore(parent_keys.queue_pending, parent_task_id)) is None
+
+    parent_task_data = await get_task_data(
+        redis_client,
+        test_namespace,
+        parent_task_id,
+    )
+    messages = parent_task_data["payload"]["messages"]
+    assert any("child_waiting_for_activity" in str(message) for message in messages)
+    assert any(
+        "child_terminal_without_parent_result" in str(message) for message in messages
+    )
+
+
+@pytest.mark.asyncio
 async def test_scheduled_recovery_requeues_due_paused_task(
     redis_client: redis.Redis,
     script_runner: ScriptRunner,

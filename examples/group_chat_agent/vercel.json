@@ -1,0 +1,22 @@
+{
+  "projectSettings": {
+    "framework": "services"
+  },
+  "experimentalServices": {
+    "web": {
+      "entrypoint": "server.py",
+      "routePrefix": "/"
+    },
+    "worker": {
+      "type": "worker",
+      "entrypoint": "orchestrator.py",
+      "topic": "nfactorial-dispatch",
+      "consumer": "default"
+    },
+    "maintenance": {
+      "type": "cron",
+      "entrypoint": "orchestrator.py",
+      "schedule": "*/1 * * * *"
+    }
+  }
+}

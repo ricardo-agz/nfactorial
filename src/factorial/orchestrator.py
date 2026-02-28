@@ -1,29 +1,41 @@
 import asyncio
+import json
 import os
 import signal
 from collections.abc import AsyncGenerator, AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 import httpx
 import redis.asyncio as redis
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
+from starlette.websockets import WebSocket, WebSocketDisconnect
 
 from factorial.agent import BaseAgent
 from factorial.context import ContextType
+from factorial.contracts import (
+    NoopWakeDispatch,
+    VercelQueueWakeDispatch,
+    WakeDispatch,
+)
 from factorial.hooks import HookResolutionResult, PendingHook
 from factorial.llms import MultiClient
 from factorial.logging import get_logger
-from factorial.queue import Task, maintenance_loop, worker_loop
+from factorial.queue import Task
 from factorial.queue.keys import RedisKeys
+from factorial.runtimes.process.maintenance_loop import maintenance_loop
+from factorial.runtimes.process.worker_loop import worker_loop
 from factorial.utils import to_snake_case
 
 logger = get_logger(__name__)
 
 if TYPE_CHECKING:
     from factorial.queue.task import Batch
+    from factorial.runtimes.vercel import VercelRuntimeSettings
 
 
 @dataclass
@@ -141,6 +153,52 @@ class ObservabilityConfig:
     dashboard_name: str | None = None
 
 
+def _resolve_runtime_mode(
+    runtime_mode: Literal["process", "vercel"] | None,
+) -> Literal["process", "vercel"]:
+    if os.getenv("VERCEL") == "1":
+        return "vercel"
+    if runtime_mode in {"process", "vercel"}:
+        return runtime_mode
+    return "process"
+
+
+def _resolve_wake_transport(
+    *,
+    runtime_mode: Literal["process", "vercel"],
+    wake_transport: Literal["none", "vercel_queue"] | None,
+) -> Literal["none", "vercel_queue"]:
+    env_transport = os.getenv("NFACTORIAL_WAKE_TRANSPORT")
+    selected = wake_transport or env_transport
+    if selected == "none":
+        return "none"
+    if selected == "vercel_queue":
+        return "vercel_queue"
+    return "vercel_queue" if runtime_mode == "vercel" else "none"
+
+
+def _vercel_workers_available() -> bool:
+    try:
+        import vercel.workers  # type: ignore  # noqa: F401
+
+        return True
+    except Exception:
+        return False
+
+
+def _build_wake_dispatch(
+    *,
+    wake_transport: Literal["none", "vercel_queue"],
+    dispatch_topic: str,
+    namespace: str,
+) -> WakeDispatch:
+    if wake_transport == "none":
+        return NoopWakeDispatch()
+    if wake_transport == "vercel_queue":
+        return VercelQueueWakeDispatch(topic=dispatch_topic, namespace=namespace)
+    return NoopWakeDispatch()
+
+
 class Runner:
     def __init__(
         self,
@@ -230,6 +288,9 @@ class Orchestrator:
         observability_config: ObservabilityConfig | None = None,
         metrics_config: MetricsTimelineConfig | None = None,
         namespace: str | None = None,
+        runtime_mode: Literal["process", "vercel"] | None = None,
+        wake_transport: Literal["none", "vercel_queue"] | None = None,
+        wake_dispatch: WakeDispatch | None = None,
     ):
         self.shutdown_event = asyncio.Event()
 
@@ -257,6 +318,38 @@ class Orchestrator:
         self.metrics_config = metrics_config
         self.agents_by_name: dict[str, BaseAgent[Any]] = {}
         self.namespace = namespace or "factorial"
+        self.runtime_mode = _resolve_runtime_mode(runtime_mode)
+        self.wake_transport = _resolve_wake_transport(
+            runtime_mode=self.runtime_mode,
+            wake_transport=wake_transport,
+        )
+        if (
+            self.runtime_mode == "vercel"
+            and self.wake_transport == "vercel_queue"
+            and not _vercel_workers_available()
+        ):
+            if os.getenv("VERCEL") == "1":
+                raise RuntimeError(
+                    "Vercel runtime requires `vercel-workers` to be installed "
+                    "for queue dispatch and worker callbacks."
+                )
+            logger.warning(
+                "`vercel-workers` is unavailable locally; falling back to "
+                "NFACTORIAL_WAKE_TRANSPORT=none for inline maintenance/testing."
+            )
+            self.wake_transport = "none"
+        self.wake_dispatch: WakeDispatch = (
+            wake_dispatch
+            if wake_dispatch is not None
+            else _build_wake_dispatch(
+                wake_transport=self.wake_transport,
+                dispatch_topic=os.getenv(
+                    "NFACTORIAL_DISPATCH_TOPIC",
+                    "nfactorial-dispatch",
+                ),
+                namespace=self.namespace,
+            )
+        )
 
         if self.observability_config.dashboard_name is None:
             self.observability_config.dashboard_name = (
@@ -461,6 +554,269 @@ class Orchestrator:
         """Get an agent by name"""
         return self.agents_by_name.get(agent_name)
 
+    async def wake_agent(
+        self,
+        *,
+        agent_name: str,
+        reason: str,
+        task_id: str | None = None,
+    ) -> bool:
+        try:
+            await self.wake_dispatch.wake_agent(
+                agent_name=agent_name,
+                reason=reason,
+                task_id=task_id,
+            )
+            return True
+        except Exception as exc:
+            logger.error(
+                "Failed to dispatch wake for agent=%s reason=%s task_id=%s",
+                agent_name,
+                reason,
+                task_id,
+                exc_info=exc,
+            )
+            return False
+
+    async def wake_agents(self, *, agent_names: list[str], reason: str) -> bool:
+        try:
+            await self.wake_dispatch.wake_agents(agent_names=agent_names, reason=reason)
+            return True
+        except Exception as exc:
+            logger.error(
+                "Failed to dispatch wakes for agents=%s reason=%s",
+                agent_names,
+                reason,
+                exc_info=exc,
+            )
+            return False
+
+    async def wake_maintenance(self, *, reason: str) -> bool:
+        try:
+            await self.wake_dispatch.wake_maintenance(reason=reason)
+            return True
+        except Exception as exc:
+            logger.error(
+                "Failed to dispatch maintenance wake reason=%s",
+                reason,
+                exc_info=exc,
+            )
+            return False
+
+    async def run_maintenance_tick(
+        self,
+        *,
+        reason: str | None = None,
+        settings: "VercelRuntimeSettings | None" = None,
+    ) -> dict[str, Any]:
+        """Run one maintenance trigger/invocation using Vercel runtime semantics."""
+        from factorial.runtimes.vercel import (
+            VercelRuntimeSettings,
+            configure_orchestrator,
+            trigger_maintenance_once,
+        )
+
+        runtime_settings = settings or VercelRuntimeSettings.from_env()
+        configure_orchestrator(self, settings=runtime_settings)
+        resolved_reason = reason or _default_maintenance_reason()
+        return await trigger_maintenance_once(
+            orchestrator=self,
+            settings=runtime_settings,
+            reason=resolved_reason,
+        )
+
+    async def run_maintenance_cron_tick(
+        self,
+        *,
+        settings: "VercelRuntimeSettings | None" = None,
+    ) -> dict[str, Any]:
+        """Run one maintenance tick with explicit cron reason semantics."""
+        return await self.run_maintenance_tick(
+            reason="cron_schedule",
+            settings=settings,
+        )
+
+    def bootstrap_vercel_worker_app(
+        self,
+        *,
+        settings: "VercelRuntimeSettings | None" = None,
+    ) -> Any:
+        """Return the Vercel worker callback app for this orchestrator."""
+        from factorial.runtimes.vercel import (
+            VercelRuntimeSettings,
+            create_worker,
+        )
+
+        runtime_settings = settings or VercelRuntimeSettings.from_env()
+        return create_worker(self, settings=runtime_settings)
+
+    def create_app(
+        self,
+        *,
+        enable_ws: bool = False,
+        cors_origins: list[str] | None = None,
+    ) -> FastAPI:
+        """Create an ASGI app for orchestrator control-plane APIs."""
+
+        class EnqueueRequest(BaseModel):
+            agent_name: str
+            owner_id: str
+            payload: dict[str, Any]
+            idempotency_key: str | None = None
+
+        class EnqueueResponse(BaseModel):
+            task_id: str
+
+        class SteerRequest(BaseModel):
+            messages: list[dict[str, Any]]
+
+        class ResumeRequest(BaseModel):
+            messages: list[dict[str, Any]]
+            idempotency_key: str | None = None
+
+        class ResolveHookRequest(BaseModel):
+            token: str
+            payload: Any
+            idempotency_key: str | None = None
+
+        app = FastAPI(title="factorial-web")
+        if cors_origins is not None:
+            app.add_middleware(
+                cast(Any, CORSMiddleware),
+                allow_origins=cors_origins,
+                allow_credentials=True,
+                allow_methods=["*"],
+                allow_headers=["*"],
+            )
+
+        @app.get("/")
+        async def health() -> dict[str, Any]:
+            return {
+                "ok": True,
+                "service": "web",
+                "runtime_mode": self.runtime_mode,
+                "namespace": self.namespace,
+            }
+
+        @app.post("/api/enqueue", response_model=EnqueueResponse)
+        async def enqueue_task_route(request: EnqueueRequest) -> EnqueueResponse:
+            agent = self.get_agent(request.agent_name)
+            if agent is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Agent '{request.agent_name}' is not registered",
+                )
+            try:
+                context = cast(Any, agent.context_class).from_dict(request.payload)
+            except Exception as exc:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid payload for agent '{request.agent_name}': {exc}",
+                ) from exc
+
+            task = await self.create_agent_task(
+                agent=agent,
+                payload=context,
+                owner_id=request.owner_id,
+                idempotency_key=request.idempotency_key,
+            )
+            return EnqueueResponse(task_id=task.id)
+
+        @app.get("/api/tasks/{task_id}")
+        async def get_task_route(task_id: str) -> dict[str, Any]:
+            task_data = await self.get_task_data(task_id)
+            if task_data is None:
+                raise HTTPException(status_code=404, detail="Task not found")
+            return task_data
+
+        @app.post("/api/tasks/{task_id}/cancel")
+        async def cancel_task_route(task_id: str) -> dict[str, Any]:
+            await self.cancel_task(task_id=task_id)
+            return {"ok": True, "task_id": task_id}
+
+        @app.post("/api/tasks/{task_id}/steer")
+        async def steer_task_route(
+            task_id: str, request: SteerRequest
+        ) -> dict[str, Any]:
+            await self.steer_task(task_id=task_id, messages=request.messages)
+            return {"ok": True, "task_id": task_id}
+
+        @app.post("/api/tasks/{task_id}/resume")
+        async def resume_task_route(
+            task_id: str, request: ResumeRequest
+        ) -> dict[str, Any]:
+            resumed = await self.resume_task(
+                task_id=task_id,
+                messages=request.messages,
+                idempotency_key=request.idempotency_key,
+            )
+            return {
+                "ok": True,
+                "source_task_id": task_id,
+                "resumed_task_id": resumed.id,
+            }
+
+        @app.post("/api/hooks/{hook_id}/resolve")
+        async def resolve_hook_route(
+            hook_id: str,
+            request: ResolveHookRequest,
+        ) -> dict[str, Any]:
+            resolution = await self.resolve_hook(
+                hook_id=hook_id,
+                payload=request.payload,
+                token=request.token,
+                idempotency_key=request.idempotency_key,
+            )
+            return {
+                "ok": True,
+                "hook_id": resolution.hook_id,
+                "task_id": resolution.task_id,
+                "tool_call_id": resolution.tool_call_id,
+                "status": resolution.status,
+                "task_resumed": resolution.task_resumed,
+            }
+
+        @app.get("/events/{owner_id}")
+        async def stream_events(owner_id: str, request: Request) -> StreamingResponse:
+            async def event_stream():
+                async for update in self.subscribe_to_updates(owner_id=owner_id):
+                    if await request.is_disconnected():
+                        break
+                    event_type = str(update.get("event_type", "update"))
+                    payload = json.dumps(update, separators=(",", ":"))
+                    yield f"event: {event_type}\ndata: {payload}\n\n"
+
+            return StreamingResponse(
+                event_stream(),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "X-Accel-Buffering": "no",
+                },
+            )
+
+        if enable_ws:
+
+            @app.websocket("/ws/{owner_id}")
+            async def websocket_updates(websocket: WebSocket, owner_id: str):
+                await websocket.accept()
+                try:
+                    async for update in self.subscribe_to_updates(owner_id=owner_id):
+                        await websocket.send_text(json.dumps(update))
+                except WebSocketDisconnect:
+                    return
+
+        return app
+
+    async def _wake_task_if_possible(self, *, task_id: str, reason: str) -> None:
+        task_data = await self.get_task_data(task_id)
+        if not task_data:
+            return
+        agent_name = task_data.get("agent")
+        if isinstance(agent_name, str) and agent_name:
+            await self.wake_agent(agent_name=agent_name, reason=reason, task_id=task_id)
+
     async def get_redis_client(self) -> redis.Redis:
         """Get a Redis client from the pool"""
         return redis.Redis(connection_pool=self.redis_pool, decode_responses=True)
@@ -492,13 +848,19 @@ class Orchestrator:
 
         redis_client = await self.get_redis_client()
         try:
-            return await q_enqueue_task(
+            task_id = await q_enqueue_task(
                 redis_client=redis_client,
                 namespace=self.namespace,
                 agent=agent,
                 task=task,
                 idempotency_key=idempotency_key,
             )
+            await self.wake_agent(
+                agent_name=agent.name,
+                reason="enqueue",
+                task_id=task_id,
+            )
+            return task_id
         finally:
             await redis_client.close()
 
@@ -551,7 +913,7 @@ class Orchestrator:
 
         redis_client = await self.get_redis_client()
         try:
-            return await q_create_batch_and_enqueue(
+            batch = await q_create_batch_and_enqueue(
                 redis_client=redis_client,
                 namespace=self.namespace,
                 agent=agent,
@@ -562,6 +924,8 @@ class Orchestrator:
                 task_ids=task_ids,
                 idempotency_key=idempotency_key,
             )
+            await self.wake_agent(agent_name=agent.name, reason="enqueue_batch")
+            return batch
         finally:
             await redis_client.close()
 
@@ -592,7 +956,7 @@ class Orchestrator:
                     f"'{source_agent_name}'. Register the agent before resuming."
                 )
 
-            return await q_resume_task(
+            resumed_task = await q_resume_task(
                 redis_client=redis_client,
                 namespace=self.namespace,
                 task_id=task_id,
@@ -600,6 +964,12 @@ class Orchestrator:
                 messages=messages,
                 idempotency_key=idempotency_key,
             )
+            await self.wake_agent(
+                agent_name=source_agent_name,
+                reason="resume",
+                task_id=resumed_task.id,
+            )
+            return resumed_task
         finally:
             await redis_client.close()
 
@@ -628,7 +998,10 @@ class Orchestrator:
         messages: list[dict[str, Any]],
     ) -> None:
         """Steer a task using the control plane's configuration"""
-        from factorial.queue import steer_task as q_steer_task
+        from factorial.queue import (
+            get_task_data as q_get_task_data,
+            steer_task as q_steer_task,
+        )
 
         redis_client = await self.get_redis_client()
         try:
@@ -638,6 +1011,18 @@ class Orchestrator:
                 task_id=task_id,
                 messages=messages,
             )
+            task_data = await q_get_task_data(
+                redis_client=redis_client,
+                namespace=self.namespace,
+                task_id=task_id,
+            )
+            agent_name = task_data.get("agent") if task_data else None
+            if isinstance(agent_name, str) and agent_name:
+                await self.wake_agent(
+                    agent_name=agent_name,
+                    reason="steer",
+                    task_id=task_id,
+                )
         finally:
             await redis_client.close()
 
@@ -690,7 +1075,7 @@ class Orchestrator:
 
         redis_client = await self.get_redis_client()
         try:
-            return await q_resolve_hook(
+            resolution = await q_resolve_hook(
                 redis_client=redis_client,
                 namespace=self.namespace,
                 hook_id=hook_id,
@@ -698,6 +1083,12 @@ class Orchestrator:
                 token=token,
                 idempotency_key=idempotency_key,
             )
+            if resolution.task_resumed:
+                await self._wake_task_if_possible(
+                    task_id=resolution.task_id,
+                    reason="hook_resolved",
+                )
+            return resolution
         finally:
             await redis_client.close()
 
@@ -775,7 +1166,7 @@ class Orchestrator:
         )
 
         app.add_middleware(
-            CORSMiddleware,
+            cast(Any, CORSMiddleware),
             allow_origins=self.observability_config.cors_origins,
             allow_credentials=True,
             allow_methods=["*"],
@@ -900,10 +1291,20 @@ class Orchestrator:
                 if hasattr(runner.llm_client, "close"):
                     await runner.llm_client.close()
 
+            try:
+                await self.wake_dispatch.flush()
+            except Exception as exc:
+                logger.error("Failed to flush wake dispatch", exc_info=exc)
+
             await self.redis_pool.disconnect()
             logger.info("Redis connection pool closed")
 
     def run(self, run_observability_server: bool = True) -> None:
+        if self.runtime_mode == "vercel":
+            raise RuntimeError(
+                "Orchestrator.run() is for long-running process mode only. "
+                "Use factorial.runtimes.vercel.create_*_app helpers in Vercel mode."
+            )
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
 
@@ -944,3 +1345,10 @@ class Orchestrator:
                 )
 
             loop.close()
+
+
+def _default_maintenance_reason() -> str:
+    service_type = (os.getenv("VERCEL_SERVICE_TYPE") or "").strip().lower()
+    if service_type == "cron":
+        return "cron_schedule"
+    return "manual"

@@ -156,6 +156,7 @@ async def _run_worker_invocation(
                     heartbeat_interval=runner.agent_worker_config.heartbeat_interval,
                     task_timeout=runner.agent_worker_config.turn_timeout,
                     metrics_retention_duration=runner.metrics_config.retention_duration,
+                    strict_batch_pickup_errors=True,
                 )
                 tick_result = await worker_tick(
                     tick_context,

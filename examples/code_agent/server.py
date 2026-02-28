@@ -8,6 +8,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from orchestrator import orchestrator
 from pydantic import BaseModel
+from vercel.headers import set_headers
+from starlette.requests import Request
+from typing import Callable
 
 app = FastAPI(root_path="/api")
 
@@ -18,6 +21,11 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+@app.middleware("http")
+async def vercel_context_middleware(request: Request, call_next: Callable):
+    set_headers(request.headers)
+    return await call_next(request)
 
 
 @app.get("/events/{user_id}")

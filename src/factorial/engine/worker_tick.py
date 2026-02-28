@@ -54,6 +54,7 @@ class WorkerTickContext:
     steering_script: TaskSteeringScript
     wait_schedule_script: WaitScheduleScript
     activity_wait_script: ActivityWaitScript
+    strict_batch_pickup_errors: bool = False
 
     @classmethod
     async def create(
@@ -68,6 +69,7 @@ class WorkerTickContext:
         heartbeat_interval: int,
         task_timeout: int,
         metrics_retention_duration: int,
+        strict_batch_pickup_errors: bool = False,
     ) -> WorkerTickContext:
         return cls(
             redis_client=redis_client,
@@ -79,6 +81,7 @@ class WorkerTickContext:
             heartbeat_interval=heartbeat_interval,
             task_timeout=task_timeout,
             metrics_retention_duration=metrics_retention_duration,
+            strict_batch_pickup_errors=strict_batch_pickup_errors,
             batch_script=await create_batch_pickup_script(redis_client),
             completion_script=await create_task_completion_script(redis_client),
             steering_script=await create_task_steering_script(redis_client),
@@ -115,6 +118,7 @@ async def worker_tick(
             agent=context.agent,
             batch_size=context.batch_size,
             metrics_ttl=context.metrics_retention_duration,
+            raise_on_error=context.strict_batch_pickup_errors,
         )
 
         if max_tasks is not None:

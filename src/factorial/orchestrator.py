@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 import signal
+import weakref
 from collections.abc import AsyncGenerator, AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -308,6 +309,19 @@ class Orchestrator:
                 db=redis_db,
                 max_connections=redis_max_connections,
             )
+        self._redis_pool_connection_class = getattr(
+            self.redis_pool, "connection_class", None
+        )
+        self._redis_pool_connection_kwargs = dict(
+            getattr(self.redis_pool, "connection_kwargs", {})
+        )
+        self._redis_pool_max_connections = getattr(
+            self.redis_pool, "max_connections", redis_max_connections
+        )
+        self._loop_redis_pools: weakref.WeakKeyDictionary[
+            asyncio.AbstractEventLoop, redis.ConnectionPool
+        ] = weakref.WeakKeyDictionary()
+        self._loop_scoped_pool_disabled = False
 
         self.api_keys = {
             "openai_api_key": openai_api_key or os.getenv("OPENAI_API_KEY"),
@@ -817,8 +831,51 @@ class Orchestrator:
         if isinstance(agent_name, str) and agent_name:
             await self.wake_agent(agent_name=agent_name, reason=reason, task_id=task_id)
 
+    def _get_loop_scoped_redis_pool(
+        self, loop: asyncio.AbstractEventLoop
+    ) -> redis.ConnectionPool:
+        if self._loop_scoped_pool_disabled:
+            return self.redis_pool
+
+        existing_pool = self._loop_redis_pools.get(loop)
+        if existing_pool is not None:
+            return existing_pool
+
+        pool_kwargs = dict(self._redis_pool_connection_kwargs)
+        pool_kwargs["decode_responses"] = True
+        if self._redis_pool_connection_class is not None:
+            pool_kwargs["connection_class"] = self._redis_pool_connection_class
+        pool_kwargs["max_connections"] = self._redis_pool_max_connections
+
+        try:
+            loop_pool = redis.ConnectionPool(**pool_kwargs)
+        except Exception as exc:
+            self._loop_scoped_pool_disabled = True
+            logger.warning(
+                "Failed to create loop-scoped Redis pool; falling back to shared pool.",
+                exc_info=exc,
+            )
+            return self.redis_pool
+        self._loop_redis_pools[loop] = loop_pool
+        return loop_pool
+
+    async def _disconnect_loop_redis_pools(self) -> None:
+        if not self._loop_redis_pools:
+            return
+
+        pools = list(self._loop_redis_pools.values())
+        self._loop_redis_pools.clear()
+        await asyncio.gather(
+            *[pool.disconnect() for pool in pools],
+            return_exceptions=True,
+        )
+
     async def get_redis_client(self) -> redis.Redis:
         """Get a Redis client from the pool"""
+        if self.runtime_mode == "vercel":
+            loop = asyncio.get_running_loop()
+            loop_pool = self._get_loop_scoped_redis_pool(loop)
+            return redis.Redis(connection_pool=loop_pool, decode_responses=True)
         return redis.Redis(connection_pool=self.redis_pool, decode_responses=True)
 
     async def create_agent_task(
@@ -1296,6 +1353,7 @@ class Orchestrator:
             except Exception as exc:
                 logger.error("Failed to flush wake dispatch", exc_info=exc)
 
+            await self._disconnect_loop_redis_pools()
             await self.redis_pool.disconnect()
             logger.info("Redis connection pool closed")
 

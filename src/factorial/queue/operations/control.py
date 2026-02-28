@@ -425,6 +425,8 @@ async def get_task_batch(
     agent: BaseAgent[Any],
     batch_size: int,
     metrics_ttl: int,
+    *,
+    raise_on_error: bool = False,
 ) -> tuple[list[str], list[str]]:
     """
     Get batch of tasks atomically
@@ -484,5 +486,7 @@ async def get_task_batch(
 
     except Exception as e:
         logger.error(f"Failed to get task batch: {e}")
+        if raise_on_error:
+            raise
         await asyncio.sleep(0.15 + random.random() * 0.1)  # backoff with jitter
         return [], []

@@ -207,6 +207,7 @@ async def steer_task(
         queue_main_key=keys.queue_main,
         queue_orphaned_key=keys.queue_orphaned,
         queue_pending_key=keys.queue_pending,
+        queue_scheduled_key=keys.queue_scheduled,
         task_statuses_key=keys.task_status,
         task_agents_key=keys.task_agent,
         task_payloads_key=keys.task_payload,
@@ -215,6 +216,7 @@ async def steer_task(
         task_metas_key=keys.task_meta,
         steering_messages_key=keys.task_steering,
         activity_wait_meta_key=root_keys.activity_wait_meta,
+        scheduled_wait_meta_key=root_keys.scheduled_wait_meta,
         message_seq_key=root_keys.messaging_message_seq,
         task_id=task_id,
         messages_json=json.dumps(
@@ -468,6 +470,8 @@ async def get_task_batch(
             activity_wait_meta_key=keys.activity_wait_meta,
             queue_pending_key_template=agent_queue_templates.queue_pending,
             queue_main_key_template=agent_queue_templates.queue_main,
+            queue_scheduled_key_template=agent_queue_templates.queue_scheduled,
+            scheduled_wait_meta_key=keys.scheduled_wait_meta,
             task_steering_key_template=steering_template,
             message_seq_key=keys.messaging_message_seq,
         )

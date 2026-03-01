@@ -1,5 +1,18 @@
 from __future__ import annotations
 
+import pytest
+
+try:
+    import vercel.workers  # type: ignore  # noqa: F401
+except Exception:
+    try:
+        import vercel.workers.client  # type: ignore  # noqa: F401
+    except Exception:
+        pytest.skip(
+            "requires nfactorial[vercel] (vercel-workers)",
+            allow_module_level=True,
+        )
+
 from factorial.runtimes.vercel.wake_dispatcher import parse_wake_envelope
 
 

@@ -39,8 +39,16 @@ class BatchPickupScript(AsyncScript):
             "queue_main_key_template",
             "task_steering_key_template",
             "message_seq_key",
+            "queue_scheduled_key_template",
+            "scheduled_wait_meta_key",
         ),
         arg_fields=("batch_size", "metrics_ttl"),
+        optional_key_fields=frozenset(
+            {
+                "queue_scheduled_key_template",
+                "scheduled_wait_meta_key",
+            }
+        ),
     )
 
     async def execute(
@@ -66,6 +74,8 @@ class BatchPickupScript(AsyncScript):
         queue_main_key_template: str = "",
         task_steering_key_template: str = "",
         message_seq_key: str = "",
+        queue_scheduled_key_template: str | None = None,
+        scheduled_wait_meta_key: str | None = None,
     ) -> BatchPickupScriptResult:
         result: tuple[list[str], list[str], list[str], list[str]] = (
             await _execute_contract(self, self._CONTRACT, locals())
@@ -153,6 +163,7 @@ class SteeringEnqueueScript(AsyncScript):
             "queue_main_key",
             "queue_orphaned_key",
             "queue_pending_key",
+            "queue_scheduled_key",
             "task_statuses_key",
             "task_agents_key",
             "task_payloads_key",
@@ -161,6 +172,7 @@ class SteeringEnqueueScript(AsyncScript):
             "task_metas_key",
             "steering_messages_key",
             "activity_wait_meta_key",
+            "scheduled_wait_meta_key",
             "message_seq_key",
         ),
         arg_fields=("task_id", "messages_json"),
@@ -172,6 +184,7 @@ class SteeringEnqueueScript(AsyncScript):
         queue_main_key: str,
         queue_orphaned_key: str,
         queue_pending_key: str,
+        queue_scheduled_key: str,
         task_statuses_key: str,
         task_agents_key: str,
         task_payloads_key: str,
@@ -180,6 +193,7 @@ class SteeringEnqueueScript(AsyncScript):
         task_metas_key: str,
         steering_messages_key: str,
         activity_wait_meta_key: str,
+        scheduled_wait_meta_key: str,
         message_seq_key: str,
         task_id: str,
         messages_json: str,
@@ -239,6 +253,8 @@ class TaskCompletionScript(AsyncScript):
             "message_seq_key",
             "queue_main_key_template",
             "queue_pending_key_template",
+            "queue_scheduled_key_template",
+            "scheduled_wait_meta_key",
         ),
         arg_fields=(
             "task_id",
@@ -256,6 +272,8 @@ class TaskCompletionScript(AsyncScript):
                 "pending_child_wait_ids_key",
                 "parent_pending_child_task_results_key",
                 "parent_pending_child_wait_ids_key",
+                "queue_scheduled_key_template",
+                "scheduled_wait_meta_key",
             }
         ),
         optional_arg_fields=frozenset(
@@ -308,6 +326,8 @@ class TaskCompletionScript(AsyncScript):
         message_seq_key: str = "",
         queue_main_key_template: str = "",
         queue_pending_key_template: str = "",
+        queue_scheduled_key_template: str | None = None,
+        scheduled_wait_meta_key: str | None = None,
     ) -> TaskCompletionScriptResult:
         result: tuple[bool, bool] = await _execute_contract(
             self, self._CONTRACT, locals()
@@ -443,6 +463,8 @@ class ActivityWaitScript(AsyncScript):
             "task_metas_key",
             "activity_wait_meta_key",
             "message_seq_key",
+            "queue_scheduled_key_template",
+            "scheduled_wait_meta_key",
         ),
         arg_fields=(
             "task_id",
@@ -452,6 +474,20 @@ class ActivityWaitScript(AsyncScript):
             "task_children_key_template",
             "queue_main_key_template",
             "queue_pending_key_template",
+            "timeout_wake_timestamp",
+            "scheduled_wait_metadata_json",
+        ),
+        optional_key_fields=frozenset(
+            {
+                "queue_scheduled_key_template",
+                "scheduled_wait_meta_key",
+            }
+        ),
+        optional_arg_fields=frozenset(
+            {
+                "timeout_wake_timestamp",
+                "scheduled_wait_metadata_json",
+            }
         ),
     )
 
@@ -476,6 +512,10 @@ class ActivityWaitScript(AsyncScript):
         task_children_key_template: str,
         queue_main_key_template: str,
         queue_pending_key_template: str,
+        queue_scheduled_key_template: str | None = None,
+        scheduled_wait_meta_key: str | None = None,
+        timeout_wake_timestamp: float | None = None,
+        scheduled_wait_metadata_json: str | None = None,
     ) -> ActivityWaitScriptResult:
         result: tuple[bool, str | bytes, int] = await _execute_contract(
             self, self._CONTRACT, locals()
@@ -586,6 +626,7 @@ class CancelTaskScript(AsyncScript):
             "activity_wait_meta_key",
             "queue_main_key_template",
             "queue_pending_key_template",
+            "queue_scheduled_key_template",
             "task_steering_key_template",
             "message_seq_key",
         ),
@@ -598,6 +639,7 @@ class CancelTaskScript(AsyncScript):
                 "activity_wait_meta_key",
                 "queue_main_key_template",
                 "queue_pending_key_template",
+                "queue_scheduled_key_template",
                 "task_steering_key_template",
                 "message_seq_key",
             }
@@ -630,6 +672,7 @@ class CancelTaskScript(AsyncScript):
         activity_wait_meta_key: str | None = None,
         queue_main_key_template: str | None = None,
         queue_pending_key_template: str | None = None,
+        queue_scheduled_key_template: str | None = None,
         task_steering_key_template: str | None = None,
         message_seq_key: str | None = None,
     ) -> CancelTaskScriptResult:

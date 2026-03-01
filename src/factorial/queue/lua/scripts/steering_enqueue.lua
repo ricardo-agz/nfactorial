@@ -13,15 +13,17 @@
 local queue_main_key = KEYS[1]
 local queue_orphaned_key = KEYS[2]
 local queue_pending_key = KEYS[3]
-local task_statuses_key = KEYS[4]
-local task_agents_key = KEYS[5]
-local task_payloads_key = KEYS[6]
-local task_pickups_key = KEYS[7]
-local task_retries_key = KEYS[8]
-local task_metas_key = KEYS[9]
-local steering_messages_key = KEYS[10]
-local activity_wait_meta_key = KEYS[11]
-local message_seq_key = KEYS[12]
+local queue_scheduled_key = KEYS[4]
+local task_statuses_key = KEYS[5]
+local task_agents_key = KEYS[6]
+local task_payloads_key = KEYS[7]
+local task_pickups_key = KEYS[8]
+local task_retries_key = KEYS[9]
+local task_metas_key = KEYS[10]
+local steering_messages_key = KEYS[11]
+local activity_wait_meta_key = KEYS[12]
+local scheduled_wait_meta_key = KEYS[13]
+local message_seq_key = KEYS[14]
 
 local task_id = ARGV[1]
 local messages_json = ARGV[2]
@@ -70,7 +72,9 @@ local woke = false
 if task_result.status == "paused" and redis.call("HEXISTS", activity_wait_meta_key, task_id) == 1 then
     redis.call("HSET", task_statuses_key, task_id, "active")
     redis.call("HDEL", activity_wait_meta_key, task_id)
+    redis.call("HDEL", scheduled_wait_meta_key, task_id)
     redis.call("ZREM", queue_pending_key, task_id)
+    redis.call("ZREM", queue_scheduled_key, task_id)
     redis.call("LPUSH", queue_main_key, task_id)
     woke = true
 end

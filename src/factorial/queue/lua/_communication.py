@@ -341,6 +341,51 @@ async def create_messaging_group_add_members_script(
     )
 
 
+class MessagingGroupRemoveMembersScript(AsyncScript):
+    _CONTRACT = LuaScriptContract(
+        script_name="MessagingGroupRemoveMembersScript.execute",
+        key_fields=(
+            "task_metas_key",
+            "group_meta_key",
+            "group_members_key",
+        ),
+        arg_fields=(
+            "sender_task_id",
+            "team_id",
+            "group_name",
+            "member_task_ids_json",
+            "groups_by_task_key_template",
+        ),
+    )
+
+    async def execute(
+        self,
+        *,
+        task_metas_key: str,
+        group_meta_key: str,
+        group_members_key: str,
+        sender_task_id: str,
+        team_id: str,
+        group_name: str,
+        member_task_ids_json: str,
+        groups_by_task_key_template: str,
+    ) -> MessagingGroupMutationScriptResult:
+        result: list[str | bytes] = await _execute_contract(
+            self, self._CONTRACT, locals()
+        )
+        return _parse_group_mutation_result(result)
+
+
+async def create_messaging_group_remove_members_script(
+    redis_client: redis.Redis,
+) -> MessagingGroupRemoveMembersScript:
+    return get_cached_script(
+        redis_client,
+        "messaging_group_remove_members",
+        MessagingGroupRemoveMembersScript,
+    )
+
+
 class MessagingGroupSendScript(AsyncScript):
     _CONTRACT = LuaScriptContract(
         script_name="MessagingGroupSendScript.execute",
@@ -354,6 +399,7 @@ class MessagingGroupSendScript(AsyncScript):
             "global_history_key",
             "message_seq_key",
             "activity_wait_meta_key",
+            "scheduled_wait_meta_key",
             "team_tasks_key",
         ),
         arg_fields=(
@@ -366,6 +412,7 @@ class MessagingGroupSendScript(AsyncScript):
             "history_maxlen",
             "queue_main_key_template",
             "queue_pending_key_template",
+            "queue_scheduled_key_template",
             "groups_by_task_key_template",
         ),
     )
@@ -382,6 +429,7 @@ class MessagingGroupSendScript(AsyncScript):
         global_history_key: str,
         message_seq_key: str,
         activity_wait_meta_key: str,
+        scheduled_wait_meta_key: str,
         team_tasks_key: str,
         sender_task_id: str,
         team_id: str,
@@ -392,6 +440,7 @@ class MessagingGroupSendScript(AsyncScript):
         history_maxlen: int,
         queue_main_key_template: str,
         queue_pending_key_template: str,
+        queue_scheduled_key_template: str,
         groups_by_task_key_template: str,
     ) -> MessagingSendScriptResult:
         result: list[str | bytes] = await _execute_contract(
@@ -408,6 +457,82 @@ async def create_messaging_group_send_script(
     )
 
 
+class MessagingHumanGroupSendScript(AsyncScript):
+    _CONTRACT = LuaScriptContract(
+        script_name="MessagingHumanGroupSendScript.execute",
+        key_fields=(
+            "task_statuses_key",
+            "task_agents_key",
+            "task_metas_key",
+            "group_meta_key",
+            "group_members_key",
+            "thread_history_key",
+            "global_history_key",
+            "message_seq_key",
+            "activity_wait_meta_key",
+            "scheduled_wait_meta_key",
+            "team_tasks_key",
+        ),
+        arg_fields=(
+            "team_id",
+            "group_name",
+            "content",
+            "metadata_json",
+            "steering_key_template",
+            "history_maxlen",
+            "queue_main_key_template",
+            "queue_pending_key_template",
+            "queue_scheduled_key_template",
+            "groups_by_task_key_template",
+            "from_owner_id",
+            "from_task_id",
+        ),
+        optional_arg_fields=frozenset({"from_task_id"}),
+    )
+
+    async def execute(
+        self,
+        *,
+        task_statuses_key: str,
+        task_agents_key: str,
+        task_metas_key: str,
+        group_meta_key: str,
+        group_members_key: str,
+        thread_history_key: str,
+        global_history_key: str,
+        message_seq_key: str,
+        activity_wait_meta_key: str,
+        scheduled_wait_meta_key: str,
+        team_tasks_key: str,
+        team_id: str,
+        group_name: str,
+        content: str,
+        metadata_json: str,
+        steering_key_template: str,
+        history_maxlen: int,
+        queue_main_key_template: str,
+        queue_pending_key_template: str,
+        queue_scheduled_key_template: str,
+        groups_by_task_key_template: str,
+        from_owner_id: str,
+        from_task_id: str | None = None,
+    ) -> MessagingSendScriptResult:
+        result: list[str | bytes] = await _execute_contract(
+            self, self._CONTRACT, locals()
+        )
+        return _parse_messaging_send_result(result)
+
+
+async def create_messaging_human_group_send_script(
+    redis_client: redis.Redis,
+) -> MessagingHumanGroupSendScript:
+    return get_cached_script(
+        redis_client,
+        "messaging_human_group_send",
+        MessagingHumanGroupSendScript,
+    )
+
+
 class MessagingDirectSendScript(AsyncScript):
     _CONTRACT = LuaScriptContract(
         script_name="MessagingDirectSendScript.execute",
@@ -419,6 +544,7 @@ class MessagingDirectSendScript(AsyncScript):
             "global_history_key",
             "message_seq_key",
             "activity_wait_meta_key",
+            "scheduled_wait_meta_key",
         ),
         arg_fields=(
             "sender_task_id",
@@ -430,6 +556,7 @@ class MessagingDirectSendScript(AsyncScript):
             "history_maxlen",
             "queue_main_key_template",
             "queue_pending_key_template",
+            "queue_scheduled_key_template",
         ),
     )
 
@@ -443,6 +570,7 @@ class MessagingDirectSendScript(AsyncScript):
         global_history_key: str,
         message_seq_key: str,
         activity_wait_meta_key: str,
+        scheduled_wait_meta_key: str,
         sender_task_id: str,
         to_task_id: str,
         team_id: str,
@@ -452,6 +580,7 @@ class MessagingDirectSendScript(AsyncScript):
         history_maxlen: int,
         queue_main_key_template: str,
         queue_pending_key_template: str,
+        queue_scheduled_key_template: str,
     ) -> MessagingSendScriptResult:
         result: list[str | bytes] = await _execute_contract(
             self, self._CONTRACT, locals()
@@ -464,4 +593,72 @@ async def create_messaging_direct_send_script(
 ) -> MessagingDirectSendScript:
     return get_cached_script(
         redis_client, "messaging_direct_send", MessagingDirectSendScript
+    )
+
+
+class MessagingHumanDirectSendScript(AsyncScript):
+    _CONTRACT = LuaScriptContract(
+        script_name="MessagingHumanDirectSendScript.execute",
+        key_fields=(
+            "task_statuses_key",
+            "task_agents_key",
+            "task_metas_key",
+            "thread_history_key",
+            "global_history_key",
+            "message_seq_key",
+            "activity_wait_meta_key",
+            "scheduled_wait_meta_key",
+        ),
+        arg_fields=(
+            "to_task_id",
+            "team_id",
+            "content",
+            "metadata_json",
+            "steering_key_template",
+            "history_maxlen",
+            "queue_main_key_template",
+            "queue_pending_key_template",
+            "queue_scheduled_key_template",
+            "from_owner_id",
+            "from_task_id",
+        ),
+        optional_arg_fields=frozenset({"from_task_id"}),
+    )
+
+    async def execute(
+        self,
+        *,
+        task_statuses_key: str,
+        task_agents_key: str,
+        task_metas_key: str,
+        thread_history_key: str,
+        global_history_key: str,
+        message_seq_key: str,
+        activity_wait_meta_key: str,
+        scheduled_wait_meta_key: str,
+        to_task_id: str,
+        team_id: str,
+        content: str,
+        metadata_json: str,
+        steering_key_template: str,
+        history_maxlen: int,
+        queue_main_key_template: str,
+        queue_pending_key_template: str,
+        queue_scheduled_key_template: str,
+        from_owner_id: str,
+        from_task_id: str | None = None,
+    ) -> MessagingSendScriptResult:
+        result: list[str | bytes] = await _execute_contract(
+            self, self._CONTRACT, locals()
+        )
+        return _parse_messaging_send_result(result)
+
+
+async def create_messaging_human_direct_send_script(
+    redis_client: redis.Redis,
+) -> MessagingHumanDirectSendScript:
+    return get_cached_script(
+        redis_client,
+        "messaging_human_direct_send",
+        MessagingHumanDirectSendScript,
     )

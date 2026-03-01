@@ -127,6 +127,7 @@ class QueueScripts:
             activity_wait_meta_key=self._keys.activity_wait_meta,
             queue_main_key_template=self._queue_templates.queue_main,
             queue_pending_key_template=self._queue_templates.queue_pending,
+            queue_scheduled_key_template=self._queue_templates.queue_scheduled,
             task_steering_key_template=self._task_steering_key_template,
             message_seq_key=self._keys.messaging_message_seq,
         )
@@ -169,6 +170,8 @@ class QueueScripts:
             message_seq_key=self._keys.messaging_message_seq,
             queue_main_key_template=self._queue_templates.queue_main,
             queue_pending_key_template=self._queue_templates.queue_pending,
+            queue_scheduled_key_template=self._queue_templates.queue_scheduled,
+            scheduled_wait_meta_key=self._keys.scheduled_wait_meta,
             current_turn=request.current_turn,
             pending_child_wait_ids_key=task_keys.pending_child_wait_ids,
             parent_pending_child_task_results_key=(

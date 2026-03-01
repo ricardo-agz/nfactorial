@@ -19,6 +19,10 @@ class WaitInstruction:
     timezone: str | None = None
     child_task_ids: list[str] | None = None
     job_refs: list[dict[str, Any]] | None = None
+    activity_timeout_kind: Literal["sleep", "cron"] | None = None
+    activity_timeout_s: float | None = None
+    activity_timeout_cron: str | None = None
+    activity_timeout_timezone: str | None = None
 
 
 def _parse_cron_field(field: str, minimum: int, maximum: int) -> tuple[set[int], bool]:
@@ -226,8 +230,49 @@ class WaitNamespace:
             data=data,
         )
 
-    def activity(self, *, data: Any = None) -> WaitInstruction:
-        return WaitInstruction(kind="activity", data=data)
+    def activity(
+        self,
+        *,
+        timeout: WaitInstruction | None = None,
+        data: Any = None,
+    ) -> WaitInstruction:
+        if timeout is None:
+            return WaitInstruction(kind="activity", data=data)
+
+        if not isinstance(timeout, WaitInstruction):
+            raise TypeError(
+                "wait.activity(timeout=...) expects wait.sleep(...) or wait.cron(...)"
+            )
+        if timeout.kind not in {"sleep", "cron"}:
+            raise ValueError(
+                "wait.activity(timeout=...) only supports wait.sleep(...) or "
+                "wait.cron(...)"
+            )
+
+        if timeout.kind == "sleep":
+            if timeout.sleep_s is None:
+                raise ValueError(
+                    "wait.activity(timeout=wait.sleep(...)) requires a sleep duration"
+                )
+            return WaitInstruction(
+                kind="activity",
+                data=data,
+                activity_timeout_kind="sleep",
+                activity_timeout_s=float(timeout.sleep_s),
+            )
+
+        if not timeout.cron:
+            raise ValueError(
+                "wait.activity(timeout=wait.cron(...)) requires a non-empty cron "
+                "expression"
+            )
+        return WaitInstruction(
+            kind="activity",
+            data=data,
+            activity_timeout_kind="cron",
+            activity_timeout_cron=timeout.cron,
+            activity_timeout_timezone=timeout.timezone or "UTC",
+        )
 
 
 wait = WaitNamespace()

@@ -205,6 +205,8 @@ wake_task_if_waiting_activity(
         activity_wait_meta_key,
         task_steering_key_template,
         message_seq_key,
+        queue_scheduled_key_template, -- optional
+        scheduled_wait_meta_key,      -- optional
     },
     {
         task_id,
@@ -224,6 +226,8 @@ local function wake_task_if_waiting_activity(keys, args)
     local activity_wait_meta_key = keys[5]
     local task_steering_key_template = keys[6]
     local message_seq_key = keys[7]
+    local queue_scheduled_key_template = keys[8]
+    local scheduled_wait_meta_key = keys[9]
 
     local task_id = args[1]
     local message_content = args[2] or ""
@@ -251,6 +255,14 @@ local function wake_task_if_waiting_activity(keys, args)
         "{agent}",
         task_agent
     )
+    local queue_scheduled_key = nil
+    if queue_scheduled_key_template and queue_scheduled_key_template ~= "" then
+        queue_scheduled_key = _format_template_key(
+            queue_scheduled_key_template,
+            "{agent}",
+            task_agent
+        )
+    end
 
     if message_content ~= "" then
         local task_steering_key = _format_template_key(
@@ -264,6 +276,12 @@ local function wake_task_if_waiting_activity(keys, args)
     redis.call('HSET', task_statuses_key, task_id, "active")
     redis.call('HDEL', activity_wait_meta_key, task_id)
     redis.call('ZREM', queue_pending_key, task_id)
+    if queue_scheduled_key then
+        redis.call('ZREM', queue_scheduled_key, task_id)
+    end
+    if scheduled_wait_meta_key and scheduled_wait_meta_key ~= "" then
+        redis.call('HDEL', scheduled_wait_meta_key, task_id)
+    end
     redis.call('LPUSH', queue_main_key, task_id)
 
     return true
@@ -288,6 +306,8 @@ maybe_wake_parent_on_subtree_idle(
         task_steering_key_template,
         message_seq_key,
         task_children_key_template,
+        queue_scheduled_key_template, -- optional
+        scheduled_wait_meta_key,      -- optional
     },
     {
         parent_task_id,
@@ -308,6 +328,8 @@ local function maybe_wake_parent_on_subtree_idle(keys, args)
     local task_steering_key_template = keys[6]
     local message_seq_key = keys[7]
     local task_children_key_template = keys[8]
+    local queue_scheduled_key_template = keys[9]
+    local scheduled_wait_meta_key = keys[10]
 
     local parent_task_id = args[1]
     local source_task_id = args[2] or ""
@@ -373,6 +395,8 @@ local function maybe_wake_parent_on_subtree_idle(keys, args)
             activity_wait_meta_key,
             task_steering_key_template,
             message_seq_key,
+            queue_scheduled_key_template,
+            scheduled_wait_meta_key,
         },
         {
             parent_task_id,
@@ -396,6 +420,8 @@ wake_parent_on_child_terminal(
         activity_wait_meta_key,
         task_steering_key_template,
         message_seq_key,
+        queue_scheduled_key_template, -- optional
+        scheduled_wait_meta_key,      -- optional
     },
     {
         parent_task_id,
@@ -415,6 +441,8 @@ local function wake_parent_on_child_terminal(keys, args)
     local activity_wait_meta_key = keys[5]
     local task_steering_key_template = keys[6]
     local message_seq_key = keys[7]
+    local queue_scheduled_key_template = keys[8]
+    local scheduled_wait_meta_key = keys[9]
 
     local parent_task_id = args[1]
     local child_task_id = args[2] or ""
@@ -434,6 +462,8 @@ local function wake_parent_on_child_terminal(keys, args)
             activity_wait_meta_key,
             task_steering_key_template,
             message_seq_key,
+            queue_scheduled_key_template,
+            scheduled_wait_meta_key,
         },
         {
             parent_task_id,

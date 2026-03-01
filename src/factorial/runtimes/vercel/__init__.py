@@ -1,15 +1,11 @@
-from factorial.runtimes.vercel.app import create_vercel_apps
-from factorial.runtimes.vercel.bootstrap import (
-    configure_orchestrator,
-    configure_orchestrator_for_vercel,
-)
-from factorial.runtimes.vercel.cron_service import (
-    trigger_maintenance_once,
-)
-from factorial.runtimes.vercel.settings import VercelRuntimeSettings
-from factorial.runtimes.vercel.worker_service import (
-    create_worker,
-)
+from __future__ import annotations
+
+from . import _deps  # noqa: F401
+from .app import create_vercel_apps
+from .bootstrap import configure_orchestrator, configure_orchestrator_for_vercel
+from .cron_service import trigger_maintenance_once
+from .settings import VercelRuntimeSettings
+from .worker_service import create_worker
 
 __all__ = [
     "VercelRuntimeSettings",

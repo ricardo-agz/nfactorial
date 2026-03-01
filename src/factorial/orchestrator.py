@@ -1,5 +1,4 @@
 import asyncio
-import json
 import os
 import signal
 import weakref
@@ -10,19 +9,16 @@ from typing import TYPE_CHECKING, Any, Literal, cast
 
 import httpx
 import redis.asyncio as redis
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
-from starlette.websockets import WebSocket, WebSocketDisconnect
 
 from factorial.agent import BaseAgent
 from factorial.context import ContextType
 from factorial.contracts import (
     NoopWakeDispatch,
-    VercelQueueWakeDispatch,
     WakeDispatch,
 )
+from factorial.exceptions import TaskNotFoundError
 from factorial.hooks import HookResolutionResult, PendingHook
 from factorial.llms import MultiClient
 from factorial.logging import get_logger
@@ -178,15 +174,6 @@ def _resolve_wake_transport(
     return "vercel_queue" if runtime_mode == "vercel" else "none"
 
 
-def _vercel_workers_available() -> bool:
-    try:
-        import vercel.workers  # type: ignore  # noqa: F401
-
-        return True
-    except Exception:
-        return False
-
-
 def _build_wake_dispatch(
     *,
     wake_transport: Literal["none", "vercel_queue"],
@@ -196,6 +183,8 @@ def _build_wake_dispatch(
     if wake_transport == "none":
         return NoopWakeDispatch()
     if wake_transport == "vercel_queue":
+        from factorial.runtimes.vercel.wake_dispatch import VercelQueueWakeDispatch
+
         return VercelQueueWakeDispatch(topic=dispatch_topic, namespace=namespace)
     return NoopWakeDispatch()
 
@@ -337,21 +326,6 @@ class Orchestrator:
             runtime_mode=self.runtime_mode,
             wake_transport=wake_transport,
         )
-        if (
-            self.runtime_mode == "vercel"
-            and self.wake_transport == "vercel_queue"
-            and not _vercel_workers_available()
-        ):
-            if os.getenv("VERCEL") == "1":
-                raise RuntimeError(
-                    "Vercel runtime requires `vercel-workers` to be installed "
-                    "for queue dispatch and worker callbacks."
-                )
-            logger.warning(
-                "`vercel-workers` is unavailable locally; falling back to "
-                "NFACTORIAL_WAKE_TRANSPORT=none for inline maintenance/testing."
-            )
-            self.wake_transport = "none"
         self.wake_dispatch: WakeDispatch = (
             wake_dispatch
             if wake_dispatch is not None
@@ -396,17 +370,15 @@ class Orchestrator:
         self, owner_id: str
     ) -> AsyncIterator[tuple[redis.Redis, Any, str]]:
         """Context manager for Redis pubsub with proper cleanup"""
-        redis_client = await self.get_redis_client()
-        pubsub = redis_client.pubsub()
-        channel = self.get_updates_channel(owner_id=owner_id)
-
-        try:
-            await pubsub.subscribe(channel)
-            yield redis_client, pubsub, channel
-        finally:
-            await pubsub.unsubscribe(channel)
-            await pubsub.aclose()
-            await redis_client.close()
+        async with self.redis_client_context() as redis_client:
+            pubsub = redis_client.pubsub()
+            channel = self.get_updates_channel(owner_id=owner_id)
+            try:
+                await pubsub.subscribe(channel)
+                yield redis_client, pubsub, channel
+            finally:
+                await pubsub.unsubscribe(channel)
+                await pubsub.aclose()
 
     async def subscribe_to_updates(
         self,
@@ -671,157 +643,13 @@ class Orchestrator:
         cors_origins: list[str] | None = None,
     ) -> FastAPI:
         """Create an ASGI app for orchestrator control-plane APIs."""
+        from factorial.api.app import create_control_plane_app
 
-        class EnqueueRequest(BaseModel):
-            agent_name: str
-            owner_id: str
-            payload: dict[str, Any]
-            idempotency_key: str | None = None
-
-        class EnqueueResponse(BaseModel):
-            task_id: str
-
-        class SteerRequest(BaseModel):
-            messages: list[dict[str, Any]]
-
-        class ResumeRequest(BaseModel):
-            messages: list[dict[str, Any]]
-            idempotency_key: str | None = None
-
-        class ResolveHookRequest(BaseModel):
-            token: str
-            payload: Any
-            idempotency_key: str | None = None
-
-        app = FastAPI(title="factorial-web")
-        if cors_origins is not None:
-            app.add_middleware(
-                cast(Any, CORSMiddleware),
-                allow_origins=cors_origins,
-                allow_credentials=True,
-                allow_methods=["*"],
-                allow_headers=["*"],
-            )
-
-        @app.get("/")
-        async def health() -> dict[str, Any]:
-            return {
-                "ok": True,
-                "service": "web",
-                "runtime_mode": self.runtime_mode,
-                "namespace": self.namespace,
-            }
-
-        @app.post("/api/enqueue", response_model=EnqueueResponse)
-        async def enqueue_task_route(request: EnqueueRequest) -> EnqueueResponse:
-            agent = self.get_agent(request.agent_name)
-            if agent is None:
-                raise HTTPException(
-                    status_code=404,
-                    detail=f"Agent '{request.agent_name}' is not registered",
-                )
-            try:
-                context = cast(Any, agent.context_class).from_dict(request.payload)
-            except Exception as exc:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Invalid payload for agent '{request.agent_name}': {exc}",
-                ) from exc
-
-            task = await self.create_agent_task(
-                agent=agent,
-                payload=context,
-                owner_id=request.owner_id,
-                idempotency_key=request.idempotency_key,
-            )
-            return EnqueueResponse(task_id=task.id)
-
-        @app.get("/api/tasks/{task_id}")
-        async def get_task_route(task_id: str) -> dict[str, Any]:
-            task_data = await self.get_task_data(task_id)
-            if task_data is None:
-                raise HTTPException(status_code=404, detail="Task not found")
-            return task_data
-
-        @app.post("/api/tasks/{task_id}/cancel")
-        async def cancel_task_route(task_id: str) -> dict[str, Any]:
-            await self.cancel_task(task_id=task_id)
-            return {"ok": True, "task_id": task_id}
-
-        @app.post("/api/tasks/{task_id}/steer")
-        async def steer_task_route(
-            task_id: str, request: SteerRequest
-        ) -> dict[str, Any]:
-            await self.steer_task(task_id=task_id, messages=request.messages)
-            return {"ok": True, "task_id": task_id}
-
-        @app.post("/api/tasks/{task_id}/resume")
-        async def resume_task_route(
-            task_id: str, request: ResumeRequest
-        ) -> dict[str, Any]:
-            resumed = await self.resume_task(
-                task_id=task_id,
-                messages=request.messages,
-                idempotency_key=request.idempotency_key,
-            )
-            return {
-                "ok": True,
-                "source_task_id": task_id,
-                "resumed_task_id": resumed.id,
-            }
-
-        @app.post("/api/hooks/{hook_id}/resolve")
-        async def resolve_hook_route(
-            hook_id: str,
-            request: ResolveHookRequest,
-        ) -> dict[str, Any]:
-            resolution = await self.resolve_hook(
-                hook_id=hook_id,
-                payload=request.payload,
-                token=request.token,
-                idempotency_key=request.idempotency_key,
-            )
-            return {
-                "ok": True,
-                "hook_id": resolution.hook_id,
-                "task_id": resolution.task_id,
-                "tool_call_id": resolution.tool_call_id,
-                "status": resolution.status,
-                "task_resumed": resolution.task_resumed,
-            }
-
-        @app.get("/events/{owner_id}")
-        async def stream_events(owner_id: str, request: Request) -> StreamingResponse:
-            async def event_stream():
-                async for update in self.subscribe_to_updates(owner_id=owner_id):
-                    if await request.is_disconnected():
-                        break
-                    event_type = str(update.get("event_type", "update"))
-                    payload = json.dumps(update, separators=(",", ":"))
-                    yield f"event: {event_type}\ndata: {payload}\n\n"
-
-            return StreamingResponse(
-                event_stream(),
-                media_type="text/event-stream",
-                headers={
-                    "Cache-Control": "no-cache",
-                    "Connection": "keep-alive",
-                    "X-Accel-Buffering": "no",
-                },
-            )
-
-        if enable_ws:
-
-            @app.websocket("/ws/{owner_id}")
-            async def websocket_updates(websocket: WebSocket, owner_id: str):
-                await websocket.accept()
-                try:
-                    async for update in self.subscribe_to_updates(owner_id=owner_id):
-                        await websocket.send_text(json.dumps(update))
-                except WebSocketDisconnect:
-                    return
-
-        return app
+        return create_control_plane_app(
+            self,
+            enable_ws=enable_ws,
+            cors_origins=cors_origins,
+        )
 
     async def _wake_task_if_possible(self, *, task_id: str, reason: str) -> None:
         task_data = await self.get_task_data(task_id)
@@ -878,6 +706,15 @@ class Orchestrator:
             return redis.Redis(connection_pool=loop_pool, decode_responses=True)
         return redis.Redis(connection_pool=self.redis_pool, decode_responses=True)
 
+    @asynccontextmanager
+    async def redis_client_context(self) -> AsyncIterator[redis.Redis]:
+        """Yield a Redis client and always close it."""
+        redis_client = await self.get_redis_client()
+        try:
+            yield redis_client
+        finally:
+            await redis_client.close()
+
     async def create_agent_task(
         self,
         agent: BaseAgent[Any],
@@ -903,8 +740,7 @@ class Orchestrator:
         """Enqueue a task using the control plane's configuration"""
         from factorial.queue import enqueue_task as q_enqueue_task
 
-        redis_client = await self.get_redis_client()
-        try:
+        async with self.redis_client_context() as redis_client:
             task_id = await q_enqueue_task(
                 redis_client=redis_client,
                 namespace=self.namespace,
@@ -918,8 +754,6 @@ class Orchestrator:
                 task_id=task_id,
             )
             return task_id
-        finally:
-            await redis_client.close()
 
     async def enqueue_batch(
         self,
@@ -968,8 +802,7 @@ class Orchestrator:
             # Preserve caller-provided task ids for non-idempotent batches.
             task_ids = [task.id for task in tasks]
 
-        redis_client = await self.get_redis_client()
-        try:
+        async with self.redis_client_context() as redis_client:
             batch = await q_create_batch_and_enqueue(
                 redis_client=redis_client,
                 namespace=self.namespace,
@@ -983,8 +816,6 @@ class Orchestrator:
             )
             await self.wake_agent(agent_name=agent.name, reason="enqueue_batch")
             return batch
-        finally:
-            await redis_client.close()
 
     async def resume_task(
         self,
@@ -998,8 +829,7 @@ class Orchestrator:
             resume_task as q_resume_task,
         )
 
-        redis_client = await self.get_redis_client()
-        try:
+        async with self.redis_client_context() as redis_client:
             source_task_data = await q_get_task_data(
                 redis_client=redis_client,
                 namespace=self.namespace,
@@ -1027,8 +857,6 @@ class Orchestrator:
                 task_id=resumed_task.id,
             )
             return resumed_task
-        finally:
-            await redis_client.close()
 
     async def cancel_task(
         self,
@@ -1037,8 +865,7 @@ class Orchestrator:
         """Cancel a task using the control plane's configuration"""
         from factorial.queue import cancel_task as q_cancel_task
 
-        redis_client = await self.get_redis_client()
-        try:
+        async with self.redis_client_context() as redis_client:
             await q_cancel_task(
                 redis_client=redis_client,
                 namespace=self.namespace,
@@ -1046,8 +873,6 @@ class Orchestrator:
                 agents_by_name=self.agents_by_name,
                 metrics_retention_duration=self.metrics_config.retention_duration,
             )
-        finally:
-            await redis_client.close()
 
     async def steer_task(
         self,
@@ -1060,8 +885,7 @@ class Orchestrator:
             steer_task as q_steer_task,
         )
 
-        redis_client = await self.get_redis_client()
-        try:
+        async with self.redis_client_context() as redis_client:
             await q_steer_task(
                 redis_client=redis_client,
                 namespace=self.namespace,
@@ -1080,8 +904,52 @@ class Orchestrator:
                     reason="steer",
                     task_id=task_id,
                 )
-        finally:
-            await redis_client.close()
+
+    async def message_task(
+        self,
+        *,
+        task_id: str,
+        owner_id: str,
+        content: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        from factorial.queue import messaging_human_send_direct as q_message_task
+
+        async with self.redis_client_context() as redis_client:
+            return await q_message_task(
+                redis_client=redis_client,
+                namespace=self.namespace,
+                owner_id=owner_id,
+                to_task_id=task_id,
+                content=content,
+                metadata=metadata,
+            )
+
+    async def message_group(
+        self,
+        *,
+        owner_id: str,
+        content: str,
+        group_id: str | None = None,
+        group_name: str | None = None,
+        task_id: str | None = None,
+        team_id: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        from factorial.queue import messaging_human_send_group as q_message_group
+
+        async with self.redis_client_context() as redis_client:
+            return await q_message_group(
+                redis_client=redis_client,
+                namespace=self.namespace,
+                owner_id=owner_id,
+                content=content,
+                group_id=group_id,
+                group_name=group_name,
+                task_id=task_id,
+                team_id=team_id,
+                metadata=metadata,
+            )
 
     async def register_pending_hook(
         self,
@@ -1100,8 +968,7 @@ class Orchestrator:
         """Register a pending hook ticket for a task/tool call."""
         from factorial.queue import register_pending_hook as q_register_pending_hook
 
-        redis_client = await self.get_redis_client()
-        try:
+        async with self.redis_client_context() as redis_client:
             return await q_register_pending_hook(
                 redis_client=redis_client,
                 namespace=self.namespace,
@@ -1116,8 +983,6 @@ class Orchestrator:
                 depends_on=depends_on,
                 hook_type_name=hook_type_name,
             )
-        finally:
-            await redis_client.close()
 
     async def resolve_hook(
         self,
@@ -1130,8 +995,7 @@ class Orchestrator:
         """Resolve a hook by id using token-authenticated payload."""
         from factorial.queue import resolve_hook as q_resolve_hook
 
-        redis_client = await self.get_redis_client()
-        try:
+        async with self.redis_client_context() as redis_client:
             resolution = await q_resolve_hook(
                 redis_client=redis_client,
                 namespace=self.namespace,
@@ -1146,8 +1010,6 @@ class Orchestrator:
                     reason="hook_resolved",
                 )
             return resolution
-        finally:
-            await redis_client.close()
 
     async def rotate_hook_token(
         self,
@@ -1158,40 +1020,36 @@ class Orchestrator:
         """Rotate token for a pending hook."""
         from factorial.queue import rotate_hook_token as q_rotate_hook_token
 
-        redis_client = await self.get_redis_client()
-        try:
+        async with self.redis_client_context() as redis_client:
             return await q_rotate_hook_token(
                 redis_client=redis_client,
                 namespace=self.namespace,
                 hook_id=hook_id,
                 revoke_previous=revoke_previous,
             )
-        finally:
-            await redis_client.close()
 
     async def get_task_status(self, task_id: str) -> Any:
         """Get task status using the control plane's configuration"""
         from factorial.queue import get_task_status as q_get_task_status
 
-        redis_client = await self.get_redis_client()
-        try:
+        async with self.redis_client_context() as redis_client:
             return await q_get_task_status(
                 redis_client=redis_client, namespace=self.namespace, task_id=task_id
             )
-        finally:
-            await redis_client.close()
 
     async def get_task_data(self, task_id: str) -> dict[str, Any] | None:
         """Get task data using the control plane's configuration"""
         from factorial.queue import get_task_data as q_get_task_data
 
-        redis_client = await self.get_redis_client()
-        try:
-            return await q_get_task_data(
-                redis_client=redis_client, namespace=self.namespace, task_id=task_id
-            )
-        finally:
-            await redis_client.close()
+        async with self.redis_client_context() as redis_client:
+            try:
+                return await q_get_task_data(
+                    redis_client=redis_client,
+                    namespace=self.namespace,
+                    task_id=task_id,
+                )
+            except TaskNotFoundError:
+                return None
 
     async def get_task_agent(self, task_id: str) -> BaseAgent[Any] | None:
         """Get the agent that owns a specific task"""

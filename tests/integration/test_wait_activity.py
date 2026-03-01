@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+from typing import Any
 
 import pytest
 import redis.asyncio as redis
@@ -22,6 +23,7 @@ from factorial.queue.lua import (
     TaskCompletionScript,
     TaskSteeringScript,
     create_activity_wait_script,
+    create_scheduled_recovery_script,
 )
 from factorial.queue.operations import (
     cancel_task,
@@ -69,6 +71,43 @@ class _WaitActivityAgent(BaseAgent[AgentContext]):
                 (
                     _make_tool_call("wait_activity", "call_wait_activity"),
                     wait.activity(data={"reason": "awaiting activity"}),
+                )
+            ],
+        )
+
+
+class _WaitActivityWithTimeoutAgent(BaseAgent[AgentContext]):
+    def __init__(
+        self,
+        *,
+        timeout: Any,
+        name: str = "wait_activity_timeout_agent",
+    ):
+        super().__init__(
+            name=name,
+            instructions="Activity wait with timeout agent",
+            context_class=AgentContext,
+        )
+        self._timeout = timeout
+
+    async def run_turn(
+        self,
+        agent_ctx: AgentContext,
+    ) -> TurnCompletion[AgentContext]:
+        agent_ctx.turn += 1
+        return TurnCompletion(
+            is_done=False,
+            context=agent_ctx,
+            tool_call_results=[
+                (
+                    _make_tool_call(
+                        "wait_activity_timeout",
+                        "call_wait_activity_timeout",
+                    ),
+                    wait.activity(
+                        timeout=self._timeout,
+                        data={"reason": "awaiting activity or timeout"},
+                    ),
                 )
             ],
         )
@@ -202,6 +241,256 @@ async def test_process_task_parks_wait_activity(
     assert wait_meta["kind"] == "activity"
     pending_score = await redis_client.zscore(keys.queue_pending, task_id)
     assert pending_score is not None
+
+
+@pytest.mark.asyncio
+async def test_process_task_parks_wait_activity_with_sleep_timeout(
+    redis_client: redis.Redis,
+    test_namespace: str,
+    test_owner_id: str,
+    pickup_script: BatchPickupScript,
+    completion_script: TaskCompletionScript,
+    steering_script: TaskSteeringScript,
+) -> None:
+    agent = _WaitActivityWithTimeoutAgent(timeout=wait.sleep(7.0))
+    keys = RedisKeys.format(namespace=test_namespace, agent=agent.name)
+    task = Task.create(
+        owner_id=test_owner_id,
+        agent=agent.name,
+        payload=AgentContext(query="wait on activity or timeout"),
+        max_turns=10,
+    )
+    task_id = await enqueue_task(
+        redis_client=redis_client,
+        namespace=test_namespace,
+        agent=agent,
+        task=task,
+    )
+
+    picked = await _pickup_single_task(
+        redis_client=redis_client,
+        keys=keys,
+        pickup_script=pickup_script,
+    )
+    assert picked == [task_id]
+
+    await process_task(
+        redis_client=redis_client,
+        namespace=test_namespace,
+        task_id=task_id,
+        completion_script=completion_script,
+        steering_script=steering_script,
+        agent=agent,
+        agents_by_name={agent.name: agent},
+        max_retries=1,
+        heartbeat_interval=30,
+        task_timeout=60,
+        metrics_retention_duration=3600,
+    )
+
+    status = await get_task_status(redis_client, test_namespace, task_id)
+    assert status == TaskStatus.PAUSED
+    activity_meta_raw = await redis_client.hget(keys.activity_wait_meta, task_id)
+    assert activity_meta_raw is not None
+    scheduled_meta_raw = await redis_client.hget(keys.scheduled_wait_meta, task_id)
+    assert scheduled_meta_raw is not None
+    scheduled_meta = json.loads(scheduled_meta_raw)
+    assert scheduled_meta["kind"] == "activity_timeout"
+    assert scheduled_meta["timeout_kind"] == "sleep"
+    wake_score = await redis_client.zscore(keys.queue_scheduled, task_id)
+    assert wake_score is not None
+    assert wake_score > time.time()
+
+
+@pytest.mark.asyncio
+async def test_process_task_parks_wait_activity_with_cron_timeout(
+    redis_client: redis.Redis,
+    test_namespace: str,
+    test_owner_id: str,
+    pickup_script: BatchPickupScript,
+    completion_script: TaskCompletionScript,
+    steering_script: TaskSteeringScript,
+) -> None:
+    agent = _WaitActivityWithTimeoutAgent(
+        timeout=wait.cron("*/5 * * * *", timezone="UTC"),
+        name="wait_activity_cron_timeout_agent",
+    )
+    keys = RedisKeys.format(namespace=test_namespace, agent=agent.name)
+    task = Task.create(
+        owner_id=test_owner_id,
+        agent=agent.name,
+        payload=AgentContext(query="wait on activity or cron"),
+        max_turns=10,
+    )
+    task_id = await enqueue_task(
+        redis_client=redis_client,
+        namespace=test_namespace,
+        agent=agent,
+        task=task,
+    )
+
+    picked = await _pickup_single_task(
+        redis_client=redis_client,
+        keys=keys,
+        pickup_script=pickup_script,
+    )
+    assert picked == [task_id]
+
+    await process_task(
+        redis_client=redis_client,
+        namespace=test_namespace,
+        task_id=task_id,
+        completion_script=completion_script,
+        steering_script=steering_script,
+        agent=agent,
+        agents_by_name={agent.name: agent},
+        max_retries=1,
+        heartbeat_interval=30,
+        task_timeout=60,
+        metrics_retention_duration=3600,
+    )
+
+    status = await get_task_status(redis_client, test_namespace, task_id)
+    assert status == TaskStatus.PAUSED
+    scheduled_meta_raw = await redis_client.hget(keys.scheduled_wait_meta, task_id)
+    assert scheduled_meta_raw is not None
+    scheduled_meta = json.loads(scheduled_meta_raw)
+    assert scheduled_meta["kind"] == "activity_timeout"
+    assert scheduled_meta["timeout_kind"] == "cron"
+    assert scheduled_meta["cron"] == "*/5 * * * *"
+    assert scheduled_meta["timezone"] == "UTC"
+
+
+@pytest.mark.asyncio
+async def test_activity_wait_wake_clears_scheduled_timeout_state(
+    redis_client: redis.Redis,
+    test_namespace: str,
+    test_owner_id: str,
+    pickup_script: BatchPickupScript,
+    completion_script: TaskCompletionScript,
+    steering_script: TaskSteeringScript,
+) -> None:
+    agent = _WaitActivityWithTimeoutAgent(timeout=wait.sleep(120.0))
+    keys = RedisKeys.format(namespace=test_namespace, agent=agent.name)
+    task = Task.create(
+        owner_id=test_owner_id,
+        agent=agent.name,
+        payload=AgentContext(query="wake me before timeout"),
+        max_turns=10,
+    )
+    task_id = await enqueue_task(
+        redis_client=redis_client,
+        namespace=test_namespace,
+        agent=agent,
+        task=task,
+    )
+
+    picked = await _pickup_single_task(
+        redis_client=redis_client,
+        keys=keys,
+        pickup_script=pickup_script,
+    )
+    assert picked == [task_id]
+
+    await process_task(
+        redis_client=redis_client,
+        namespace=test_namespace,
+        task_id=task_id,
+        completion_script=completion_script,
+        steering_script=steering_script,
+        agent=agent,
+        agents_by_name={agent.name: agent},
+        max_retries=1,
+        heartbeat_interval=30,
+        task_timeout=60,
+        metrics_retention_duration=3600,
+    )
+
+    await steer_task(
+        redis_client=redis_client,
+        namespace=test_namespace,
+        task_id=task_id,
+        messages=[{"role": "user", "content": "wake now"}],
+    )
+    status = await get_task_status(redis_client, test_namespace, task_id)
+    assert status == TaskStatus.ACTIVE
+    assert await redis_client.hget(keys.activity_wait_meta, task_id) is None
+    assert await redis_client.hget(keys.scheduled_wait_meta, task_id) is None
+    assert await redis_client.zscore(keys.queue_pending, task_id) is None
+    assert await redis_client.zscore(keys.queue_scheduled, task_id) is None
+
+
+@pytest.mark.asyncio
+async def test_activity_wait_sleep_timeout_recovers_via_scheduled_queue(
+    redis_client: redis.Redis,
+    test_namespace: str,
+    test_owner_id: str,
+    pickup_script: BatchPickupScript,
+    completion_script: TaskCompletionScript,
+    steering_script: TaskSteeringScript,
+) -> None:
+    agent = _WaitActivityWithTimeoutAgent(timeout=wait.sleep(0.0))
+    keys = RedisKeys.format(namespace=test_namespace, agent=agent.name)
+    task = Task.create(
+        owner_id=test_owner_id,
+        agent=agent.name,
+        payload=AgentContext(query="timeout immediately"),
+        max_turns=10,
+    )
+    task_id = await enqueue_task(
+        redis_client=redis_client,
+        namespace=test_namespace,
+        agent=agent,
+        task=task,
+    )
+
+    picked = await _pickup_single_task(
+        redis_client=redis_client,
+        keys=keys,
+        pickup_script=pickup_script,
+    )
+    assert picked == [task_id]
+
+    await process_task(
+        redis_client=redis_client,
+        namespace=test_namespace,
+        task_id=task_id,
+        completion_script=completion_script,
+        steering_script=steering_script,
+        agent=agent,
+        agents_by_name={agent.name: agent},
+        max_retries=1,
+        heartbeat_interval=30,
+        task_timeout=60,
+        metrics_retention_duration=3600,
+    )
+
+    scheduled_recovery_script = await create_scheduled_recovery_script(redis_client)
+    recovered_ids = await scheduled_recovery_script.execute(
+        queue_scheduled_key=keys.queue_scheduled,
+        queue_main_key=keys.queue_main,
+        queue_pending_key=keys.queue_pending,
+        queue_orphaned_key=keys.queue_orphaned,
+        task_statuses_key=keys.task_status,
+        task_agents_key=keys.task_agent,
+        task_payloads_key=keys.task_payload,
+        task_pickups_key=keys.task_pickups,
+        task_retries_key=keys.task_retries,
+        task_metas_key=keys.task_meta,
+        scheduled_wait_meta_key=keys.scheduled_wait_meta,
+        activity_wait_meta_key=keys.activity_wait_meta,
+        max_batch_size=10,
+    )
+    assert task_id in recovered_ids
+    assert (
+        await get_task_status(redis_client, test_namespace, task_id)
+        == TaskStatus.ACTIVE
+    )
+    assert await redis_client.hget(keys.activity_wait_meta, task_id) is None
+    assert await redis_client.hget(keys.scheduled_wait_meta, task_id) is None
+    assert await redis_client.zscore(keys.queue_pending, task_id) is None
+    queued_ids = await redis_client.lrange(keys.queue_main, 0, -1)
+    assert task_id in queued_ids
 
 
 @pytest.mark.asyncio

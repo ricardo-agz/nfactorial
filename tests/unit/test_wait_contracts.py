@@ -96,6 +96,32 @@ def test_wait_namespace_builders_return_serializable_instructions() -> None:
     assert jobs_wait.data == "waiting for child tasks"
 
 
+def test_wait_activity_timeout_sleep_builder() -> None:
+    instruction = wait.activity(timeout=wait.sleep(12.0), data="awaiting input")
+    assert instruction.kind == "activity"
+    assert instruction.data == "awaiting input"
+    assert instruction.activity_timeout_kind == "sleep"
+    assert instruction.activity_timeout_s == 12.0
+    assert instruction.activity_timeout_cron is None
+
+
+def test_wait_activity_timeout_cron_builder() -> None:
+    instruction = wait.activity(
+        timeout=wait.cron("*/5 * * * *", timezone="UTC"),
+        data={"mode": "tick"},
+    )
+    assert instruction.kind == "activity"
+    assert instruction.data == {"mode": "tick"}
+    assert instruction.activity_timeout_kind == "cron"
+    assert instruction.activity_timeout_cron == "*/5 * * * *"
+    assert instruction.activity_timeout_timezone == "UTC"
+
+
+def test_wait_activity_timeout_rejects_non_scheduled_waits() -> None:
+    with pytest.raises(ValueError, match="only supports wait.sleep"):
+        wait.activity(timeout=wait.activity())
+
+
 def test_wait_jobs_rejects_empty_job_list() -> None:
     with pytest.raises(ValueError, match="at least one job reference"):
         wait.jobs([])

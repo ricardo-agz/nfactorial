@@ -1,10 +1,7 @@
 from __future__ import annotations
 
-import os
 import time
 from typing import TYPE_CHECKING, Any
-
-from fastapi import FastAPI, Request
 
 from factorial.engine import WorkerTickContext, worker_tick
 from factorial.logging import get_logger
@@ -33,18 +30,9 @@ def create_worker(
     workers_runtime = _resolve_vercel_workers_runtime()
 
     if workers_runtime is None:
-        if os.getenv("VERCEL") == "1":
-            raise RuntimeError(
-                "`vercel-workers` is required on Vercel deployments for "
-                "queue worker callbacks."
-            )
-        logger.warning(
-            "`vercel-workers` is not installed. "
-            "Falling back to a plain HTTP worker callback app."
-        )
-        return _build_fallback_worker_app(
-            orchestrator=orchestrator,
-            settings=settings,
+        raise RuntimeError(
+            "Vercel runtime requires `vercel-workers`. "
+            "Install with `pip install \"nfactorial[vercel]\"`."
         )
 
     subscribe, get_asgi_app = workers_runtime
@@ -127,11 +115,18 @@ async def _run_worker_invocation(
 ) -> dict[str, Any]:
     runners = _select_runners(orchestrator, agent_name=agent_name)
     if not runners:
-        return {"processed_tasks": 0, "picked_tasks": 0, "runners": 0}
+        return {
+            "processed_tasks": 0,
+            "picked_tasks": 0,
+            "cancelled_tasks": 0,
+            "failed_tasks": 0,
+            "runners": 0,
+        }
 
     total_processed = 0
     total_picked = 0
     total_cancelled = 0
+    total_failed = 0
     deadline = time.monotonic() + settings.worker_budget_s
     max_passes = max(1, settings.worker_max_batches)
     passes = 0
@@ -167,6 +162,7 @@ async def _run_worker_invocation(
                 total_processed += tick_result.processed_tasks
                 total_picked += tick_result.picked_tasks
                 total_cancelled += tick_result.cancelled_tasks_processed
+                total_failed += tick_result.failed_tasks
                 if (
                     tick_result.picked_tasks > 0
                     or tick_result.cancelled_tasks_processed > 0
@@ -193,6 +189,7 @@ async def _run_worker_invocation(
         "processed_tasks": total_processed,
         "picked_tasks": total_picked,
         "cancelled_tasks": total_cancelled,
+        "failed_tasks": total_failed,
         "runners": len(runners),
         "passes": passes,
         "backlogged_agents": backlogged_agents,
@@ -248,25 +245,3 @@ def _resolve_vercel_workers_runtime():
             return subscribe, get_asgi_app
         except Exception:
             return None
-
-
-def _build_fallback_worker_app(
-    *, orchestrator: Orchestrator, settings: VercelRuntimeSettings
-) -> FastAPI:
-    app = FastAPI(title="factorial-vercel-worker-fallback")
-
-    @app.get("/")
-    async def health() -> dict[str, Any]:
-        return {"ok": True, "service": "worker"}
-
-    @app.post("/")
-    async def callback(request: Request) -> dict[str, Any]:
-        payload = await request.json()
-        return await _handle_queue_payload(
-            orchestrator=orchestrator,
-            settings=settings,
-            payload=payload,
-            metadata={},
-        )
-
-    return app

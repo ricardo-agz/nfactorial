@@ -28,6 +28,8 @@ local queue_pending_key_template = KEYS[15]
 local queue_main_key_template = KEYS[16]
 local task_steering_key_template = KEYS[17]
 local message_seq_key = KEYS[18]
+local queue_scheduled_key_template = KEYS[19]
+local scheduled_wait_meta_key = KEYS[20]
 
 local batch_size = tonumber(ARGV[1])
 local metrics_ttl = tonumber(ARGV[2])
@@ -96,6 +98,8 @@ for i = 1, attempts do
                             activity_wait_meta_key,
                             task_steering_key_template,
                             message_seq_key,
+                            queue_scheduled_key_template,
+                            scheduled_wait_meta_key,
                         },
                         {
                             parent_task_id,

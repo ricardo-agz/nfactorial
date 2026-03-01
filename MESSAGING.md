@@ -79,6 +79,27 @@ await group.add_members(more_jobs)
 await messaging.send(to_task_id, "you own synthesis")
 ```
 
+## Human Messaging (Control Plane)
+
+Human-originated messaging now has explicit control-plane endpoints:
+
+- `POST /api/tasks/{task_id}/message`
+  - body: `{ "owner_id": "...", "content": "...", "metadata": {...} }`
+- `POST /api/groups/message`
+  - body supports one of:
+    - `{ "owner_id": "...", "content": "...", "group_id": "..." }`
+    - `{ "owner_id": "...", "content": "...", "task_id": "...", "group_name": "..." }`
+    - `{ "owner_id": "...", "content": "...", "team_id": "...", "group_name": "..." }`
+
+Delivery uses the same steering and activity-wake path as agent messaging, and
+returns the same delivery receipt shape (`delivered_task_ids`,
+`skipped_inactive_task_ids`, `failed_task_ids`) plus thread metadata.
+
+`group_id` is a deterministic encoded identifier:
+
+- format: `grp1.<base64url({"team_id":"...","group_name":"..."})>`
+- canonicalized from `(team_id, group_name)` to avoid ambiguous global names
+
 ## Design Decisions
 
 - No mode strings (`mode="create"` / `mode="require"`). Use explicit methods.

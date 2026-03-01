@@ -165,6 +165,7 @@ async def process_task(
         queue_scripts=queue_scripts,
         wait_schedule_script=wait_schedule_script,
         activity_wait_script=activity_wait_script,
+        metrics_retention_duration=metrics_retention_duration,
     )
 
     task_failed = False
@@ -187,6 +188,8 @@ async def process_task(
                 subagents=SubagentsExecutionNamespace(
                     enqueue_callback=runtime.enqueue_child_task,
                     enqueue_batch_callback=runtime.enqueue_batch,
+                    cancel_callback=runtime.cancel_child_task,
+                    cancel_many_callback=runtime.cancel_child_tasks,
                 ),
                 hooks=HooksExecutionNamespace(
                     persist_runtime_callback=runtime.persist_hook_runtime
@@ -199,6 +202,8 @@ async def process_task(
                         list_callback=runtime.messaging_list_groups,
                         find_callback=runtime.messaging_find_groups,
                         add_members_callback=runtime.messaging_add_group_members,
+                        remove_members_callback=runtime.messaging_remove_group_members,
+                        leave_callback=runtime.messaging_leave_group,
                         send_callback=runtime.messaging_send_group,
                     ),
                 ),

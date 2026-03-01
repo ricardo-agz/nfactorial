@@ -237,6 +237,7 @@ async def recover_scheduled_tasks(
         recovered_task_ids = await scheduled_recovery_script.execute(
             queue_scheduled_key=keys.queue_scheduled,
             queue_main_key=keys.queue_main,
+            queue_pending_key=keys.queue_pending,
             queue_orphaned_key=keys.queue_orphaned,
             task_statuses_key=keys.task_status,
             task_agents_key=keys.task_agent,
@@ -245,6 +246,7 @@ async def recover_scheduled_tasks(
             task_retries_key=keys.task_retries,
             task_metas_key=keys.task_meta,
             scheduled_wait_meta_key=keys.scheduled_wait_meta,
+            activity_wait_meta_key=keys.activity_wait_meta,
             max_batch_size=batch_size,
         )
         return len(recovered_task_ids)

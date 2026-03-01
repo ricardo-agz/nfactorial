@@ -166,13 +166,81 @@ async def handle_wait_state(
 
     if wait_kind == "activity":
         wait_data: Any = None
+        timeout_candidates: list[tuple[float, str, str | None, str | None]] = []
         for _, wait_instruction in wait_instructions:
             if wait_data is None and wait_instruction.data is not None:
                 wait_data = wait_instruction.data
+            timeout_kind = wait_instruction.activity_timeout_kind
+            if timeout_kind is None:
+                continue
+
+            if timeout_kind == "sleep":
+                timeout_s = wait_instruction.activity_timeout_s
+                if timeout_s is None:
+                    raise ValueError(
+                        "wait.activity(timeout=wait.sleep(...)) requires "
+                        "a sleep duration."
+                    )
+                if timeout_s < 0:
+                    raise ValueError(
+                        "wait.activity(timeout=wait.sleep(...)) requires "
+                        "a non-negative duration."
+                    )
+                timeout_candidates.append(
+                    (time.time() + timeout_s, "sleep", None, None)
+                )
+            elif timeout_kind == "cron":
+                cron_expression = wait_instruction.activity_timeout_cron
+                if not cron_expression:
+                    raise ValueError(
+                        "wait.activity(timeout=wait.cron(...)) requires a "
+                        "non-empty cron expression."
+                    )
+                cron_timezone = wait_instruction.activity_timeout_timezone or "UTC"
+                timeout_candidates.append(
+                    (
+                        next_cron_wake_timestamp(cron_expression, cron_timezone),
+                        "cron",
+                        cron_expression,
+                        cron_timezone,
+                    )
+                )
+            else:
+                raise ValueError(
+                    "wait.activity timeout kind must be 'sleep' or 'cron'."
+                )
+
+        timeout_wake_timestamp: float | None = None
+        timeout_kind: str | None = None
+        timeout_cron_expression: str | None = None
+        timeout_cron_timezone: str | None = None
+        if timeout_candidates:
+            (
+                timeout_wake_timestamp,
+                timeout_kind,
+                timeout_cron_expression,
+                timeout_cron_timezone,
+            ) = min(timeout_candidates, key=lambda item: item[0])
+
         await park_activity_wait(
             source_tool_call_ids=source_tool_call_ids,
             data=wait_data,
+            timeout_wake_timestamp=timeout_wake_timestamp,
+            timeout_kind=timeout_kind,
+            timeout_cron_expression=timeout_cron_expression,
+            timeout_cron_timezone=timeout_cron_timezone,
         )
+        event_data: dict[str, Any] = {
+            "wait_kind": "activity",
+            "source_tool_call_ids": source_tool_call_ids,
+        }
+        if timeout_wake_timestamp is not None:
+            event_data["timeout_kind"] = timeout_kind
+            event_data["wake_timestamp"] = timeout_wake_timestamp
+            if timeout_cron_expression is not None:
+                event_data["timeout_cron"] = timeout_cron_expression
+            if timeout_cron_timezone is not None:
+                event_data["timeout_timezone"] = timeout_cron_timezone
         await event_publisher.publish_event(
             AgentEvent(
                 event_type="task_activity_waiting",
@@ -180,10 +248,7 @@ async def handle_wait_state(
                 owner_id=task.metadata.owner_id,
                 agent_name=agent.name,
                 turn=task.payload.turn,
-                data={
-                    "wait_kind": "activity",
-                    "source_tool_call_ids": source_tool_call_ids,
-                },
+                data=event_data,
             )
         )
         return True

@@ -33,8 +33,9 @@ local pending_child_wait_ids_key = KEYS[18]
 local activity_wait_meta_key = KEYS[19]
 local queue_main_key_template = KEYS[20]
 local queue_pending_key_template = KEYS[21]
-local task_steering_key_template = KEYS[22]
-local message_seq_key = KEYS[23]
+local queue_scheduled_key_template = KEYS[22]
+local task_steering_key_template = KEYS[23]
+local message_seq_key = KEYS[24]
 
 local task_id = ARGV[1]
 local metrics_ttl = tonumber(ARGV[2])
@@ -96,6 +97,8 @@ local function wake_parent_if_waiting_activity()
             activity_wait_meta_key,
             task_steering_key_template,
             message_seq_key,
+            queue_scheduled_key_template,
+            scheduled_wait_meta_key,
         },
         {
             parent_task_id,

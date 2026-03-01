@@ -3,10 +3,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Literal
 
-from factorial.contracts import VercelQueueWakeDispatch, WakeDispatch
+from factorial.contracts import WakeDispatch
 from factorial.logging import get_logger
 
 from .settings import VercelRuntimeSettings
+from .wake_dispatch import VercelQueueWakeDispatch
 
 logger = get_logger(__name__)
 

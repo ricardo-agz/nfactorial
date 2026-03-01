@@ -113,6 +113,17 @@ class MessagingGroupHandle:
             _coerce_member_task_ids(members),
         )
 
+    async def remove_members(self, members: list[Any]) -> list[str]:
+        ctx = _current_execution_context()
+        return await ctx.messaging.groups.remove_members(
+            self.name,
+            _coerce_member_task_ids(members),
+        )
+
+    async def leave(self) -> bool:
+        ctx = _current_execution_context()
+        return await ctx.messaging.groups.leave(self.name)
+
 
 class MessagingGroupsNamespace:
     """Namespace for team-scoped messaging group operations."""
@@ -189,6 +200,19 @@ class MessagingGroupsNamespace:
             _normalize_group_name(group_name),
             _coerce_member_task_ids(members),
         )
+
+    async def remove_members(
+        self, group_name: str, members: builtins.list[Any]
+    ) -> builtins.list[str]:
+        ctx = _current_execution_context()
+        return await ctx.messaging.groups.remove_members(
+            _normalize_group_name(group_name),
+            _coerce_member_task_ids(members),
+        )
+
+    async def leave(self, group_name: str) -> bool:
+        ctx = _current_execution_context()
+        return await ctx.messaging.groups.leave(_normalize_group_name(group_name))
 
 
 class MessagingNamespace:

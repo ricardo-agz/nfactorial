@@ -1,3 +1,4 @@
+from factorial.engine.maintenance_loop import maintenance_loop
 from factorial.engine.maintenance_tick import (
     MaintenanceTickContext,
     MaintenanceTickResult,
@@ -16,4 +17,5 @@ __all__ = [
     "MaintenanceTickContext",
     "MaintenanceTickResult",
     "maintenance_tick",
+    "maintenance_loop",
 ]

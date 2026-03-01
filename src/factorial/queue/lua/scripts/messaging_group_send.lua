@@ -17,7 +17,8 @@ local thread_history_key = KEYS[6]
 local global_history_key = KEYS[7]
 local message_seq_key = KEYS[8]
 local activity_wait_meta_key = KEYS[9]
-local team_tasks_key = KEYS[10]
+local scheduled_wait_meta_key = KEYS[10]
+local team_tasks_key = KEYS[11]
 
 local sender_task_id = ARGV[1]
 local team_id = ARGV[2]
@@ -28,7 +29,8 @@ local steering_key_template = ARGV[6]
 local history_maxlen = tonumber(ARGV[7]) or 0
 local queue_main_key_template = ARGV[8]
 local queue_pending_key_template = ARGV[9]
-local groups_by_task_key_template = ARGV[10]
+local queue_scheduled_key_template = ARGV[10]
+local groups_by_task_key_template = ARGV[11]
 
 local function steering_key(task_id)
     return string.gsub(steering_key_template, "{task_id}", task_id)
@@ -40,6 +42,10 @@ end
 
 local function queue_pending_key(agent_name)
     return string.gsub(queue_pending_key_template, "{agent}", agent_name)
+end
+
+local function queue_scheduled_key(agent_name)
+    return string.gsub(queue_scheduled_key_template, "{agent}", agent_name)
 end
 
 local function groups_by_task_key(task_id)
@@ -160,7 +166,13 @@ for _, member_task_id in ipairs(members) do
                 if member_agent then
                     redis.call("HSET", task_statuses_key, member_task_id, "active")
                     redis.call("HDEL", activity_wait_meta_key, member_task_id)
+                    if scheduled_wait_meta_key and scheduled_wait_meta_key ~= "" then
+                        redis.call("HDEL", scheduled_wait_meta_key, member_task_id)
+                    end
                     redis.call("ZREM", queue_pending_key(member_agent), member_task_id)
+                    if queue_scheduled_key_template and queue_scheduled_key_template ~= "" then
+                        redis.call("ZREM", queue_scheduled_key(member_agent), member_task_id)
+                    end
                     redis.call("LPUSH", queue_main_key(member_agent), member_task_id)
                 end
             end

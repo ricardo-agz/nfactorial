@@ -366,6 +366,9 @@ async def test_spawn_uses_batch_enqueue_with_deterministic_ids() -> None:
 
 @pytest.mark.asyncio
 async def test_execution_context_subagents_namespace_routes_callbacks() -> None:
+    cancelled_task_ids: list[str] = []
+    cancelled_task_batches: list[list[str]] = []
+
     async def _enqueue_child_task(
         _agent: Any,
         _payload: Any,
@@ -381,6 +384,12 @@ async def test_execution_context_subagents_namespace_routes_callbacks() -> None:
     ) -> Any:
         return SimpleNamespace(task_ids=task_ids or [])
 
+    async def _cancel_child(task_id: str) -> None:
+        cancelled_task_ids.append(task_id)
+
+    async def _cancel_children(task_ids: list[str]) -> None:
+        cancelled_task_batches.append(list(task_ids))
+
     ctx = ExecutionContext(
         task_id="parent-1",
         owner_id="owner-1",
@@ -390,6 +399,8 @@ async def test_execution_context_subagents_namespace_routes_callbacks() -> None:
         subagents=SubagentsExecutionNamespace(
             enqueue_callback=_enqueue_child_task,
             enqueue_batch_callback=_enqueue_batch,
+            cancel_callback=_cancel_child,
+            cancel_many_callback=_cancel_children,
         ),
     )
 
@@ -404,7 +415,138 @@ async def test_execution_context_subagents_namespace_routes_callbacks() -> None:
         task_ids=["child-1", "child-2"],
         batch_id="batch-1",
     )
+    await ctx.subagents.cancel("child-3")
+    await ctx.subagents.cancel_many(["child-3", "child-4", "child-3"])
 
     assert child_task_id == "child-1"
     assert batch.task_ids == ["child-1", "child-2"]
+    assert cancelled_task_ids == ["child-3"]
+    assert cancelled_task_batches == [["child-3", "child-4"]]
+
+
+@pytest.mark.asyncio
+async def test_subagents_cancel_routes_to_execution_context_callback() -> None:
+    cancelled_task_ids: list[str] = []
+
+    async def _cancel_child(task_id: str) -> None:
+        cancelled_task_ids.append(task_id)
+
+    ctx = ExecutionContext(
+        task_id="parent-1",
+        owner_id="owner-1",
+        retries=0,
+        iterations=0,
+        events=cast(EventPublisher, _NoopEvents()),
+        subagents=SubagentsExecutionNamespace(cancel_callback=_cancel_child),
+    )
+    token = execution_context.set(ctx)
+    try:
+        cancelled = await subagents.cancel("child-1")
+    finally:
+        execution_context.reset(token)
+
+    assert cancelled == "child-1"
+    assert cancelled_task_ids == ["child-1"]
+
+
+@pytest.mark.asyncio
+async def test_subagents_cancel_accepts_job_ref_like_target() -> None:
+    cancelled_task_ids: list[str] = []
+
+    async def _cancel_child(task_id: str) -> None:
+        cancelled_task_ids.append(task_id)
+
+    ctx = ExecutionContext(
+        task_id="parent-1",
+        owner_id="owner-1",
+        retries=0,
+        iterations=0,
+        events=cast(EventPublisher, _NoopEvents()),
+        subagents=SubagentsExecutionNamespace(cancel_callback=_cancel_child),
+    )
+    token = execution_context.set(ctx)
+    try:
+        await subagents.cancel(
+            JobRef(
+                task_id="child-2",
+                agent_name="child-agent",
+                parent_task_id="parent-1",
+            )
+        )
+    finally:
+        execution_context.reset(token)
+
+    assert cancelled_task_ids == ["child-2"]
+
+
+@pytest.mark.asyncio
+async def test_subagents_cancel_accepts_list_and_uses_batch_callback() -> None:
+    cancelled_task_batches: list[list[str]] = []
+
+    async def _cancel_children(task_ids: list[str]) -> None:
+        cancelled_task_batches.append(list(task_ids))
+
+    ctx = ExecutionContext(
+        task_id="parent-1",
+        owner_id="owner-1",
+        retries=0,
+        iterations=0,
+        events=cast(EventPublisher, _NoopEvents()),
+        subagents=SubagentsExecutionNamespace(cancel_many_callback=_cancel_children),
+    )
+    token = execution_context.set(ctx)
+    try:
+        cancelled = await subagents.cancel(
+            [
+                "child-1",
+                JobRef(
+                    task_id="child-2",
+                    agent_name="child-agent",
+                    parent_task_id="parent-1",
+                ),
+                {"task_id": "child-1"},
+            ]
+        )
+    finally:
+        execution_context.reset(token)
+
+    assert cancelled == ["child-1", "child-2"]
+    assert cancelled_task_batches == [["child-1", "child-2"]]
+
+
+@pytest.mark.asyncio
+async def test_subagents_cancel_returns_empty_list_for_empty_targets() -> None:
+    ctx = ExecutionContext(
+        task_id="parent-1",
+        owner_id="owner-1",
+        retries=0,
+        iterations=0,
+        events=cast(EventPublisher, _NoopEvents()),
+    )
+    token = execution_context.set(ctx)
+    try:
+        cancelled = await subagents.cancel([])
+    finally:
+        execution_context.reset(token)
+
+    assert cancelled == []
+
+
+@pytest.mark.asyncio
+async def test_subagents_cancel_rejects_invalid_target() -> None:
+    ctx = ExecutionContext(
+        task_id="parent-1",
+        owner_id="owner-1",
+        retries=0,
+        iterations=0,
+        events=cast(EventPublisher, _NoopEvents()),
+    )
+    token = execution_context.set(ctx)
+    try:
+        with pytest.raises(TypeError, match="expects a task_id string"):
+            await subagents.cancel(object())
+        with pytest.raises(TypeError, match="expects a task_id string"):
+            await subagents.cancel(["child-1", object()])
+    finally:
+        execution_context.reset(token)
 

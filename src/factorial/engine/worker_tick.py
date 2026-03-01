@@ -33,6 +33,7 @@ class WorkerTickResult:
     processed_tasks: int = 0
     picked_tasks: int = 0
     cancelled_tasks_processed: int = 0
+    failed_tasks: int = 0
     remaining_backlog_estimate: int | None = None
     touched_agents: list[str] = field(default_factory=list)
     duration_ms: int = 0
@@ -133,8 +134,7 @@ async def worker_tick(
 
         if tasks_to_process_ids:
             result.picked_tasks += len(tasks_to_process_ids)
-        if tasks_to_cancel_ids:
-            result.cancelled_tasks_processed += len(tasks_to_cancel_ids)
+        cancellations_requested = len(tasks_to_cancel_ids)
 
         cancellation_task: asyncio.Task[Any] | None = None
         if tasks_to_cancel_ids:
@@ -169,10 +169,42 @@ async def worker_tick(
         ]
 
         all_tasks = current_tasks + ([cancellation_task] if cancellation_task else [])
+        gathered_results: list[Any] = []
         if all_tasks:
-            await asyncio.gather(*all_tasks, return_exceptions=True)
+            gathered_results = list(
+                await asyncio.gather(*all_tasks, return_exceptions=True)
+            )
 
-        result.processed_tasks += len(tasks_to_process_ids)
+        process_results = gathered_results[: len(current_tasks)]
+        successful_tasks = 0
+        for task_id, process_result in zip(
+            tasks_to_process_ids,
+            process_results,
+            strict=True,
+        ):
+            if isinstance(process_result, BaseException):
+                result.failed_tasks += 1
+                logger.error(
+                    "Worker tick task execution failed for agent=%s task_id=%s",
+                    context.agent.name,
+                    task_id,
+                    exc_info=process_result,
+                )
+            else:
+                successful_tasks += 1
+        result.processed_tasks += successful_tasks
+
+        if cancellation_task is not None:
+            cancellation_result = gathered_results[-1]
+            if isinstance(cancellation_result, BaseException):
+                logger.error(
+                    "Worker tick cancellation processing failed for agent=%s",
+                    context.agent.name,
+                    exc_info=cancellation_result,
+                )
+            else:
+                result.cancelled_tasks_processed += cancellations_requested
+
         batch_count += 1
 
     result.remaining_backlog_estimate = await _estimate_backlog(context)

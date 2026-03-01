@@ -1,4 +1,4 @@
-from factorial.queue.maintenance import maintenance_loop
+from factorial.engine import maintenance_loop
 from factorial.queue.operations import (
     cancel_task,
     create_batch_and_enqueue,
@@ -8,8 +8,12 @@ from factorial.queue.operations import (
     messaging_groups_create,
     messaging_groups_find,
     messaging_groups_get,
+    messaging_groups_leave,
     messaging_groups_list,
+    messaging_groups_remove_members,
     messaging_groups_send,
+    messaging_human_send_direct,
+    messaging_human_send_group,
     messaging_send_direct,
     register_pending_hook,
     resolve_hook,
@@ -43,8 +47,12 @@ __all__ = [
     "messaging_groups_list",
     "messaging_groups_find",
     "messaging_groups_add_members",
+    "messaging_groups_remove_members",
+    "messaging_groups_leave",
     "messaging_groups_send",
     "messaging_send_direct",
+    "messaging_human_send_direct",
+    "messaging_human_send_group",
     "register_pending_hook",
     "resolve_hook",
     "rotate_hook_token",

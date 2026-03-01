@@ -197,6 +197,7 @@ class ScheduledRecoveryScript(AsyncScript):
         key_fields=(
             "queue_scheduled_key",
             "queue_main_key",
+            "queue_pending_key",
             "queue_orphaned_key",
             "task_statuses_key",
             "task_agents_key",
@@ -205,6 +206,7 @@ class ScheduledRecoveryScript(AsyncScript):
             "task_retries_key",
             "task_metas_key",
             "scheduled_wait_meta_key",
+            "activity_wait_meta_key",
         ),
         arg_fields=("max_batch_size",),
     )
@@ -214,6 +216,7 @@ class ScheduledRecoveryScript(AsyncScript):
         *,
         queue_scheduled_key: str,
         queue_main_key: str,
+        queue_pending_key: str,
         queue_orphaned_key: str,
         task_statuses_key: str,
         task_agents_key: str,
@@ -222,6 +225,7 @@ class ScheduledRecoveryScript(AsyncScript):
         task_retries_key: str,
         task_metas_key: str,
         scheduled_wait_meta_key: str,
+        activity_wait_meta_key: str,
         max_batch_size: int,
     ) -> list[str]:
         result: list[str | bytes] = await _execute_contract(

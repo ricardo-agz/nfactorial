@@ -1,3 +1,4 @@
+import asyncio
 import json
 from dataclasses import dataclass
 from typing import Any, cast
@@ -14,19 +15,28 @@ from factorial.queue.lua import (
     WaitScheduleScript,
 )
 from factorial.queue.operations import (
+    cancel_task,
     create_batch_and_enqueue,
     enqueue_task,
     messaging_groups_add_members,
     messaging_groups_create,
     messaging_groups_find,
     messaging_groups_get,
+    messaging_groups_leave,
     messaging_groups_list,
+    messaging_groups_remove_members,
     messaging_groups_send,
     messaging_send_direct,
     persist_hook_runtime_payload,
     resume_if_no_remaining_child_tasks,
 )
-from factorial.queue.task import Batch, Task, get_batch_data
+from factorial.queue.task import (
+    Batch,
+    Task,
+    effective_team_id,
+    get_batch_data,
+    get_task_data,
+)
 
 from .common import CompletionAction, logger
 
@@ -45,6 +55,7 @@ class TaskRuntimeOps:
     queue_scripts: QueueScripts
     wait_schedule_script: WaitScheduleScript
     activity_wait_script: ActivityWaitScript
+    metrics_retention_duration: int
 
     async def complete(
         self,
@@ -135,17 +146,51 @@ class TaskRuntimeOps:
         *,
         source_tool_call_ids: list[str],
         data: Any = None,
+        timeout_wake_timestamp: float | None = None,
+        timeout_kind: str | None = None,
+        timeout_cron_expression: str | None = None,
+        timeout_cron_timezone: str | None = None,
     ) -> None:
         steering_key_template = RedisKeys.format(
             namespace=self.namespace,
             task_id="{task_id}",
         ).task_steering
-        wait_metadata = {
+        queue_templates = RedisKeys.format(
+            namespace=self.namespace,
+            agent="{agent}",
+        )
+        wait_metadata: dict[str, Any] = {
             "kind": "activity",
             "source_tool_call_ids": source_tool_call_ids,
         }
         if data is not None:
             wait_metadata["data"] = serialize_data(data)
+        scheduled_wait_metadata_json: str | None = None
+        if timeout_wake_timestamp is not None:
+            timeout_metadata: dict[str, Any] = {
+                "kind": timeout_kind,
+                "wake_timestamp": timeout_wake_timestamp,
+            }
+            if timeout_cron_expression is not None:
+                timeout_metadata["cron"] = timeout_cron_expression
+            if timeout_cron_timezone is not None:
+                timeout_metadata["timezone"] = timeout_cron_timezone
+            wait_metadata["timeout"] = timeout_metadata
+
+            scheduled_wait_metadata: dict[str, Any] = {
+                "kind": "activity_timeout",
+                "wake_timestamp": timeout_wake_timestamp,
+                "source_tool_call_ids": source_tool_call_ids,
+                "timeout_kind": timeout_kind,
+            }
+            if timeout_cron_expression is not None:
+                scheduled_wait_metadata["cron"] = timeout_cron_expression
+            if timeout_cron_timezone is not None:
+                scheduled_wait_metadata["timezone"] = timeout_cron_timezone
+            if data is not None:
+                scheduled_wait_metadata["data"] = serialize_data(data)
+            scheduled_wait_metadata_json = json.dumps(scheduled_wait_metadata)
+
         wait_result = await self.activity_wait_script.execute(
             queue_pending_key=self.keys.queue_pending,
             queue_orphaned_key=self.keys.queue_orphaned,
@@ -163,14 +208,12 @@ class TaskRuntimeOps:
             wait_metadata_json=json.dumps(wait_metadata),
             task_steering_key_template=steering_key_template,
             task_children_key_template=self.keys.task_children("{parent_task_id}"),
-            queue_main_key_template=RedisKeys.format(
-                namespace=self.namespace,
-                agent="{agent}",
-            ).queue_main,
-            queue_pending_key_template=RedisKeys.format(
-                namespace=self.namespace,
-                agent="{agent}",
-            ).queue_pending,
+            queue_main_key_template=queue_templates.queue_main,
+            queue_pending_key_template=queue_templates.queue_pending,
+            queue_scheduled_key_template=queue_templates.queue_scheduled,
+            scheduled_wait_meta_key=self.keys.scheduled_wait_meta,
+            timeout_wake_timestamp=timeout_wake_timestamp,
+            scheduled_wait_metadata_json=scheduled_wait_metadata_json,
         )
         if not wait_result.success:
             raise RuntimeError(
@@ -310,6 +353,72 @@ class TaskRuntimeOps:
             batch_id=batch_id,
         )
 
+    async def cancel_child_task(self, child_task_id: str) -> None:
+        await self._validate_child_cancellation_scope(child_task_id)
+        await cancel_task(
+            redis_client=self.redis_client,
+            namespace=self.namespace,
+            task_id=child_task_id,
+            agents_by_name=self.agents_by_name,
+            metrics_retention_duration=self.metrics_retention_duration,
+        )
+
+    async def cancel_child_tasks(self, child_task_ids: list[str]) -> None:
+        if not child_task_ids:
+            return
+        deduped_child_task_ids = list(dict.fromkeys(child_task_ids))
+        for child_task_id in deduped_child_task_ids:
+            await self._validate_child_cancellation_scope(child_task_id)
+
+        await asyncio.gather(
+            *[
+                cancel_task(
+                    redis_client=self.redis_client,
+                    namespace=self.namespace,
+                    task_id=child_task_id,
+                    agents_by_name=self.agents_by_name,
+                    metrics_retention_duration=self.metrics_retention_duration,
+                )
+                for child_task_id in deduped_child_task_ids
+            ]
+        )
+
+    async def _validate_child_cancellation_scope(self, child_task_id: str) -> None:
+        if not isinstance(child_task_id, str) or not child_task_id:
+            raise ValueError("subagents.cancel requires a non-empty task_id")
+
+        child_task_data = await get_task_data(
+            self.redis_client,
+            self.namespace,
+            child_task_id,
+        )
+        child_metadata = cast(dict[str, Any], child_task_data["metadata"])
+        child_owner_id = child_metadata.get("owner_id")
+        if (
+            not isinstance(child_owner_id, str)
+            or child_owner_id != self.task.metadata.owner_id
+        ):
+            raise PermissionError(
+                "subagents.cancel can only cancel child tasks in the same owner scope"
+            )
+
+        child_parent_id = child_metadata.get("parent_id")
+        if child_parent_id != self.task.id:
+            raise PermissionError(
+                "subagents.cancel can only cancel direct child tasks "
+                "of the current task"
+            )
+
+        parent_team_id = self.task.metadata.team_id or self.task.id
+        child_team_id = effective_team_id(
+            task_id=child_task_id,
+            metadata=child_metadata,
+        )
+        if child_team_id != parent_team_id:
+            raise PermissionError(
+                "subagents.cancel can only cancel child tasks in the same team scope"
+            )
+
     async def publish_batch_progress(self, batch_id: str) -> None:
         batch = await get_batch_data(self.redis_client, self.namespace, batch_id)
         if not batch or batch.metadata.status != "active":
@@ -383,6 +492,27 @@ class TaskRuntimeOps:
             sender_task_id=self.task.id,
             group_name=group_name,
             member_task_ids=member_task_ids,
+        )
+
+    async def messaging_remove_group_members(
+        self,
+        group_name: str,
+        member_task_ids: list[str],
+    ) -> list[str]:
+        return await messaging_groups_remove_members(
+            redis_client=self.redis_client,
+            namespace=self.namespace,
+            sender_task_id=self.task.id,
+            group_name=group_name,
+            member_task_ids=member_task_ids,
+        )
+
+    async def messaging_leave_group(self, group_name: str) -> bool:
+        return await messaging_groups_leave(
+            redis_client=self.redis_client,
+            namespace=self.namespace,
+            sender_task_id=self.task.id,
+            group_name=group_name,
         )
 
     async def messaging_send_group(

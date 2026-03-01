@@ -11,14 +11,16 @@
 ]]--
 local queue_scheduled_key = KEYS[1]
 local queue_main_key = KEYS[2]
-local queue_orphaned_key = KEYS[3]
-local task_statuses_key = KEYS[4]
-local task_agents_key = KEYS[5]
-local task_payloads_key = KEYS[6]
-local task_pickups_key = KEYS[7]
-local task_retries_key = KEYS[8]
-local task_metas_key = KEYS[9]
-local scheduled_wait_meta_key = KEYS[10]
+local queue_pending_key = KEYS[3]
+local queue_orphaned_key = KEYS[4]
+local task_statuses_key = KEYS[5]
+local task_agents_key = KEYS[6]
+local task_payloads_key = KEYS[7]
+local task_pickups_key = KEYS[8]
+local task_retries_key = KEYS[9]
+local task_metas_key = KEYS[10]
+local scheduled_wait_meta_key = KEYS[11]
+local activity_wait_meta_key = KEYS[12]
 
 local max_batch_size = tonumber(ARGV[1])
 
@@ -54,6 +56,11 @@ for i = 1, #ready_task_ids do
 
     if task_result.state == "ok" then
         if task_result.status == "paused" then
+            -- Timeout fired while task was in activity wait: clear activity markers.
+            if redis.call('HEXISTS', activity_wait_meta_key, task_id) == 1 then
+                redis.call('HDEL', activity_wait_meta_key, task_id)
+                redis.call('ZREM', queue_pending_key, task_id)
+            end
             table.insert(recovered_task_ids, task_id)
         end
     elseif task_result.state == "missing" then

@@ -22,7 +22,11 @@ def test_orchestrator_forces_vercel_mode_when_vercel_env_present(
 ) -> None:
     monkeypatch.setenv("VERCEL", "1")
     monkeypatch.delenv("NFACTORIAL_WAKE_TRANSPORT", raising=False)
-    monkeypatch.setattr(orchestrator_module, "_vercel_workers_available", lambda: True)
+    monkeypatch.setattr(
+        orchestrator_module,
+        "_build_wake_dispatch",
+        lambda **_: orchestrator_module.NoopWakeDispatch(),
+    )
 
     orchestrator = Orchestrator(runtime_mode="process")
     assert orchestrator.runtime_mode == "vercel"
@@ -45,7 +49,11 @@ def test_orchestrator_requires_vercel_workers_when_running_on_vercel(
 ) -> None:
     monkeypatch.setenv("VERCEL", "1")
     monkeypatch.delenv("NFACTORIAL_WAKE_TRANSPORT", raising=False)
-    monkeypatch.setattr(orchestrator_module, "_vercel_workers_available", lambda: False)
+    monkeypatch.setattr(
+        orchestrator_module,
+        "_build_wake_dispatch",
+        lambda **_: (_ for _ in ()).throw(RuntimeError("vercel-workers")),
+    )
 
     with pytest.raises(RuntimeError, match="vercel-workers"):
         Orchestrator()

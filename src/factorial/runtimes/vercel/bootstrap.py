@@ -18,7 +18,10 @@ def configure_orchestrator_for_vercel(
     settings: VercelRuntimeSettings | None = None,
 ) -> Orchestrator:
     if os.getenv("VERCEL") != "1":
-        logger.warning("VERCEL environment variable is not set; skipping Vercel runtime configuration.")
+        logger.warning(
+            "VERCEL environment variable is not set; "
+            "skipping Vercel runtime configuration."
+        )
         return orchestrator
 
     settings = settings or VercelRuntimeSettings.from_env()
@@ -27,17 +30,6 @@ def configure_orchestrator_for_vercel(
     wake_transport = (os.getenv("NFACTORIAL_WAKE_TRANSPORT") or "").strip().lower()
     if wake_transport not in {"none", "vercel_queue"}:
         wake_transport = "vercel_queue"
-    if wake_transport == "vercel_queue" and not _vercel_workers_available():
-        if os.getenv("VERCEL") == "1":
-            raise RuntimeError(
-                "Vercel runtime requires `vercel-workers` to be installed "
-                "for queue dispatch and worker callbacks."
-            )
-        logger.warning(
-            "`vercel-workers` is unavailable locally; falling back to "
-            "NFACTORIAL_WAKE_TRANSPORT=none for inline maintenance/testing."
-        )
-        wake_transport = "none"
     orchestrator.wake_transport = wake_transport
 
     if wake_transport == "none":
@@ -63,12 +55,3 @@ def configure_orchestrator(
 ) -> Orchestrator:
     """Ergonomic alias for configuring an orchestrator for Vercel runtime."""
     return configure_orchestrator_for_vercel(orchestrator, settings=settings)
-
-
-def _vercel_workers_available() -> bool:
-    try:
-        import vercel.workers  # type: ignore  # noqa: F401
-
-        return True
-    except Exception:
-        return False

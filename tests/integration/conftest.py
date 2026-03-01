@@ -617,6 +617,7 @@ class ScriptRunner:
         return await self._scheduled_recovery_script.execute(
             queue_scheduled_key=self.keys.queue_scheduled,
             queue_main_key=self.keys.queue_main,
+            queue_pending_key=self.keys.queue_pending,
             queue_orphaned_key=self.keys.queue_orphaned,
             task_statuses_key=self.keys.task_status,
             task_agents_key=self.keys.task_agent,
@@ -625,6 +626,7 @@ class ScriptRunner:
             task_retries_key=self.keys.task_retries,
             task_metas_key=self.keys.task_meta,
             scheduled_wait_meta_key=self.keys.scheduled_wait_meta,
+            activity_wait_meta_key=self.keys.activity_wait_meta,
             max_batch_size=max_batch_size,
         )
 

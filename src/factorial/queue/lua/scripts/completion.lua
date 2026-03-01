@@ -43,6 +43,8 @@ local task_steering_key_template     = KEYS[26]
 local message_seq_key                = KEYS[27]
 local queue_main_key_template        = KEYS[28]
 local queue_pending_key_template     = KEYS[29]
+local queue_scheduled_key_template   = KEYS[30]
+local scheduled_wait_meta_key        = KEYS[31]
 
 local task_id                        = ARGV[1]
 local action                         = ARGV[2] -- complete, continue, retry, backoff, fail, pending_tool_call_results, pending_child_task_results
@@ -161,6 +163,8 @@ local function wake_parent_if_waiting_activity(child_id)
             activity_wait_meta_key,
             task_steering_key_template,
             message_seq_key,
+            queue_scheduled_key_template,
+            scheduled_wait_meta_key,
         },
         {
             parent_task_id,

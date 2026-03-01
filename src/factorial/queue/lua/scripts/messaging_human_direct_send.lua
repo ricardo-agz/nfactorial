@@ -1,7 +1,7 @@
 --[[
--- Send a direct task-to-task message atomically.
+-- Send a human-originated direct message to a task atomically.
 --
--- The operation validates sender/recipient scope, persists history, and enqueues
+-- The operation validates recipient scope, persists history, and enqueues
 -- a steering envelope for active recipients in one transaction.
 --
 -- State transitions:
@@ -17,16 +17,17 @@ local message_seq_key = KEYS[6]
 local activity_wait_meta_key = KEYS[7]
 local scheduled_wait_meta_key = KEYS[8]
 
-local sender_task_id = ARGV[1]
-local to_task_id = ARGV[2]
-local team_id = ARGV[3]
-local content = ARGV[4]
-local metadata_json = ARGV[5]
-local steering_key_template = ARGV[6]
-local history_maxlen = tonumber(ARGV[7]) or 0
-local queue_main_key_template = ARGV[8]
-local queue_pending_key_template = ARGV[9]
-local queue_scheduled_key_template = ARGV[10]
+local to_task_id = ARGV[1]
+local team_id = ARGV[2]
+local content = ARGV[3]
+local metadata_json = ARGV[4]
+local steering_key_template = ARGV[5]
+local history_maxlen = tonumber(ARGV[6]) or 0
+local queue_main_key_template = ARGV[7]
+local queue_pending_key_template = ARGV[8]
+local queue_scheduled_key_template = ARGV[9]
+local from_owner_id = ARGV[10]
+local from_task_id = ARGV[11]
 
 local function steering_key(task_id)
     return string.gsub(steering_key_template, "{task_id}", task_id)
@@ -70,14 +71,8 @@ local function is_terminal(status)
     return status == "completed" or status == "failed" or status == "cancelled"
 end
 
-local sender_meta_raw = redis.call("HGET", task_metas_key, sender_task_id)
-local sender_meta = decode_meta(sender_meta_raw)
-if sender_meta == nil then
-    return { "sender_not_found" }
-end
-local sender_team_id = resolve_team_id(sender_task_id, sender_meta)
-if sender_team_id ~= team_id then
-    return { "scope_mismatch", sender_team_id or "" }
+if not from_owner_id or from_owner_id == "" then
+    return { "invalid_owner" }
 end
 
 local recipient_meta_raw = redis.call("HGET", task_metas_key, to_task_id)
@@ -112,11 +107,17 @@ if not recipient_status then
 elseif is_terminal(recipient_status) then
     table.insert(skipped_inactive_task_ids, to_task_id)
 else
-    local steering_content = "<peer_message kind='direct' team_id='" ..
+    local from_task_attr = ""
+    if from_task_id and from_task_id ~= "" then
+        from_task_attr = " from_task_id='" .. tostring(from_task_id) .. "'"
+    end
+    local steering_content = "<peer_message kind='human_direct' team_id='" ..
         tostring(team_id) ..
-        "' from_task_id='" ..
-        tostring(sender_task_id) ..
-        "'>" ..
+        "' from_owner_id='" ..
+        tostring(from_owner_id) ..
+        "'" ..
+        from_task_attr ..
+        ">" ..
         tostring(content) ..
         "</peer_message>"
     local steering_payload = cjson.encode({
@@ -148,11 +149,16 @@ end
 if history_maxlen < 1 then
     history_maxlen = 20000
 end
+local from_task_value = cjson.null
+if from_task_id and from_task_id ~= "" then
+    from_task_value = from_task_id
+end
 local history_payload = cjson.encode({
-    kind = "direct",
+    kind = "human_direct",
     team_id = team_id,
     group_name = cjson.null,
-    from_task_id = sender_task_id,
+    from_task_id = from_task_value,
+    from_owner_id = from_owner_id,
     to_task_ids = { to_task_id },
     delivered_task_ids = delivered_task_ids,
     skipped_inactive_task_ids = skipped_inactive_task_ids,

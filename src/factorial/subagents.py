@@ -85,6 +85,24 @@ def _coerce_inputs_for_agent(agent: Any, inputs: list[Any]) -> list[AgentContext
     return coerced_inputs
 
 
+def _coerce_task_id(task_or_ref: Any) -> str:
+    if isinstance(task_or_ref, str) and task_or_ref:
+        return task_or_ref
+
+    if isinstance(task_or_ref, dict):
+        candidate = task_or_ref.get("task_id")
+        if isinstance(candidate, str) and candidate:
+            return candidate
+
+    candidate = getattr(task_or_ref, "task_id", None)
+    if isinstance(candidate, str) and candidate:
+        return candidate
+
+    raise TypeError(
+        "subagents.cancel expects a task_id string or JobRef-like object with task_id"
+    )
+
+
 def _deterministic_child_task_id(
     *,
     parent_task_id: str,
@@ -208,6 +226,21 @@ class SubagentsNamespace:
     ) -> WaitInstruction:
         jobs = await self.spawn(agent=agent, inputs=inputs, key=key)
         return wait.jobs(jobs, data=data)
+
+    async def cancel(self, task_or_refs: Any) -> str | list[str]:
+        """Cancel one or more previously spawned direct child tasks."""
+        execution_ctx = ExecutionContext.current()
+        if isinstance(task_or_refs, list):
+            if not task_or_refs:
+                return []
+            task_ids = [_coerce_task_id(task_or_ref) for task_or_ref in task_or_refs]
+            deduped_task_ids = list(dict.fromkeys(task_ids))
+            await execution_ctx.subagents.cancel_many(deduped_task_ids)
+            return deduped_task_ids
+
+        task_id = _coerce_task_id(task_or_refs)
+        await execution_ctx.subagents.cancel(task_id)
+        return task_id
 
 
 subagents = SubagentsNamespace()

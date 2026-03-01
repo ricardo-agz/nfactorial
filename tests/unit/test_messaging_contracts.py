@@ -130,6 +130,44 @@ async def test_group_handle_send_uses_group_callback() -> None:
 
 
 @pytest.mark.asyncio
+async def test_group_handle_member_mutations_use_group_callbacks() -> None:
+    captured: dict[str, Any] = {}
+
+    async def _remove_members(
+        group_name: str,
+        member_task_ids: list[str],
+    ) -> list[str]:
+        captured["remove_group_name"] = group_name
+        captured["remove_member_task_ids"] = member_task_ids
+        return member_task_ids
+
+    async def _leave(group_name: str) -> bool:
+        captured["leave_group_name"] = group_name
+        return True
+
+    ctx = _base_ctx()
+    ctx.messaging.groups.remove_members_callback = _remove_members
+    ctx.messaging.groups.leave_callback = _leave
+    token = execution_context.set(ctx)
+    try:
+        handle = MessagingGroupHandle(name="research", team_id="team-1")
+        removed = await handle.remove_members(
+            [SimpleNamespace(task_id="task-a"), "task-b", "task-a"]
+        )
+        left = await handle.leave()
+    finally:
+        execution_context.reset(token)
+
+    assert removed == ["task-a", "task-b"]
+    assert left is True
+    assert captured == {
+        "remove_group_name": "research",
+        "remove_member_task_ids": ["task-a", "task-b"],
+        "leave_group_name": "research",
+    }
+
+
+@pytest.mark.asyncio
 async def test_direct_send_accepts_jobref_like_target() -> None:
     captured: dict[str, Any] = {}
 
@@ -170,6 +208,40 @@ async def test_direct_send_accepts_jobref_like_target() -> None:
 
 
 @pytest.mark.asyncio
+async def test_groups_remove_members_normalizes_members() -> None:
+    captured: dict[str, Any] = {}
+
+    async def _remove_members(
+        group_name: str,
+        member_task_ids: list[str],
+    ) -> list[str]:
+        captured["group_name"] = group_name
+        captured["member_task_ids"] = member_task_ids
+        return member_task_ids
+
+    ctx = _base_ctx()
+    ctx.messaging.groups.remove_members_callback = _remove_members
+    token = execution_context.set(ctx)
+    try:
+        removed = await messaging.groups.remove_members(
+            "research",
+            [
+                {"task_id": "task-a"},
+                SimpleNamespace(task_id="task-b"),
+                "task-a",
+            ],
+        )
+    finally:
+        execution_context.reset(token)
+
+    assert removed == ["task-a", "task-b"]
+    assert captured == {
+        "group_name": "research",
+        "member_task_ids": ["task-a", "task-b"],
+    }
+
+
+@pytest.mark.asyncio
 async def test_execution_context_messaging_namespace_routes_callbacks() -> None:
     async def _list_groups() -> list[dict[str, Any]]:
         return [{"team_id": "team-1", "group_name": "research"}]
@@ -201,16 +273,31 @@ async def test_execution_context_messaging_namespace_routes_callbacks() -> None:
             "failed_task_ids": [],
         }
 
+    async def _remove_members(
+        group_name: str,
+        member_task_ids: list[str],
+    ) -> list[str]:
+        return [group_name, *member_task_ids]
+
+    async def _leave_group(_group_name: str) -> bool:
+        return True
+
     ctx = _base_ctx()
     ctx.messaging.groups.list_callback = _list_groups
     ctx.messaging.groups.send_callback = _send_group
+    ctx.messaging.groups.remove_members_callback = _remove_members
+    ctx.messaging.groups.leave_callback = _leave_group
     ctx.messaging.send_callback = _send_direct
 
     groups = await ctx.messaging.groups.list()
+    removed = await ctx.messaging.groups.remove_members("research", ["task-z"])
+    left = await ctx.messaging.groups.leave("research")
     group_report = await ctx.messaging.groups.send("research", "kickoff")
     direct_report = await ctx.messaging.send("task-z", "ping")
 
     assert groups == [{"team_id": "team-1", "group_name": "research"}]
+    assert removed == ["research", "task-z"]
+    assert left is True
     assert group_report["thread_message_id"] == "group-1"
     assert direct_report["delivered_task_ids"] == ["task-z"]
 

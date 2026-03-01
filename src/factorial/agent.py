@@ -1075,6 +1075,25 @@ class BaseAgent(Generic[ContextType]):
             return f"Waiting for next cron tick '{expr}' ({tz})"
         if wait_instr.kind == "jobs":
             return "Waiting for spawned jobs"
+        if wait_instr.kind == "activity":
+            if (
+                wait_instr.activity_timeout_kind == "sleep"
+                and wait_instr.activity_timeout_s is not None
+            ):
+                return (
+                    "Waiting for activity or timeout after "
+                    f"{wait_instr.activity_timeout_s}s"
+                )
+            if (
+                wait_instr.activity_timeout_kind == "cron"
+                and wait_instr.activity_timeout_cron
+            ):
+                tz = wait_instr.activity_timeout_timezone or "UTC"
+                return (
+                    "Waiting for activity or next cron tick "
+                    f"'{wait_instr.activity_timeout_cron}' ({tz})"
+                )
+            return "Waiting for activity"
         return "Waiting"
 
     def _normalize_tool_result(

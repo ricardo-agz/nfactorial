@@ -339,6 +339,33 @@ class _RetrySpawnThenSucceedAgent(BaseAgent[AgentContext]):
         )
 
 
+class _CancelSubagentAgent(BaseAgent[AgentContext]):
+    def __init__(
+        self,
+        *,
+        target_task_ids: str | list[str],
+        name: str = "cancel_subagent_parent",
+    ):
+        super().__init__(
+            name=name,
+            instructions="Cancel a child subagent task",
+            context_class=AgentContext,
+        )
+        self.target_task_ids = target_task_ids
+
+    async def run_turn(
+        self,
+        agent_ctx: AgentContext,
+    ) -> TurnCompletion[AgentContext]:
+        agent_ctx.turn += 1
+        cancelled_task_ids = await subagents.cancel(self.target_task_ids)
+        return TurnCompletion(
+            is_done=True,
+            context=agent_ctx,
+            output={"cancelled_task_ids": cancelled_task_ids},
+        )
+
+
 async def _pickup_single_task(
     *,
     redis_client: redis.Redis,
@@ -834,6 +861,340 @@ async def test_subagents_spawn_is_idempotent_across_parent_retry(
 
 
 @pytest.mark.asyncio
+async def test_subagents_cancel_allows_direct_child_task(
+    redis_client: redis.Redis,
+    test_namespace: str,
+    test_owner_id: str,
+    pickup_script: BatchPickupScript,
+    completion_script: TaskCompletionScript,
+    steering_script: TaskSteeringScript,
+) -> None:
+    child_agent = SimpleTestAgent(name="cancelable_child_agent")
+    parent_agent = _CancelSubagentAgent(target_task_ids="pending-target")
+    parent_keys = RedisKeys.format(namespace=test_namespace, agent=parent_agent.name)
+    child_keys = RedisKeys.format(namespace=test_namespace, agent=child_agent.name)
+
+    parent_task = Task.create(
+        owner_id=test_owner_id,
+        agent=parent_agent.name,
+        payload=AgentContext(query="cancel direct child"),
+    )
+    parent_task_id = await enqueue_task(
+        redis_client=redis_client,
+        namespace=test_namespace,
+        agent=parent_agent,
+        task=parent_task,
+    )
+
+    child_task = Task.create(
+        owner_id=test_owner_id,
+        agent=child_agent.name,
+        payload=AgentContext(query="child to cancel"),
+    )
+    child_task.metadata.parent_id = parent_task_id
+    child_task.metadata.team_id = parent_task_id
+    child_task_id = await enqueue_task(
+        redis_client=redis_client,
+        namespace=test_namespace,
+        agent=child_agent,
+        task=child_task,
+    )
+    parent_agent.target_task_ids = child_task_id
+
+    picked = await _pickup_single_task(
+        redis_client=redis_client,
+        keys=parent_keys,
+        pickup_script=pickup_script,
+    )
+    assert picked == [parent_task_id]
+
+    await process_task(
+        redis_client=redis_client,
+        namespace=test_namespace,
+        task_id=parent_task_id,
+        completion_script=completion_script,
+        steering_script=steering_script,
+        agent=parent_agent,
+        agents_by_name={
+            parent_agent.name: parent_agent,
+            child_agent.name: child_agent,
+        },
+        max_retries=3,
+        heartbeat_interval=30,
+        task_timeout=30,
+        metrics_retention_duration=3600,
+    )
+
+    assert (
+        await get_task_status(redis_client, test_namespace, parent_task_id)
+        == TaskStatus.COMPLETED
+    )
+    assert await cast(
+        Any,
+        redis_client.sismember(child_keys.task_cancellations, child_task_id),
+    )
+
+
+@pytest.mark.asyncio
+async def test_subagents_cancel_rejects_non_child_task(
+    redis_client: redis.Redis,
+    test_namespace: str,
+    test_owner_id: str,
+    pickup_script: BatchPickupScript,
+    completion_script: TaskCompletionScript,
+    steering_script: TaskSteeringScript,
+) -> None:
+    child_agent = SimpleTestAgent(name="cancel_guard_child_agent")
+    parent_agent = _CancelSubagentAgent(target_task_ids="pending-target")
+    parent_keys = RedisKeys.format(namespace=test_namespace, agent=parent_agent.name)
+    child_keys = RedisKeys.format(namespace=test_namespace, agent=child_agent.name)
+
+    parent_task = Task.create(
+        owner_id=test_owner_id,
+        agent=parent_agent.name,
+        payload=AgentContext(query="attempt invalid cancel"),
+    )
+    parent_task_id = await enqueue_task(
+        redis_client=redis_client,
+        namespace=test_namespace,
+        agent=parent_agent,
+        task=parent_task,
+    )
+
+    non_child_task = Task.create(
+        owner_id=test_owner_id,
+        agent=child_agent.name,
+        payload=AgentContext(query="not a direct child"),
+    )
+    non_child_task.metadata.team_id = parent_task_id
+    non_child_task_id = await enqueue_task(
+        redis_client=redis_client,
+        namespace=test_namespace,
+        agent=child_agent,
+        task=non_child_task,
+    )
+    parent_agent.target_task_ids = non_child_task_id
+
+    picked = await _pickup_single_task(
+        redis_client=redis_client,
+        keys=parent_keys,
+        pickup_script=pickup_script,
+    )
+    assert picked == [parent_task_id]
+
+    await process_task(
+        redis_client=redis_client,
+        namespace=test_namespace,
+        task_id=parent_task_id,
+        completion_script=completion_script,
+        steering_script=steering_script,
+        agent=parent_agent,
+        agents_by_name={
+            parent_agent.name: parent_agent,
+            child_agent.name: child_agent,
+        },
+        max_retries=0,
+        heartbeat_interval=30,
+        task_timeout=30,
+        metrics_retention_duration=3600,
+    )
+
+    assert (
+        await get_task_status(redis_client, test_namespace, parent_task_id)
+        == TaskStatus.FAILED
+    )
+    assert not await cast(
+        Any,
+        redis_client.sismember(child_keys.task_cancellations, non_child_task_id),
+    )
+
+
+@pytest.mark.asyncio
+async def test_subagents_cancel_list_allows_direct_child_tasks(
+    redis_client: redis.Redis,
+    test_namespace: str,
+    test_owner_id: str,
+    pickup_script: BatchPickupScript,
+    completion_script: TaskCompletionScript,
+    steering_script: TaskSteeringScript,
+) -> None:
+    child_agent = SimpleTestAgent(name="cancel_list_child_agent")
+    parent_agent = _CancelSubagentAgent(target_task_ids=[])
+    parent_keys = RedisKeys.format(namespace=test_namespace, agent=parent_agent.name)
+    child_keys = RedisKeys.format(namespace=test_namespace, agent=child_agent.name)
+
+    parent_task = Task.create(
+        owner_id=test_owner_id,
+        agent=parent_agent.name,
+        payload=AgentContext(query="cancel direct children list"),
+    )
+    parent_task_id = await enqueue_task(
+        redis_client=redis_client,
+        namespace=test_namespace,
+        agent=parent_agent,
+        task=parent_task,
+    )
+
+    child_a = Task.create(
+        owner_id=test_owner_id,
+        agent=child_agent.name,
+        payload=AgentContext(query="child-a"),
+    )
+    child_a.metadata.parent_id = parent_task_id
+    child_a.metadata.team_id = parent_task_id
+    child_a_id = await enqueue_task(
+        redis_client=redis_client,
+        namespace=test_namespace,
+        agent=child_agent,
+        task=child_a,
+    )
+
+    child_b = Task.create(
+        owner_id=test_owner_id,
+        agent=child_agent.name,
+        payload=AgentContext(query="child-b"),
+    )
+    child_b.metadata.parent_id = parent_task_id
+    child_b.metadata.team_id = parent_task_id
+    child_b_id = await enqueue_task(
+        redis_client=redis_client,
+        namespace=test_namespace,
+        agent=child_agent,
+        task=child_b,
+    )
+
+    parent_agent.target_task_ids = [child_a_id, child_b_id]
+    picked = await _pickup_single_task(
+        redis_client=redis_client,
+        keys=parent_keys,
+        pickup_script=pickup_script,
+    )
+    assert picked == [parent_task_id]
+
+    await process_task(
+        redis_client=redis_client,
+        namespace=test_namespace,
+        task_id=parent_task_id,
+        completion_script=completion_script,
+        steering_script=steering_script,
+        agent=parent_agent,
+        agents_by_name={
+            parent_agent.name: parent_agent,
+            child_agent.name: child_agent,
+        },
+        max_retries=3,
+        heartbeat_interval=30,
+        task_timeout=30,
+        metrics_retention_duration=3600,
+    )
+
+    assert (
+        await get_task_status(redis_client, test_namespace, parent_task_id)
+        == TaskStatus.COMPLETED
+    )
+    assert await cast(
+        Any,
+        redis_client.sismember(child_keys.task_cancellations, child_a_id),
+    )
+    assert await cast(
+        Any,
+        redis_client.sismember(child_keys.task_cancellations, child_b_id),
+    )
+
+
+@pytest.mark.asyncio
+async def test_subagents_cancel_list_rejects_mixed_scope_without_partial_cancellation(
+    redis_client: redis.Redis,
+    test_namespace: str,
+    test_owner_id: str,
+    pickup_script: BatchPickupScript,
+    completion_script: TaskCompletionScript,
+    steering_script: TaskSteeringScript,
+) -> None:
+    child_agent = SimpleTestAgent(name="cancel_list_guard_child_agent")
+    parent_agent = _CancelSubagentAgent(target_task_ids=[])
+    parent_keys = RedisKeys.format(namespace=test_namespace, agent=parent_agent.name)
+    child_keys = RedisKeys.format(namespace=test_namespace, agent=child_agent.name)
+
+    parent_task = Task.create(
+        owner_id=test_owner_id,
+        agent=parent_agent.name,
+        payload=AgentContext(query="attempt mixed-scope list cancel"),
+    )
+    parent_task_id = await enqueue_task(
+        redis_client=redis_client,
+        namespace=test_namespace,
+        agent=parent_agent,
+        task=parent_task,
+    )
+
+    valid_child = Task.create(
+        owner_id=test_owner_id,
+        agent=child_agent.name,
+        payload=AgentContext(query="valid-child"),
+    )
+    valid_child.metadata.parent_id = parent_task_id
+    valid_child.metadata.team_id = parent_task_id
+    valid_child_id = await enqueue_task(
+        redis_client=redis_client,
+        namespace=test_namespace,
+        agent=child_agent,
+        task=valid_child,
+    )
+
+    invalid_non_child = Task.create(
+        owner_id=test_owner_id,
+        agent=child_agent.name,
+        payload=AgentContext(query="invalid-non-child"),
+    )
+    invalid_non_child.metadata.team_id = parent_task_id
+    invalid_non_child_id = await enqueue_task(
+        redis_client=redis_client,
+        namespace=test_namespace,
+        agent=child_agent,
+        task=invalid_non_child,
+    )
+
+    parent_agent.target_task_ids = [valid_child_id, invalid_non_child_id]
+    picked = await _pickup_single_task(
+        redis_client=redis_client,
+        keys=parent_keys,
+        pickup_script=pickup_script,
+    )
+    assert picked == [parent_task_id]
+
+    await process_task(
+        redis_client=redis_client,
+        namespace=test_namespace,
+        task_id=parent_task_id,
+        completion_script=completion_script,
+        steering_script=steering_script,
+        agent=parent_agent,
+        agents_by_name={
+            parent_agent.name: parent_agent,
+            child_agent.name: child_agent,
+        },
+        max_retries=0,
+        heartbeat_interval=30,
+        task_timeout=30,
+        metrics_retention_duration=3600,
+    )
+
+    assert (
+        await get_task_status(redis_client, test_namespace, parent_task_id)
+        == TaskStatus.FAILED
+    )
+    assert not await cast(
+        Any,
+        redis_client.sismember(child_keys.task_cancellations, valid_child_id),
+    )
+    assert not await cast(
+        Any,
+        redis_client.sismember(child_keys.task_cancellations, invalid_non_child_id),
+    )
+
+
+@pytest.mark.asyncio
 async def test_wait_jobs_fast_path_preserves_results_when_continue_rejected(
     redis_client: redis.Redis,
     test_namespace: str,
@@ -1001,7 +1362,10 @@ async def test_wait_jobs_quiescent_children_auto_resume_parent(
         await cast(Any, redis_client.lrange(parent_keys.queue_main, 0, -1)),
     )
     assert parent_task_id in queued_parent_ids
-    assert await cast(Any, redis_client.zscore(parent_keys.queue_pending, parent_task_id)) is None
+    assert (
+        await cast(Any, redis_client.zscore(parent_keys.queue_pending, parent_task_id))
+        is None
+    )
 
     parent_task_data = await get_task_data(
         redis_client,

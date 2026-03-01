@@ -1,9 +1,6 @@
 from __future__ import annotations
 
-import asyncio
-import json
 import os
-import sys
 
 from agent import basic_agent, search_agent
 
@@ -71,10 +68,6 @@ orchestrator.register_runner(
 
 
 def main() -> None:
-    if os.getenv("VERCEL_SERVICE_TYPE") == "cron":
-        result = asyncio.run(orchestrator.run_maintenance_cron_tick())
-        print(json.dumps(result), file=sys.stderr)
-        return
     orchestrator.run()
 
 

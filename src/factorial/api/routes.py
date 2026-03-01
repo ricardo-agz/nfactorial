@@ -7,7 +7,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
-from factorial.exceptions import (
+from factorial.core.exceptions import (
     MessagingGroupNotFoundError,
     MessagingScopeError,
     TaskNotFoundError,

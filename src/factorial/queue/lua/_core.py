@@ -8,7 +8,7 @@ from weakref import WeakKeyDictionary
 import redis.asyncio as redis
 from redis.commands.core import AsyncScript
 
-from factorial.utils import decode
+from factorial.core.utils import decode
 
 T = TypeVar("T", bound=AsyncScript)
 

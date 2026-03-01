@@ -8,10 +8,12 @@ from typing import Any, cast
 
 import redis.asyncio as redis
 
-from factorial.agent import BaseAgent, ExecutionContext
-from factorial.events import AgentEvent, BatchEvent, EventPublisher
-from factorial.exceptions import InactiveTaskError, TaskNotFoundError
-from factorial.logging import colored, get_logger
+from factorial.agent import BaseAgent
+from factorial.core.events import AgentEvent, BatchEvent, EventPublisher
+from factorial.core.exceptions import InactiveTaskError, TaskNotFoundError
+from factorial.core.logging import colored, get_logger
+from factorial.core.utils import decode, serialize_data
+from factorial.execution.context import ExecutionContext
 from factorial.queue.keys import PENDING_SENTINEL, RedisKeys
 from factorial.queue.lua import (
     BatchPickupScript,
@@ -30,7 +32,6 @@ from factorial.queue.task import (
     get_task_agent,
     get_task_data,
 )
-from factorial.utils import decode, serialize_data
 
 logger = get_logger(__name__)
 

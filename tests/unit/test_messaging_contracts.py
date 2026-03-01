@@ -7,9 +7,13 @@ from typing import Any, cast
 
 import pytest
 
-from factorial.context import ExecutionContext, execution_context
-from factorial.events import EventPublisher
-from factorial.messaging import MessageDeliveryReport, MessagingGroupHandle, messaging
+from factorial.core.events import EventPublisher
+from factorial.execution.context import ExecutionContext, execution_context
+from factorial.execution.messaging import (
+    MessageDeliveryReport,
+    MessagingGroupHandle,
+    messaging,
+)
 
 
 class _NoopEvents:

@@ -49,7 +49,7 @@ standardized verification lifecycle.
 ```python
 from pydantic import BaseModel
 from factorial import Agent, AgentContext, ExecutionContext
-from factorial.exceptions import VerificationRejected
+from factorial.core.exceptions import VerificationRejected
 
 
 class AgentOutput(BaseModel):

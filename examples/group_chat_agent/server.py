@@ -1,43 +1,20 @@
-from contextlib import asynccontextmanager
+import importlib
+import json
+from collections.abc import Callable
 from typing import Any
 
-import redis.asyncio as redis
 from agent import DemoContext, parent_agent
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from orchestrator import orchestrator
 from pydantic import BaseModel
-from redis.asyncio.client import PubSub, Redis as RedisType
-from starlette.websockets import WebSocket, WebSocketDisconnect
+from starlette.requests import Request
 
-WS_REDIS_SUB_TIMEOUT = 5.0
-
-redis_client: RedisType
-
-
-@asynccontextmanager
-async def lifespan(_app: FastAPI):
-    global redis_client
-    redis_client = await orchestrator.get_redis_client()
-
-    try:
-        await redis_client.ping()  # type: ignore[misc]
-        print("Connected to Redis successfully")
-    except redis.ConnectionError:
-        print("Failed to connect to Redis")
-        raise
-
-    yield
-
-    if redis_client:
-        await redis_client.close()
-        print("Redis connection closed")
-
-
-app = FastAPI(lifespan=lifespan)
+app = FastAPI(root_path="/api")
 
 app.add_middleware(
-    CORSMiddleware,
+    CORSMiddleware,  # type: ignore[arg-type]
     allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
@@ -45,29 +22,38 @@ app.add_middleware(
 )
 
 
-@app.websocket("/ws/{user_id}")
-async def websocket_updates(websocket: WebSocket, user_id: str):
-    await websocket.accept()
-    pubsub: PubSub = redis_client.pubsub()  # type: ignore[misc]
-    channel = orchestrator.get_updates_channel(owner_id=user_id)
-    await pubsub.subscribe(channel)  # type: ignore[misc]
-
+def _set_vercel_headers(headers: Any) -> None:
     try:
-        while True:
-            msg: dict[str, Any] | None = await pubsub.get_message(
-                ignore_subscribe_messages=True,
-                timeout=WS_REDIS_SUB_TIMEOUT,
-            )
-            if msg and msg["type"] == "message":
-                data = msg["data"]
-                if isinstance(data, bytes):
-                    data = data.decode("utf-8")
-                await websocket.send_text(data)
-    except WebSocketDisconnect:
-        print(f"WebSocket disconnected for user_id={user_id}")
-    finally:
-        await pubsub.unsubscribe(channel)  # type: ignore[misc]
-        await pubsub.aclose()
+        module = importlib.import_module("vercel.headers")
+    except Exception:
+        return
+    set_headers = getattr(module, "set_headers", None)
+    if callable(set_headers):
+        set_headers(headers)
+
+
+@app.middleware("http")
+async def vercel_context_middleware(request: Request, call_next: Callable):
+    _set_vercel_headers(request.headers)
+    return await call_next(request)
+
+
+@app.get("/events/{user_id}")
+@app.get("/api/events/{user_id}")
+async def stream_updates(user_id: str):
+    async def event_stream():
+        async for update in orchestrator.subscribe_to_updates(owner_id=user_id):
+            yield f"data: {json.dumps(update)}\n\n"
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @app.get("/")
@@ -92,6 +78,7 @@ class SteerRequest(BaseModel):
     messages: list[dict[str, str]]
 
 
+@app.post("/enqueue")
 @app.post("/api/enqueue")
 async def enqueue(request: EnqueueRequest):
     payload = DemoContext(
@@ -108,6 +95,7 @@ async def enqueue(request: EnqueueRequest):
     return {"task_id": task.id}
 
 
+@app.post("/steer")
 @app.post("/api/steer")
 async def steer_task_endpoint(request: SteerRequest) -> dict[str, Any]:
     try:
@@ -126,6 +114,7 @@ async def steer_task_endpoint(request: SteerRequest) -> dict[str, Any]:
         ) from exc
 
 
+@app.post("/cancel")
 @app.post("/api/cancel")
 async def cancel_task_endpoint(request: CancelRequest) -> dict[str, Any]:
     try:

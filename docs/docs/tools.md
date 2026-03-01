@@ -204,7 +204,7 @@ def dangerous_operation(path: str) -> str:
 For unrecoverable errors that should immediately fail the task, use `FatalAgentError`:
 
 ```python
-from factorial.exceptions import FatalAgentError
+from factorial.core.exceptions import FatalAgentError
 
 @tool
 def critical_operation() -> str:

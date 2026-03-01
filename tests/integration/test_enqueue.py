@@ -5,7 +5,7 @@ from typing import Any, cast
 import pytest
 import redis.asyncio as redis
 
-from factorial.context import AgentContext
+from factorial.execution.context import AgentContext
 from factorial.queue.keys import RedisKeys
 from factorial.queue.lua import EnqueueTaskScript
 from factorial.queue.operations import create_batch_and_enqueue, enqueue_task

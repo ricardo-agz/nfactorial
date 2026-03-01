@@ -298,7 +298,7 @@ Host selection should be environment-driven:
 Behavior:
 
 - process mode: existing `run()`
-- vercel mode: no local loops; expose reusable app builders under `factorial.runtimes.vercel.*`
+- vercel mode: no local loops; expose reusable app builders under `factorial.platforms.vercel.*`
 
 Public helper signatures (proposed):
 
@@ -519,9 +519,9 @@ Each invariant gets:
 Provide stable helpers:
 
 - `orchestrator.create_app(...)`
-- `factorial.runtimes.vercel.create_worker(orchestrator, ...)`
+- `factorial.platforms.vercel.create_worker(orchestrator, ...)`
 - `orchestrator.run_maintenance_cron_tick()`
-- `factorial.runtimes.vercel.VercelRuntimeSettings.from_env()`
+- `factorial.platforms.vercel.VercelRuntimeSettings.from_env()`
 
 App authors should only need:
 

@@ -5,7 +5,7 @@ from typing import Any
 import redis.asyncio as redis
 
 from factorial.agent import BaseAgent
-from factorial.engine import WorkerTickContext, worker_tick
+from factorial.queue.worker.tick import WorkerTickContext, worker_tick
 
 from .common import logger
 

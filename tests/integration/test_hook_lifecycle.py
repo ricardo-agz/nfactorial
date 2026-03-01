@@ -14,19 +14,21 @@ from openai.types.chat.chat_completion_message_function_tool_call import (
 )
 
 from factorial import Agent, AgentContext, hook, tool
-from factorial.context import (
+from factorial.core.exceptions import HookExpiredError, HookTokenValidationError
+from factorial.core.utils import decode
+from factorial.execution.context import (
     ExecutionContext,
     HooksExecutionNamespace,
     execution_context,
 )
-from factorial.exceptions import HookExpiredError, HookTokenValidationError
-from factorial.hooks import (
+from factorial.execution.hooks import (
     Hook,
     HookRequestContext,
     HookSessionNode,
     HookSessionRecord,
     PendingHook,
 )
+from factorial.execution.tools import _ToolResultInternal
 from factorial.queue.keys import PENDING_SENTINEL, RedisKeys
 from factorial.queue.operations import (
     enqueue_task,
@@ -39,8 +41,6 @@ from factorial.queue.operations import (
 )
 from factorial.queue.task import Task, TaskStatus, get_task_data, get_task_status
 from factorial.queue.worker import CompletionAction, process_task
-from factorial.tools import _ToolResultInternal
-from factorial.utils import decode
 
 from .conftest import SimpleTestAgent
 

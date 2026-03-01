@@ -25,9 +25,9 @@ from factorial import (
     ToolDefinition,
     tool,
 )
-from factorial.context import execution_context
-from factorial.events import EventPublisher
-from factorial.tools import (
+from factorial.core.events import EventPublisher
+from factorial.execution.context import execution_context
+from factorial.execution.tools import (
     _ToolResultInternal,
     convert_tools_list,
     forking_tool,
@@ -35,7 +35,7 @@ from factorial.tools import (
     serialize_for_client,
     serialize_for_model,
 )
-from factorial.waits import WaitInstruction, wait
+from factorial.execution.waits import WaitInstruction, wait
 
 
 def _make_tool_call(

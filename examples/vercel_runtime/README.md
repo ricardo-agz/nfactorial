@@ -4,16 +4,16 @@ This example shows how to run nfactorial on Vercel services with:
 
 - a web service (`server.py`)
 - a queue worker service (`orchestrator.py` entrypoint)
-- a cron maintenance trigger service (`orchestrator.py` entrypoint)
+- queue-driven self-renewing maintenance heartbeat (managed by the worker service)
 - a simple browser chat UI (`/chat`) to watch task/event progress
 
 ## Files
 
 - `agent.py`: defines the agent(s).
-- `orchestrator.py`: creates the shared orchestrator instance and serves as both worker and cron entrypoint.
+- `orchestrator.py`: creates the shared orchestrator instance and serves as the worker entrypoint.
 - `server.py`: parent FastAPI app that mounts `orchestrator.create_app()` as a sub-app.
 - `chat.html`: minimal frontend for enqueue + SSE progress.
-- `vercel.json`: service definitions (web/worker/maintenance).
+- `vercel.json`: service definitions (web/worker).
 
 ## Environment Variables
 
@@ -31,6 +31,10 @@ Optional tuning:
 - `NFACTORIAL_WORKER_MAX_TASKS`
 - `NFACTORIAL_WORKER_BUDGET_S`
 - `NFACTORIAL_MAINTENANCE_BUDGET_S`
+- `NFACTORIAL_MAINTENANCE_HEARTBEAT_INTERVAL_S`
+- `NFACTORIAL_MAINTENANCE_HEARTBEAT_DEDUPE_TTL_S`
+- `NFACTORIAL_MAINTENANCE_CONTINUATION_DELAY_S`
+- `NFACTORIAL_MAINTENANCE_MESSAGE_RETENTION_S`
 
 On Vercel, `VERCEL=1` is set automatically and nfactorial will auto-select the Vercel host mode.
 

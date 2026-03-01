@@ -19,7 +19,7 @@ import pytest
 import redis.asyncio as redis
 
 from factorial.agent import BaseAgent, TurnCompletion
-from factorial.context import AgentContext, ExecutionContext
+from factorial.execution.context import AgentContext, ExecutionContext
 from factorial.queue.keys import RedisKeys
 from factorial.queue.lua import (
     create_batch_pickup_script,

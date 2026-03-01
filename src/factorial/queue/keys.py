@@ -111,6 +111,14 @@ MESSAGING_THREAD_HISTORY = "{namespace}:messaging:thread:{thread_id}:history"
 MESSAGING_HISTORY_GLOBAL = "{namespace}:messaging:history"
 # COUNTER: monotonically increasing sequence for message IDs
 MESSAGING_MESSAGE_SEQ = "{namespace}:messaging:seq"
+# ZSET: group thread_id -> last activity timestamp_ms
+MESSAGING_GROUP_THREADS_BY_TEAM = (
+    "{namespace}:messaging:threads:group:by_team:{team_id}"
+)
+# ZSET: direct thread_id -> last activity timestamp_ms
+MESSAGING_DIRECT_THREADS_BY_TEAM = (
+    "{namespace}:messaging:threads:direct:by_team:{team_id}"
+)
 
 # ===== METRICS =====
 # Rolling (fixed-memory) metrics ring buffers.
@@ -175,6 +183,8 @@ class RedisKeys:
     _messaging_thread_history: str
     _messaging_history_global: str
     _messaging_message_seq: str
+    _messaging_group_threads_by_team: str
+    _messaging_direct_threads_by_team: str
 
     # Defaults after
     _queue_main: str | None = None
@@ -368,6 +378,14 @@ class RedisKeys:
     def messaging_message_seq(self) -> str:
         """{namespace}:messaging:seq"""
         return self._messaging_message_seq
+
+    def messaging_group_threads_by_team(self, team_id: str) -> str:
+        """{namespace}:messaging:threads:group:by_team:{team_id}"""
+        return self._messaging_group_threads_by_team.format(team_id=team_id)
+
+    def messaging_direct_threads_by_team(self, team_id: str) -> str:
+        """{namespace}:messaging:threads:direct:by_team:{team_id}"""
+        return self._messaging_direct_threads_by_team.format(team_id=team_id)
 
     @property
     def queue_main(self) -> str:
@@ -652,6 +670,14 @@ class RedisKeys:
             ),
             _messaging_history_global=MESSAGING_HISTORY_GLOBAL.format(namespace=namespace),
             _messaging_message_seq=MESSAGING_MESSAGE_SEQ.format(namespace=namespace),
+            _messaging_group_threads_by_team=MESSAGING_GROUP_THREADS_BY_TEAM.format(
+                namespace=namespace,
+                team_id="{team_id}",
+            ),
+            _messaging_direct_threads_by_team=MESSAGING_DIRECT_THREADS_BY_TEAM.format(
+                namespace=namespace,
+                team_id="{team_id}",
+            ),
             # Agent-scoped keys
             _queue_main=QUEUE_MAIN.format(namespace=namespace, agent=agent)
             if agent

@@ -130,7 +130,7 @@ agent = Agent(
 Define structured output using Pydantic models:
 
 ```python
-from factorial.utils import BaseModel
+from factorial.core.utils import BaseModel
 
 class Joke(BaseModel):
     setup: str

@@ -8,7 +8,7 @@ from typing import Any
 import pytest
 import redis.asyncio as redis
 
-from factorial.context import AgentContext, VerificationState
+from factorial.execution.context import AgentContext, VerificationState
 from factorial.queue.keys import RedisKeys
 from factorial.queue.operations import resume_task
 from factorial.queue.task import Task, TaskStatus, get_task_data, get_task_status

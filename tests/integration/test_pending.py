@@ -775,7 +775,7 @@ class TestChildTaskCompletion:
         )
 
         # Create updated payload with child results
-        from factorial.context import AgentContext
+        from factorial.execution.context import AgentContext
 
         updated_context = AgentContext(
             query=sample_task.payload.query,

@@ -6,7 +6,7 @@ import {
   type SetStateAction,
 } from "react";
 
-import { WS_BASE_URL } from "../constants";
+import { SSE_BASE_URL } from "../constants";
 import type {
   AgentEvent,
   AgentNode,
@@ -192,7 +192,7 @@ export function useWebSocket({
   setCancelling,
   setFinalDeliverable,
 }: UseWebSocketProps) {
-  const wsRef = useRef<WebSocket | null>(null);
+  const streamRef = useRef<EventSource | null>(null);
   const selectedThreadIdRef = useRef<string | null>(selectedThreadId);
   const currentTaskIdRef = useRef<string | null>(currentTaskId);
   const waitingTasksRef = useRef<Set<string>>(new Set());
@@ -686,14 +686,17 @@ export function useWebSocket({
   );
 
   useEffect(() => {
-    const ws = new WebSocket(`${WS_BASE_URL}/${userId}`);
-    ws.onmessage = handleWsMessage;
-    wsRef.current = ws;
+    const stream = new EventSource(`${SSE_BASE_URL}/${userId}`);
+    stream.onmessage = handleWsMessage;
+    stream.onerror = (error) => {
+      console.error("SSE stream error:", error);
+    };
+    streamRef.current = stream;
 
     return () => {
-      ws.close();
+      stream.close();
     };
   }, [handleWsMessage, userId]);
 
-  return wsRef;
+  return streamRef;
 }

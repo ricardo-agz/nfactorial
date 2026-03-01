@@ -8,14 +8,14 @@ from typing import Any, cast
 
 import pytest
 
-from factorial.context import (
+from factorial.core.events import EventPublisher
+from factorial.execution.context import (
     AgentContext,
     ExecutionContext,
     SubagentsExecutionNamespace,
     execution_context,
 )
-from factorial.events import EventPublisher
-from factorial.subagents import JobRef, subagents
+from factorial.execution.subagents import JobRef, subagents
 
 
 class _NoopEvents:

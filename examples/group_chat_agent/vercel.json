@@ -3,20 +3,19 @@
     "framework": "services"
   },
   "experimentalServices": {
-    "web": {
-      "entrypoint": "server.py",
+    "ui": {
+      "entrypoint": "ui",
       "routePrefix": "/"
+    },
+    "api": {
+      "entrypoint": "server.py",
+      "routePrefix": "/api"
     },
     "worker": {
       "type": "worker",
       "entrypoint": "orchestrator.py",
       "topic": "nfactorial-dispatch",
       "consumer": "default"
-    },
-    "maintenance": {
-      "type": "cron",
-      "entrypoint": "orchestrator.py",
-      "schedule": "*/1 * * * *"
     }
   }
 }

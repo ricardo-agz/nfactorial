@@ -13,7 +13,7 @@ except Exception:
             allow_module_level=True,
         )
 
-from factorial.runtimes.vercel.wake_dispatcher import parse_wake_envelope
+from factorial.platforms.vercel.wake_dispatcher import parse_wake_envelope
 
 
 def test_parse_wake_envelope_accepts_valid_payload() -> None:

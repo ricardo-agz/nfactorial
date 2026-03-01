@@ -6,7 +6,7 @@ from typing import Any
 
 import pytest
 
-from factorial.context import AgentContext
+from factorial.execution.context import AgentContext
 from factorial.queue.task import Task, TaskMetadata, TaskStatus
 
 

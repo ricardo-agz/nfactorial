@@ -16,8 +16,8 @@ import pytest_asyncio
 import redis.asyncio as redis
 
 from factorial.agent import BaseAgent, TurnCompletion
-from factorial.context import AgentContext
-from factorial.llms import Model, Provider
+from factorial.execution.context import AgentContext
+from factorial.llm.models import Model, Provider
 from tests.mocks.llm import (
     MockLLMClient,
     MockResponse,

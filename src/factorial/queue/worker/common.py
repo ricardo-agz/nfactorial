@@ -6,15 +6,15 @@ from typing import Any
 
 import redis.asyncio as redis
 
-from factorial.agent import BaseAgent, ExecutionContext
-from factorial.context import ContextType
-from factorial.events import AgentEvent, EventPublisher
-from factorial.exceptions import RETRYABLE_EXCEPTIONS, FatalAgentError
-from factorial.logging import get_logger
+from factorial.agent import BaseAgent
+from factorial.core.events import AgentEvent, EventPublisher
+from factorial.core.exceptions import RETRYABLE_EXCEPTIONS, FatalAgentError
+from factorial.core.logging import get_logger
+from factorial.execution.context import ContextType, ExecutionContext
+from factorial.execution.waits import WaitInstruction
 from factorial.queue.keys import RedisKeys
 from factorial.queue.lua import TaskSteeringScript
 from factorial.queue.task import Task, get_task_steering_messages
-from factorial.waits import WaitInstruction
 
 logger = get_logger("factorial.queue")
 

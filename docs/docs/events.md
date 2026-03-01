@@ -472,7 +472,7 @@ You can create your own event types by extending the base event classes:
 
 ```python
 from dataclasses import dataclass
-from factorial.events import AgentEvent
+from factorial.core.events import AgentEvent
 
 @dataclass
 class CustomAnalysisEvent(AgentEvent):

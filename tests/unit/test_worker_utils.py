@@ -3,7 +3,7 @@
 import asyncio
 import json
 
-from factorial.exceptions import (
+from factorial.core.exceptions import (
     FatalAgentError,
     InvalidLLMResponseError,
     RateLimitError,

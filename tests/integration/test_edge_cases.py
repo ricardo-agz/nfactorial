@@ -1,7 +1,7 @@
 import pytest
 import redis.asyncio as redis
 
-from factorial.context import AgentContext
+from factorial.execution.context import AgentContext
 from factorial.queue.keys import PENDING_SENTINEL, RedisKeys
 from factorial.queue.operations import enqueue_task
 from factorial.queue.task import Task, TaskStatus, get_task_status

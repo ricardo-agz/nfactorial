@@ -3,12 +3,12 @@ from __future__ import annotations
 import base64
 import json
 import time
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 import redis.asyncio as redis
 
-from factorial.events import AgentEvent, EventPublisher
-from factorial.exceptions import (
+from factorial.core.events import AgentEvent, EventPublisher
+from factorial.core.exceptions import (
     MessagingGroupAlreadyExistsError,
     MessagingGroupNotFoundError,
     MessagingInvalidRecipientError,
@@ -16,7 +16,8 @@ from factorial.exceptions import (
     MessagingScopeError,
     TaskNotFoundError,
 )
-from factorial.logging import get_logger
+from factorial.core.logging import get_logger
+from factorial.core.utils import decode, serialize_data
 from factorial.queue.keys import RedisKeys
 from factorial.queue.lua import (
     MessagingGroupMutationScriptResult,
@@ -30,12 +31,15 @@ from factorial.queue.lua import (
     create_messaging_human_group_send_script,
 )
 from factorial.queue.task import effective_team_id, get_task_data
-from factorial.utils import decode, serialize_data
 
 logger = get_logger(__name__)
 
 _MESSAGING_HISTORY_MAXLEN = 20_000
 _GROUP_ID_PREFIX = "grp1."
+_DEFAULT_HISTORY_LIMIT = 50
+_MAX_HISTORY_LIMIT = 500
+_DEFAULT_LIST_LIMIT = 50
+_MAX_LIST_LIMIT = 200
 
 def _normalize_group_name(group_name: str) -> str:
     if not isinstance(group_name, str) or not group_name.strip():
@@ -109,6 +113,122 @@ def _delivery_report(result: MessagingSendScriptResult) -> dict[str, Any]:
         "skipped_inactive_task_ids": result.skipped_inactive_task_ids,
         "failed_task_ids": result.failed_task_ids,
     }
+
+
+def _normalize_history_limit(limit: int) -> int:
+    if not isinstance(limit, int):
+        raise TypeError("limit must be an integer")
+    if limit < 1:
+        raise ValueError("limit must be >= 1")
+    return min(limit, _MAX_HISTORY_LIMIT)
+
+
+def _normalize_list_limit(limit: int) -> int:
+    if not isinstance(limit, int):
+        raise TypeError("limit must be an integer")
+    if limit < 1:
+        raise ValueError("limit must be >= 1")
+    return min(limit, _MAX_LIST_LIMIT)
+
+
+def _normalize_history_order(order: str) -> Literal["asc", "desc"]:
+    if order not in {"asc", "desc"}:
+        raise ValueError("order must be 'asc' or 'desc'")
+    return cast(Literal["asc", "desc"], order)
+
+
+def _decode_list_cursor(cursor: str | None) -> int:
+    if cursor is None:
+        return 0
+    if not isinstance(cursor, str) or not cursor:
+        raise ValueError("cursor must be a non-empty string when provided")
+    try:
+        offset = int(cursor)
+    except ValueError as exc:
+        raise ValueError("cursor has invalid format") from exc
+    if offset < 0:
+        raise ValueError("cursor has invalid format")
+    return offset
+
+
+def _decode_message_payload(raw_payload: Any) -> dict[str, Any]:
+    if raw_payload is None:
+        return {}
+    try:
+        text = decode(raw_payload)
+        parsed = json.loads(text)
+    except Exception:
+        return {}
+    if not isinstance(parsed, dict):
+        return {}
+    return cast(dict[str, Any], parsed)
+
+
+def _coerce_string_list(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [str(item) for item in value]
+
+
+def _coerce_dict(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    return cast(dict[str, Any], value)
+
+
+def _coerce_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value)
+        except ValueError:
+            return None
+    return None
+
+
+async def _touch_group_thread_index(
+    *,
+    redis_client: redis.Redis,
+    namespace: str,
+    team_id: str,
+    thread_id: str,
+) -> None:
+    keys = RedisKeys.format(namespace=namespace)
+    try:
+        await redis_client.zadd(  # type: ignore[misc]
+            keys.messaging_group_threads_by_team(team_id),
+            {thread_id: int(time.time() * 1000)},
+        )
+    except Exception as exc:  # pragma: no cover - best effort index update
+        logger.warning(
+            "Failed to update group thread index for %s",
+            thread_id,
+            exc_info=exc,
+        )
+
+
+async def _touch_direct_thread_index(
+    *,
+    redis_client: redis.Redis,
+    namespace: str,
+    team_id: str,
+    thread_id: str,
+) -> None:
+    keys = RedisKeys.format(namespace=namespace)
+    try:
+        await redis_client.zadd(  # type: ignore[misc]
+            keys.messaging_direct_threads_by_team(team_id),
+            {thread_id: int(time.time() * 1000)},
+        )
+    except Exception as exc:  # pragma: no cover - best effort index update
+        logger.warning(
+            "Failed to update direct thread index for %s",
+            thread_id,
+            exc_info=exc,
+        )
 
 def _decode_group_meta(
     *,
@@ -193,6 +313,72 @@ async def _publish_messaging_event(
             task_id,
             exc_info=exc,
         )
+
+
+async def _read_thread_history_page(
+    *,
+    redis_client: redis.Redis,
+    thread_history_key: str,
+    limit: int,
+    before: str | None,
+    after: str | None,
+    order: Literal["asc", "desc"],
+) -> dict[str, Any]:
+    if before is not None and after is not None:
+        raise ValueError("Specify only one of before or after")
+
+    normalized_limit = _normalize_history_limit(limit)
+    fetch_limit = normalized_limit + 1
+
+    if order == "desc":
+        max_bound = f"({before}" if before is not None else "+"
+        min_bound = f"({after}" if after is not None else "-"
+        rows = cast(
+            list[tuple[str, dict[str, Any]]],
+            await redis_client.xrevrange(  # type: ignore[misc]
+                thread_history_key,
+                max=max_bound,
+                min=min_bound,
+                count=fetch_limit,
+            ),
+        )
+    else:
+        min_bound = f"({after}" if after is not None else "-"
+        max_bound = f"({before}" if before is not None else "+"
+        rows = cast(
+            list[tuple[str, dict[str, Any]]],
+            await redis_client.xrange(  # type: ignore[misc]
+                thread_history_key,
+                min=min_bound,
+                max=max_bound,
+                count=fetch_limit,
+            ),
+        )
+
+    has_more = len(rows) > normalized_limit
+    if has_more:
+        rows = rows[:normalized_limit]
+
+    messages: list[dict[str, Any]] = []
+    for message_id, fields in rows:
+        payload = _decode_message_payload(fields.get("payload"))
+        messages.append({"message_id": message_id, "payload": payload})
+
+    next_before: str | None = None
+    next_after: str | None = None
+    if rows:
+        last_row_message_id = rows[-1][0]
+        if has_more and order == "desc":
+            next_before = last_row_message_id
+        if has_more and order == "asc":
+            next_after = last_row_message_id
+
+    return {
+        "messages": messages,
+        "next_before": next_before,
+        "next_after": next_after,
+        "has_more": has_more,
+    }
 
 async def messaging_groups_create(
     *,
@@ -391,6 +577,182 @@ async def messaging_groups_find(
         sender_task_id=sender_task_id,
     )
     return [group for group in groups if group["group_name"] == normalized_group_name]
+
+
+async def messaging_groups_history(
+    *,
+    redis_client: redis.Redis,
+    namespace: str,
+    group_id: str | None = None,
+    team_id: str | None = None,
+    group_name: str | None = None,
+    limit: int = _DEFAULT_HISTORY_LIMIT,
+    before: str | None = None,
+    after: str | None = None,
+    order: Literal["asc", "desc"] = "desc",
+) -> dict[str, Any]:
+    if group_id is not None:
+        resolved_team_id, resolved_group_name = _decode_group_id(group_id)
+        if team_id is not None and _normalize_team_id(team_id) != resolved_team_id:
+            raise MessagingScopeError("group_id and team_id scope mismatch")
+        if (
+            group_name is not None
+            and _normalize_group_name(group_name) != resolved_group_name
+        ):
+            raise ValueError("group_id and group_name refer to different groups")
+    else:
+        if team_id is None or group_name is None:
+            raise ValueError("Provide group_id, or both team_id and group_name")
+        resolved_team_id = _normalize_team_id(team_id)
+        resolved_group_name = _normalize_group_name(group_name)
+
+    normalized_order = _normalize_history_order(order)
+    keys = RedisKeys.format(namespace=namespace)
+    group_meta_key = keys.messaging_group_meta(resolved_team_id)
+    raw_meta = await redis_client.hget(group_meta_key, resolved_group_name)  # type: ignore[misc]
+    group_meta = _decode_group_meta(
+        raw_meta=raw_meta,
+        group_name=resolved_group_name,
+        team_id=resolved_team_id,
+    )
+
+    thread_id = _group_thread_id(
+        team_id=resolved_team_id,
+        group_name=resolved_group_name,
+    )
+    history = await _read_thread_history_page(
+        redis_client=redis_client,
+        thread_history_key=keys.messaging_thread_history(thread_id),
+        limit=limit,
+        before=before,
+        after=after,
+        order=normalized_order,
+    )
+    resolved_group_id = cast(
+        str,
+        group_meta.get("group_id")
+        or _encode_group_id(team_id=resolved_team_id, group_name=resolved_group_name),
+    )
+
+    messages: list[dict[str, Any]] = []
+    for message in cast(list[dict[str, Any]], history["messages"]):
+        payload = cast(dict[str, Any], message["payload"])
+        from_task_id_raw = payload.get("from_task_id")
+        from_owner_id_raw = payload.get("from_owner_id")
+        messages.append(
+            {
+                "message_id": str(message["message_id"]),
+                "thread_id": thread_id,
+                "team_id": resolved_team_id,
+                "group_id": resolved_group_id,
+                "group_name": resolved_group_name,
+                "from_task_id": (
+                    str(from_task_id_raw) if isinstance(from_task_id_raw, str) else None
+                ),
+                "from_owner_id": (
+                    str(from_owner_id_raw)
+                    if isinstance(from_owner_id_raw, str)
+                    else None
+                ),
+                "to_task_ids": _coerce_string_list(payload.get("to_task_ids")),
+                "delivered_task_ids": _coerce_string_list(
+                    payload.get("delivered_task_ids")
+                ),
+                "skipped_inactive_task_ids": _coerce_string_list(
+                    payload.get("skipped_inactive_task_ids")
+                ),
+                "failed_task_ids": _coerce_string_list(payload.get("failed_task_ids")),
+                "content": str(payload.get("content", "")),
+                "metadata": _coerce_dict(payload.get("metadata")),
+                "created_at": _coerce_float(payload.get("created_at")),
+            }
+        )
+
+    return {
+        "team_id": resolved_team_id,
+        "group_id": resolved_group_id,
+        "group_name": resolved_group_name,
+        "thread_id": thread_id,
+        "messages": messages,
+        "next_before": history["next_before"],
+        "next_after": history["next_after"],
+        "has_more": history["has_more"],
+    }
+
+
+async def messaging_groups_list_threads(
+    *,
+    redis_client: redis.Redis,
+    namespace: str,
+    team_id: str,
+    limit: int = _DEFAULT_LIST_LIMIT,
+    cursor: str | None = None,
+) -> dict[str, Any]:
+    normalized_team_id = _normalize_team_id(team_id)
+    normalized_limit = _normalize_list_limit(limit)
+    offset = _decode_list_cursor(cursor)
+
+    keys = RedisKeys.format(namespace=namespace)
+    index_key = keys.messaging_group_threads_by_team(normalized_team_id)
+    raw_thread_ids = cast(
+        list[str | bytes],
+        await redis_client.zrevrange(  # type: ignore[misc]
+            index_key,
+            offset,
+            offset + normalized_limit,
+        ),
+    )
+    thread_ids = [decode(thread_id) for thread_id in raw_thread_ids]
+    has_more = len(thread_ids) > normalized_limit
+    if has_more:
+        thread_ids = thread_ids[:normalized_limit]
+    next_cursor = str(offset + normalized_limit) if has_more else None
+
+    pipe = redis_client.pipeline(transaction=False)
+    for thread_id in thread_ids:
+        pipe.xrevrange(keys.messaging_thread_history(thread_id), "+", "-", count=1)
+    latest_rows = cast(list[list[tuple[str, dict[str, Any]]]], await pipe.execute())
+
+    prefix = f"group:{normalized_team_id}:"
+    conversations: list[dict[str, Any]] = []
+    for thread_id, rows in zip(thread_ids, latest_rows, strict=True):
+        if not thread_id.startswith(prefix):
+            continue
+        resolved_group_name = thread_id[len(prefix) :]
+        if not resolved_group_name:
+            continue
+        last_message_id: str | None = None
+        last_message_at: float | None = None
+        last_message_preview: str | None = None
+        if rows:
+            last_message_id = rows[0][0]
+            payload = _decode_message_payload(rows[0][1].get("payload"))
+            last_message_at = _coerce_float(payload.get("created_at"))
+            content = payload.get("content")
+            if isinstance(content, str) and content:
+                last_message_preview = content
+
+        conversations.append(
+            {
+                "team_id": normalized_team_id,
+                "group_id": _encode_group_id(
+                    team_id=normalized_team_id,
+                    group_name=resolved_group_name,
+                ),
+                "group_name": resolved_group_name,
+                "thread_id": thread_id,
+                "last_message_id": last_message_id,
+                "last_message_at": last_message_at,
+                "last_message_preview": last_message_preview,
+            }
+        )
+
+    return {
+        "conversations": conversations,
+        "next_cursor": next_cursor,
+        "has_more": has_more,
+    }
+
 
 async def messaging_groups_add_members(
     *,
@@ -635,6 +997,12 @@ async def messaging_groups_send(
         )
 
     report = _delivery_report(result)
+    await _touch_group_thread_index(
+        redis_client=redis_client,
+        namespace=namespace,
+        team_id=sender_team_id,
+        thread_id=thread_id,
+    )
     await _publish_messaging_event(
         redis_client=redis_client,
         namespace=namespace,
@@ -726,6 +1094,12 @@ async def messaging_send_direct(
         )
 
     report = _delivery_report(result)
+    await _touch_direct_thread_index(
+        redis_client=redis_client,
+        namespace=namespace,
+        team_id=sender_team_id,
+        thread_id=thread_id,
+    )
     await _publish_messaging_event(
         redis_client=redis_client,
         namespace=namespace,
@@ -754,6 +1128,163 @@ async def messaging_send_direct(
             },
         )
     return report
+
+
+async def messaging_direct_history(
+    *,
+    redis_client: redis.Redis,
+    namespace: str,
+    task_a_id: str,
+    task_b_id: str,
+    limit: int = _DEFAULT_HISTORY_LIMIT,
+    before: str | None = None,
+    after: str | None = None,
+    order: Literal["asc", "desc"] = "desc",
+) -> dict[str, Any]:
+    if not isinstance(task_a_id, str) or not task_a_id:
+        raise ValueError("task_a_id must be a non-empty string")
+    if not isinstance(task_b_id, str) or not task_b_id:
+        raise ValueError("task_b_id must be a non-empty string")
+    if task_a_id == task_b_id:
+        raise ValueError("task_a_id and task_b_id must be different")
+
+    task_a_data = await get_task_data(redis_client, namespace, task_a_id)
+    task_b_data = await get_task_data(redis_client, namespace, task_b_id)
+    team_a_id = _resolve_task_team_id(task_a_data)
+    team_b_id = _resolve_task_team_id(task_b_data)
+    if team_a_id != team_b_id:
+        raise MessagingScopeError("Direct history requires tasks in the same team")
+    normalized_order = _normalize_history_order(order)
+    canonical_task_a_id, canonical_task_b_id = sorted([task_a_id, task_b_id])
+    thread_id = _direct_thread_id(
+        team_id=team_a_id,
+        sender_task_id=canonical_task_a_id,
+        to_task_id=canonical_task_b_id,
+    )
+    keys = RedisKeys.format(namespace=namespace)
+    history = await _read_thread_history_page(
+        redis_client=redis_client,
+        thread_history_key=keys.messaging_thread_history(thread_id),
+        limit=limit,
+        before=before,
+        after=after,
+        order=normalized_order,
+    )
+
+    messages: list[dict[str, Any]] = []
+    for message in cast(list[dict[str, Any]], history["messages"]):
+        payload = cast(dict[str, Any], message["payload"])
+        from_task_id_raw = payload.get("from_task_id")
+        messages.append(
+            {
+                "message_id": str(message["message_id"]),
+                "thread_id": thread_id,
+                "team_id": team_a_id,
+                "task_a_id": canonical_task_a_id,
+                "task_b_id": canonical_task_b_id,
+                "from_task_id": (
+                    str(from_task_id_raw) if isinstance(from_task_id_raw, str) else None
+                ),
+                "to_task_ids": _coerce_string_list(payload.get("to_task_ids")),
+                "delivered_task_ids": _coerce_string_list(
+                    payload.get("delivered_task_ids")
+                ),
+                "skipped_inactive_task_ids": _coerce_string_list(
+                    payload.get("skipped_inactive_task_ids")
+                ),
+                "failed_task_ids": _coerce_string_list(payload.get("failed_task_ids")),
+                "content": str(payload.get("content", "")),
+                "metadata": _coerce_dict(payload.get("metadata")),
+                "created_at": _coerce_float(payload.get("created_at")),
+            }
+        )
+
+    return {
+        "team_id": team_a_id,
+        "thread_id": thread_id,
+        "task_a_id": canonical_task_a_id,
+        "task_b_id": canonical_task_b_id,
+        "messages": messages,
+        "next_before": history["next_before"],
+        "next_after": history["next_after"],
+        "has_more": history["has_more"],
+    }
+
+
+async def messaging_direct_list_threads(
+    *,
+    redis_client: redis.Redis,
+    namespace: str,
+    team_id: str,
+    limit: int = _DEFAULT_LIST_LIMIT,
+    cursor: str | None = None,
+) -> dict[str, Any]:
+    normalized_team_id = _normalize_team_id(team_id)
+    normalized_limit = _normalize_list_limit(limit)
+    offset = _decode_list_cursor(cursor)
+
+    keys = RedisKeys.format(namespace=namespace)
+    index_key = keys.messaging_direct_threads_by_team(normalized_team_id)
+    raw_thread_ids = cast(
+        list[str | bytes],
+        await redis_client.zrevrange(  # type: ignore[misc]
+            index_key,
+            offset,
+            offset + normalized_limit,
+        ),
+    )
+    thread_ids = [decode(thread_id) for thread_id in raw_thread_ids]
+    has_more = len(thread_ids) > normalized_limit
+    if has_more:
+        thread_ids = thread_ids[:normalized_limit]
+    next_cursor = str(offset + normalized_limit) if has_more else None
+
+    pipe = redis_client.pipeline(transaction=False)
+    for thread_id in thread_ids:
+        pipe.xrevrange(keys.messaging_thread_history(thread_id), "+", "-", count=1)
+    latest_rows = cast(list[list[tuple[str, dict[str, Any]]]], await pipe.execute())
+
+    prefix = f"dm:{normalized_team_id}:"
+    conversations: list[dict[str, Any]] = []
+    for thread_id, rows in zip(thread_ids, latest_rows, strict=True):
+        if not thread_id.startswith(prefix):
+            continue
+        participants = thread_id[len(prefix) :].split(":", 1)
+        if len(participants) != 2:
+            continue
+        task_a_id, task_b_id = participants
+        if not task_a_id or not task_b_id:
+            continue
+
+        last_message_id: str | None = None
+        last_message_at: float | None = None
+        last_message_preview: str | None = None
+        if rows:
+            last_message_id = rows[0][0]
+            payload = _decode_message_payload(rows[0][1].get("payload"))
+            last_message_at = _coerce_float(payload.get("created_at"))
+            content = payload.get("content")
+            if isinstance(content, str) and content:
+                last_message_preview = content
+
+        conversations.append(
+            {
+                "team_id": normalized_team_id,
+                "task_a_id": task_a_id,
+                "task_b_id": task_b_id,
+                "thread_id": thread_id,
+                "last_message_id": last_message_id,
+                "last_message_at": last_message_at,
+                "last_message_preview": last_message_preview,
+            }
+        )
+
+    return {
+        "conversations": conversations,
+        "next_cursor": next_cursor,
+        "has_more": has_more,
+    }
+
 
 async def messaging_human_send_direct(
     *,
@@ -941,6 +1472,12 @@ async def messaging_human_send_group(
         )
 
     report = _delivery_report(result)
+    await _touch_group_thread_index(
+        redis_client=redis_client,
+        namespace=namespace,
+        team_id=resolved_team_id,
+        thread_id=thread_id,
+    )
     event_task_id = (
         anchor_task_id
         or (result.delivered_task_ids[0] if result.delivered_task_ids else thread_id)

@@ -7,15 +7,15 @@ from factorial.agent import (
     publish_progress,
     retry,
 )
-from factorial.context import (
+from factorial.core.events import AgentEvent, EventPublisher, QueueEvent
+from factorial.core.exceptions import FatalAgentError, VerificationRejected
+from factorial.execution.context import (
     AgentContext,
     ContextType,
     ExecutionContext,
     VerificationState,
 )
-from factorial.events import AgentEvent, EventPublisher, QueueEvent
-from factorial.exceptions import FatalAgentError, VerificationRejected
-from factorial.hooks import (
+from factorial.execution.hooks import (
     Hook,
     HookDependency,
     HookRequestBuilder,
@@ -24,7 +24,21 @@ from factorial.hooks import (
     PendingHook,
     hook,
 )
-from factorial.llms import (
+from factorial.execution.messaging import (
+    MessageDeliveryReport,
+    MessagingGroupHandle,
+    MessagingGroupsNamespace,
+    MessagingNamespace,
+    messaging,
+)
+from factorial.execution.subagents import JobRef, SubagentsNamespace, subagents
+from factorial.execution.tools import (
+    Hidden,
+    ToolDefinition,
+    tool,
+)
+from factorial.execution.waits import WaitInstruction, WaitNamespace, wait
+from factorial.llm.models import (
     MODELS,
     Model,
     MultiClient,
@@ -61,13 +75,6 @@ from factorial.llms import (
     o3,
     o4_mini,
 )
-from factorial.messaging import (
-    MessageDeliveryReport,
-    MessagingGroupHandle,
-    MessagingGroupsNamespace,
-    MessagingNamespace,
-    messaging,
-)
 from factorial.orchestrator import (
     AgentWorkerConfig,
     MaintenanceWorkerConfig,
@@ -77,13 +84,6 @@ from factorial.orchestrator import (
     TaskTTLConfig,
 )
 from factorial.queue.task import Task, TaskStatus
-from factorial.subagents import JobRef, SubagentsNamespace, subagents
-from factorial.tools import (
-    Hidden,
-    ToolDefinition,
-    tool,
-)
-from factorial.waits import WaitInstruction, WaitNamespace, wait
 
 __all__ = [
     "BaseAgent",

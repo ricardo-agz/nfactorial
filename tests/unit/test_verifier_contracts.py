@@ -11,14 +11,14 @@ import pytest
 from pydantic import BaseModel
 
 from factorial import Agent, AgentContext, ExecutionContext
-from factorial.context import execution_context
-from factorial.events import EventPublisher
-from factorial.exceptions import (
+from factorial.core.events import EventPublisher
+from factorial.core.exceptions import (
     FatalAgentError,
     InvalidLLMResponseError,
     VerificationRejected,
 )
-from factorial.llms import Model, Provider
+from factorial.execution.context import execution_context
+from factorial.llm.models import Model, Provider
 from tests.mocks.llm import MockLLMClient, MockResponse, MockToolCall
 
 MOCK_MODEL = Model(

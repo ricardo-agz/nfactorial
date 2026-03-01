@@ -17,20 +17,25 @@ except Exception:
         )
 
 import factorial.queue as queue_module
-from factorial.engine import WorkerTickResult
-from factorial.exceptions import TaskNotFoundError
+from factorial.core.exceptions import TaskNotFoundError
 from factorial.orchestrator import Orchestrator
-from factorial.runtimes import vercel as vercel_runtime
-from factorial.runtimes.vercel import (
+from factorial.platforms import vercel as vercel_runtime
+from factorial.platforms.vercel import (
     VercelRuntimeSettings,
     bootstrap as vercel_bootstrap,
     cron_service as vercel_cron_service,
     worker_service as vercel_worker_service,
 )
+from factorial.queue.worker.tick import WorkerTickResult
 
 
 def test_worker_service_requires_vercel_workers_on_vercel(monkeypatch) -> None:
     monkeypatch.setenv("VERCEL", "1")
+    monkeypatch.setattr(
+        vercel_worker_service,
+        "_resolve_vercel_worker_class",
+        lambda: None,
+    )
     monkeypatch.setattr(
         vercel_worker_service,
         "_resolve_vercel_workers_runtime",
@@ -40,6 +45,45 @@ def test_worker_service_requires_vercel_workers_on_vercel(monkeypatch) -> None:
     orchestrator = Orchestrator(wake_transport="none")
     with pytest.raises(RuntimeError, match="vercel-workers"):
         vercel_worker_service.create_worker(orchestrator)
+
+
+def test_create_worker_prefers_worker_class_api(monkeypatch) -> None:
+    monkeypatch.setenv("VERCEL", "1")
+    monkeypatch.setattr(vercel_worker_service, "_REGISTERED_WORKER_APPS", {})
+    captured: dict[str, object] = {}
+
+    class _FakeWorker:
+        def receive(self, *, topic: str, consumer: str):  # type: ignore[no-untyped-def]
+            captured["topic"] = topic
+            captured["consumer"] = consumer
+
+            def _decorator(fn):  # type: ignore[no-untyped-def]
+                captured["handler"] = fn
+                return fn
+
+            return _decorator
+
+        def asgi_app(self):  # type: ignore[no-untyped-def]
+            return "fake-worker-app"
+
+    monkeypatch.setattr(
+        vercel_worker_service,
+        "_resolve_vercel_worker_class",
+        lambda: _FakeWorker,
+    )
+    monkeypatch.setattr(
+        vercel_worker_service,
+        "_resolve_vercel_workers_runtime",
+        lambda: None,
+    )
+
+    orchestrator = Orchestrator(wake_transport="none")
+    app = vercel_worker_service.create_worker(orchestrator)
+
+    assert app == "fake-worker-app"
+    assert captured["topic"] == "nfactorial-dispatch"
+    assert captured["consumer"] == "default"
+    assert callable(captured["handler"])
 
 
 def test_bootstrap_leaves_none_transport_locally(monkeypatch) -> None:
@@ -88,6 +132,109 @@ async def test_cron_trigger_queues_maintenance_tick(monkeypatch) -> None:
     assert result["ok"] is True
     assert result["mode"] == "queued"
     assert wake_called["count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_handle_queue_payload_schedules_heartbeat_after_worker_tick(
+    monkeypatch,
+) -> None:
+    orchestrator = Orchestrator()
+    orchestrator.wake_transport = "vercel_queue"
+    settings = VercelRuntimeSettings()
+    calls = {"heartbeat": 0}
+
+    async def _fake_run_worker_invocation(**kwargs):  # type: ignore[no-untyped-def]
+        return {"processed_tasks": 0}
+
+    async def _fake_heartbeat(**kwargs):  # type: ignore[no-untyped-def]
+        calls["heartbeat"] += 1
+        return True
+
+    monkeypatch.setattr(
+        vercel_worker_service,
+        "_run_worker_invocation",
+        _fake_run_worker_invocation,
+    )
+    monkeypatch.setattr(
+        vercel_worker_service,
+        "ensure_maintenance_heartbeat",
+        _fake_heartbeat,
+    )
+
+    result = await vercel_worker_service._handle_queue_payload(
+        orchestrator=orchestrator,
+        settings=settings,
+        payload={
+            "schema_version": 1,
+            "kind": "wake_agent",
+            "namespace": orchestrator.namespace,
+            "agent_name": "agent_a",
+            "reason": "enqueue",
+        },
+        metadata={"topic": "nfactorial-dispatch", "consumer": "default"},
+    )
+
+    assert result["ok"] is True
+    assert calls["heartbeat"] == 1
+
+
+@pytest.mark.asyncio
+async def test_handle_queue_payload_dispatches_continuation_without_heartbeat(
+    monkeypatch,
+) -> None:
+    orchestrator = Orchestrator()
+    orchestrator.wake_transport = "vercel_queue"
+    settings = VercelRuntimeSettings()
+    calls = {"continuation": 0, "heartbeat": 0}
+
+    class _Summary:
+        needs_follow_up = True
+
+        def to_dict(self) -> dict[str, object]:
+            return {"ok": True, "needs_follow_up": True}
+
+    async def _fake_maintenance_invocation(**kwargs):  # type: ignore[no-untyped-def]
+        return _Summary()
+
+    async def _fake_continuation(**kwargs):  # type: ignore[no-untyped-def]
+        calls["continuation"] += 1
+        return True
+
+    async def _fake_heartbeat(**kwargs):  # type: ignore[no-untyped-def]
+        calls["heartbeat"] += 1
+        return True
+
+    monkeypatch.setattr(
+        vercel_worker_service,
+        "run_maintenance_invocation",
+        _fake_maintenance_invocation,
+    )
+    monkeypatch.setattr(
+        vercel_worker_service,
+        "dispatch_maintenance_continuation",
+        _fake_continuation,
+    )
+    monkeypatch.setattr(
+        vercel_worker_service,
+        "ensure_maintenance_heartbeat",
+        _fake_heartbeat,
+    )
+
+    result = await vercel_worker_service._handle_queue_payload(
+        orchestrator=orchestrator,
+        settings=settings,
+        payload={
+            "schema_version": 1,
+            "kind": "maintenance_tick",
+            "namespace": orchestrator.namespace,
+            "reason": "cron_schedule",
+        },
+        metadata={"topic": "nfactorial-dispatch", "consumer": "default"},
+    )
+
+    assert result["ok"] is True
+    assert calls["continuation"] == 1
+    assert calls["heartbeat"] == 0
 
 
 @pytest.mark.asyncio

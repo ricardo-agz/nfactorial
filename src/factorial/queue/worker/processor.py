@@ -7,15 +7,16 @@ from typing import Any
 
 import redis.asyncio as redis
 
-from factorial.agent import BaseAgent, ExecutionContext
-from factorial.context import (
+from factorial.agent import BaseAgent
+from factorial.core.events import AgentEvent, EventPublisher
+from factorial.execution.context import (
     ContextType,
+    ExecutionContext,
     HooksExecutionNamespace,
     MessagingExecutionNamespace,
     MessagingGroupsExecutionNamespace,
     SubagentsExecutionNamespace,
 )
-from factorial.events import AgentEvent, EventPublisher
 from factorial.queue.keys import RedisKeys
 from factorial.queue.lua import (
     ActivityWaitScript,

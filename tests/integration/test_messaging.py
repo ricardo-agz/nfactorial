@@ -4,20 +4,24 @@ from typing import Any
 import pytest
 import redis.asyncio as redis
 
-from factorial.context import AgentContext
-from factorial.exceptions import (
+from factorial.core.exceptions import (
     MessagingGroupAlreadyExistsError,
     MessagingPermissionError,
     MessagingScopeError,
 )
+from factorial.execution.context import AgentContext
 from factorial.queue.keys import RedisKeys
 from factorial.queue.operations import (
     enqueue_task,
+    messaging_direct_history,
+    messaging_direct_list_threads,
     messaging_groups_add_members,
     messaging_groups_create,
     messaging_groups_get,
+    messaging_groups_history,
     messaging_groups_leave,
     messaging_groups_list,
+    messaging_groups_list_threads,
     messaging_groups_remove_members,
     messaging_groups_send,
     messaging_human_send_direct,
@@ -745,3 +749,202 @@ async def test_human_group_send_supports_all_target_selectors(
     assert history_payload["kind"] == "human_group"
     assert history_payload["from_owner_id"] == test_owner_id
     assert set(history_payload["to_task_ids"]) == {sender.id, teammate.id}
+
+
+@pytest.mark.asyncio
+async def test_group_history_and_thread_list_support_pagination(
+    redis_client: redis.Redis,
+    test_namespace: str,
+    test_agent: SimpleTestAgent,
+    test_owner_id: str,
+) -> None:
+    sender = await _enqueue_root_task(
+        redis_client=redis_client,
+        namespace=test_namespace,
+        agent=test_agent,
+        owner_id=test_owner_id,
+        query="sender",
+    )
+    team_id = sender.metadata.team_id or sender.id
+
+    teammate = Task.create(
+        owner_id=test_owner_id,
+        agent=test_agent.name,
+        payload=AgentContext(query="teammate"),
+    )
+    teammate.metadata.team_id = team_id
+    await enqueue_task(
+        redis_client=redis_client,
+        namespace=test_namespace,
+        agent=test_agent,
+        task=teammate,
+    )
+
+    created = await messaging_groups_create(
+        redis_client=redis_client,
+        namespace=test_namespace,
+        sender_task_id=sender.id,
+        group_name="village",
+        member_task_ids=[teammate.id],
+    )
+    await messaging_groups_send(
+        redis_client=redis_client,
+        namespace=test_namespace,
+        sender_task_id=sender.id,
+        group_name="village",
+        content="first",
+    )
+    await messaging_groups_send(
+        redis_client=redis_client,
+        namespace=test_namespace,
+        sender_task_id=sender.id,
+        group_name="village",
+        content="second",
+    )
+
+    latest_page = await messaging_groups_history(
+        redis_client=redis_client,
+        namespace=test_namespace,
+        team_id=team_id,
+        group_name="village",
+        limit=1,
+        order="desc",
+    )
+    assert latest_page["group_id"] == created["group_id"]
+    assert latest_page["has_more"] is True
+    assert latest_page["messages"][0]["content"] == "second"
+    assert isinstance(latest_page["next_before"], str)
+
+    older_page = await messaging_groups_history(
+        redis_client=redis_client,
+        namespace=test_namespace,
+        group_id=created["group_id"],
+        limit=1,
+        before=latest_page["next_before"],
+        order="desc",
+    )
+    assert older_page["messages"][0]["content"] == "first"
+
+    thread_list = await messaging_groups_list_threads(
+        redis_client=redis_client,
+        namespace=test_namespace,
+        team_id=team_id,
+        limit=10,
+    )
+    assert thread_list["has_more"] is False
+    assert len(thread_list["conversations"]) == 1
+    conversation = thread_list["conversations"][0]
+    assert conversation["team_id"] == team_id
+    assert conversation["group_id"] == created["group_id"]
+    assert conversation["group_name"] == "village"
+    assert conversation["thread_id"] == f"group:{team_id}:village"
+    assert conversation["last_message_preview"] == "second"
+    assert isinstance(conversation["last_message_id"], str)
+    assert isinstance(conversation["last_message_at"], float)
+
+
+@pytest.mark.asyncio
+async def test_direct_history_and_thread_list_are_symmetric(
+    redis_client: redis.Redis,
+    test_namespace: str,
+    test_agent: SimpleTestAgent,
+    test_owner_id: str,
+) -> None:
+    task_a = await _enqueue_root_task(
+        redis_client=redis_client,
+        namespace=test_namespace,
+        agent=test_agent,
+        owner_id=test_owner_id,
+        query="task-a",
+    )
+    team_id = task_a.metadata.team_id or task_a.id
+
+    task_b = Task.create(
+        owner_id=test_owner_id,
+        agent=test_agent.name,
+        payload=AgentContext(query="task-b"),
+    )
+    task_b.metadata.team_id = team_id
+    await enqueue_task(
+        redis_client=redis_client,
+        namespace=test_namespace,
+        agent=test_agent,
+        task=task_b,
+    )
+
+    task_c = Task.create(
+        owner_id=test_owner_id,
+        agent=test_agent.name,
+        payload=AgentContext(query="task-c"),
+    )
+    task_c.metadata.team_id = team_id
+    await enqueue_task(
+        redis_client=redis_client,
+        namespace=test_namespace,
+        agent=test_agent,
+        task=task_c,
+    )
+
+    await messaging_send_direct(
+        redis_client=redis_client,
+        namespace=test_namespace,
+        sender_task_id=task_a.id,
+        to_task_id=task_b.id,
+        content="alpha",
+    )
+    await messaging_send_direct(
+        redis_client=redis_client,
+        namespace=test_namespace,
+        sender_task_id=task_b.id,
+        to_task_id=task_a.id,
+        content="beta",
+    )
+    await messaging_send_direct(
+        redis_client=redis_client,
+        namespace=test_namespace,
+        sender_task_id=task_a.id,
+        to_task_id=task_c.id,
+        content="gamma",
+    )
+
+    history_ab = await messaging_direct_history(
+        redis_client=redis_client,
+        namespace=test_namespace,
+        task_a_id=task_a.id,
+        task_b_id=task_b.id,
+        order="desc",
+    )
+    history_ba = await messaging_direct_history(
+        redis_client=redis_client,
+        namespace=test_namespace,
+        task_a_id=task_b.id,
+        task_b_id=task_a.id,
+        order="desc",
+    )
+    assert history_ab["thread_id"] == history_ba["thread_id"]
+    assert history_ab["task_a_id"] == history_ba["task_a_id"]
+    assert history_ab["task_b_id"] == history_ba["task_b_id"]
+    assert [entry["content"] for entry in history_ab["messages"][:2]] == [
+        "beta",
+        "alpha",
+    ]
+
+    first_page = await messaging_direct_list_threads(
+        redis_client=redis_client,
+        namespace=test_namespace,
+        team_id=team_id,
+        limit=1,
+    )
+    assert first_page["has_more"] is True
+    assert isinstance(first_page["next_cursor"], str)
+    second_page = await messaging_direct_list_threads(
+        redis_client=redis_client,
+        namespace=test_namespace,
+        team_id=team_id,
+        limit=1,
+        cursor=first_page["next_cursor"],
+    )
+    assert second_page["conversations"]
+    first_thread_id = first_page["conversations"][0]["thread_id"]
+    second_thread_id = second_page["conversations"][0]["thread_id"]
+    assert first_thread_id != second_thread_id

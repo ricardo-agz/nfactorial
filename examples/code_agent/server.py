@@ -1,4 +1,5 @@
 import json
+from collections.abc import Callable
 from typing import Any
 
 from agent import IdeAgentContext, ide_agent
@@ -8,9 +9,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from orchestrator import orchestrator
 from pydantic import BaseModel
-from vercel.headers import set_headers
 from starlette.requests import Request
-from typing import Callable
+from vercel.headers import set_headers
 
 app = FastAPI(root_path="/api")
 

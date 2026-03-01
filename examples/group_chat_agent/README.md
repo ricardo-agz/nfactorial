@@ -16,23 +16,23 @@ This example demonstrates:
 export OPENAI_API_KEY=...
 ```
 
-2. Run everything:
+1. Run everything:
 
 ```bash
 docker-compose up
 ```
 
-3. Open:
+1. Open:
 
 - UI: <http://localhost:5173>
 - Dashboard: <http://localhost:8081>
 
 ## Deploy on Vercel
 
-This example now supports both runtime modes:
+This example supports both runtime modes:
 
 - **Process mode (local):** `docker-compose up`
-- **Serverless mode (Vercel):** `vercel.json` + queue worker + cron maintenance
+- **Serverless mode (Vercel):** `vercel.json` + queue worker
 
 ### Required environment variables (Vercel Project)
 
@@ -51,9 +51,9 @@ vercel
 
 Service wiring in `vercel.json`:
 
-- `web` -> `server.py`
-- `worker` -> `orchestrator.py` (Vercel Queue consumer)
-- `maintenance` -> `orchestrator.py` (cron tick)
+- `ui` -> `ui`
+- `api` -> `server.py`
+- `worker` -> `orchestrator.py` (Vercel Queue consumer + self-renewing maintenance heartbeat)
 
 ## Manual Setup
 

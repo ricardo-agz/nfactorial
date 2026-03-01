@@ -1,5 +1,5 @@
 import { Loader2, Send, Square } from "lucide-react";
-import React, { useMemo, useState } from "react";
+import { useMemo, useState } from "react";
 
 import { AgentTracePanel } from "./components/AgentTracePanel";
 import { FinalDeliverablePanel } from "./components/FinalDeliverablePanel";

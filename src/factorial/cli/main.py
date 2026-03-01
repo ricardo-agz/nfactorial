@@ -20,7 +20,7 @@ from factorial import (
     gpt_41,
     grok_4,
 )
-from factorial.llms import Model, MultiClient
+from factorial.llm.models import Model, MultiClient
 
 from .agent import CLIAgentContext, NFactorialAgent
 from .event_printer import event_printer

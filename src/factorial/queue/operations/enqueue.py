@@ -9,10 +9,11 @@ from typing import Any, cast
 import redis.asyncio as redis
 
 from factorial.agent import BaseAgent
-from factorial.context import VerificationState
-from factorial.events import AgentEvent, EventPublisher
-from factorial.exceptions import InvalidTaskIdError
-from factorial.logging import get_logger
+from factorial.core.events import AgentEvent, EventPublisher
+from factorial.core.exceptions import InvalidTaskIdError
+from factorial.core.logging import get_logger
+from factorial.core.utils import is_valid_task_id, serialize_data
+from factorial.execution.context import VerificationState
 from factorial.queue.keys import RedisKeys
 from factorial.queue.lua import (
     EnqueueBatchScript,
@@ -29,7 +30,6 @@ from factorial.queue.task import (
     get_batch_data,
     get_task_data,
 )
-from factorial.utils import is_valid_task_id, serialize_data
 
 logger = get_logger(__name__)
 

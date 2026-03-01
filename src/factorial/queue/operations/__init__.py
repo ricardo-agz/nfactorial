@@ -1,4 +1,4 @@
-from factorial.events import EventPublisher
+from factorial.core.events import EventPublisher
 from factorial.queue.keys import PENDING_SENTINEL
 from factorial.queue.operations.control import (
     cancel_batch,
@@ -24,12 +24,16 @@ from factorial.queue.operations.hooks import (
     rotate_hook_token,
 )
 from factorial.queue.operations.messaging import (
+    messaging_direct_history,
+    messaging_direct_list_threads,
     messaging_groups_add_members,
     messaging_groups_create,
     messaging_groups_find,
     messaging_groups_get,
+    messaging_groups_history,
     messaging_groups_leave,
     messaging_groups_list,
+    messaging_groups_list_threads,
     messaging_groups_remove_members,
     messaging_groups_send,
     messaging_human_send_direct,
@@ -54,11 +58,15 @@ __all__ = [
     "messaging_groups_get",
     "messaging_groups_list",
     "messaging_groups_find",
+    "messaging_groups_history",
+    "messaging_groups_list_threads",
     "messaging_groups_add_members",
     "messaging_groups_remove_members",
     "messaging_groups_leave",
     "messaging_groups_send",
     "messaging_send_direct",
+    "messaging_direct_history",
+    "messaging_direct_list_threads",
     "messaging_human_send_direct",
     "messaging_human_send_group",
     "cancel_batch",

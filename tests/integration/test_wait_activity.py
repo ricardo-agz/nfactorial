@@ -15,7 +15,8 @@ from openai.types.chat.chat_completion_message_function_tool_call import (
 )
 
 from factorial.agent import BaseAgent, TurnCompletion
-from factorial.context import AgentContext
+from factorial.execution.context import AgentContext
+from factorial.execution.waits import wait
 from factorial.queue.keys import PENDING_SENTINEL, RedisKeys
 from factorial.queue.lua import (
     ActivityWaitScript,
@@ -35,7 +36,6 @@ from factorial.queue.operations import (
 )
 from factorial.queue.task import Task, TaskStatus, get_task_status
 from factorial.queue.worker import CompletionAction, process_task
-from factorial.waits import wait
 
 from .conftest import SimpleTestAgent
 

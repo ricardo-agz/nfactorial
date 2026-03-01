@@ -5,8 +5,9 @@ from typing import Any, cast
 
 import redis.asyncio as redis
 
-from factorial.agent import BaseAgent, serialize_data
-from factorial.events import AgentEvent, BatchEvent, EventPublisher
+from factorial.agent import BaseAgent
+from factorial.core.events import AgentEvent, BatchEvent, EventPublisher
+from factorial.core.utils import serialize_data
 from factorial.queue.keys import PENDING_SENTINEL, RedisKeys
 from factorial.queue.lua import (
     ActivityWaitScript,

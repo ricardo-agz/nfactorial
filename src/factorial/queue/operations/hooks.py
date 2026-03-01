@@ -15,16 +15,18 @@ from openai.types.chat.chat_completion_message_function_tool_call import (
     Function as ToolCallFunction,
 )
 
-from factorial.agent import BaseAgent, ExecutionContext
-from factorial.context import execution_context
-from factorial.exceptions import (
+from factorial.agent import BaseAgent
+from factorial.core.exceptions import (
     HookAlreadyResolvedError,
     HookExpiredError,
     HookNotFoundError,
     HookTokenValidationError,
     InactiveTaskError,
 )
-from factorial.hooks import (
+from factorial.core.logging import get_logger
+from factorial.core.utils import decode, serialize_data
+from factorial.execution.context import ExecutionContext, execution_context
+from factorial.execution.hooks import (
     HookRecord,
     HookRequestContext,
     HookResolutionResult,
@@ -32,12 +34,10 @@ from factorial.hooks import (
     PendingHook,
     build_request_builder_kwargs,
 )
-from factorial.logging import get_logger
+from factorial.execution.tools import _ToolResultInternal
 from factorial.queue.keys import PENDING_SENTINEL, RedisKeys
 from factorial.queue.lua import create_hook_resolve_script, create_hook_wake_script
 from factorial.queue.task import Task, TaskStatus, get_task_data
-from factorial.tools import _ToolResultInternal
-from factorial.utils import decode, serialize_data
 
 logger = get_logger(__name__)
 

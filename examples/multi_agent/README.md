@@ -39,7 +39,7 @@ docker-compose up
 This example supports both runtime modes:
 
 - **Process mode (local):** `docker-compose up`
-- **Serverless mode (Vercel):** `vercel.json` + queue worker + cron maintenance
+- **Serverless mode (Vercel):** `vercel.json` + queue worker
 
 ### Required environment variables (Vercel Project)
 
@@ -60,8 +60,7 @@ vercel
 Service wiring in `vercel.json`:
 
 - `web` -> `server.py`
-- `worker` -> `orchestrator.py` (Vercel Queue consumer)
-- `maintenance` -> `orchestrator.py` (cron tick)
+- `worker` -> `orchestrator.py` (Vercel Queue consumer + self-renewing maintenance heartbeat)
 
 ## Manual Setup
 

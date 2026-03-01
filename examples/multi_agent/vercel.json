@@ -12,11 +12,6 @@
       "entrypoint": "orchestrator.py",
       "topic": "nfactorial-dispatch",
       "consumer": "default"
-    },
-    "maintenance": {
-      "type": "cron",
-      "entrypoint": "orchestrator.py",
-      "schedule": "*/1 * * * *"
     }
   }
 }

@@ -25,8 +25,8 @@ from openai.types.chat.chat_completion_message_function_tool_call import (
 )
 from openai.types.completion_usage import CompletionUsage
 
-from factorial.context import AgentContext
-from factorial.llms import Model
+from factorial.execution.context import AgentContext
+from factorial.llm.models import Model
 
 
 @dataclass

@@ -204,7 +204,7 @@ Recommendation: skip inactive and report (do not fail whole operation).
 
 ## Error Model
 
-Add explicit exceptions (in `factorial.exceptions`):
+Add explicit exceptions (in `factorial.core.exceptions`):
 
 - `MessagingError`
 - `MessagingGroupNotFoundError`

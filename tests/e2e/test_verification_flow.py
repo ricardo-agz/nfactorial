@@ -8,8 +8,8 @@ import pytest
 import redis.asyncio as redis
 from pydantic import BaseModel
 
-from factorial.context import AgentContext
-from factorial.exceptions import VerificationRejected
+from factorial.core.exceptions import VerificationRejected
+from factorial.execution.context import AgentContext
 from factorial.queue.keys import RedisKeys
 from factorial.queue.lua import (
     create_batch_pickup_script,

@@ -4,7 +4,7 @@ from dataclasses import dataclass
 import redis.asyncio as redis
 from redis.commands.core import AsyncScript
 
-from factorial.utils import decode
+from factorial.core.utils import decode
 
 from ._core import LuaScriptContract, _execute_contract, get_cached_script
 

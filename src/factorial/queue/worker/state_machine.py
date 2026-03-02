@@ -114,6 +114,7 @@ async def handle_wait_state(
     event_publisher: EventPublisher,
     park_or_resume_child_wait: Any,
     park_activity_wait: Any,
+    park_signal_wait: Any,
     park_scheduled_wait: Any,
 ) -> bool:
     """Handle all wait instructions for the current turn."""
@@ -245,6 +246,113 @@ async def handle_wait_state(
         await event_publisher.publish_event(
             AgentEvent(
                 event_type="task_activity_waiting",
+                task_id=task.id,
+                owner_id=task.metadata.owner_id,
+                agent_name=agent.name,
+                turn=task.payload.turn,
+                data=event_data,
+            )
+        )
+        return True
+
+    if wait_kind == "signal":
+        signal_ids: set[str] = set()
+        wait_data: Any = None
+        timeout_candidates: list[tuple[float, str, str | None, str | None]] = []
+        for _, wait_instruction in wait_instructions:
+            signal_id = wait_instruction.signal_id
+            if not isinstance(signal_id, str) or not signal_id:
+                raise ValueError("wait.until_signal requires a non-empty signal_id.")
+            signal_ids.add(signal_id)
+            if wait_data is None and wait_instruction.data is not None:
+                wait_data = wait_instruction.data
+            timeout_kind = wait_instruction.signal_timeout_kind
+            if timeout_kind is None:
+                continue
+
+            if timeout_kind == "sleep":
+                timeout_s = wait_instruction.signal_timeout_s
+                if timeout_s is None:
+                    raise ValueError(
+                        "wait.until_signal(timeout=wait.sleep(...)) requires "
+                        "a sleep duration."
+                    )
+                if timeout_s < 0:
+                    raise ValueError(
+                        "wait.until_signal(timeout=wait.sleep(...)) requires "
+                        "a non-negative duration."
+                    )
+                timeout_candidates.append(
+                    (time.time() + timeout_s, "sleep", None, None)
+                )
+            elif timeout_kind == "cron":
+                cron_expression = wait_instruction.signal_timeout_cron
+                if not cron_expression:
+                    raise ValueError(
+                        "wait.until_signal(timeout=wait.cron(...)) requires a "
+                        "non-empty cron expression."
+                    )
+                cron_timezone = wait_instruction.signal_timeout_timezone or "UTC"
+                timeout_candidates.append(
+                    (
+                        next_cron_wake_timestamp(cron_expression, cron_timezone),
+                        "cron",
+                        cron_expression,
+                        cron_timezone,
+                    )
+                )
+            else:
+                raise ValueError(
+                    "wait.until_signal timeout kind must be 'sleep' or 'cron'."
+                )
+
+        if len(signal_ids) != 1:
+            raise RuntimeError(
+                "All wait.until_signal instructions in a single turn must "
+                "use the same signal_id."
+            )
+        signal_id = next(iter(signal_ids))
+        timeout_wake_timestamp: float | None = None
+        timeout_kind: str | None = None
+        timeout_cron_expression: str | None = None
+        timeout_cron_timezone: str | None = None
+        if timeout_candidates:
+            (
+                timeout_wake_timestamp,
+                timeout_kind,
+                timeout_cron_expression,
+                timeout_cron_timezone,
+            ) = min(timeout_candidates, key=lambda item: item[0])
+
+        woken_immediately = await park_signal_wait(
+            signal_id=signal_id,
+            source_tool_call_ids=source_tool_call_ids,
+            data=wait_data,
+            timeout_wake_timestamp=timeout_wake_timestamp,
+            timeout_kind=timeout_kind,
+            timeout_cron_expression=timeout_cron_expression,
+            timeout_cron_timezone=timeout_cron_timezone,
+        )
+        event_data: dict[str, Any] = {
+            "wait_kind": "signal",
+            "signal_id": signal_id,
+            "source_tool_call_ids": source_tool_call_ids,
+        }
+        if timeout_wake_timestamp is not None:
+            event_data["timeout_kind"] = timeout_kind
+            event_data["wake_timestamp"] = timeout_wake_timestamp
+            if timeout_cron_expression is not None:
+                event_data["timeout_cron"] = timeout_cron_expression
+            if timeout_cron_timezone is not None:
+                event_data["timeout_timezone"] = timeout_cron_timezone
+
+        await event_publisher.publish_event(
+            AgentEvent(
+                event_type=(
+                    "task_signal_wait_satisfied"
+                    if woken_immediately
+                    else "task_signal_waiting"
+                ),
                 task_id=task.id,
                 owner_id=task.metadata.owner_id,
                 agent_name=agent.name,
@@ -441,6 +549,7 @@ async def run_task_state_machine(
     complete: Any,
     park_or_resume_child_wait: Any,
     park_activity_wait: Any,
+    park_signal_wait: Any,
     park_scheduled_wait: Any,
     publish_batch_progress: Any,
 ) -> None:
@@ -486,6 +595,7 @@ async def run_task_state_machine(
                     event_publisher=event_publisher,
                     park_or_resume_child_wait=park_or_resume_child_wait,
                     park_activity_wait=park_activity_wait,
+                    park_signal_wait=park_signal_wait,
                     park_scheduled_wait=park_scheduled_wait,
                 )
                 state = (

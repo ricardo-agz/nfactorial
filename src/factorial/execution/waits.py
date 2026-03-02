@@ -12,17 +12,22 @@ from factorial.execution.context import ExecutionContext
 class WaitInstruction:
     """Serializable wait intent used by the namespace-style API."""
 
-    kind: Literal["sleep", "cron", "jobs", "activity"]
+    kind: Literal["sleep", "cron", "jobs", "activity", "signal"]
     data: Any = None
     sleep_s: float | None = None
     cron: str | None = None
     timezone: str | None = None
     child_task_ids: list[str] | None = None
     job_refs: list[dict[str, Any]] | None = None
+    signal_id: str | None = None
     activity_timeout_kind: Literal["sleep", "cron"] | None = None
     activity_timeout_s: float | None = None
     activity_timeout_cron: str | None = None
     activity_timeout_timezone: str | None = None
+    signal_timeout_kind: Literal["sleep", "cron"] | None = None
+    signal_timeout_s: float | None = None
+    signal_timeout_cron: str | None = None
+    signal_timeout_timezone: str | None = None
 
 
 def _parse_cron_field(field: str, minimum: int, maximum: int) -> tuple[set[int], bool]:
@@ -272,6 +277,62 @@ class WaitNamespace:
             activity_timeout_kind="cron",
             activity_timeout_cron=timeout.cron,
             activity_timeout_timezone=timeout.timezone or "UTC",
+        )
+
+    def until_signal(
+        self,
+        signal_id: str,
+        *,
+        timeout: WaitInstruction | None = None,
+        data: Any = None,
+    ) -> WaitInstruction:
+        if not isinstance(signal_id, str) or not signal_id.strip():
+            raise ValueError("wait.until_signal requires a non-empty signal_id")
+        normalized_signal_id = signal_id.strip()
+        if timeout is None:
+            return WaitInstruction(
+                kind="signal",
+                signal_id=normalized_signal_id,
+                data=data,
+            )
+
+        if not isinstance(timeout, WaitInstruction):
+            raise TypeError(
+                "wait.until_signal(timeout=...) expects wait.sleep(...) or "
+                "wait.cron(...)"
+            )
+        if timeout.kind not in {"sleep", "cron"}:
+            raise ValueError(
+                "wait.until_signal(timeout=...) only supports wait.sleep(...) "
+                "or wait.cron(...)"
+            )
+
+        if timeout.kind == "sleep":
+            if timeout.sleep_s is None:
+                raise ValueError(
+                    "wait.until_signal(timeout=wait.sleep(...)) requires a sleep "
+                    "duration"
+                )
+            return WaitInstruction(
+                kind="signal",
+                signal_id=normalized_signal_id,
+                data=data,
+                signal_timeout_kind="sleep",
+                signal_timeout_s=float(timeout.sleep_s),
+            )
+
+        if not timeout.cron:
+            raise ValueError(
+                "wait.until_signal(timeout=wait.cron(...)) requires a non-empty "
+                "cron expression"
+            )
+        return WaitInstruction(
+            kind="signal",
+            signal_id=normalized_signal_id,
+            data=data,
+            signal_timeout_kind="cron",
+            signal_timeout_cron=timeout.cron,
+            signal_timeout_timezone=timeout.timezone or "UTC",
         )
 
 

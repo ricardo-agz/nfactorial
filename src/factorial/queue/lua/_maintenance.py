@@ -207,6 +207,8 @@ class ScheduledRecoveryScript(AsyncScript):
             "task_metas_key",
             "scheduled_wait_meta_key",
             "activity_wait_meta_key",
+            "signal_wait_meta_key",
+            "signal_wake_meta_key",
         ),
         arg_fields=("max_batch_size",),
     )
@@ -226,6 +228,8 @@ class ScheduledRecoveryScript(AsyncScript):
         task_metas_key: str,
         scheduled_wait_meta_key: str,
         activity_wait_meta_key: str,
+        signal_wait_meta_key: str,
+        signal_wake_meta_key: str,
         max_batch_size: int,
     ) -> list[str]:
         result: list[str | bytes] = await _execute_contract(

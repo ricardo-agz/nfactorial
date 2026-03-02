@@ -93,6 +93,7 @@ def register_control_plane_routes(
                 task_id=task_id,
                 owner_id=request.owner_id,
                 content=request.content,
+                data=request.data,
                 metadata=request.metadata,
             )
         except TaskNotFoundError as exc:
@@ -107,6 +108,7 @@ def register_control_plane_routes(
             report = await orchestrator.message_group(
                 owner_id=request.owner_id,
                 content=request.content,
+                data=request.data,
                 group_id=request.group_id,
                 group_name=request.group_name,
                 task_id=request.task_id,

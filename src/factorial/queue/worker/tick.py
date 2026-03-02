@@ -13,11 +13,13 @@ from factorial.queue.keys import RedisKeys
 from factorial.queue.lua import (
     ActivityWaitScript,
     BatchPickupScript,
+    SignalWaitScript,
     TaskCompletionScript,
     TaskSteeringScript,
     WaitScheduleScript,
     create_activity_wait_script,
     create_batch_pickup_script,
+    create_signal_wait_script,
     create_task_completion_script,
     create_task_steering_script,
     create_wait_schedule_script,
@@ -55,6 +57,7 @@ class WorkerTickContext:
     steering_script: TaskSteeringScript
     wait_schedule_script: WaitScheduleScript
     activity_wait_script: ActivityWaitScript
+    signal_wait_script: SignalWaitScript | None = None
     strict_batch_pickup_errors: bool = False
 
     @classmethod
@@ -88,6 +91,7 @@ class WorkerTickContext:
             steering_script=await create_task_steering_script(redis_client),
             wait_schedule_script=await create_wait_schedule_script(redis_client),
             activity_wait_script=await create_activity_wait_script(redis_client),
+            signal_wait_script=await create_signal_wait_script(redis_client),
         )
 
 
@@ -163,6 +167,7 @@ async def worker_tick(
                     metrics_retention_duration=context.metrics_retention_duration,
                     wait_schedule_script=context.wait_schedule_script,
                     activity_wait_script=context.activity_wait_script,
+                    signal_wait_script=context.signal_wait_script,
                 )
             )
             for task_id in tasks_to_process_ids

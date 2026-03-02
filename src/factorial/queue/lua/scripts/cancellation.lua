@@ -36,6 +36,9 @@ local queue_pending_key_template = KEYS[21]
 local queue_scheduled_key_template = KEYS[22]
 local task_steering_key_template = KEYS[23]
 local message_seq_key = KEYS[24]
+local signal_wait_meta_key = KEYS[25]
+local signal_wake_meta_key = KEYS[26]
+local task_signals_key = KEYS[27]
 
 local task_id = ARGV[1]
 local metrics_ttl = tonumber(ARGV[2])
@@ -119,6 +122,15 @@ if scheduled_wait_meta_key and scheduled_wait_meta_key ~= "" then
 end
 if activity_wait_meta_key and activity_wait_meta_key ~= "" then
     redis.call('HDEL', activity_wait_meta_key, task_id)
+end
+if signal_wait_meta_key and signal_wait_meta_key ~= "" then
+    redis.call('HDEL', signal_wait_meta_key, task_id)
+end
+if signal_wake_meta_key and signal_wake_meta_key ~= "" then
+    redis.call('HDEL', signal_wake_meta_key, task_id)
+end
+if task_signals_key and task_signals_key ~= "" then
+    redis.call('DEL', task_signals_key)
 end
 
 if status == "pending_tool_results" or status == "pending_child_tasks" then

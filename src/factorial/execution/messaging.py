@@ -98,11 +98,13 @@ class MessagingGroupHandle:
         self,
         content: str,
         *,
+        data: Any = None,
         metadata: dict[str, Any] | None = None,
     ) -> MessageDeliveryReport:
         return await messaging.groups.send(
             self.name,
             content,
+            data=data,
             metadata=metadata,
         )
 
@@ -182,12 +184,14 @@ class MessagingGroupsNamespace:
         group_name: str,
         content: str,
         *,
+        data: Any = None,
         metadata: dict[str, Any] | None = None,
     ) -> MessageDeliveryReport:
         ctx = _current_execution_context()
         result = await ctx.messaging.groups.send(
             _normalize_group_name(group_name),
             _normalize_content(content),
+            data,
             _coerce_metadata(metadata),
         )
         return _delivery_from_dict(result)
@@ -220,21 +224,69 @@ class MessagingNamespace:
 
     def __init__(self) -> None:
         self.groups = MessagingGroupsNamespace()
+        self.direct = _MessagingDirectNamespace(self)
+        self.group = _MessagingGroupNamespace(self)
 
     async def send(
         self,
         to_task_id: Any,
         content: str,
         *,
+        data: Any = None,
         metadata: dict[str, Any] | None = None,
     ) -> MessageDeliveryReport:
         ctx = _current_execution_context()
         result = await ctx.messaging.send(
             _coerce_task_id(to_task_id),
             _normalize_content(content),
+            data,
             _coerce_metadata(metadata),
         )
         return _delivery_from_dict(result)
+
+
+class _MessagingDirectNamespace:
+    """Ergonomic alias for direct messaging (`messaging.direct.send`)."""
+
+    def __init__(self, parent: MessagingNamespace) -> None:
+        self._parent = parent
+
+    async def send(
+        self,
+        to_task_id: Any,
+        content: str,
+        *,
+        data: Any = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> MessageDeliveryReport:
+        return await self._parent.send(
+            to_task_id,
+            content,
+            data=data,
+            metadata=metadata,
+        )
+
+
+class _MessagingGroupNamespace:
+    """Ergonomic alias for group messaging (`messaging.group.send`)."""
+
+    def __init__(self, parent: MessagingNamespace) -> None:
+        self._parent = parent
+
+    async def send(
+        self,
+        group_name: str,
+        content: str,
+        *,
+        data: Any = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> MessageDeliveryReport:
+        return await self._parent.groups.send(
+            group_name,
+            content,
+            data=data,
+            metadata=metadata,
+        )
 
 
 messaging = MessagingNamespace()

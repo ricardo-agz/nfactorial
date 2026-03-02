@@ -95,10 +95,12 @@ async def test_group_handle_send_uses_group_callback() -> None:
     async def _send_group(
         group_name: str,
         content: str,
+        data: Any,
         metadata: dict[str, Any] | None,
     ) -> dict[str, Any]:
         captured["group_name"] = group_name
         captured["content"] = content
+        captured["data"] = data
         captured["metadata"] = metadata
         return {
             "thread_message_id": "1-0",
@@ -122,6 +124,7 @@ async def test_group_handle_send_uses_group_callback() -> None:
     assert captured == {
         "group_name": "research",
         "content": "kickoff",
+        "data": None,
         "metadata": {"priority": "high"},
     }
     assert report == MessageDeliveryReport(
@@ -178,10 +181,12 @@ async def test_direct_send_accepts_jobref_like_target() -> None:
     async def _send_direct(
         to_task_id: str,
         content: str,
+        data: Any,
         metadata: dict[str, Any] | None,
     ) -> dict[str, Any]:
         captured["to_task_id"] = to_task_id
         captured["content"] = content
+        captured["data"] = data
         captured["metadata"] = metadata
         return {
             "thread_message_id": "3-0",
@@ -206,6 +211,7 @@ async def test_direct_send_accepts_jobref_like_target() -> None:
     assert captured == {
         "to_task_id": "task-x",
         "content": "hello",
+        "data": None,
         "metadata": {"reason": "coordination"},
     }
     assert report.delivered_task_ids == ["task-x"]
@@ -253,6 +259,7 @@ async def test_execution_context_messaging_namespace_routes_callbacks() -> None:
     async def _send_group(
         group_name: str,
         content: str,
+        _data: Any,
         metadata: dict[str, Any] | None,
     ) -> dict[str, Any]:
         return {
@@ -267,6 +274,7 @@ async def test_execution_context_messaging_namespace_routes_callbacks() -> None:
     async def _send_direct(
         to_task_id: str,
         _content: str,
+        _data: Any,
         _metadata: dict[str, Any] | None,
     ) -> dict[str, Any]:
         return {

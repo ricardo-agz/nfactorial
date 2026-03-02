@@ -1279,18 +1279,15 @@ class BaseAgent(Generic[ContextType]):
             messages,
         )
 
-        assistant_msg = {
+        assistant_msg: dict[str, Any] = {
             "role": "assistant",
             "content": response.choices[0].message.content,
-            "tool_calls": (
-                [
-                    tc.model_dump()  # type: ignore
-                    for tc in response.choices[0].message.tool_calls
-                ]
-                if response.choices[0].message.tool_calls
-                else None
-            ),
         }
+        if response.choices[0].message.tool_calls:
+            assistant_msg["tool_calls"] = [
+                tc.model_dump()  # type: ignore
+                for tc in response.choices[0].message.tool_calls
+            ]
         messages.append(assistant_msg)
 
         if self._is_done(response):
@@ -1565,6 +1562,26 @@ class BaseAgent(Generic[ContextType]):
 
         return instructions
 
+    @staticmethod
+    def _sanitize_message_for_completion(message: dict[str, Any]) -> dict[str, Any]:
+        """Remove nullable fields that OpenAI rejects in chat history."""
+        sanitized = dict(message)
+        if sanitized.get("tool_calls", "__missing__") is None:
+            sanitized.pop("tool_calls", None)
+        if sanitized.get("function_call", "__missing__") is None:
+            sanitized.pop("function_call", None)
+
+        # Assistant messages with no tool calls must have non-null content.
+        if (
+            sanitized.get("role") == "assistant"
+            and sanitized.get("content") is None
+            and "tool_calls" not in sanitized
+            and "function_call" not in sanitized
+        ):
+            sanitized["content"] = ""
+
+        return sanitized
+
     def prepare_messages(self, agent_ctx: ContextType) -> list[dict[str, Any]]:
         """Prepare messages for LLM request. Override to customize."""
         if agent_ctx.turn == 0:
@@ -1575,11 +1592,18 @@ class BaseAgent(Generic[ContextType]):
             )
             if agent_ctx.messages:
                 messages.extend(
-                    [message for message in agent_ctx.messages if message["content"]]
+                    [
+                        self._sanitize_message_for_completion(message)
+                        for message in agent_ctx.messages
+                        if message.get("content")
+                    ]
                 )
             messages.append({"role": "user", "content": agent_ctx.query})
         else:
-            messages = agent_ctx.messages
+            messages = [
+                self._sanitize_message_for_completion(message)
+                for message in agent_ctx.messages
+            ]
 
         return messages
 

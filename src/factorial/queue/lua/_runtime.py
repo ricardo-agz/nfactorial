@@ -532,6 +532,165 @@ async def create_activity_wait_script(redis_client: redis.Redis) -> ActivityWait
 
 
 @dataclass
+class SignalWaitScriptResult:
+    success: bool
+    message: str
+    woken_immediately: bool
+
+
+class SignalWaitScript(AsyncScript):
+    _CONTRACT = LuaScriptContract(
+        script_name="SignalWaitScript.execute",
+        key_fields=(
+            "queue_main_key",
+            "queue_pending_key",
+            "queue_orphaned_key",
+            "processing_heartbeats_key",
+            "task_statuses_key",
+            "task_agents_key",
+            "task_payloads_key",
+            "task_pickups_key",
+            "task_retries_key",
+            "task_metas_key",
+            "signal_wait_meta_key",
+            "signal_wake_meta_key",
+            "task_signals_key",
+            "queue_scheduled_key",
+            "scheduled_wait_meta_key",
+        ),
+        arg_fields=(
+            "task_id",
+            "signal_id",
+            "updated_task_payload_json",
+            "wait_metadata_json",
+            "timeout_wake_timestamp",
+            "scheduled_wait_metadata_json",
+        ),
+        optional_key_fields=frozenset(
+            {
+                "queue_scheduled_key",
+                "scheduled_wait_meta_key",
+            }
+        ),
+        optional_arg_fields=frozenset(
+            {
+                "timeout_wake_timestamp",
+                "scheduled_wait_metadata_json",
+            }
+        ),
+    )
+
+    async def execute(
+        self,
+        *,
+        queue_main_key: str,
+        queue_pending_key: str,
+        queue_orphaned_key: str,
+        processing_heartbeats_key: str,
+        task_statuses_key: str,
+        task_agents_key: str,
+        task_payloads_key: str,
+        task_pickups_key: str,
+        task_retries_key: str,
+        task_metas_key: str,
+        signal_wait_meta_key: str,
+        signal_wake_meta_key: str,
+        task_signals_key: str,
+        task_id: str,
+        signal_id: str,
+        updated_task_payload_json: str,
+        wait_metadata_json: str,
+        queue_scheduled_key: str | None = None,
+        scheduled_wait_meta_key: str | None = None,
+        timeout_wake_timestamp: float | None = None,
+        scheduled_wait_metadata_json: str | None = None,
+    ) -> SignalWaitScriptResult:
+        result: tuple[bool, str | bytes, int] = await _execute_contract(
+            self, self._CONTRACT, locals()
+        )
+        return SignalWaitScriptResult(
+            success=bool(result[0]),
+            message=decode(result[1]),
+            woken_immediately=bool(result[2]),
+        )
+
+
+async def create_signal_wait_script(redis_client: redis.Redis) -> SignalWaitScript:
+    return get_cached_script(redis_client, "signal_wait", SignalWaitScript)
+
+
+@dataclass
+class SignalEnqueueScriptResult:
+    success: bool
+    status: str
+    woken: bool
+    signal_seq: int | None
+
+
+class SignalEnqueueScript(AsyncScript):
+    _CONTRACT = LuaScriptContract(
+        script_name="SignalEnqueueScript.execute",
+        key_fields=(
+            "task_statuses_key",
+            "task_agents_key",
+            "task_payloads_key",
+            "task_pickups_key",
+            "task_retries_key",
+            "task_metas_key",
+            "signal_wait_meta_key",
+            "signal_wake_meta_key",
+            "task_signals_key",
+            "queue_main_key_template",
+            "queue_pending_key_template",
+            "queue_scheduled_key_template",
+            "scheduled_wait_meta_key",
+            "signal_seq_key",
+        ),
+        arg_fields=("sender_task_id", "task_id", "signal_id", "payload_json"),
+    )
+
+    async def execute(
+        self,
+        *,
+        task_statuses_key: str,
+        task_agents_key: str,
+        task_payloads_key: str,
+        task_pickups_key: str,
+        task_retries_key: str,
+        task_metas_key: str,
+        signal_wait_meta_key: str,
+        signal_wake_meta_key: str,
+        task_signals_key: str,
+        queue_main_key_template: str,
+        queue_pending_key_template: str,
+        queue_scheduled_key_template: str,
+        scheduled_wait_meta_key: str,
+        signal_seq_key: str,
+        sender_task_id: str,
+        task_id: str,
+        signal_id: str,
+        payload_json: str,
+    ) -> SignalEnqueueScriptResult:
+        result: tuple[bool, str | bytes, int, int] = await _execute_contract(
+            self, self._CONTRACT, locals()
+        )
+        raw_seq = result[3]
+        seq = int(raw_seq) if isinstance(raw_seq, int) and raw_seq > 0 else None
+        return SignalEnqueueScriptResult(
+            success=bool(result[0]),
+            status=decode(result[1]),
+            woken=bool(result[2]),
+            signal_seq=seq,
+        )
+
+
+async def create_signal_enqueue_script(
+    redis_client: redis.Redis,
+) -> SignalEnqueueScript:
+    return get_cached_script(redis_client, "signal_enqueue", SignalEnqueueScript)
+
+
+@dataclass
 class WaitScheduleScriptResult:
     success: bool
     message: str
@@ -629,6 +788,9 @@ class CancelTaskScript(AsyncScript):
             "queue_scheduled_key_template",
             "task_steering_key_template",
             "message_seq_key",
+            "signal_wait_meta_key",
+            "signal_wake_meta_key",
+            "task_signals_key",
         ),
         arg_fields=("task_id", "metrics_ttl"),
         optional_key_fields=frozenset(
@@ -642,6 +804,9 @@ class CancelTaskScript(AsyncScript):
                 "queue_scheduled_key_template",
                 "task_steering_key_template",
                 "message_seq_key",
+                "signal_wait_meta_key",
+                "signal_wake_meta_key",
+                "task_signals_key",
             }
         ),
     )
@@ -675,6 +840,9 @@ class CancelTaskScript(AsyncScript):
         queue_scheduled_key_template: str | None = None,
         task_steering_key_template: str | None = None,
         message_seq_key: str | None = None,
+        signal_wait_meta_key: str | None = None,
+        signal_wake_meta_key: str | None = None,
+        task_signals_key: str | None = None,
     ) -> CancelTaskScriptResult:
         result: tuple[bool, str | bytes | None, str | bytes, str | bytes | None] = (
             await _execute_contract(self, self._CONTRACT, locals())

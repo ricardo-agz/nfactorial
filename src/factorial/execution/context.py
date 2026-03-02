@@ -29,6 +29,11 @@ EnqueueBatchCallback = Callable[
 ]
 CancelChildTaskCallback = Callable[[str], Awaitable[None]]
 CancelChildTasksCallback = Callable[[list[str]], Awaitable[None]]
+SignalChildTaskCallback = Callable[[str, str, Any], Awaitable[dict[str, Any]]]
+SignalChildTasksCallback = Callable[
+    [list[str], str, Any],
+    Awaitable[dict[str, Any]],
+]
 PersistHookRuntimeCallback = Callable[[dict[str, Any]], Awaitable[None]]
 MessagingCreateGroupCallback = Callable[
     [str, list[str] | None],
@@ -41,13 +46,34 @@ MessagingAddGroupMembersCallback = Callable[[str, list[str]], Awaitable[list[str
 MessagingRemoveGroupMembersCallback = Callable[[str, list[str]], Awaitable[list[str]]]
 MessagingLeaveGroupCallback = Callable[[str], Awaitable[bool]]
 MessagingSendGroupCallback = Callable[
-    [str, str, dict[str, Any] | None],
+    [str, str, Any, dict[str, Any] | None],
     Awaitable[dict[str, Any]],
 ]
 MessagingSendDirectCallback = Callable[
-    [str, str, dict[str, Any] | None],
+    [str, str, Any, dict[str, Any] | None],
     Awaitable[dict[str, Any]],
 ]
+InboxDirectPeekCallback = Callable[
+    [bool, int, str | None],
+    Awaitable[dict[str, Any]],
+]
+InboxDirectMarkReadCallback = Callable[
+    [list[str], bool, Any],
+    Awaitable[dict[str, Any]],
+]
+InboxGroupPeekCallback = Callable[
+    [str, bool, int, str | None],
+    Awaitable[dict[str, Any]],
+]
+InboxGroupMarkReadCallback = Callable[
+    [str, list[str], bool, Any],
+    Awaitable[dict[str, Any]],
+]
+InboxReceiptsPeekCallback = Callable[
+    [bool, int, str | None],
+    Awaitable[dict[str, Any]],
+]
+InboxReceiptsMarkReadCallback = Callable[[list[str]], Awaitable[dict[str, Any]]]
 
 
 @dataclass
@@ -58,6 +84,8 @@ class SubagentsExecutionNamespace:
     enqueue_batch_callback: EnqueueBatchCallback | None = None
     cancel_callback: CancelChildTaskCallback | None = None
     cancel_many_callback: CancelChildTasksCallback | None = None
+    signal_callback: SignalChildTaskCallback | None = None
+    signal_many_callback: SignalChildTasksCallback | None = None
 
     @property
     def has_enqueue_batch(self) -> bool:
@@ -124,6 +152,88 @@ class SubagentsExecutionNamespace:
             )
         for task_id in deduped_task_ids:
             await cancel_callback(task_id)
+
+    async def signal(
+        self,
+        task_id: str,
+        signal_id: str,
+        payload: Any = None,
+    ) -> dict[str, Any]:
+        signal_callback = self.signal_callback
+        if signal_callback is not None:
+            return await signal_callback(task_id, signal_id, payload)
+
+        signal_many_callback = self.signal_many_callback
+        if signal_many_callback is not None:
+            return await signal_many_callback([task_id], signal_id, payload)
+
+        raise RuntimeError(
+            "subagents.signal is not configured for this execution context"
+        )
+
+    async def signal_many(
+        self,
+        task_ids: list[str],
+        signal_id: str,
+        payload: Any = None,
+    ) -> dict[str, Any]:
+        if not task_ids:
+            return {
+                "signal_id": signal_id,
+                "target_task_ids": [],
+                "signaled_task_ids": [],
+                "woken_task_ids": [],
+                "skipped_inactive_task_ids": [],
+                "failed_task_ids": [],
+            }
+        deduped_task_ids = list(dict.fromkeys(task_ids))
+        signal_many_callback = self.signal_many_callback
+        if signal_many_callback is not None:
+            return await signal_many_callback(deduped_task_ids, signal_id, payload)
+
+        signal_callback = self.signal_callback
+        if signal_callback is None:
+            raise RuntimeError(
+                "subagents.signal_many is not configured for this execution context"
+            )
+
+        aggregate: dict[str, Any] = {
+            "signal_id": signal_id,
+            "target_task_ids": list(deduped_task_ids),
+            "signaled_task_ids": [],
+            "woken_task_ids": [],
+            "skipped_inactive_task_ids": [],
+            "failed_task_ids": [],
+        }
+        signaled_set: set[str] = set()
+        woken_set: set[str] = set()
+        skipped_set: set[str] = set()
+        failed_set: set[str] = set()
+        for task_id in deduped_task_ids:
+            try:
+                result = await signal_callback(task_id, signal_id, payload)
+            except Exception:
+                if task_id not in failed_set:
+                    failed_set.add(task_id)
+                    aggregate["failed_task_ids"].append(task_id)
+                continue
+            for value in result.get("signaled_task_ids", []):
+                if isinstance(value, str) and value not in signaled_set:
+                    signaled_set.add(value)
+                    aggregate["signaled_task_ids"].append(value)
+            for value in result.get("woken_task_ids", []):
+                if isinstance(value, str) and value not in woken_set:
+                    woken_set.add(value)
+                    aggregate["woken_task_ids"].append(value)
+            for value in result.get("skipped_inactive_task_ids", []):
+                if isinstance(value, str) and value not in skipped_set:
+                    skipped_set.add(value)
+                    aggregate["skipped_inactive_task_ids"].append(value)
+            for value in result.get("failed_task_ids", []):
+                if isinstance(value, str) and value not in failed_set:
+                    failed_set.add(value)
+                    aggregate["failed_task_ids"].append(value)
+        return aggregate
 
 
 @dataclass
@@ -231,6 +341,7 @@ class MessagingGroupsExecutionNamespace:
         self,
         group_name: str,
         content: str,
+        data: Any = None,
         metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         callback = self.send_callback
@@ -238,7 +349,7 @@ class MessagingGroupsExecutionNamespace:
             raise RuntimeError(
                 "messaging.groups.send is not configured for this execution context"
             )
-        return await callback(group_name, content, metadata)
+        return await callback(group_name, content, data, metadata)
 
 
 @dataclass
@@ -254,6 +365,7 @@ class MessagingExecutionNamespace:
         self,
         to_task_id: str,
         content: str,
+        data: Any = None,
         metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         callback = self.send_callback
@@ -261,7 +373,148 @@ class MessagingExecutionNamespace:
             raise RuntimeError(
                 "messaging.send is not configured for this execution context"
             )
-        return await callback(to_task_id, content, metadata)
+        return await callback(to_task_id, content, data, metadata)
+
+
+@dataclass
+class InboxDirectExecutionNamespace:
+    """Direct-message inbox operations available during runtime."""
+
+    peek_callback: InboxDirectPeekCallback | None = None
+    mark_read_callback: InboxDirectMarkReadCallback | None = None
+
+    async def peek(
+        self,
+        *,
+        unread_only: bool,
+        limit: int,
+        cursor: str | None,
+    ) -> dict[str, Any]:
+        callback = self.peek_callback
+        if callback is None:
+            raise RuntimeError(
+                "inbox.direct.peek is not configured for this execution context"
+            )
+        return await callback(unread_only, limit, cursor)
+
+    async def mark_read(
+        self,
+        *,
+        message_ids: list[str],
+        notify_sender: bool = False,
+        data: Any = None,
+    ) -> dict[str, Any]:
+        callback = self.mark_read_callback
+        if callback is None:
+            raise RuntimeError(
+                "inbox.direct.mark_read is not configured for this execution context"
+            )
+        return await callback(message_ids, notify_sender, data)
+
+
+@dataclass
+class InboxGroupExecutionNamespace:
+    """Group-message inbox operations available during runtime."""
+
+    peek_callback: InboxGroupPeekCallback | None = None
+    mark_read_callback: InboxGroupMarkReadCallback | None = None
+
+    async def peek(
+        self,
+        *,
+        group_name: str,
+        unread_only: bool,
+        limit: int,
+        cursor: str | None,
+    ) -> dict[str, Any]:
+        callback = self.peek_callback
+        if callback is None:
+            raise RuntimeError(
+                "inbox.group.peek is not configured for this execution context"
+            )
+        return await callback(group_name, unread_only, limit, cursor)
+
+    async def mark_read(
+        self,
+        *,
+        group_name: str,
+        message_ids: list[str],
+        notify_sender: bool = False,
+        data: Any = None,
+    ) -> dict[str, Any]:
+        callback = self.mark_read_callback
+        if callback is None:
+            raise RuntimeError(
+                "inbox.group.mark_read is not configured for this execution context"
+            )
+        return await callback(group_name, message_ids, notify_sender, data)
+
+
+@dataclass
+class InboxReceiptsExecutionNamespace:
+    """Read-receipt inbox operations available during runtime."""
+
+    peek_callback: InboxReceiptsPeekCallback | None = None
+    mark_read_callback: InboxReceiptsMarkReadCallback | None = None
+
+    async def peek(
+        self,
+        *,
+        unread_only: bool,
+        limit: int,
+        cursor: str | None,
+    ) -> dict[str, Any]:
+        callback = self.peek_callback
+        if callback is None:
+            raise RuntimeError(
+                "inbox.receipts.peek is not configured for this execution context"
+            )
+        return await callback(unread_only, limit, cursor)
+
+    async def mark_read(
+        self,
+        *,
+        receipt_ids: list[str],
+    ) -> dict[str, Any]:
+        callback = self.mark_read_callback
+        if callback is None:
+            raise RuntimeError(
+                "inbox.receipts.mark_read is not configured for this execution context"
+            )
+        return await callback(receipt_ids)
+
+
+@dataclass
+class InboxExecutionNamespace:
+    """Inbox operations available during active task execution."""
+
+    direct: InboxDirectExecutionNamespace = field(
+        default_factory=InboxDirectExecutionNamespace
+    )
+    group: InboxGroupExecutionNamespace = field(
+        default_factory=InboxGroupExecutionNamespace
+    )
+    receipts: InboxReceiptsExecutionNamespace = field(
+        default_factory=InboxReceiptsExecutionNamespace
+    )
+
+
+@dataclass
+class SignalsExecutionNamespace:
+    """Signal wait wake context available during active task execution."""
+
+    current_signal: dict[str, Any] | None = None
+    wake_reason_value: str | None = None
+
+    def current(self) -> dict[str, Any] | None:
+        if self.current_signal is None:
+            return None
+        return dict(self.current_signal)
+
+    def wake_reason(self) -> str | None:
+        if self.wake_reason_value is None:
+            return None
+        return str(self.wake_reason_value)
 
 
 @dataclass
@@ -280,6 +533,8 @@ class ExecutionContext:
     messaging: MessagingExecutionNamespace = field(
         default_factory=MessagingExecutionNamespace
     )
+    inbox: InboxExecutionNamespace = field(default_factory=InboxExecutionNamespace)
+    signals: SignalsExecutionNamespace = field(default_factory=SignalsExecutionNamespace)
 
     @classmethod
     def current(cls) -> ExecutionContext:

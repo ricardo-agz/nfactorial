@@ -49,6 +49,16 @@ class JobRef:
         )
 
 
+@dataclass(frozen=True)
+class SignalDeliveryReport:
+    signal_id: str
+    target_task_ids: list[str]
+    signaled_task_ids: list[str]
+    woken_task_ids: list[str]
+    skipped_inactive_task_ids: list[str]
+    failed_task_ids: list[str]
+
+
 def _coerce_inputs_for_agent(agent: Any, inputs: list[Any]) -> list[AgentContext]:
     context_class = getattr(agent, "context_class", None)
     if (
@@ -99,7 +109,37 @@ def _coerce_task_id(task_or_ref: Any) -> str:
         return candidate
 
     raise TypeError(
-        "subagents.cancel expects a task_id string or JobRef-like object with task_id"
+        "subagents expects a task_id string or JobRef-like object with task_id"
+    )
+
+
+def _normalize_signal_id(signal_id: str) -> str:
+    if not isinstance(signal_id, str) or not signal_id.strip():
+        raise ValueError("subagents.signal requires a non-empty signal_id")
+    return signal_id.strip()
+
+
+def _signal_delivery_from_dict(
+    data: dict[str, Any],
+    *,
+    signal_id: str,
+    fallback_target_task_ids: list[str],
+) -> SignalDeliveryReport:
+    def _as_string_list(value: Any) -> list[str]:
+        if not isinstance(value, list):
+            return []
+        return [item for item in value if isinstance(item, str)]
+
+    target_task_ids = _as_string_list(data.get("target_task_ids"))
+    return SignalDeliveryReport(
+        signal_id=str(data.get("signal_id", signal_id)),
+        target_task_ids=target_task_ids or list(fallback_target_task_ids),
+        signaled_task_ids=_as_string_list(data.get("signaled_task_ids")),
+        woken_task_ids=_as_string_list(data.get("woken_task_ids")),
+        skipped_inactive_task_ids=_as_string_list(
+            data.get("skipped_inactive_task_ids")
+        ),
+        failed_task_ids=_as_string_list(data.get("failed_task_ids")),
     )
 
 
@@ -241,6 +281,51 @@ class SubagentsNamespace:
         task_id = _coerce_task_id(task_or_refs)
         await execution_ctx.subagents.cancel(task_id)
         return task_id
+
+    async def signal(
+        self,
+        task_or_refs: Any | list[Any],
+        *,
+        signal_id: str,
+        payload: Any = None,
+    ) -> SignalDeliveryReport:
+        """Signal one or more direct child tasks to resume from wait.until_signal."""
+        execution_ctx = ExecutionContext.current()
+        normalized_signal_id = _normalize_signal_id(signal_id)
+        if isinstance(task_or_refs, list):
+            if not task_or_refs:
+                return SignalDeliveryReport(
+                    signal_id=normalized_signal_id,
+                    target_task_ids=[],
+                    signaled_task_ids=[],
+                    woken_task_ids=[],
+                    skipped_inactive_task_ids=[],
+                    failed_task_ids=[],
+                )
+            task_ids = [_coerce_task_id(task_or_ref) for task_or_ref in task_or_refs]
+            deduped_task_ids = list(dict.fromkeys(task_ids))
+            result = await execution_ctx.subagents.signal_many(
+                deduped_task_ids,
+                normalized_signal_id,
+                payload,
+            )
+            return _signal_delivery_from_dict(
+                result,
+                signal_id=normalized_signal_id,
+                fallback_target_task_ids=deduped_task_ids,
+            )
+
+        task_id = _coerce_task_id(task_or_refs)
+        result = await execution_ctx.subagents.signal(
+            task_id,
+            normalized_signal_id,
+            payload,
+        )
+        return _signal_delivery_from_dict(
+            result,
+            signal_id=normalized_signal_id,
+            fallback_target_task_ids=[task_id],
+        )
 
 
 subagents = SubagentsNamespace()

@@ -247,6 +247,8 @@ async def recover_scheduled_tasks(
             task_metas_key=keys.task_meta,
             scheduled_wait_meta_key=keys.scheduled_wait_meta,
             activity_wait_meta_key=keys.activity_wait_meta,
+            signal_wait_meta_key=keys.signal_wait_meta,
+            signal_wake_meta_key=keys.signal_wake_meta,
             max_batch_size=batch_size,
         )
         return len(recovered_task_ids)

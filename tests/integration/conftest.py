@@ -627,6 +627,8 @@ class ScriptRunner:
             task_metas_key=self.keys.task_meta,
             scheduled_wait_meta_key=self.keys.scheduled_wait_meta,
             activity_wait_meta_key=self.keys.activity_wait_meta,
+            signal_wait_meta_key=self.keys.signal_wait_meta,
+            signal_wake_meta_key=self.keys.signal_wake_meta,
             max_batch_size=max_batch_size,
         )
 

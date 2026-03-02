@@ -15,6 +15,53 @@ Status: draft for iteration
 - Persist message history in Redis for observability.
 - Use existing steering delivery path so running agents receive messages naturally.
 
+## Runtime Inbox API (Implemented)
+
+Agents now have a typed runtime inbox alongside outbound `messaging.*`:
+
+```python
+from factorial import inbox, messaging
+
+# sender
+await messaging.direct.send(
+    target_task_id,
+    "vote cast",
+    data={"target": "task-7"},
+)
+
+# receiver
+direct_page = await inbox.direct.peek(unread_only=True, limit=20)
+for msg in direct_page.messages:
+    vote = msg.data_as(DayVote)
+    await msg.mark_read(
+        notify_sender=True,
+        data={"accepted": True, "round": 2},
+    )
+
+# sender reads receipts
+receipts = await inbox.receipts.peek(unread_only=True, limit=50)
+await receipts.mark_read()
+```
+
+### Inbox Semantics
+
+- `peek()` is non-mutating and supports cursor pagination.
+- `mark_read()` is explicit:
+  - batch-level (`page.mark_read(...)`)
+  - per-message (`msg.mark_read(...)`)
+- `notify_sender=True` writes a receipt into the sender task's `inbox.receipts`.
+- Read state is tracked per task and message.
+
+### Structured Message Data
+
+Outbound messaging now supports structured payloads:
+
+- `messaging.send(..., data=..., metadata=...)`
+- `messaging.groups.send(..., data=..., metadata=...)`
+- human control-plane messaging also accepts `data`.
+
+The `data` field is persisted in history and exposed by inbox/history readers.
+
 ## Non-Goals (V1)
 
 - Full chat application features (edit/delete messages, reactions, typing, unread counts).

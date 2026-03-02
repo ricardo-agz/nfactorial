@@ -34,12 +34,14 @@ class ResolveHookRequest(BaseModel):
 class MessageTaskRequest(BaseModel):
     owner_id: str
     content: str
+    data: Any | None = None
     metadata: dict[str, Any] | None = None
 
 
 class MessageGroupRequest(BaseModel):
     owner_id: str
     content: str
+    data: Any | None = None
     group_id: str | None = None
     group_name: str | None = None
     task_id: str | None = None

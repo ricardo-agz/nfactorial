@@ -12,6 +12,7 @@ from factorial.queue.keys import PENDING_SENTINEL, RedisKeys
 from factorial.queue.lua import (
     ActivityWaitScript,
     QueueScripts,
+    SignalWaitScript,
     TaskCompletionInput,
     WaitScheduleScript,
 )
@@ -27,9 +28,16 @@ from factorial.queue.operations import (
     messaging_groups_list,
     messaging_groups_remove_members,
     messaging_groups_send,
+    messaging_inbox_direct_mark_read,
+    messaging_inbox_direct_peek,
+    messaging_inbox_group_mark_read,
+    messaging_inbox_group_peek,
+    messaging_inbox_receipts_mark_read,
+    messaging_inbox_receipts_peek,
     messaging_send_direct,
     persist_hook_runtime_payload,
     resume_if_no_remaining_child_tasks,
+    signal_task as queue_signal_task,
 )
 from factorial.queue.task import (
     Batch,
@@ -56,6 +64,7 @@ class TaskRuntimeOps:
     queue_scripts: QueueScripts
     wait_schedule_script: WaitScheduleScript
     activity_wait_script: ActivityWaitScript
+    signal_wait_script: SignalWaitScript
     metrics_retention_duration: int
 
     async def complete(
@@ -222,6 +231,101 @@ class TaskRuntimeOps:
                 f"{wait_result.message}"
             )
 
+    async def park_signal_wait(
+        self,
+        *,
+        signal_id: str,
+        source_tool_call_ids: list[str],
+        data: Any = None,
+        timeout_wake_timestamp: float | None = None,
+        timeout_kind: str | None = None,
+        timeout_cron_expression: str | None = None,
+        timeout_cron_timezone: str | None = None,
+    ) -> bool:
+        wait_metadata: dict[str, Any] = {
+            "kind": "signal",
+            "signal_id": signal_id,
+            "source_tool_call_ids": source_tool_call_ids,
+        }
+        if data is not None:
+            wait_metadata["data"] = serialize_data(data)
+        scheduled_wait_metadata_json: str | None = None
+        if timeout_wake_timestamp is not None:
+            timeout_metadata: dict[str, Any] = {
+                "kind": timeout_kind,
+                "wake_timestamp": timeout_wake_timestamp,
+            }
+            if timeout_cron_expression is not None:
+                timeout_metadata["cron"] = timeout_cron_expression
+            if timeout_cron_timezone is not None:
+                timeout_metadata["timezone"] = timeout_cron_timezone
+            wait_metadata["timeout"] = timeout_metadata
+            scheduled_wait_metadata: dict[str, Any] = {
+                "kind": "signal_timeout",
+                "signal_id": signal_id,
+                "wake_timestamp": timeout_wake_timestamp,
+                "source_tool_call_ids": source_tool_call_ids,
+                "timeout_kind": timeout_kind,
+            }
+            if timeout_cron_expression is not None:
+                scheduled_wait_metadata["cron"] = timeout_cron_expression
+            if timeout_cron_timezone is not None:
+                scheduled_wait_metadata["timezone"] = timeout_cron_timezone
+            if data is not None:
+                scheduled_wait_metadata["data"] = serialize_data(data)
+            scheduled_wait_metadata_json = json.dumps(scheduled_wait_metadata)
+
+        wait_result = await self.signal_wait_script.execute(
+            queue_main_key=self.keys.queue_main,
+            queue_pending_key=self.keys.queue_pending,
+            queue_orphaned_key=self.keys.queue_orphaned,
+            processing_heartbeats_key=self.keys.processing_heartbeats,
+            task_statuses_key=self.keys.task_status,
+            task_agents_key=self.keys.task_agent,
+            task_payloads_key=self.keys.task_payload,
+            task_pickups_key=self.keys.task_pickups,
+            task_retries_key=self.keys.task_retries,
+            task_metas_key=self.keys.task_meta,
+            signal_wait_meta_key=self.keys.signal_wait_meta,
+            signal_wake_meta_key=self.keys.signal_wake_meta,
+            task_signals_key=self.keys.task_signals,
+            queue_scheduled_key=self.keys.queue_scheduled,
+            scheduled_wait_meta_key=self.keys.scheduled_wait_meta,
+            task_id=self.task.id,
+            signal_id=signal_id,
+            updated_task_payload_json=self.task.payload.to_json(),
+            wait_metadata_json=json.dumps(wait_metadata),
+            timeout_wake_timestamp=timeout_wake_timestamp,
+            scheduled_wait_metadata_json=scheduled_wait_metadata_json,
+        )
+        if not wait_result.success:
+            raise RuntimeError(
+                f"Failed to park signal wait for task {self.task.id}: "
+                f"{wait_result.message}"
+            )
+        return wait_result.woken_immediately
+
+    async def pop_signal_wake_context(self) -> dict[str, Any] | None:
+        raw_value = await self.redis_client.hget(
+            self.keys.signal_wake_meta,
+            self.task.id,
+        )
+        if raw_value is None:
+            return None
+        await self.redis_client.hdel(self.keys.signal_wake_meta, self.task.id)
+        try:
+            decoded_value = (
+                raw_value.decode("utf-8")
+                if isinstance(raw_value, bytes)
+                else str(raw_value)
+            )
+            parsed = json.loads(decoded_value)
+        except Exception:
+            return None
+        if not isinstance(parsed, dict):
+            return None
+        return cast(dict[str, Any], parsed)
+
     async def park_or_resume_child_wait(
         self,
         *,
@@ -355,7 +459,10 @@ class TaskRuntimeOps:
         )
 
     async def cancel_child_task(self, child_task_id: str) -> None:
-        await self._validate_child_cancellation_scope(child_task_id)
+        await self._validate_direct_child_scope(
+            child_task_id,
+            operation="subagents.cancel",
+        )
         await cancel_task(
             redis_client=self.redis_client,
             namespace=self.namespace,
@@ -369,7 +476,10 @@ class TaskRuntimeOps:
             return
         deduped_child_task_ids = list(dict.fromkeys(child_task_ids))
         for child_task_id in deduped_child_task_ids:
-            await self._validate_child_cancellation_scope(child_task_id)
+            await self._validate_direct_child_scope(
+                child_task_id,
+                operation="subagents.cancel",
+            )
 
         await asyncio.gather(
             *[
@@ -384,9 +494,141 @@ class TaskRuntimeOps:
             ]
         )
 
-    async def _validate_child_cancellation_scope(self, child_task_id: str) -> None:
+    async def signal_child_task(
+        self,
+        child_task_id: str,
+        signal_id: str,
+        payload: Any = None,
+    ) -> dict[str, Any]:
+        await self._validate_direct_child_scope(
+            child_task_id,
+            operation="subagents.signal",
+        )
+        try:
+            return await queue_signal_task(
+                self.redis_client,
+                self.namespace,
+                sender_task_id=self.task.id,
+                task_id=child_task_id,
+                signal_id=signal_id,
+                payload=payload,
+            )
+        except Exception:
+            return {
+                "signal_id": signal_id,
+                "signal_seq": None,
+                "target_task_ids": [child_task_id],
+                "signaled_task_ids": [],
+                "woken_task_ids": [],
+                "skipped_inactive_task_ids": [],
+                "failed_task_ids": [child_task_id],
+            }
+
+    async def signal_child_tasks(
+        self,
+        child_task_ids: list[str],
+        signal_id: str,
+        payload: Any = None,
+    ) -> dict[str, Any]:
+        deduped_child_task_ids = list(dict.fromkeys(child_task_ids))
+        if not deduped_child_task_ids:
+            return {
+                "signal_id": signal_id,
+                "signal_seq": None,
+                "target_task_ids": [],
+                "signaled_task_ids": [],
+                "woken_task_ids": [],
+                "skipped_inactive_task_ids": [],
+                "failed_task_ids": [],
+            }
+        validated_child_task_ids: list[str] = []
+        failed_validation_task_ids: list[str] = []
+        for child_task_id in deduped_child_task_ids:
+            try:
+                await self._validate_direct_child_scope(
+                    child_task_id,
+                    operation="subagents.signal",
+                )
+                validated_child_task_ids.append(child_task_id)
+            except Exception:
+                failed_validation_task_ids.append(child_task_id)
+
+        if not validated_child_task_ids:
+            return {
+                "signal_id": signal_id,
+                "signal_seq": None,
+                "target_task_ids": list(deduped_child_task_ids),
+                "signaled_task_ids": [],
+                "woken_task_ids": [],
+                "skipped_inactive_task_ids": [],
+                "failed_task_ids": failed_validation_task_ids,
+            }
+
+        results = await asyncio.gather(
+            *[
+                queue_signal_task(
+                    self.redis_client,
+                    self.namespace,
+                    sender_task_id=self.task.id,
+                    task_id=child_task_id,
+                    signal_id=signal_id,
+                    payload=payload,
+                )
+                for child_task_id in validated_child_task_ids
+            ],
+            return_exceptions=True,
+        )
+        aggregate: dict[str, Any] = {
+            "signal_id": signal_id,
+            "signal_seq": None,
+            "target_task_ids": list(deduped_child_task_ids),
+            "signaled_task_ids": [],
+            "woken_task_ids": [],
+            "skipped_inactive_task_ids": [],
+            "failed_task_ids": list(dict.fromkeys(failed_validation_task_ids)),
+        }
+        signaled_set: set[str] = set()
+        woken_set: set[str] = set()
+        skipped_set: set[str] = set()
+        failed_set: set[str] = set(aggregate["failed_task_ids"])
+        for child_task_id, result in zip(
+            validated_child_task_ids,
+            results,
+            strict=True,
+        ):
+            if isinstance(result, BaseException):
+                if child_task_id not in failed_set:
+                    failed_set.add(child_task_id)
+                    aggregate["failed_task_ids"].append(child_task_id)
+                continue
+            if aggregate["signal_seq"] is None and result.get("signal_seq") is not None:
+                aggregate["signal_seq"] = result.get("signal_seq")
+            for value in result.get("signaled_task_ids", []):
+                if isinstance(value, str) and value not in signaled_set:
+                    signaled_set.add(value)
+                    aggregate["signaled_task_ids"].append(value)
+            for value in result.get("woken_task_ids", []):
+                if isinstance(value, str) and value not in woken_set:
+                    woken_set.add(value)
+                    aggregate["woken_task_ids"].append(value)
+            for value in result.get("skipped_inactive_task_ids", []):
+                if isinstance(value, str) and value not in skipped_set:
+                    skipped_set.add(value)
+                    aggregate["skipped_inactive_task_ids"].append(value)
+            for value in result.get("failed_task_ids", []):
+                if isinstance(value, str) and value not in failed_set:
+                    failed_set.add(value)
+                    aggregate["failed_task_ids"].append(value)
+        return aggregate
+
+    async def _validate_direct_child_scope(
+        self,
+        child_task_id: str,
+        *,
+        operation: str,
+    ) -> None:
         if not isinstance(child_task_id, str) or not child_task_id:
-            raise ValueError("subagents.cancel requires a non-empty task_id")
+            raise ValueError(f"{operation} requires a non-empty task_id")
 
         child_task_data = await get_task_data(
             self.redis_client,
@@ -400,13 +642,13 @@ class TaskRuntimeOps:
             or child_owner_id != self.task.metadata.owner_id
         ):
             raise PermissionError(
-                "subagents.cancel can only cancel child tasks in the same owner scope"
+                f"{operation} can only target child tasks in the same owner scope"
             )
 
         child_parent_id = child_metadata.get("parent_id")
         if child_parent_id != self.task.id:
             raise PermissionError(
-                "subagents.cancel can only cancel direct child tasks "
+                f"{operation} can only target direct child tasks "
                 "of the current task"
             )
 
@@ -417,7 +659,7 @@ class TaskRuntimeOps:
         )
         if child_team_id != parent_team_id:
             raise PermissionError(
-                "subagents.cancel can only cancel child tasks in the same team scope"
+                f"{operation} can only target child tasks in the same team scope"
             )
 
     async def publish_batch_progress(self, batch_id: str) -> None:
@@ -520,6 +762,7 @@ class TaskRuntimeOps:
         self,
         group_name: str,
         content: str,
+        data: Any = None,
         metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         return await messaging_groups_send(
@@ -528,6 +771,7 @@ class TaskRuntimeOps:
             sender_task_id=self.task.id,
             group_name=group_name,
             content=content,
+            data=data,
             metadata=metadata,
         )
 
@@ -535,6 +779,7 @@ class TaskRuntimeOps:
         self,
         to_task_id: str,
         content: str,
+        data: Any = None,
         metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         return await messaging_send_direct(
@@ -543,6 +788,97 @@ class TaskRuntimeOps:
             sender_task_id=self.task.id,
             to_task_id=to_task_id,
             content=content,
+            data=data,
             metadata=metadata,
+        )
+
+    async def inbox_direct_peek(
+        self,
+        unread_only: bool,
+        limit: int,
+        cursor: str | None,
+    ) -> dict[str, Any]:
+        return await messaging_inbox_direct_peek(
+            redis_client=self.redis_client,
+            namespace=self.namespace,
+            task_id=self.task.id,
+            unread_only=unread_only,
+            limit=limit,
+            cursor=cursor,
+        )
+
+    async def inbox_direct_mark_read(
+        self,
+        message_ids: list[str],
+        notify_sender: bool,
+        data: Any = None,
+    ) -> dict[str, Any]:
+        return await messaging_inbox_direct_mark_read(
+            redis_client=self.redis_client,
+            namespace=self.namespace,
+            task_id=self.task.id,
+            message_ids=message_ids,
+            notify_sender=notify_sender,
+            data=data,
+        )
+
+    async def inbox_group_peek(
+        self,
+        group_name: str,
+        unread_only: bool,
+        limit: int,
+        cursor: str | None,
+    ) -> dict[str, Any]:
+        return await messaging_inbox_group_peek(
+            redis_client=self.redis_client,
+            namespace=self.namespace,
+            task_id=self.task.id,
+            group_name=group_name,
+            unread_only=unread_only,
+            limit=limit,
+            cursor=cursor,
+        )
+
+    async def inbox_group_mark_read(
+        self,
+        group_name: str,
+        message_ids: list[str],
+        notify_sender: bool,
+        data: Any = None,
+    ) -> dict[str, Any]:
+        return await messaging_inbox_group_mark_read(
+            redis_client=self.redis_client,
+            namespace=self.namespace,
+            task_id=self.task.id,
+            group_name=group_name,
+            message_ids=message_ids,
+            notify_sender=notify_sender,
+            data=data,
+        )
+
+    async def inbox_receipts_peek(
+        self,
+        unread_only: bool,
+        limit: int,
+        cursor: str | None,
+    ) -> dict[str, Any]:
+        return await messaging_inbox_receipts_peek(
+            redis_client=self.redis_client,
+            namespace=self.namespace,
+            task_id=self.task.id,
+            unread_only=unread_only,
+            limit=limit,
+            cursor=cursor,
+        )
+
+    async def inbox_receipts_mark_read(
+        self,
+        receipt_ids: list[str],
+    ) -> dict[str, Any]:
+        return await messaging_inbox_receipts_mark_read(
+            redis_client=self.redis_client,
+            namespace=self.namespace,
+            task_id=self.task.id,
+            receipt_ids=receipt_ids,
         )
 

@@ -21,12 +21,13 @@ local sender_task_id = ARGV[1]
 local to_task_id = ARGV[2]
 local team_id = ARGV[3]
 local content = ARGV[4]
-local metadata_json = ARGV[5]
-local steering_key_template = ARGV[6]
-local history_maxlen = tonumber(ARGV[7]) or 0
-local queue_main_key_template = ARGV[8]
-local queue_pending_key_template = ARGV[9]
-local queue_scheduled_key_template = ARGV[10]
+local data_json = ARGV[5]
+local metadata_json = ARGV[6]
+local steering_key_template = ARGV[7]
+local history_maxlen = tonumber(ARGV[8]) or 0
+local queue_main_key_template = ARGV[9]
+local queue_pending_key_template = ARGV[10]
+local queue_scheduled_key_template = ARGV[11]
 
 local function steering_key(task_id)
     return string.gsub(steering_key_template, "{task_id}", task_id)
@@ -98,6 +99,14 @@ if metadata_json and metadata_json ~= "" then
     end
 end
 
+local data = cjson.null
+if data_json and data_json ~= "" then
+    local ok, decoded = pcall(cjson.decode, data_json)
+    if ok then
+        data = decoded
+    end
+end
+
 local time_result = redis.call("TIME")
 local timestamp_s = tonumber(time_result[1]) + (tonumber(time_result[2]) / 1000000)
 local timestamp_ms = math.floor(timestamp_s * 1000)
@@ -122,6 +131,7 @@ else
     local steering_payload = cjson.encode({
         role = "user",
         content = steering_content,
+        data = data,
         metadata = metadata,
     })
     local seq = redis.call("INCR", message_seq_key)
@@ -158,6 +168,7 @@ local history_payload = cjson.encode({
     skipped_inactive_task_ids = skipped_inactive_task_ids,
     failed_task_ids = failed_task_ids,
     content = content,
+    data = data,
     metadata = metadata,
     created_at = timestamp_s,
 })

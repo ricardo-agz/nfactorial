@@ -13,18 +13,25 @@ from factorial.execution.context import (
     ContextType,
     ExecutionContext,
     HooksExecutionNamespace,
+    InboxDirectExecutionNamespace,
+    InboxExecutionNamespace,
+    InboxGroupExecutionNamespace,
+    InboxReceiptsExecutionNamespace,
     MessagingExecutionNamespace,
     MessagingGroupsExecutionNamespace,
+    SignalsExecutionNamespace,
     SubagentsExecutionNamespace,
 )
 from factorial.queue.keys import RedisKeys
 from factorial.queue.lua import (
     ActivityWaitScript,
     QueueScripts,
+    SignalWaitScript,
     TaskCompletionScript,
     TaskSteeringScript,
     WaitScheduleScript,
     create_activity_wait_script,
+    create_signal_wait_script,
     create_wait_schedule_script,
 )
 from factorial.queue.task import Task, get_task_data
@@ -113,6 +120,7 @@ async def process_task(
     metrics_retention_duration: int,
     wait_schedule_script: WaitScheduleScript | None = None,
     activity_wait_script: ActivityWaitScript | None = None,
+    signal_wait_script: SignalWaitScript | None = None,
 ) -> None:
     """Process a single task."""
     task_data = await get_task_data(redis_client, namespace, task_id)
@@ -146,6 +154,8 @@ async def process_task(
         wait_schedule_script = await create_wait_schedule_script(redis_client)
     if activity_wait_script is None:
         activity_wait_script = await create_activity_wait_script(redis_client)
+    if signal_wait_script is None:
+        signal_wait_script = await create_signal_wait_script(redis_client)
 
     queue_scripts = QueueScripts.for_agent(
         redis_client=redis_client,
@@ -166,6 +176,7 @@ async def process_task(
         queue_scripts=queue_scripts,
         wait_schedule_script=wait_schedule_script,
         activity_wait_script=activity_wait_script,
+        signal_wait_script=signal_wait_script,
         metrics_retention_duration=metrics_retention_duration,
     )
 
@@ -191,6 +202,8 @@ async def process_task(
                     enqueue_batch_callback=runtime.enqueue_batch,
                     cancel_callback=runtime.cancel_child_task,
                     cancel_many_callback=runtime.cancel_child_tasks,
+                    signal_callback=runtime.signal_child_task,
+                    signal_many_callback=runtime.signal_child_tasks,
                 ),
                 hooks=HooksExecutionNamespace(
                     persist_runtime_callback=runtime.persist_hook_runtime
@@ -208,6 +221,21 @@ async def process_task(
                         send_callback=runtime.messaging_send_group,
                     ),
                 ),
+                inbox=InboxExecutionNamespace(
+                    direct=InboxDirectExecutionNamespace(
+                        peek_callback=runtime.inbox_direct_peek,
+                        mark_read_callback=runtime.inbox_direct_mark_read,
+                    ),
+                    group=InboxGroupExecutionNamespace(
+                        peek_callback=runtime.inbox_group_peek,
+                        mark_read_callback=runtime.inbox_group_mark_read,
+                    ),
+                    receipts=InboxReceiptsExecutionNamespace(
+                        peek_callback=runtime.inbox_receipts_peek,
+                        mark_read_callback=runtime.inbox_receipts_mark_read,
+                    ),
+                ),
+                signals=SignalsExecutionNamespace(),
             )
 
             if task.payload.turn == 0 and task.retries == 0:
@@ -232,6 +260,24 @@ async def process_task(
             )
             runtime.task = task
 
+            signal_wake_context = await runtime.pop_signal_wake_context()
+            if (
+                isinstance(signal_wake_context, dict)
+                and str(signal_wake_context.get("wake_reason", "")).lower() == "timeout"
+            ):
+                execution_ctx.signals.current_signal = None
+                execution_ctx.signals.wake_reason_value = "timeout"
+            elif isinstance(signal_wake_context, dict):
+                execution_ctx.signals.current_signal = signal_wake_context
+                wake_reason = signal_wake_context.get("wake_reason")
+                if isinstance(wake_reason, str) and wake_reason:
+                    execution_ctx.signals.wake_reason_value = wake_reason
+                else:
+                    execution_ctx.signals.wake_reason_value = "signal"
+            else:
+                execution_ctx.signals.current_signal = None
+                execution_ctx.signals.wake_reason_value = None
+
             await run_task_state_machine(
                 redis_client=redis_client,
                 namespace=namespace,
@@ -245,6 +291,7 @@ async def process_task(
                 complete=runtime.complete,
                 park_or_resume_child_wait=runtime.park_or_resume_child_wait,
                 park_activity_wait=runtime.park_activity_wait,
+                park_signal_wait=runtime.park_signal_wait,
                 park_scheduled_wait=runtime.park_scheduled_wait,
                 publish_batch_progress=runtime.publish_batch_progress,
             )

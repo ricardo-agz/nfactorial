@@ -24,6 +24,17 @@ from factorial.execution.hooks import (
     PendingHook,
     hook,
 )
+from factorial.execution.inbox import (
+    InboxDirectNamespace,
+    InboxGroupNamespace,
+    InboxMessage,
+    InboxMessagePage,
+    InboxNamespace,
+    InboxReceipt,
+    InboxReceiptPage,
+    InboxReceiptsNamespace,
+    inbox,
+)
 from factorial.execution.messaging import (
     MessageDeliveryReport,
     MessagingGroupHandle,
@@ -31,7 +42,13 @@ from factorial.execution.messaging import (
     MessagingNamespace,
     messaging,
 )
-from factorial.execution.subagents import JobRef, SubagentsNamespace, subagents
+from factorial.execution.signals import SignalEnvelope, SignalsNamespace, signals
+from factorial.execution.subagents import (
+    JobRef,
+    SignalDeliveryReport,
+    SubagentsNamespace,
+    subagents,
+)
 from factorial.execution.tools import (
     Hidden,
     ToolDefinition,
@@ -109,13 +126,26 @@ __all__ = [
     "Task",
     "TaskStatus",
     "JobRef",
+    "SignalDeliveryReport",
     "SubagentsNamespace",
     "subagents",
+    "InboxMessage",
+    "InboxMessagePage",
+    "InboxReceipt",
+    "InboxReceiptPage",
+    "InboxDirectNamespace",
+    "InboxGroupNamespace",
+    "InboxReceiptsNamespace",
+    "InboxNamespace",
+    "inbox",
     "MessageDeliveryReport",
     "MessagingGroupHandle",
     "MessagingGroupsNamespace",
     "MessagingNamespace",
     "messaging",
+    "SignalEnvelope",
+    "SignalsNamespace",
+    "signals",
     "AgentEvent",
     "QueueEvent",
     "EventPublisher",

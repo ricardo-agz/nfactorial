@@ -21,6 +21,8 @@ local task_retries_key = KEYS[9]
 local task_metas_key = KEYS[10]
 local scheduled_wait_meta_key = KEYS[11]
 local activity_wait_meta_key = KEYS[12]
+local signal_wait_meta_key = KEYS[13]
+local signal_wake_meta_key = KEYS[14]
 
 local max_batch_size = tonumber(ARGV[1])
 
@@ -46,6 +48,7 @@ local recovered_task_ids = {}
 
 for i = 1, #ready_task_ids do
     local task_id = ready_task_ids[i]
+    local scheduled_wait_meta_raw = redis.call('HGET', scheduled_wait_meta_key, task_id)
     local task_result = load_task(
         { task_statuses_key, task_agents_key, task_payloads_key, task_pickups_key, task_retries_key, task_metas_key },
         { task_id }
@@ -60,6 +63,50 @@ for i = 1, #ready_task_ids do
             if redis.call('HEXISTS', activity_wait_meta_key, task_id) == 1 then
                 redis.call('HDEL', activity_wait_meta_key, task_id)
                 redis.call('ZREM', queue_pending_key, task_id)
+            end
+            if signal_wake_meta_key and signal_wake_meta_key ~= "" then
+                redis.call('HDEL', signal_wake_meta_key, task_id)
+            end
+            local signal_wait_meta_raw = nil
+            if signal_wait_meta_key and signal_wait_meta_key ~= "" then
+                signal_wait_meta_raw = redis.call('HGET', signal_wait_meta_key, task_id)
+                if signal_wait_meta_raw and signal_wait_meta_raw ~= "" then
+                    redis.call('HDEL', signal_wait_meta_key, task_id)
+                    redis.call('ZREM', queue_pending_key, task_id)
+                end
+            end
+
+            if signal_wait_meta_raw and signal_wait_meta_raw ~= ""
+                and signal_wake_meta_key and signal_wake_meta_key ~= ""
+                and scheduled_wait_meta_raw and scheduled_wait_meta_raw ~= ""
+            then
+                local wait_signal_id = nil
+                local wait_ok, wait_meta = pcall(cjson.decode, signal_wait_meta_raw)
+                if wait_ok and type(wait_meta) == "table" then
+                    wait_signal_id = wait_meta.signal_id
+                end
+
+                local scheduled_ok, scheduled_meta = pcall(cjson.decode, scheduled_wait_meta_raw)
+                local is_signal_timeout = false
+                if scheduled_ok and type(scheduled_meta) == "table" then
+                    is_signal_timeout = scheduled_meta.kind == "signal_timeout"
+                end
+
+                if is_signal_timeout and wait_signal_id then
+                    redis.call(
+                        'HSET',
+                        signal_wake_meta_key,
+                        task_id,
+                        cjson.encode({
+                            signal_id = wait_signal_id,
+                            payload = cjson.null,
+                            sender_task_id = cjson.null,
+                            sent_at = timestamp,
+                            seq = cjson.null,
+                            wake_reason = "timeout",
+                        })
+                    )
+                end
             end
             table.insert(recovered_task_ids, task_id)
         end

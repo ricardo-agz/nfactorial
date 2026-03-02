@@ -26,6 +26,12 @@ from factorial.queue.operations import (
     messaging_groups_send,
     messaging_human_send_direct,
     messaging_human_send_group,
+    messaging_inbox_direct_mark_read,
+    messaging_inbox_direct_peek,
+    messaging_inbox_group_mark_read,
+    messaging_inbox_group_peek,
+    messaging_inbox_receipts_mark_read,
+    messaging_inbox_receipts_peek,
     messaging_send_direct,
 )
 from factorial.queue.task import Task, TaskStatus
@@ -948,3 +954,176 @@ async def test_direct_history_and_thread_list_are_symmetric(
     first_thread_id = first_page["conversations"][0]["thread_id"]
     second_thread_id = second_page["conversations"][0]["thread_id"]
     assert first_thread_id != second_thread_id
+
+
+@pytest.mark.asyncio
+async def test_direct_inbox_peek_mark_read_and_receipts_flow(
+    redis_client: redis.Redis,
+    test_namespace: str,
+    test_agent: SimpleTestAgent,
+    test_owner_id: str,
+) -> None:
+    sender = await _enqueue_root_task(
+        redis_client=redis_client,
+        namespace=test_namespace,
+        agent=test_agent,
+        owner_id=test_owner_id,
+        query="sender",
+    )
+    team_id = sender.metadata.team_id or sender.id
+
+    recipient = Task.create(
+        owner_id=test_owner_id,
+        agent=test_agent.name,
+        payload=AgentContext(query="recipient"),
+    )
+    recipient.metadata.team_id = team_id
+    await enqueue_task(
+        redis_client=redis_client,
+        namespace=test_namespace,
+        agent=test_agent,
+        task=recipient,
+    )
+
+    await messaging_send_direct(
+        redis_client=redis_client,
+        namespace=test_namespace,
+        sender_task_id=sender.id,
+        to_task_id=recipient.id,
+        content="day vote",
+        data={"target": "task-z"},
+        metadata={"round": 1},
+    )
+
+    recipient_page = await messaging_inbox_direct_peek(
+        redis_client=redis_client,
+        namespace=test_namespace,
+        task_id=recipient.id,
+        unread_only=True,
+        limit=10,
+    )
+    assert len(recipient_page["messages"]) == 1
+    recipient_message = recipient_page["messages"][0]
+    assert recipient_message["content"] == "day vote"
+    assert recipient_message["data"] == {"target": "task-z"}
+    assert recipient_message["is_read"] is False
+
+    mark_result = await messaging_inbox_direct_mark_read(
+        redis_client=redis_client,
+        namespace=test_namespace,
+        task_id=recipient.id,
+        message_ids=[recipient_message["message_id"]],
+        notify_sender=True,
+        data={"accepted": True},
+    )
+    assert mark_result["marked_message_ids"] == [recipient_message["message_id"]]
+    assert mark_result["receipt_ids"]
+
+    recipient_unread_after = await messaging_inbox_direct_peek(
+        redis_client=redis_client,
+        namespace=test_namespace,
+        task_id=recipient.id,
+        unread_only=True,
+        limit=10,
+    )
+    assert recipient_unread_after["messages"] == []
+
+    sender_receipts = await messaging_inbox_receipts_peek(
+        redis_client=redis_client,
+        namespace=test_namespace,
+        task_id=sender.id,
+        unread_only=True,
+        limit=10,
+    )
+    assert len(sender_receipts["messages"]) == 1
+    receipt = sender_receipts["messages"][0]
+    assert receipt["source_message_id"] == recipient_message["message_id"]
+    assert receipt["reader_task_id"] == recipient.id
+    assert receipt["data"] == {"accepted": True}
+
+    receipts_marked = await messaging_inbox_receipts_mark_read(
+        redis_client=redis_client,
+        namespace=test_namespace,
+        task_id=sender.id,
+        receipt_ids=[receipt["receipt_id"]],
+    )
+    assert receipts_marked["marked_receipt_ids"] == [receipt["receipt_id"]]
+
+
+@pytest.mark.asyncio
+async def test_group_inbox_peek_mark_read_and_data_roundtrip(
+    redis_client: redis.Redis,
+    test_namespace: str,
+    test_agent: SimpleTestAgent,
+    test_owner_id: str,
+) -> None:
+    sender = await _enqueue_root_task(
+        redis_client=redis_client,
+        namespace=test_namespace,
+        agent=test_agent,
+        owner_id=test_owner_id,
+        query="sender",
+    )
+    team_id = sender.metadata.team_id or sender.id
+
+    teammate = Task.create(
+        owner_id=test_owner_id,
+        agent=test_agent.name,
+        payload=AgentContext(query="teammate"),
+    )
+    teammate.metadata.team_id = team_id
+    await enqueue_task(
+        redis_client=redis_client,
+        namespace=test_namespace,
+        agent=test_agent,
+        task=teammate,
+    )
+
+    await messaging_groups_create(
+        redis_client=redis_client,
+        namespace=test_namespace,
+        sender_task_id=sender.id,
+        group_name="village",
+        member_task_ids=[teammate.id],
+    )
+    await messaging_groups_send(
+        redis_client=redis_client,
+        namespace=test_namespace,
+        sender_task_id=sender.id,
+        group_name="village",
+        content="lynch vote",
+        data={"target": "task-w"},
+        metadata={"round": 2},
+    )
+
+    unread_group = await messaging_inbox_group_peek(
+        redis_client=redis_client,
+        namespace=test_namespace,
+        task_id=teammate.id,
+        group_name="village",
+        unread_only=True,
+        limit=10,
+    )
+    assert len(unread_group["messages"]) == 1
+    group_message = unread_group["messages"][0]
+    assert group_message["content"] == "lynch vote"
+    assert group_message["data"] == {"target": "task-w"}
+
+    mark_result = await messaging_inbox_group_mark_read(
+        redis_client=redis_client,
+        namespace=test_namespace,
+        task_id=teammate.id,
+        group_name="village",
+        message_ids=[group_message["message_id"]],
+    )
+    assert mark_result["marked_message_ids"] == [group_message["message_id"]]
+
+    unread_after = await messaging_inbox_group_peek(
+        redis_client=redis_client,
+        namespace=test_namespace,
+        task_id=teammate.id,
+        group_name="village",
+        unread_only=True,
+        limit=10,
+    )
+    assert unread_after["messages"] == []

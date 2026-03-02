@@ -952,6 +952,7 @@ class Orchestrator:
         task_id: str,
         owner_id: str,
         content: str,
+        data: Any = None,
         metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         from factorial.queue import messaging_human_send_direct as q_message_task
@@ -963,6 +964,7 @@ class Orchestrator:
                 owner_id=owner_id,
                 to_task_id=task_id,
                 content=content,
+                data=data,
                 metadata=metadata,
             )
 
@@ -971,6 +973,7 @@ class Orchestrator:
         *,
         owner_id: str,
         content: str,
+        data: Any = None,
         group_id: str | None = None,
         group_name: str | None = None,
         task_id: str | None = None,
@@ -985,6 +988,7 @@ class Orchestrator:
                 namespace=self.namespace,
                 owner_id=owner_id,
                 content=content,
+                data=data,
                 group_id=group_id,
                 group_name=group_name,
                 task_id=task_id,

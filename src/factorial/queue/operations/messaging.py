@@ -40,6 +40,16 @@ _DEFAULT_HISTORY_LIMIT = 50
 _MAX_HISTORY_LIMIT = 500
 _DEFAULT_LIST_LIMIT = 50
 _MAX_LIST_LIMIT = 200
+_DEFAULT_INBOX_LIMIT = 50
+_MAX_INBOX_LIMIT = 200
+_INBOX_SCAN_MULTIPLIER = 4
+_INBOX_SCAN_MIN_BATCH = 32
+
+
+def _normalize_data(data: Any) -> Any:
+    if data is None:
+        return None
+    return serialize_data(data)
 
 def _normalize_group_name(group_name: str) -> str:
     if not isinstance(group_name, str) or not group_name.strip():
@@ -131,6 +141,14 @@ def _normalize_list_limit(limit: int) -> int:
     return min(limit, _MAX_LIST_LIMIT)
 
 
+def _normalize_inbox_limit(limit: int) -> int:
+    if not isinstance(limit, int):
+        raise TypeError("limit must be an integer")
+    if limit < 1:
+        raise ValueError("limit must be >= 1")
+    return min(limit, _MAX_INBOX_LIMIT)
+
+
 def _normalize_history_order(order: str) -> Literal["asc", "desc"]:
     if order not in {"asc", "desc"}:
         raise ValueError("order must be 'asc' or 'desc'")
@@ -149,6 +167,19 @@ def _decode_list_cursor(cursor: str | None) -> int:
     if offset < 0:
         raise ValueError("cursor has invalid format")
     return offset
+
+
+def _normalize_stream_cursor(cursor: str | None) -> str | None:
+    if cursor is None:
+        return None
+    if not isinstance(cursor, str):
+        raise TypeError("cursor must be a string when provided")
+    normalized = cursor.strip()
+    if not normalized:
+        raise ValueError("cursor must be a non-empty string when provided")
+    if "-" not in normalized:
+        raise ValueError("cursor has invalid format")
+    return normalized
 
 
 def _decode_message_payload(raw_payload: Any) -> dict[str, Any]:
@@ -663,6 +694,7 @@ async def messaging_groups_history(
                 ),
                 "failed_task_ids": _coerce_string_list(payload.get("failed_task_ids")),
                 "content": str(payload.get("content", "")),
+                "data": payload.get("data"),
                 "metadata": _coerce_dict(payload.get("metadata")),
                 "created_at": _coerce_float(payload.get("created_at")),
             }
@@ -929,6 +961,7 @@ async def messaging_groups_send(
     sender_task_id: str,
     group_name: str,
     content: str,
+    data: Any = None,
     metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     normalized_group_name = _normalize_group_name(group_name)
@@ -972,6 +1005,7 @@ async def messaging_groups_send(
         team_id=sender_team_id,
         group_name=normalized_group_name,
         content=content,
+        data_json=json.dumps(_normalize_data(data)),
         metadata_json=json.dumps(serialize_data(metadata or {}), sort_keys=True),
         steering_key_template=steering_key_template,
         history_maxlen=_MESSAGING_HISTORY_MAXLEN,
@@ -1039,6 +1073,7 @@ async def messaging_send_direct(
     sender_task_id: str,
     to_task_id: str,
     content: str,
+    data: Any = None,
     metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     sender_task_data = await get_task_data(redis_client, namespace, sender_task_id)
@@ -1074,6 +1109,7 @@ async def messaging_send_direct(
         to_task_id=to_task_id,
         team_id=sender_team_id,
         content=content,
+        data_json=json.dumps(_normalize_data(data)),
         metadata_json=json.dumps(serialize_data(metadata or {}), sort_keys=True),
         steering_key_template=steering_key_template,
         history_maxlen=_MESSAGING_HISTORY_MAXLEN,
@@ -1194,6 +1230,7 @@ async def messaging_direct_history(
                 ),
                 "failed_task_ids": _coerce_string_list(payload.get("failed_task_ids")),
                 "content": str(payload.get("content", "")),
+                "data": payload.get("data"),
                 "metadata": _coerce_dict(payload.get("metadata")),
                 "created_at": _coerce_float(payload.get("created_at")),
             }
@@ -1293,6 +1330,7 @@ async def messaging_human_send_direct(
     owner_id: str,
     to_task_id: str,
     content: str,
+    data: Any = None,
     metadata: dict[str, Any] | None = None,
     from_task_id: str | None = None,
 ) -> dict[str, Any]:
@@ -1336,6 +1374,7 @@ async def messaging_human_send_direct(
         to_task_id=to_task_id,
         team_id=recipient_team_id,
         content=normalized_content,
+        data_json=json.dumps(_normalize_data(data)),
         metadata_json=json.dumps(serialize_data(metadata or {}), sort_keys=True),
         steering_key_template=steering_key_template,
         history_maxlen=_MESSAGING_HISTORY_MAXLEN,
@@ -1392,6 +1431,7 @@ async def messaging_human_send_group(
     namespace: str,
     owner_id: str,
     content: str,
+    data: Any = None,
     group_id: str | None = None,
     group_name: str | None = None,
     task_id: str | None = None,
@@ -1451,6 +1491,7 @@ async def messaging_human_send_group(
         team_id=resolved_team_id,
         group_name=resolved_group_name,
         content=normalized_content,
+        data_json=json.dumps(_normalize_data(data)),
         metadata_json=json.dumps(serialize_data(metadata or {}), sort_keys=True),
         steering_key_template=steering_key_template,
         history_maxlen=_MESSAGING_HISTORY_MAXLEN,
@@ -1514,3 +1555,729 @@ async def messaging_human_send_group(
             data=payload,
         )
     return payload
+
+
+def _message_read_marker(message_id: str) -> str:
+    return f"msg:{message_id}"
+
+
+def _receipt_read_marker(receipt_id: str) -> str:
+    return f"receipt:{receipt_id}"
+
+
+def _decode_read_marker(raw: str | bytes | None) -> tuple[bool, dict[str, Any]]:
+    if raw is None:
+        return False, {}
+    try:
+        parsed = json.loads(decode(raw))
+    except Exception:
+        return True, {}
+    if not isinstance(parsed, dict):
+        return True, {}
+    return True, cast(dict[str, Any], parsed)
+
+
+def _derive_direct_thread_id(payload: dict[str, Any]) -> str | None:
+    kind = payload.get("kind")
+    if kind == "direct":
+        team_id = payload.get("team_id")
+        from_task_id = payload.get("from_task_id")
+        to_task_ids = _coerce_string_list(payload.get("to_task_ids"))
+        if (
+            isinstance(team_id, str)
+            and isinstance(from_task_id, str)
+            and to_task_ids
+        ):
+            return _direct_thread_id(
+                team_id=team_id,
+                sender_task_id=from_task_id,
+                to_task_id=to_task_ids[0],
+            )
+        return None
+    if kind == "human_direct":
+        from_owner_id = payload.get("from_owner_id")
+        to_task_ids = _coerce_string_list(payload.get("to_task_ids"))
+        if isinstance(from_owner_id, str) and to_task_ids:
+            return _human_direct_thread_id(
+                owner_id=from_owner_id,
+                to_task_id=to_task_ids[0],
+            )
+    return None
+
+
+def _build_direct_inbox_message(
+    *,
+    message_id: str,
+    task_id: str,
+    payload: dict[str, Any],
+) -> dict[str, Any] | None:
+    kind = payload.get("kind")
+    if kind not in {"direct", "human_direct"}:
+        return None
+    delivered_task_ids = _coerce_string_list(payload.get("delivered_task_ids"))
+    if task_id not in delivered_task_ids:
+        return None
+    return {
+        "message_id": message_id,
+        "thread_id": _derive_direct_thread_id(payload),
+        "team_id": payload.get("team_id"),
+        "from_task_id": (
+            str(payload["from_task_id"])
+            if isinstance(payload.get("from_task_id"), str)
+            else None
+        ),
+        "from_owner_id": (
+            str(payload["from_owner_id"])
+            if isinstance(payload.get("from_owner_id"), str)
+            else None
+        ),
+        "content": str(payload.get("content", "")),
+        "data": payload.get("data"),
+        "metadata": _coerce_dict(payload.get("metadata")),
+        "created_at": _coerce_float(payload.get("created_at")),
+    }
+
+
+def _build_group_inbox_message(
+    *,
+    message_id: str,
+    task_id: str,
+    expected_group_name: str,
+    payload: dict[str, Any],
+) -> dict[str, Any] | None:
+    kind = payload.get("kind")
+    if kind not in {"group", "human_group"}:
+        return None
+    group_name = payload.get("group_name")
+    if not isinstance(group_name, str) or group_name != expected_group_name:
+        return None
+    delivered_task_ids = _coerce_string_list(payload.get("delivered_task_ids"))
+    if task_id not in delivered_task_ids:
+        return None
+    team_id = payload.get("team_id")
+    thread_id = (
+        _group_thread_id(team_id=team_id, group_name=group_name)
+        if isinstance(team_id, str)
+        else None
+    )
+    return {
+        "message_id": message_id,
+        "thread_id": thread_id,
+        "team_id": team_id,
+        "group_name": group_name,
+        "from_task_id": (
+            str(payload["from_task_id"])
+            if isinstance(payload.get("from_task_id"), str)
+            else None
+        ),
+        "from_owner_id": (
+            str(payload["from_owner_id"])
+            if isinstance(payload.get("from_owner_id"), str)
+            else None
+        ),
+        "content": str(payload.get("content", "")),
+        "data": payload.get("data"),
+        "metadata": _coerce_dict(payload.get("metadata")),
+        "created_at": _coerce_float(payload.get("created_at")),
+    }
+
+
+async def _peek_global_history(
+    *,
+    redis_client: redis.Redis,
+    global_history_key: str,
+    read_markers_key: str,
+    read_marker_builder: Any,
+    limit: int,
+    cursor: str | None,
+    unread_only: bool,
+    record_builder: Any,
+) -> dict[str, Any]:
+    normalized_limit = _normalize_inbox_limit(limit)
+    normalized_cursor = _normalize_stream_cursor(cursor)
+    scan_cursor = normalized_cursor
+    records: list[dict[str, Any]] = []
+    has_more = False
+
+    while len(records) < normalized_limit:
+        fetch_count = max(
+            _INBOX_SCAN_MIN_BATCH,
+            (normalized_limit - len(records)) * _INBOX_SCAN_MULTIPLIER,
+        )
+        min_bound = f"({scan_cursor}" if scan_cursor is not None else "-"
+        rows = cast(
+            list[tuple[str, dict[str, Any]]],
+            await redis_client.xrange(  # type: ignore[misc]
+                global_history_key,
+                min=min_bound,
+                max="+",
+                count=fetch_count,
+            ),
+        )
+        if not rows:
+            has_more = False
+            break
+
+        scan_cursor = decode(rows[-1][0])
+        candidate_ids: list[str] = []
+        candidate_records: list[dict[str, Any]] = []
+
+        for message_id_raw, fields in rows:
+            message_id = decode(message_id_raw)
+            payload = _decode_message_payload(fields.get("payload"))
+            record = record_builder(message_id, payload)
+            if record is None:
+                continue
+            candidate_ids.append(message_id)
+            candidate_records.append(record)
+
+        read_flags: list[bool] = []
+        if candidate_ids:
+            pipe = redis_client.pipeline(transaction=False)
+            for message_id in candidate_ids:
+                pipe.hexists(read_markers_key, read_marker_builder(message_id))
+            read_flags = [bool(value) for value in await pipe.execute()]
+
+        for record, _message_id, is_read in zip(
+            candidate_records,
+            candidate_ids,
+            read_flags,
+            strict=True,
+        ):
+            if unread_only and is_read:
+                continue
+            record["is_read"] = is_read
+            records.append(record)
+            if len(records) >= normalized_limit:
+                break
+
+        has_more = len(rows) == fetch_count
+        if len(rows) < fetch_count:
+            has_more = False
+            break
+
+    return {
+        "messages": records,
+        "next_cursor": scan_cursor,
+        "has_more": has_more,
+    }
+
+
+async def _read_global_payloads_by_message_id(
+    *,
+    redis_client: redis.Redis,
+    global_history_key: str,
+    message_ids: list[str],
+) -> dict[str, dict[str, Any]]:
+    if not message_ids:
+        return {}
+    pipe = redis_client.pipeline(transaction=False)
+    for message_id in message_ids:
+        pipe.xrange(global_history_key, min=message_id, max=message_id, count=1)
+    rows_by_id = cast(
+        list[list[tuple[str, dict[str, Any]]]],
+        await pipe.execute(),
+    )
+    payloads: dict[str, dict[str, Any]] = {}
+    for message_id, rows in zip(message_ids, rows_by_id, strict=True):
+        if not rows:
+            continue
+        row_id, fields = rows[0]
+        if decode(row_id) != message_id:
+            continue
+        payloads[message_id] = _decode_message_payload(fields.get("payload"))
+    return payloads
+
+
+async def _append_read_receipt(
+    *,
+    redis_client: redis.Redis,
+    namespace: str,
+    reader_task_id: str,
+    source_message_id: str,
+    source_payload: dict[str, Any],
+    receipt_data: Any,
+) -> str | None:
+    sender_task_id = source_payload.get("from_task_id")
+    if not isinstance(sender_task_id, str) or not sender_task_id:
+        return None
+    if sender_task_id == reader_task_id:
+        return None
+
+    try:
+        sender_task_data = await get_task_data(redis_client, namespace, sender_task_id)
+    except TaskNotFoundError:
+        return None
+    sender_owner_id = str(sender_task_data["metadata"]["owner_id"])
+    sender_agent_name = str(sender_task_data["agent"])
+    source_kind = str(source_payload.get("kind", "unknown"))
+    receipt_payload = {
+        "source_message_id": source_message_id,
+        "source_kind": source_kind,
+        "source_group_name": source_payload.get("group_name"),
+        "source_from_owner_id": source_payload.get("from_owner_id"),
+        "source_from_task_id": source_payload.get("from_task_id"),
+        "source_created_at": source_payload.get("created_at"),
+        "reader_task_id": reader_task_id,
+        "sender_task_id": sender_task_id,
+        "data": _normalize_data(receipt_data),
+        "created_at": time.time(),
+    }
+
+    keys = RedisKeys.format(namespace=namespace)
+    receipts_key = keys.messaging_receipts_by_task(sender_task_id)
+    receipt_id = cast(
+        str,
+        await redis_client.xadd(  # type: ignore[misc]
+            receipts_key,
+            {"payload": json.dumps(receipt_payload, sort_keys=True)},
+            maxlen=_MESSAGING_HISTORY_MAXLEN,
+            approximate=True,
+        ),
+    )
+
+    await _publish_messaging_event(
+        redis_client=redis_client,
+        namespace=namespace,
+        owner_id=sender_owner_id,
+        task_id=sender_task_id,
+        agent_name=sender_agent_name,
+        event_type="messaging_read_receipt_sent",
+        data={
+            "receipt_id": receipt_id,
+            "source_message_id": source_message_id,
+            "reader_task_id": reader_task_id,
+            "sender_task_id": sender_task_id,
+            "data": _normalize_data(receipt_data),
+        },
+    )
+    return receipt_id
+
+
+async def messaging_inbox_direct_peek(
+    *,
+    redis_client: redis.Redis,
+    namespace: str,
+    task_id: str,
+    unread_only: bool = True,
+    limit: int = _DEFAULT_INBOX_LIMIT,
+    cursor: str | None = None,
+) -> dict[str, Any]:
+    await get_task_data(redis_client, namespace, task_id)
+    keys = RedisKeys.format(namespace=namespace)
+    read_markers_key = keys.messaging_read_by_task(task_id)
+    page = await _peek_global_history(
+        redis_client=redis_client,
+        global_history_key=keys.messaging_history_global,
+        read_markers_key=read_markers_key,
+        read_marker_builder=_message_read_marker,
+        limit=limit,
+        cursor=cursor,
+        unread_only=unread_only,
+        record_builder=lambda message_id, payload: _build_direct_inbox_message(
+            message_id=message_id,
+            task_id=task_id,
+            payload=payload,
+        ),
+    )
+    return page
+
+
+async def messaging_inbox_group_peek(
+    *,
+    redis_client: redis.Redis,
+    namespace: str,
+    task_id: str,
+    group_name: str,
+    unread_only: bool = True,
+    limit: int = _DEFAULT_INBOX_LIMIT,
+    cursor: str | None = None,
+) -> dict[str, Any]:
+    normalized_group_name = _normalize_group_name(group_name)
+    await messaging_groups_get(
+        redis_client=redis_client,
+        namespace=namespace,
+        sender_task_id=task_id,
+        group_name=normalized_group_name,
+    )
+    keys = RedisKeys.format(namespace=namespace)
+    read_markers_key = keys.messaging_read_by_task(task_id)
+    page = await _peek_global_history(
+        redis_client=redis_client,
+        global_history_key=keys.messaging_history_global,
+        read_markers_key=read_markers_key,
+        read_marker_builder=_message_read_marker,
+        limit=limit,
+        cursor=cursor,
+        unread_only=unread_only,
+        record_builder=lambda message_id, payload: _build_group_inbox_message(
+            message_id=message_id,
+            task_id=task_id,
+            expected_group_name=normalized_group_name,
+            payload=payload,
+        ),
+    )
+    return page
+
+
+async def messaging_inbox_direct_mark_read(
+    *,
+    redis_client: redis.Redis,
+    namespace: str,
+    task_id: str,
+    message_ids: list[str],
+    notify_sender: bool = False,
+    data: Any = None,
+) -> dict[str, Any]:
+    deduped_ids = list(dict.fromkeys(message_ids))
+    if not deduped_ids:
+        return {
+            "marked_message_ids": [],
+            "already_marked_message_ids": [],
+            "ignored_message_ids": [],
+            "receipt_ids": [],
+        }
+
+    await get_task_data(redis_client, namespace, task_id)
+    keys = RedisKeys.format(namespace=namespace)
+    payloads_by_id = await _read_global_payloads_by_message_id(
+        redis_client=redis_client,
+        global_history_key=keys.messaging_history_global,
+        message_ids=deduped_ids,
+    )
+    read_key = keys.messaging_read_by_task(task_id)
+    marker_fields = [_message_read_marker(message_id) for message_id in deduped_ids]
+    existing_markers = cast(
+        list[str | bytes | None],
+        await redis_client.hmget(read_key, marker_fields),  # type: ignore[arg-type,misc]
+    )
+
+    marked_message_ids: list[str] = []
+    already_marked_message_ids: list[str] = []
+    ignored_message_ids: list[str] = []
+    receipt_ids: list[str] = []
+    marker_updates: dict[str, str] = {}
+
+    for message_id, marker_field, existing_marker_raw in zip(
+        deduped_ids,
+        marker_fields,
+        existing_markers,
+        strict=True,
+    ):
+        payload = payloads_by_id.get(message_id)
+        if payload is None:
+            ignored_message_ids.append(message_id)
+            continue
+        message_record = _build_direct_inbox_message(
+            message_id=message_id,
+            task_id=task_id,
+            payload=payload,
+        )
+        if message_record is None:
+            ignored_message_ids.append(message_id)
+            continue
+
+        is_marked, marker_payload = _decode_read_marker(existing_marker_raw)
+        already_notified = bool(marker_payload.get("notify_sender"))
+        if is_marked:
+            already_marked_message_ids.append(message_id)
+        else:
+            marked_message_ids.append(message_id)
+
+        should_notify = notify_sender and not already_notified
+        receipt_id: str | None = None
+        if should_notify:
+            receipt_id = await _append_read_receipt(
+                redis_client=redis_client,
+                namespace=namespace,
+                reader_task_id=task_id,
+                source_message_id=message_id,
+                source_payload=payload,
+                receipt_data=data,
+            )
+            if receipt_id:
+                receipt_ids.append(receipt_id)
+
+        merged_payload = {
+            **marker_payload,
+            "read_at": time.time(),
+            "notify_sender": bool(already_notified or should_notify),
+        }
+        if data is not None:
+            merged_payload["data"] = _normalize_data(data)
+        marker_updates[marker_field] = json.dumps(merged_payload, sort_keys=True)
+
+    if marker_updates:
+        await redis_client.hset(read_key, mapping=marker_updates)  # type: ignore[misc]
+
+    return {
+        "marked_message_ids": marked_message_ids,
+        "already_marked_message_ids": already_marked_message_ids,
+        "ignored_message_ids": ignored_message_ids,
+        "receipt_ids": receipt_ids,
+    }
+
+
+async def messaging_inbox_group_mark_read(
+    *,
+    redis_client: redis.Redis,
+    namespace: str,
+    task_id: str,
+    group_name: str,
+    message_ids: list[str],
+    notify_sender: bool = False,
+    data: Any = None,
+) -> dict[str, Any]:
+    normalized_group_name = _normalize_group_name(group_name)
+    await messaging_groups_get(
+        redis_client=redis_client,
+        namespace=namespace,
+        sender_task_id=task_id,
+        group_name=normalized_group_name,
+    )
+    deduped_ids = list(dict.fromkeys(message_ids))
+    if not deduped_ids:
+        return {
+            "marked_message_ids": [],
+            "already_marked_message_ids": [],
+            "ignored_message_ids": [],
+            "receipt_ids": [],
+        }
+
+    keys = RedisKeys.format(namespace=namespace)
+    payloads_by_id = await _read_global_payloads_by_message_id(
+        redis_client=redis_client,
+        global_history_key=keys.messaging_history_global,
+        message_ids=deduped_ids,
+    )
+    read_key = keys.messaging_read_by_task(task_id)
+    marker_fields = [_message_read_marker(message_id) for message_id in deduped_ids]
+    existing_markers = cast(
+        list[str | bytes | None],
+        await redis_client.hmget(read_key, marker_fields),  # type: ignore[arg-type,misc]
+    )
+
+    marked_message_ids: list[str] = []
+    already_marked_message_ids: list[str] = []
+    ignored_message_ids: list[str] = []
+    receipt_ids: list[str] = []
+    marker_updates: dict[str, str] = {}
+
+    for message_id, marker_field, existing_marker_raw in zip(
+        deduped_ids,
+        marker_fields,
+        existing_markers,
+        strict=True,
+    ):
+        payload = payloads_by_id.get(message_id)
+        if payload is None:
+            ignored_message_ids.append(message_id)
+            continue
+        message_record = _build_group_inbox_message(
+            message_id=message_id,
+            task_id=task_id,
+            expected_group_name=normalized_group_name,
+            payload=payload,
+        )
+        if message_record is None:
+            ignored_message_ids.append(message_id)
+            continue
+
+        is_marked, marker_payload = _decode_read_marker(existing_marker_raw)
+        already_notified = bool(marker_payload.get("notify_sender"))
+        if is_marked:
+            already_marked_message_ids.append(message_id)
+        else:
+            marked_message_ids.append(message_id)
+
+        should_notify = notify_sender and not already_notified
+        receipt_id: str | None = None
+        if should_notify:
+            receipt_id = await _append_read_receipt(
+                redis_client=redis_client,
+                namespace=namespace,
+                reader_task_id=task_id,
+                source_message_id=message_id,
+                source_payload=payload,
+                receipt_data=data,
+            )
+            if receipt_id:
+                receipt_ids.append(receipt_id)
+
+        merged_payload = {
+            **marker_payload,
+            "read_at": time.time(),
+            "notify_sender": bool(already_notified or should_notify),
+        }
+        if data is not None:
+            merged_payload["data"] = _normalize_data(data)
+        marker_updates[marker_field] = json.dumps(merged_payload, sort_keys=True)
+
+    if marker_updates:
+        await redis_client.hset(read_key, mapping=marker_updates)  # type: ignore[misc]
+
+    return {
+        "marked_message_ids": marked_message_ids,
+        "already_marked_message_ids": already_marked_message_ids,
+        "ignored_message_ids": ignored_message_ids,
+        "receipt_ids": receipt_ids,
+    }
+
+
+async def messaging_inbox_receipts_peek(
+    *,
+    redis_client: redis.Redis,
+    namespace: str,
+    task_id: str,
+    unread_only: bool = True,
+    limit: int = _DEFAULT_INBOX_LIMIT,
+    cursor: str | None = None,
+) -> dict[str, Any]:
+    await get_task_data(redis_client, namespace, task_id)
+    keys = RedisKeys.format(namespace=namespace)
+    receipts_key = keys.messaging_receipts_by_task(task_id)
+    read_markers_key = keys.messaging_read_by_task(task_id)
+
+    normalized_limit = _normalize_inbox_limit(limit)
+    normalized_cursor = _normalize_stream_cursor(cursor)
+    scan_cursor = normalized_cursor
+    records: list[dict[str, Any]] = []
+    has_more = False
+
+    while len(records) < normalized_limit:
+        fetch_count = max(
+            _INBOX_SCAN_MIN_BATCH,
+            (normalized_limit - len(records)) * _INBOX_SCAN_MULTIPLIER,
+        )
+        min_bound = f"({scan_cursor}" if scan_cursor is not None else "-"
+        rows = cast(
+            list[tuple[str, dict[str, Any]]],
+            await redis_client.xrange(  # type: ignore[misc]
+                receipts_key,
+                min=min_bound,
+                max="+",
+                count=fetch_count,
+            ),
+        )
+        if not rows:
+            has_more = False
+            break
+
+        scan_cursor = decode(rows[-1][0])
+        receipt_ids = [decode(row[0]) for row in rows]
+        pipe = redis_client.pipeline(transaction=False)
+        for receipt_id in receipt_ids:
+            pipe.hexists(read_markers_key, _receipt_read_marker(receipt_id))
+        read_flags = [bool(value) for value in await pipe.execute()]
+
+        for (receipt_id_raw, fields), is_read in zip(rows, read_flags, strict=True):
+            if unread_only and is_read:
+                continue
+            receipt_id = decode(receipt_id_raw)
+            payload = _decode_message_payload(fields.get("payload"))
+            records.append(
+                {
+                    "receipt_id": receipt_id,
+                    "source_message_id": payload.get("source_message_id"),
+                    "source_kind": payload.get("source_kind"),
+                    "source_group_name": payload.get("source_group_name"),
+                    "reader_task_id": payload.get("reader_task_id"),
+                    "sender_task_id": payload.get("sender_task_id"),
+                    "data": payload.get("data"),
+                    "created_at": _coerce_float(payload.get("created_at")),
+                    "is_read": is_read,
+                }
+            )
+            if len(records) >= normalized_limit:
+                break
+
+        has_more = len(rows) == fetch_count
+        if len(rows) < fetch_count:
+            has_more = False
+            break
+
+    return {
+        "messages": records,
+        "next_cursor": scan_cursor,
+        "has_more": has_more,
+    }
+
+
+async def messaging_inbox_receipts_mark_read(
+    *,
+    redis_client: redis.Redis,
+    namespace: str,
+    task_id: str,
+    receipt_ids: list[str],
+) -> dict[str, Any]:
+    deduped_ids = list(dict.fromkeys(receipt_ids))
+    if not deduped_ids:
+        return {
+            "marked_receipt_ids": [],
+            "already_marked_receipt_ids": [],
+            "ignored_receipt_ids": [],
+        }
+
+    await get_task_data(redis_client, namespace, task_id)
+    keys = RedisKeys.format(namespace=namespace)
+    receipts_key = keys.messaging_receipts_by_task(task_id)
+    read_key = keys.messaging_read_by_task(task_id)
+    marker_fields = [_receipt_read_marker(receipt_id) for receipt_id in deduped_ids]
+
+    pipe = redis_client.pipeline(transaction=False)
+    for receipt_id in deduped_ids:
+        pipe.xrange(receipts_key, min=receipt_id, max=receipt_id, count=1)
+    for marker_field in marker_fields:
+        pipe.hget(read_key, marker_field)
+    raw_results = await pipe.execute()
+    row_results = cast(
+        list[list[tuple[str, dict[str, Any]]]],
+        raw_results[: len(deduped_ids)],
+    )
+    marker_results = cast(
+        list[str | bytes | None],
+        raw_results[len(deduped_ids) :],
+    )
+
+    marked_receipt_ids: list[str] = []
+    already_marked_receipt_ids: list[str] = []
+    ignored_receipt_ids: list[str] = []
+    marker_updates: dict[str, str] = {}
+
+    for receipt_id, marker_field, rows, marker_raw in zip(
+        deduped_ids,
+        marker_fields,
+        row_results,
+        marker_results,
+        strict=True,
+    ):
+        if not rows:
+            ignored_receipt_ids.append(receipt_id)
+            continue
+        row_id = decode(rows[0][0])
+        if row_id != receipt_id:
+            ignored_receipt_ids.append(receipt_id)
+            continue
+
+        is_marked, marker_payload = _decode_read_marker(marker_raw)
+        if is_marked:
+            already_marked_receipt_ids.append(receipt_id)
+        else:
+            marked_receipt_ids.append(receipt_id)
+
+        marker_updates[marker_field] = json.dumps(
+            {
+                **marker_payload,
+                "read_at": time.time(),
+            },
+            sort_keys=True,
+        )
+
+    if marker_updates:
+        await redis_client.hset(read_key, mapping=marker_updates)  # type: ignore[misc]
+
+    return {
+        "marked_receipt_ids": marked_receipt_ids,
+        "already_marked_receipt_ids": already_marked_receipt_ids,
+        "ignored_receipt_ids": ignored_receipt_ids,
+    }

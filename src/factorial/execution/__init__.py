@@ -8,6 +8,17 @@ from .hooks import (
     PendingHook,
     hook,
 )
+from .inbox import (
+    InboxDirectNamespace,
+    InboxGroupNamespace,
+    InboxMessage,
+    InboxMessagePage,
+    InboxNamespace,
+    InboxReceipt,
+    InboxReceiptPage,
+    InboxReceiptsNamespace,
+    inbox,
+)
 from .messaging import (
     MessageDeliveryReport,
     MessagingGroupHandle,
@@ -15,7 +26,8 @@ from .messaging import (
     MessagingNamespace,
     messaging,
 )
-from .subagents import JobRef, SubagentsNamespace, subagents
+from .signals import SignalEnvelope, SignalsNamespace, signals
+from .subagents import JobRef, SignalDeliveryReport, SubagentsNamespace, subagents
 from .tools import Hidden, ToolDefinition, tool
 from .waits import WaitInstruction, WaitNamespace, wait
 
@@ -31,12 +43,25 @@ __all__ = [
     "HookResolutionResult",
     "PendingHook",
     "hook",
+    "InboxMessage",
+    "InboxMessagePage",
+    "InboxReceipt",
+    "InboxReceiptPage",
+    "InboxDirectNamespace",
+    "InboxGroupNamespace",
+    "InboxReceiptsNamespace",
+    "InboxNamespace",
+    "inbox",
     "MessageDeliveryReport",
     "MessagingGroupHandle",
     "MessagingGroupsNamespace",
     "MessagingNamespace",
     "messaging",
+    "SignalEnvelope",
+    "SignalsNamespace",
+    "signals",
     "JobRef",
+    "SignalDeliveryReport",
     "SubagentsNamespace",
     "subagents",
     "Hidden",

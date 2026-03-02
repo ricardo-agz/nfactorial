@@ -130,6 +130,9 @@ class QueueScripts:
             queue_scheduled_key_template=self._queue_templates.queue_scheduled,
             task_steering_key_template=self._task_steering_key_template,
             message_seq_key=self._keys.messaging_message_seq,
+            signal_wait_meta_key=self._keys.signal_wait_meta,
+            signal_wake_meta_key=self._keys.signal_wake_meta,
+            task_signals_key=task_keys.task_signals,
         )
 
     async def complete_task(

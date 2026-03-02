@@ -20,8 +20,10 @@ from factorial.queue.lua import (
     BatchPickupScriptResult,
     CancelTaskScriptResult,
     QueueScripts,
+    SignalEnqueueScriptResult,
     SteeringEnqueueScriptResult,
     create_child_task_completion_script,
+    create_signal_enqueue_script,
     create_steering_enqueue_script,
 )
 from factorial.queue.task import (
@@ -234,6 +236,83 @@ async def steer_task(
         raise RuntimeError(
             f"steer_task failed with unexpected status '{result.status}'"
         )
+
+
+async def signal_task(
+    redis_client: redis.Redis,
+    namespace: str,
+    *,
+    sender_task_id: str,
+    task_id: str,
+    signal_id: str,
+    payload: Any = None,
+) -> dict[str, Any]:
+    if not isinstance(signal_id, str) or not signal_id.strip():
+        raise ValueError("signal_id must be a non-empty string")
+    normalized_signal_id = signal_id.strip()
+
+    sender_task_data = await get_task_data(redis_client, namespace, sender_task_id)
+    sender_owner_id = str(sender_task_data["metadata"]["owner_id"])
+    sender_agent_name = str(sender_task_data["agent"])
+
+    target_keys = RedisKeys.format(namespace=namespace, task_id=task_id)
+    root_keys = RedisKeys.format(namespace=namespace)
+    queue_templates = RedisKeys.format(namespace=namespace, agent="{agent}")
+    script = await create_signal_enqueue_script(redis_client)
+    result: SignalEnqueueScriptResult = await script.execute(
+        task_statuses_key=root_keys.task_status,
+        task_agents_key=root_keys.task_agent,
+        task_payloads_key=root_keys.task_payload,
+        task_pickups_key=root_keys.task_pickups,
+        task_retries_key=root_keys.task_retries,
+        task_metas_key=root_keys.task_meta,
+        signal_wait_meta_key=root_keys.signal_wait_meta,
+        signal_wake_meta_key=root_keys.signal_wake_meta,
+        task_signals_key=target_keys.task_signals,
+        queue_main_key_template=queue_templates.queue_main,
+        queue_pending_key_template=queue_templates.queue_pending,
+        queue_scheduled_key_template=queue_templates.queue_scheduled,
+        scheduled_wait_meta_key=root_keys.scheduled_wait_meta,
+        signal_seq_key=root_keys.signal_seq,
+        sender_task_id=sender_task_id,
+        task_id=task_id,
+        signal_id=normalized_signal_id,
+        payload_json=json.dumps(serialize_data(payload)),
+    )
+    if not result.success:
+        if result.status == "missing":
+            raise TaskNotFoundError(task_id)
+        if result.status == "corrupted":
+            raise RuntimeError(f"Task {task_id} data is corrupted")
+        raise RuntimeError(
+            f"signal_task failed with unexpected status '{result.status}'"
+        )
+
+    report = {
+        "signal_id": normalized_signal_id,
+        "signal_seq": result.signal_seq,
+        "target_task_ids": [task_id],
+        "signaled_task_ids": [task_id] if result.status == "sent" else [],
+        "woken_task_ids": [task_id] if result.woken else [],
+        "skipped_inactive_task_ids": [task_id] if result.status == "inactive" else [],
+        "failed_task_ids": [],
+    }
+    await EventPublisher(
+        redis_client=redis_client,
+        channel=RedisKeys.for_owner(
+            namespace=namespace,
+            owner_id=sender_owner_id,
+        ).updates_channel,
+    ).publish_event(
+        AgentEvent(
+            event_type="subagents_signal_sent",
+            task_id=sender_task_id,
+            owner_id=sender_owner_id,
+            agent_name=sender_agent_name,
+            data=report,
+        )
+    )
+    return report
 
 async def resume_if_no_remaining_child_tasks(
     redis_client: redis.Redis,

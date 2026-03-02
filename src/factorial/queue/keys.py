@@ -65,6 +65,14 @@ PENDING_CHILD_WAIT_IDS = "{namespace}:pending:{task_id}:children_wait_ids"
 SCHEDULED_WAIT_META = "{namespace}:scheduled:wait_meta"
 # HASH: task_id -> activity wait metadata JSON
 ACTIVITY_WAIT_META = "{namespace}:wait:activity:meta"
+# HASH: task_id -> signal wait metadata JSON
+SIGNAL_WAIT_META = "{namespace}:wait:signal:meta"
+# HASH: task_id -> signal wake metadata JSON
+SIGNAL_WAKE_META = "{namespace}:wait:signal:wake"
+# COUNTER: monotonically increasing sequence for signal delivery IDs
+SIGNAL_SEQ = "{namespace}:signals:seq"
+# HASH: signal_id -> signal envelope JSON (task scoped)
+TASK_SIGNALS = "{namespace}:signals:{task_id}:pending"
 
 # ===== HOOK STATE MANAGEMENT =====
 # HASH: hook_id -> hook_record_json
@@ -119,6 +127,10 @@ MESSAGING_GROUP_THREADS_BY_TEAM = (
 MESSAGING_DIRECT_THREADS_BY_TEAM = (
     "{namespace}:messaging:threads:direct:by_team:{team_id}"
 )
+# HASH: message marker -> read metadata JSON (task scoped)
+MESSAGING_READ_BY_TASK = "{namespace}:messaging:read:{task_id}"
+# STREAM: read receipt payload entries addressed to a sender task
+MESSAGING_RECEIPTS_BY_TASK = "{namespace}:messaging:receipts:{task_id}"
 
 # ===== METRICS =====
 # Rolling (fixed-memory) metrics ring buffers.
@@ -169,6 +181,9 @@ class RedisKeys:
     _hook_sessions: str
     _scheduled_wait_meta: str
     _activity_wait_meta: str
+    _signal_wait_meta: str
+    _signal_wake_meta: str
+    _signal_seq: str
     # Batch keys
     _batch_tasks: str
     _batch_remaining_tasks: str
@@ -185,6 +200,8 @@ class RedisKeys:
     _messaging_message_seq: str
     _messaging_group_threads_by_team: str
     _messaging_direct_threads_by_team: str
+    _messaging_read_by_task: str
+    _messaging_receipts_by_task: str
 
     # Defaults after
     _queue_main: str | None = None
@@ -203,6 +220,7 @@ class RedisKeys:
 
     # Task-scoped keys (present when task_id provided)
     _task_steering: str | None = None
+    _task_signals: str | None = None
     _pending_tool_results: str | None = None
     _pending_child_task_results: str | None = None
     _pending_child_wait_ids: str | None = None
@@ -322,6 +340,21 @@ class RedisKeys:
         return self._activity_wait_meta
 
     @property
+    def signal_wait_meta(self) -> str:
+        """{namespace}:wait:signal:meta"""
+        return self._signal_wait_meta
+
+    @property
+    def signal_wake_meta(self) -> str:
+        """{namespace}:wait:signal:wake"""
+        return self._signal_wake_meta
+
+    @property
+    def signal_seq(self) -> str:
+        """{namespace}:signals:seq"""
+        return self._signal_seq
+
+    @property
     def batch_completed(self) -> str:
         """{namespace}:batches:completed"""
         return self._batch_completed
@@ -386,6 +419,14 @@ class RedisKeys:
     def messaging_direct_threads_by_team(self, team_id: str) -> str:
         """{namespace}:messaging:threads:direct:by_team:{team_id}"""
         return self._messaging_direct_threads_by_team.format(team_id=team_id)
+
+    def messaging_read_by_task(self, task_id: str) -> str:
+        """{namespace}:messaging:read:{task_id}"""
+        return self._messaging_read_by_task.format(task_id=task_id)
+
+    def messaging_receipts_by_task(self, task_id: str) -> str:
+        """{namespace}:messaging:receipts:{task_id}"""
+        return self._messaging_receipts_by_task.format(task_id=task_id)
 
     @property
     def queue_main(self) -> str:
@@ -506,6 +547,16 @@ class RedisKeys:
                 "task_id was not provided during RedisKeys.format()"
             )
         return self._task_steering
+
+    @property
+    def task_signals(self) -> str:
+        """{namespace}:signals:{task_id}:pending"""
+        if self._task_signals is None:
+            raise ValueError(
+                "task_signals is not available - "
+                "task_id was not provided during RedisKeys.format()"
+            )
+        return self._task_signals
 
     @property
     def pending_tool_results(self) -> str:
@@ -647,6 +698,9 @@ class RedisKeys:
             _hook_sessions=HOOK_SESSIONS.format(namespace=namespace),
             _scheduled_wait_meta=SCHEDULED_WAIT_META.format(namespace=namespace),
             _activity_wait_meta=ACTIVITY_WAIT_META.format(namespace=namespace),
+            _signal_wait_meta=SIGNAL_WAIT_META.format(namespace=namespace),
+            _signal_wake_meta=SIGNAL_WAKE_META.format(namespace=namespace),
+            _signal_seq=SIGNAL_SEQ.format(namespace=namespace),
             _messaging_group_meta=MESSAGING_GROUP_META.format(
                 namespace=namespace,
                 team_id="{team_id}",
@@ -677,6 +731,14 @@ class RedisKeys:
             _messaging_direct_threads_by_team=MESSAGING_DIRECT_THREADS_BY_TEAM.format(
                 namespace=namespace,
                 team_id="{team_id}",
+            ),
+            _messaging_read_by_task=MESSAGING_READ_BY_TASK.format(
+                namespace=namespace,
+                task_id="{task_id}",
+            ),
+            _messaging_receipts_by_task=MESSAGING_RECEIPTS_BY_TASK.format(
+                namespace=namespace,
+                task_id="{task_id}",
             ),
             # Agent-scoped keys
             _queue_main=QUEUE_MAIN.format(namespace=namespace, agent=agent)
@@ -725,6 +787,9 @@ class RedisKeys:
             _batch_completed=BATCH_COMPLETED.format(namespace=namespace),
             # Task-scoped keys
             _task_steering=TASK_STEERING.format(namespace=namespace, task_id=task_id)
+            if task_id
+            else None,
+            _task_signals=TASK_SIGNALS.format(namespace=namespace, task_id=task_id)
             if task_id
             else None,
             _pending_tool_results=PENDING_TOOL_RESULTS.format(

@@ -39,6 +39,7 @@ class GroupMessageRecord:
     skipped_inactive_task_ids: list[str]
     failed_task_ids: list[str]
     content: str
+    data: Any
     metadata: dict[str, Any]
     created_at: float | None
 
@@ -86,6 +87,7 @@ class DirectMessageRecord:
     skipped_inactive_task_ids: list[str]
     failed_task_ids: list[str]
     content: str
+    data: Any
     metadata: dict[str, Any]
     created_at: float | None
 
@@ -118,6 +120,7 @@ def _group_message_from_dict(data: dict[str, Any]) -> GroupMessageRecord:
         ),
         failed_task_ids=list(cast(list[str], data.get("failed_task_ids", []))),
         content=str(data.get("content", "")),
+        data=data.get("data"),
         metadata=dict(cast(dict[str, Any], data.get("metadata", {}))),
         created_at=cast(float | None, data.get("created_at")),
     )
@@ -138,6 +141,7 @@ def _direct_message_from_dict(data: dict[str, Any]) -> DirectMessageRecord:
         ),
         failed_task_ids=list(cast(list[str], data.get("failed_task_ids", []))),
         content=str(data.get("content", "")),
+        data=data.get("data"),
         metadata=dict(cast(dict[str, Any], data.get("metadata", {}))),
         created_at=cast(float | None, data.get("created_at")),
     )

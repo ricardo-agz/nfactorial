@@ -479,6 +479,8 @@ async def test_activity_wait_sleep_timeout_recovers_via_scheduled_queue(
         task_metas_key=keys.task_meta,
         scheduled_wait_meta_key=keys.scheduled_wait_meta,
         activity_wait_meta_key=keys.activity_wait_meta,
+        signal_wait_meta_key=keys.signal_wait_meta,
+        signal_wake_meta_key=keys.signal_wake_meta,
         max_batch_size=10,
     )
     assert task_id in recovered_ids

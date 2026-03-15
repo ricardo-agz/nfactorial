@@ -77,7 +77,7 @@ Use `subagents.spawn(...)` and `wait.jobs(...)` to fan out to child tasks and bl
 First, create the research subagent:
 
 ```python
-from factorial import Agent, stop, ai_gateway, gpt_41_mini
+from factorial import Agent, ai_gateway, any_of, gpt_41_mini, no_tool_calls, turn_count_is
 
 search_agent = Agent(
     name="research_subagent",
@@ -85,7 +85,7 @@ search_agent = Agent(
     model=ai_gateway(gpt_41_mini),
     instructions="You are an intelligent research assistant.",
     tools=[plan, reflect, search],
-    stop_when=stop.any_of(stop.no_tool_calls(), stop.turn_count_is(10)),
+    stop_when=any_of(no_tool_calls(), turn_count_is(10)),
 )
 ```
 

@@ -158,16 +158,12 @@ class WaitNamespace:
         expression: str,
         *,
         timezone: str = "UTC",
-        tz: str | None = None,
         data: Any = None,
     ) -> WaitInstruction:
-        if tz and timezone != "UTC" and tz != timezone:
-            raise ValueError("Provide either 'timezone' or 'tz', not both")
-        resolved_timezone = tz or timezone
         return WaitInstruction(
             kind="cron",
             cron=expression,
-            timezone=resolved_timezone,
+            timezone=timezone,
             data=data,
         )
 

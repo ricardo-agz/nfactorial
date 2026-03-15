@@ -1,15 +1,12 @@
-import asyncio
 import inspect
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from enum import Enum
-from functools import wraps
 from typing import (
     Any,
     Generic,
     TypeVar,
     Union,
-    cast,
     get_args,
     get_origin,
     get_type_hints,
@@ -29,13 +26,7 @@ from factorial.execution.hooks import (
 
 ContextT = TypeVar("ContextT", bound=AgentContext)
 F = Callable[..., Any]
-T = TypeVar("T")
 
-
-# ---------------------------------------------------------------------------
-# Hidden sentinel -- used with Annotated[T, Hidden] to exclude BaseModel
-# fields from the model context while keeping them in client/event payloads.
-# ---------------------------------------------------------------------------
 
 class _HiddenType:
     """Sentinel for ``Annotated[T, Hidden]``.
@@ -98,19 +89,9 @@ def serialize_for_client(result: BaseModel) -> dict[str, Any]:
     return result.model_dump()
 
 
-# ---------------------------------------------------------------------------
-# Internal tool result -- used by the framework to carry results through
-# the execution pipeline. NOT part of the public API.
-# ---------------------------------------------------------------------------
-
 @dataclass
 class _ToolResultInternal:
-    """Internal representation of a tool execution result.
-
-    This is a framework-internal type used to carry tool results through
-    the execution pipeline. Users never construct or interact with this
-    type directly.
-    """
+    """Internal representation of a tool execution result."""
 
     tool_call: ChatCompletionMessageToolCall | None = None
     model_output: str = ""
@@ -119,44 +100,22 @@ class _ToolResultInternal:
     pending_child_task_ids: list[str] | None = None
 
 
-# ---------------------------------------------------------------------------
-# Type aliases
-# ---------------------------------------------------------------------------
-
 ToolAction = Callable[..., Any] | Callable[..., Awaitable[Any]]
 
-
-# ---------------------------------------------------------------------------
-# Tool definition
-# ---------------------------------------------------------------------------
 
 @dataclass
 class ToolDefinition(Generic[ContextT]):
     """Canonical tool definition used by ``@tool``."""
 
     name: str
-    """The name of the tool, as shown to the LLM."""
-
     description: str
-    """A description of the tool, as shown to the LLM."""
-
     params_json_schema: dict[str, Any]
-    """The JSON schema for the tool's parameters."""
-
     on_invoke_tool: ToolAction
-    """The function that implements the tool."""
-
     strict_json_schema: bool = True
-    """Whether the JSON schema is in strict mode."""
-
     is_enabled: bool | Callable[[ContextT], bool] = True
-    """Whether the tool is enabled."""
-
     hook_plan: HookExecutionPlan | None = None
-    """Compiled hook dependency metadata, if any."""
 
     def to_openai_tool_schema(self) -> dict[str, Any]:
-        """Convert this tool definition to OpenAI tool schema format."""
         return {
             "type": "function",
             "function": {
@@ -167,10 +126,6 @@ class ToolDefinition(Generic[ContextT]):
             },
         }
 
-
-# ---------------------------------------------------------------------------
-# JSON schema helpers
-# ---------------------------------------------------------------------------
 
 def _python_type_to_json_schema(python_type: type) -> dict[str, Any]:
     """Convert a Python type (including Annotated/Pydantic) to JSON schema."""
@@ -209,8 +164,7 @@ def _python_type_to_json_schema(python_type: type) -> dict[str, Any]:
         if args:
             item_type = args[0]
             return {"type": "array", "items": _python_type_to_json_schema(item_type)}
-        else:
-            return {"type": "array", "items": {"type": "string"}}
+        return {"type": "array", "items": {"type": "string"}}
 
     if origin is dict:
         return {"type": "object"}
@@ -234,24 +188,18 @@ def _python_type_to_json_schema(python_type: type) -> dict[str, Any]:
 
     if python_type is str:
         return {"type": "string"}
-    elif python_type is int:
+    if python_type is int:
         return {"type": "integer"}
-    elif python_type is float:
+    if python_type is float:
         return {"type": "number"}
-    elif python_type is bool:
+    if python_type is bool:
         return {"type": "boolean"}
-    else:
-        return {"type": "string"}
+    return {"type": "string"}
 
 
 def _function_to_json_schema(func: F) -> tuple[dict[str, Any], bool]:
-    """Convert a Python function to JSON schema for its parameters.
+    """Convert a Python function to JSON schema for its parameters."""
 
-    Returns a tuple of (schema, has_optional). ``has_optional`` is **True**
-    if the function has *any* parameter that is optional (either via a
-    default value **or** via ``Optional`` / ``Union[NoneType]``). This flag
-    is later used to decide whether the tool can be in strict mode.
-    """
     sig = inspect.signature(func)
     type_hints = get_type_hints(func)
     type_hints_with_extras = get_type_hints(func, include_extras=True)
@@ -279,9 +227,7 @@ def _function_to_json_schema(func: F) -> tuple[dict[str, Any], bool]:
             continue
 
         param_type = type_hints.get(param_name, str)
-        json_schema = _python_type_to_json_schema(param_type)
-
-        properties[param_name] = json_schema
+        properties[param_name] = _python_type_to_json_schema(param_type)
 
         origin = get_origin(param_type)
         args = get_args(param_type)
@@ -297,16 +243,10 @@ def _function_to_json_schema(func: F) -> tuple[dict[str, Any], bool]:
         "properties": properties,
         "additionalProperties": False,
     }
-
     if required:
         schema["required"] = required
-
     return schema, has_optional_param
 
-
-# ---------------------------------------------------------------------------
-# Tool factory and decorator
-# ---------------------------------------------------------------------------
 
 def _tool_factory(
     func: F | None = None,
@@ -350,7 +290,7 @@ def _tool_factory(
 
 
 class _ToolDecorator:
-    """The ``tool`` decorator. No result-builder methods."""
+    """The ``tool`` decorator."""
 
     @overload
     def __call__(self, func: F) -> ToolDefinition[Any]: ...
@@ -387,10 +327,6 @@ class _ToolDecorator:
 tool = _ToolDecorator()
 
 
-# ---------------------------------------------------------------------------
-# Tool list conversion
-# ---------------------------------------------------------------------------
-
 def convert_tools_list(
     tools: Sequence[ToolDefinition[ContextT] | F],
 ) -> tuple[list[ToolDefinition[ContextT]], dict[str, ToolAction]]:
@@ -399,33 +335,10 @@ def convert_tools_list(
     tool_actions: dict[str, ToolAction] = {}
 
     for tool_like in tools:
-        if isinstance(tool_like, ToolDefinition):
-            tool_instance = tool_like
-        else:
-            tool_instance = tool(tool_like)
-
+        tool_instance = (
+            tool_like if isinstance(tool_like, ToolDefinition) else tool(tool_like)
+        )
         tool_schemas.append(tool_instance)
         tool_actions[tool_instance.name] = tool_instance.on_invoke_tool
 
     return tool_schemas, tool_actions
-def forking_tool(
-    timeout: float,
-) -> Callable[
-    [Callable[..., T] | Callable[..., Awaitable[T]]], Callable[..., Awaitable[T]]
-]:
-    def decorator(
-        func: Callable[..., T] | Callable[..., Awaitable[T]],
-    ) -> Callable[..., Awaitable[T]]:
-        """Wrap tool function so it can be awaited regardless of sync/async."""
-
-        @wraps(func)
-        async def wrapper(*args: Any, **kwargs: Any) -> T:
-            if asyncio.iscoroutinefunction(func):
-                return await cast(Callable[..., Awaitable[T]], func)(*args, **kwargs)
-            return func(*args, **kwargs)  # type: ignore[return-value,arg-type,no-any-return]
-
-        wrapper.forking_tool = True  # type: ignore[attr-defined]
-        wrapper.timeout = timeout  # type: ignore[attr-defined]
-        return wrapper
-
-    return decorator

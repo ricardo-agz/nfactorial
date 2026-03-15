@@ -287,10 +287,6 @@ class RedisKeys:
             hook_id=hook_id, idempotency_key=request_key
         )
 
-    def hook_idempotency(self, hook_id: str, idempotency_key: str) -> str:
-        """Backward-compatible alias for hook_resolution()."""
-        return self.hook_resolution(hook_id=hook_id, request_key=idempotency_key)
-
     def resume_idempotency(self, source_task_id: str, idempotency_key: str) -> str:
         """{namespace}:resume:idem:{source_task_id}:{idempotency_key}"""
         return self._resume_idempotency.format(

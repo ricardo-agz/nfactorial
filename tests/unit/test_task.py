@@ -7,6 +7,7 @@ from typing import Any
 import pytest
 
 from factorial.agent.context import AgentContext
+from factorial.core.exceptions import CorruptedTaskDataError
 from factorial.queue.task import Task, TaskMetadata, TaskStatus
 
 
@@ -150,8 +151,8 @@ class TestTaskMetadata:
         assert restored.resumed_from_task_id == resumed_from_task_id
         assert restored.batch_id == batch_id
 
-    def test_from_dict_without_team_id_uses_default(self, owner_id: str) -> None:
-        """Legacy metadata without team_id remains supported."""
+    def test_from_dict_without_team_id_leaves_none(self, owner_id: str) -> None:
+        """TaskMetadata.from_dict preserves an absent team_id as None."""
         metadata_dict = {
             "owner_id": owner_id,
             "parent_id": None,
@@ -333,24 +334,23 @@ class TestTask:
         assert task.payload.messages == [{"role": "user", "content": "minimal query"}]
         assert task.payload.turn_number == 1
 
-    def test_from_dict_defaults_missing_team_id_to_task_id(
+    def test_from_dict_without_team_id_raises(
         self,
         agent_name: str,
         sample_metadata: TaskMetadata,
     ) -> None:
         metadata = sample_metadata.to_dict()
         metadata.pop("team_id", None)
-        task_id = str(uuid.uuid4())
-        task = Task.from_dict(
-            {
-                "id": task_id,
-                "status": "queued",
-                "agent": agent_name,
-                "payload": {"messages": [{"role": "user", "content": "hello"}]},
-                "pickups": 0,
-                "retries": 0,
-                "metadata": metadata,
-            },
-            payload_parser=AgentContext.from_dict,
-        )
-        assert task.metadata.team_id == task_id
+        with pytest.raises(CorruptedTaskDataError, match="metadata.team_id"):
+            Task.from_dict(
+                {
+                    "id": str(uuid.uuid4()),
+                    "status": "queued",
+                    "agent": agent_name,
+                    "payload": {"messages": [{"role": "user", "content": "hello"}]},
+                    "pickups": 0,
+                    "retries": 0,
+                    "metadata": metadata,
+                },
+                payload_parser=AgentContext.from_dict,
+            )

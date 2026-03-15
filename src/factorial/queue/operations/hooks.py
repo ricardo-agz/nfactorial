@@ -16,6 +16,8 @@ from openai.types.chat.chat_completion_message_function_tool_call import (
 )
 
 from factorial.agent import BaseAgent
+from factorial.agent.tools.core import _ToolResultInternal
+from factorial.agent.tools.runtime import tool_action
 from factorial.core.exceptions import (
     HookAlreadyResolvedError,
     HookExpiredError,
@@ -34,15 +36,16 @@ from factorial.execution.hooks import (
     PendingHook,
     build_request_builder_kwargs,
 )
-from factorial.execution.tools import _ToolResultInternal
 from factorial.queue.keys import PENDING_SENTINEL, RedisKeys
 from factorial.queue.lua import create_hook_resolve_script, create_hook_wake_script
 from factorial.queue.task import Task, TaskStatus, get_task_data
 
 logger = get_logger(__name__)
 
+
 def _hash_hook_token(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
 
 def _hook_resolution_request_hash(*, payload: Any) -> str:
     payload_json = json.dumps(
@@ -52,12 +55,14 @@ def _hook_resolution_request_hash(*, payload: Any) -> str:
     )
     return hashlib.sha256(payload_json.encode("utf-8")).hexdigest()
 
+
 def _is_terminal_status(task_status: TaskStatus) -> bool:
     return task_status in [
         TaskStatus.COMPLETED,
         TaskStatus.FAILED,
         TaskStatus.CANCELLED,
     ]
+
 
 async def _load_hook_session(
     redis_client: redis.Redis,
@@ -70,6 +75,7 @@ async def _load_hook_session(
         return None
     return HookSessionRecord.from_json(session_json)
 
+
 async def _save_hook_session(
     redis_client: redis.Redis,
     *,
@@ -77,6 +83,7 @@ async def _save_hook_session(
     session: HookSessionRecord,
 ) -> None:
     await redis_client.hset(keys.hook_sessions, session.session_id, session.to_json())  # type: ignore[misc]
+
 
 async def _clear_pending_tool_call_runtime_state(
     redis_client: redis.Redis,
@@ -90,6 +97,7 @@ async def _clear_pending_tool_call_runtime_state(
     pipe.hdel(keys.hook_runtime_ready, tool_call_id)
     pipe.hdel(keys.hook_session_by_tool_call, tool_call_id)
     await pipe.execute()
+
 
 async def _finalize_hook_session_state(
     redis_client: redis.Redis,
@@ -107,6 +115,7 @@ async def _finalize_hook_session_state(
         keys=keys,
         tool_call_id=session.tool_call_id,
     )
+
 
 async def persist_hook_runtime_payload(
     redis_client: redis.Redis,
@@ -198,6 +207,7 @@ async def persist_hook_runtime_payload(
         pipe.zadd(task_keys.hooks_expiring, {record.hook_id: record.expires_at})  # type: ignore[arg-type]
     await pipe.execute()
 
+
 async def register_pending_hook(
     redis_client: redis.Redis,
     namespace: str,
@@ -245,10 +255,7 @@ async def register_pending_hook(
     existing_json = await redis_client.hget(task_keys.hooks_index, pending_hook.hook_id)  # type: ignore[misc]
     if existing_json:
         existing = HookRecord.from_json(existing_json)
-        if (
-            existing.task_id != task_id
-            or existing.tool_call_id != tool_call_id
-        ):
+        if existing.task_id != task_id or existing.tool_call_id != tool_call_id:
             raise ValueError(
                 f"Hook {pending_hook.hook_id} is already registered for "
                 "another task or tool call."
@@ -294,12 +301,14 @@ async def register_pending_hook(
     await pipe.execute()
     return True
 
+
 @dataclass
 class HookRuntimeTickOutcome:
     had_wake_requests: bool
     should_repark: bool
     pending_tool_call_ids: list[str]
     completed_results: list[tuple[str, Any]]
+
 
 async def _pending_sentinel_tool_call_ids(
     redis_client: redis.Redis,
@@ -317,6 +326,7 @@ async def _pending_sentinel_tool_call_ids(
         if result_str == PENDING_SENTINEL:
             ids.append(tool_call_id)
     return sorted(ids)
+
 
 async def _execute_hook_tool_continuation(
     *,
@@ -341,7 +351,9 @@ async def _execute_hook_tool_continuation(
 
     token = execution_context.set(execution_ctx)
     try:
-        continuation_result = await agent.tool_action(synthetic_tool_call, task.payload)
+        continuation_result = await tool_action(
+            agent, synthetic_tool_call, task.payload
+        )
     finally:
         execution_context.reset(token)
 
@@ -352,6 +364,7 @@ async def _execute_hook_tool_continuation(
         )
 
     return continuation_result
+
 
 async def process_hook_runtime_wake_requests(
     *,
@@ -635,6 +648,7 @@ async def process_hook_runtime_wake_requests(
         completed_results=completed_results,
     )
 
+
 async def resolve_hook(
     redis_client: redis.Redis,
     namespace: str,
@@ -884,6 +898,7 @@ async def resolve_hook(
                 )
         raise
 
+
 async def rotate_hook_token(
     redis_client: redis.Redis,
     namespace: str,
@@ -916,9 +931,7 @@ async def rotate_hook_token(
     if revoke_previous:
         hook_record.token_hashes = [next_hash]
     else:
-        existing_hashes = [
-            h for h in hook_record.token_hashes if isinstance(h, str)
-        ]
+        existing_hashes = [h for h in hook_record.token_hashes if isinstance(h, str)]
         hook_record.token_hashes = list(dict.fromkeys([*existing_hashes, next_hash]))
 
     hook_record.token_version = int(hook_record.token_version) + 1
@@ -927,6 +940,7 @@ async def rotate_hook_token(
     )
 
     return next_token
+
 
 async def expire_pending_hooks(
     *,

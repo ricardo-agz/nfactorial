@@ -121,10 +121,11 @@ class Task(Generic[ContextType]):
         data: dict[str, Any],
         payload_parser: Callable[[dict[str, Any]], ContextType],
     ) -> "Task[ContextType]":
+        task_id = str(data["id"])
         status = TaskStatus(data["status"])
         metadata = TaskMetadata.from_dict(data["metadata"])
-        if metadata.team_id is None:
-            metadata.team_id = str(data["id"])
+        if not isinstance(metadata.team_id, str) or not metadata.team_id:
+            raise CorruptedTaskDataError(task_id, ["metadata.team_id"])
 
         payload: ContextType
         if data["payload"]:
@@ -139,7 +140,7 @@ class Task(Generic[ContextType]):
             payload = payload_parser({})
 
         return cls(
-            id=data["id"],
+            id=task_id,
             status=status,
             agent=data["agent"],
             payload=payload,
@@ -158,12 +159,12 @@ class Task(Generic[ContextType]):
         return cls.from_dict(data, payload_parser)
 
 
-def effective_team_id(*, task_id: str, metadata: dict[str, Any]) -> str:
-    """Resolve a task's effective team id with legacy fallback semantics."""
+def task_team_id(*, task_id: str, metadata: dict[str, Any]) -> str:
+    """Return a task's persisted team id or raise on malformed task data."""
     raw_team_id = metadata.get("team_id")
     if isinstance(raw_team_id, str) and raw_team_id:
         return raw_team_id
-    return task_id
+    raise CorruptedTaskDataError(task_id, ["metadata.team_id"])
 
 
 async def get_task_data(

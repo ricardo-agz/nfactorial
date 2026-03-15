@@ -241,7 +241,7 @@ def test_wait_jobs_rejects_missing_parent_ref_in_execution_context() -> None:
         execution_context.reset(token)
 
 
-def test_wait_cron_rejects_conflicting_timezone_aliases() -> None:
-    with pytest.raises(ValueError, match="either 'timezone' or 'tz'"):
-        wait.cron("0 * * * *", timezone="Europe/London", tz="America/New_York")
+def test_wait_cron_rejects_removed_tz_alias() -> None:
+    with pytest.raises(TypeError, match="unexpected keyword argument 'tz'"):
+        wait.cron("0 * * * *", tz="America/New_York")
 

@@ -33,6 +33,7 @@ from dotenv import load_dotenv
 from pydantic import BaseModel
 from factorial import (
     Agent,
+    AgentContext,
     Hidden,
     Hook,
     HookRequestContext,
@@ -51,6 +52,9 @@ class IdeAgentState:
     query: str = ""
 
 
+IdeAgentContext = AgentContext[IdeAgentState]
+
+
 def think(thoughts: str) -> str:
     """Think deeply about the task and plan your next steps before executing"""
     return thoughts
@@ -59,6 +63,8 @@ def think(thoughts: str) -> str:
 class EditResult(BaseModel):
     summary: str
     new_code: Annotated[str, Hidden]
+    old_text: Annotated[str, Hidden]
+    new_text: Annotated[str, Hidden]
 
 
 def edit_code(
@@ -66,7 +72,7 @@ def edit_code(
     find_start_line: int,
     find_end_line: int,
     replace: str,
-    agent_ctx,
+    agent_ctx: IdeAgentContext,
 ) -> EditResult:
     """
     Edit code in a file
@@ -86,11 +92,12 @@ def edit_code(
         )
 
     existing_text = "\n".join(lines[start_idx : end_idx + 1])
+    line_range = f"{find_start_line}-{find_end_line}"
 
     # Check if the find text matches what's at those line numbers
     if find not in existing_text:
         raise ValueError(
-            f"Text '{find}' not found at lines {find_start_line}-{find_end_line}. "
+            f"Text '{find}' not found at lines {line_range}. "
             f"Existing text: {existing_text}"
         )
 
@@ -103,9 +110,11 @@ def edit_code(
     return EditResult(
         summary=(
             f"Code successfully edited: replaced '{find}' with '{replace}' "
-            f"at lines {find_start_line}-{find_end_line}"
+            f"at lines {line_range}"
         ),
         new_code=agent_ctx.state.code,
+        old_text=existing_text,
+        new_text=new_text,
     )
 
 
@@ -133,7 +142,7 @@ async def request_code_execution(
         CodeExecutionApproval,
         hook.requires(request_code_execution_approval),
     ],
-    agent_ctx,
+    agent_ctx: IdeAgentContext,
 ) -> CodeExecutionResult:
     """Request code execution behind an explicit approval hook."""
     if not approval.approved:

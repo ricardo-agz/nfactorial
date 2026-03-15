@@ -5,7 +5,7 @@ import httpx
 from dotenv import load_dotenv
 from pydantic import BaseModel
 
-from factorial import Agent, Model, MultiClient, stop
+from factorial import Agent, Model, MultiClient, any_of, no_tool_calls, turn_count_is
 
 from .tools.file import file_tools
 from .tools.project import project_tools
@@ -38,7 +38,7 @@ class FinalOutput(BaseModel):
     run_commands: list[str]
 
 
-def _cli_prepare_turn(turn, agent_ctx, execution_ctx):
+def _cli_prepare_turn(turn, agent_ctx):
     if agent_ctx.turn_number == 1:
         turn.tool_choice = {"type": "function", "function": {"name": "think"}}
     elif agent_ctx.turn_number == 2:
@@ -88,5 +88,5 @@ def create_nfactorial_agent(
         model=model,
         prepare_turn=_cli_prepare_turn,
         client=client,
-        stop_when=stop.any_of(stop.no_tool_calls(), stop.turn_count_is(60)),
+        stop_when=any_of(no_tool_calls(), turn_count_is(60)),
     )

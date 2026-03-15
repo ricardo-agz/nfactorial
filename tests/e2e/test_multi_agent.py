@@ -588,6 +588,7 @@ class TestParentChildAgentFlow:
                 parent_id,
                 json.dumps({
                     "owner_id": test_owner_id,
+                        "team_id": test_owner_id,
                     "created_at": time.time(),
                 }),
             )
@@ -642,6 +643,7 @@ class TestParentChildAgentFlow:
                     child_id,
                     json.dumps({
                         "owner_id": test_owner_id,
+                        "team_id": test_owner_id,
                         "parent_id": parent_id,
                         "created_at": time.time(),
                     }),
@@ -798,7 +800,10 @@ class TestMultiAgentConcurrency:
                 redis_client.hset(
                     parent_keys_obj.task_meta,
                     parent_id,
-                    json.dumps({"owner_id": test_owner_id}),
+                    json.dumps({
+                        "owner_id": test_owner_id,
+                        "team_id": test_owner_id,
+                    }),
                 )
             )
             await _await_redis(
@@ -840,7 +845,11 @@ class TestMultiAgentConcurrency:
                 redis_client.hset(
                     child_keys_obj.task_meta,
                     child_id,
-                    json.dumps({"owner_id": test_owner_id, "parent_id": parent_id}),
+                    json.dumps({
+                        "owner_id": test_owner_id,
+                        "team_id": test_owner_id,
+                        "parent_id": parent_id,
+                    }),
                 )
             )
 

@@ -9,6 +9,7 @@ from typing import Any, cast
 import redis.asyncio as redis
 
 from factorial.agent import BaseAgent
+from factorial.agent.tools.runtime import process_child_task_results
 from factorial.core.events import AgentEvent, BatchEvent, EventPublisher, FinishEvent
 from factorial.core.exceptions import InactiveTaskError, TaskNotFoundError
 from factorial.core.logging import colored, get_logger
@@ -149,6 +150,7 @@ async def cancel_batch(
 
     return batch
 
+
 async def cancel_task(
     redis_client: redis.Redis,
     namespace: str,
@@ -187,6 +189,7 @@ async def cancel_task(
             agent=agents_by_name[agent_name],
             task_id=task_id,
         )
+
 
 async def steer_task(
     redis_client: redis.Redis,
@@ -315,6 +318,7 @@ async def signal_task(
     )
     return report
 
+
 async def resume_if_no_remaining_child_tasks(
     redis_client: redis.Redis,
     namespace: str,
@@ -411,7 +415,7 @@ async def resume_if_no_remaining_child_tasks(
         completed_results.extend(synthesized_results)
 
     # Update the task context with the completed results
-    updated_context = agent.process_child_task_results(
+    updated_context = process_child_task_results(
         task.payload, completed_results
     ).context
 
@@ -436,6 +440,7 @@ async def resume_if_no_remaining_child_tasks(
     )
 
     return success
+
 
 async def run_agent_cancellation(
     redis_client: redis.Redis,
@@ -490,6 +495,7 @@ async def run_agent_cancellation(
     except Exception as e:
         logger.error(f"Error sending cancellation event for {task.id}", exc_info=e)
 
+
 async def process_cancelled_tasks(
     redis_client: redis.Redis,
     namespace: str,
@@ -502,6 +508,7 @@ async def process_cancelled_tasks(
         for task_id in cancelled_task_ids
     ]
     await asyncio.gather(*tasks)
+
 
 async def get_task_batch(
     batch_script: BatchPickupScript,

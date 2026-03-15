@@ -7,15 +7,16 @@ from pydantic import BaseModel, Field
 
 from factorial import (
     Agent,
-    EmptyMetadata,
     ExecutionContext,
     WaitInstruction,
     ai_gateway,
+    any_of,
     gpt_41_mini,
     messaging,
-    stop,
+    no_tool_calls,
     subagents,
     tool,
+    turn_count_is,
     verify,
     wait,
 )
@@ -653,19 +654,19 @@ Keep all content brief and concrete.
 """
 
 
-def _parent_prepare_turn(turn, agent_ctx, execution_ctx):
+def _parent_prepare_turn(turn, agent_ctx):
     turn.tool_choice = _parent_tool_choice(agent_ctx)
     turn.parallel_tool_calls = False
     turn.temperature = 0.1
 
 
-def _child_prepare_turn(turn, agent_ctx, execution_ctx):
+def _child_prepare_turn(turn, agent_ctx):
     turn.tool_choice = _child_tool_choice(agent_ctx)
     turn.parallel_tool_calls = False
     turn.temperature = 0.1
 
 
-parent_agent = Agent[DemoState, EmptyMetadata](
+parent_agent = Agent[DemoState](
     name="parent_coordinator",
     description="Parent coordinator agent",
     model=ai_gateway(gpt_41_mini),
@@ -679,10 +680,10 @@ parent_agent = Agent[DemoState, EmptyMetadata](
     ],
     prepare_turn=_parent_prepare_turn,
     verifier=verify_parent_output,
-    stop_when=stop.any_of(stop.no_tool_calls(), stop.turn_count_is(16)),
+    stop_when=any_of(no_tool_calls(), turn_count_is(16)),
 )
 
-researcher_agent = Agent[DemoState, EmptyMetadata](
+researcher_agent = Agent[DemoState](
     name="researcher_agent",
     description="Researcher subagent",
     model=ai_gateway(gpt_41_mini),
@@ -694,10 +695,10 @@ researcher_agent = Agent[DemoState, EmptyMetadata](
         wait_for_activity,
     ],
     prepare_turn=_child_prepare_turn,
-    stop_when=stop.any_of(stop.no_tool_calls(), stop.turn_count_is(12)),
+    stop_when=any_of(no_tool_calls(), turn_count_is(12)),
 )
 
-skeptic_agent = Agent[DemoState, EmptyMetadata](
+skeptic_agent = Agent[DemoState](
     name="skeptic_agent",
     description="Skeptic subagent",
     model=ai_gateway(gpt_41_mini),
@@ -709,10 +710,10 @@ skeptic_agent = Agent[DemoState, EmptyMetadata](
         wait_for_activity,
     ],
     prepare_turn=_child_prepare_turn,
-    stop_when=stop.any_of(stop.no_tool_calls(), stop.turn_count_is(12)),
+    stop_when=any_of(no_tool_calls(), turn_count_is(12)),
 )
 
-synthesizer_agent = Agent[DemoState, EmptyMetadata](
+synthesizer_agent = Agent[DemoState](
     name="synthesizer_agent",
     description="Synthesizer subagent",
     model=ai_gateway(gpt_41_mini),
@@ -724,5 +725,5 @@ synthesizer_agent = Agent[DemoState, EmptyMetadata](
         wait_for_activity,
     ],
     prepare_turn=_child_prepare_turn,
-    stop_when=stop.any_of(stop.no_tool_calls(), stop.turn_count_is(12)),
+    stop_when=any_of(no_tool_calls(), turn_count_is(12)),
 )

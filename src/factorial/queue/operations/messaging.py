@@ -30,7 +30,7 @@ from factorial.queue.lua import (
     create_messaging_human_direct_send_script,
     create_messaging_human_group_send_script,
 )
-from factorial.queue.task import effective_team_id, get_task_data
+from factorial.queue.task import get_task_data, task_team_id
 
 logger = get_logger(__name__)
 
@@ -103,7 +103,7 @@ def _decode_group_id(group_id: str) -> tuple[str, str]:
 def _resolve_task_team_id(task_data: dict[str, Any]) -> str:
     task_id = str(task_data["id"])
     metadata = cast(dict[str, Any], task_data["metadata"])
-    return effective_team_id(task_id=task_id, metadata=metadata)
+    return task_team_id(task_id=task_id, metadata=metadata)
 
 def _group_thread_id(*, team_id: str, group_name: str) -> str:
     return f"group:{team_id}:{group_name}"

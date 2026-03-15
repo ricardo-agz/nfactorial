@@ -8,12 +8,13 @@ from pydantic import BaseModel
 
 from factorial import (
     Agent,
-    EmptyMetadata,
     Hidden,
     WaitInstruction,
-    stop,
+    any_of,
+    no_tool_calls,
     subagents,
     tool,
+    turn_count_is,
     verify,
     wait,
 )
@@ -126,7 +127,7 @@ async def research(
     return wait.jobs(jobs, data="Waiting on research subagents")
 
 
-def _main_prepare_turn(turn, agent_ctx, execution_ctx):
+def _main_prepare_turn(turn, agent_ctx):
     if agent_ctx.turn_number == 1:
         turn.tool_choice = {"type": "function", "function": {"name": "plan"}}
     else:
@@ -135,7 +136,7 @@ def _main_prepare_turn(turn, agent_ctx, execution_ctx):
     turn.temperature = 0.0
 
 
-search_agent = Agent[Any, Any](
+search_agent = Agent[Any](
     name="research_subagent",
     description="Research Sub-Agent",
     model=ai_gateway(gpt_41_mini),
@@ -143,10 +144,10 @@ search_agent = Agent[Any, Any](
     tools=[reflect, search],
     temperature=1.0,
     tool_choice="required",
-    stop_when=stop.any_of(stop.no_tool_calls(), stop.turn_count_is(10)),
+    stop_when=any_of(no_tool_calls(), turn_count_is(10)),
 )
 
-basic_agent = Agent[MainAgentState, EmptyMetadata](
+basic_agent = Agent[MainAgentState](
     name="main_agent",
     description="Main Agent",
     model=ai_gateway(gpt_41_mini),
@@ -154,5 +155,5 @@ basic_agent = Agent[MainAgentState, EmptyMetadata](
     tools=[plan, reflect, research, search],
     prepare_turn=_main_prepare_turn,
     verifier=verify_final_output,
-    stop_when=stop.any_of(stop.no_tool_calls(), stop.turn_count_is(15)),
+    stop_when=any_of(no_tool_calls(), turn_count_is(15)),
 )

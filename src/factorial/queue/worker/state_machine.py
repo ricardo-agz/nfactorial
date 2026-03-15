@@ -7,6 +7,8 @@ import redis.asyncio as redis
 
 from factorial.agent import BaseAgent
 from factorial.agent.context import ContextType
+from factorial.agent.tools.core import _ToolResultInternal
+from factorial.agent.tools.runtime import process_deferred_tool_results
 from factorial.core.events import (
     AgentEvent,
     EventPublisher,
@@ -17,8 +19,7 @@ from factorial.core.events import (
 from factorial.core.logging import colored
 from factorial.core.run_types import RunError, RunStatus
 from factorial.core.utils import serialize_data
-from factorial.execution.context import ExecutionContext
-from factorial.execution.tools import _ToolResultInternal
+from factorial.execution.context import ExecutionContext, execution_context
 from factorial.execution.waits import WaitInstruction, next_cron_wake_timestamp
 from factorial.queue.operations import (
     process_hook_runtime_wake_requests,
@@ -64,7 +65,7 @@ async def handle_hook_state(
             ):
                 hook_pending_child_task_ids.extend(hook_result.pending_child_task_ids)
 
-        task.payload = agent.process_deferred_tool_results(
+        task.payload = process_deferred_tool_results(
             task.payload,
             hook_tick.completed_results,
         ).context
@@ -138,10 +139,7 @@ async def handle_wait_state(
     park_scheduled_wait: Any,
 ) -> bool:
     """Handle all wait instructions for the current turn."""
-    if (
-        turn_completion.pending_tool_call_ids
-        or turn_completion.pending_child_task_ids
-    ):
+    if turn_completion.pending_tool_call_ids or turn_completion.pending_child_task_ids:
         raise RuntimeError(
             "Turn cannot combine wait instructions with pending tool "
             "or child-task continuations."
@@ -151,8 +149,7 @@ async def handle_wait_state(
     wait_kinds = {wait_instruction.kind for _, wait_instruction in wait_instructions}
     if len(wait_kinds) != 1:
         raise RuntimeError(
-            "All wait instructions in a single turn must have "
-            "the same kind."
+            "All wait instructions in a single turn must have the same kind."
         )
 
     wait_kind = next(iter(wait_kinds))
@@ -463,10 +460,7 @@ async def handle_completion_state(
     publish_batch_progress: Any,
 ) -> None:
     """Handle non-wait turn completion transitions."""
-    if (
-        turn_completion.pending_tool_call_ids
-        and turn_completion.pending_child_task_ids
-    ):
+    if turn_completion.pending_tool_call_ids and turn_completion.pending_child_task_ids:
         raise RuntimeError(
             "Turn cannot simultaneously park on pending tool results and "
             "pending child task results."
@@ -586,17 +580,19 @@ async def run_task_state_machine(
                 park_or_resume_child_wait=park_or_resume_child_wait,
             )
             state = (
-                TaskProcessingState.DONE
-                if should_stop
-                else TaskProcessingState.EXECUTE
+                TaskProcessingState.DONE if should_stop else TaskProcessingState.EXECUTE
             )
             continue
 
         if state is TaskProcessingState.EXECUTE:
-            execution_result = await asyncio.wait_for(
-                agent.execute(task.payload, execution_ctx),
-                timeout=task_timeout,
-            )
+            token = execution_context.set(execution_ctx)
+            try:
+                execution_result = await asyncio.wait_for(
+                    agent.run_turn(task.payload),
+                    timeout=task_timeout,
+                )
+            finally:
+                execution_context.reset(token)
             turn_completion = execution_result
             task.payload = execution_result.context
             wait_instructions = extract_wait_instructions(
@@ -755,4 +751,3 @@ async def emit_failure_outcome_events(
             agent_name=agent.name,
         )
     )
-

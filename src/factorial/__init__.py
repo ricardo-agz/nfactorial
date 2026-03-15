@@ -22,6 +22,11 @@ from factorial.agent.context import (
     EmptyState,
     VerificationState,
 )
+from factorial.agent.tools import (
+    Hidden,
+    ToolDefinition,
+    tool,
+)
 from factorial.ai.messages import (
     AssistantMessageDict,
     ContentPartLike,
@@ -142,11 +147,6 @@ from factorial.execution.subagents import (
     SignalDeliveryReport,
     SubagentsNamespace,
     subagents,
-)
-from factorial.execution.tools import (
-    Hidden,
-    ToolDefinition,
-    tool,
 )
 from factorial.execution.waits import WaitInstruction, WaitNamespace, wait
 from factorial.orchestrator import (

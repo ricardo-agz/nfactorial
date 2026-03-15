@@ -37,7 +37,7 @@ This document tracks implementation progress, decisions, and user feedback for t
   - full proposal in `NEW_DESIGN.md`
 - Confirmed current pending/resume machinery is a strong base for hook sessions.
 - Started Phase 0 implementation:
-  - creating regression tests for current tool/deferred/forking behavior
+  - creating regression tests for current tool/deferred/child-wait behavior
   - no production runtime behavior changes planned in this phase
 - Added Phase 0 regression test file:
   - `tests/unit/test_tools_phase0_regression.py`
@@ -46,9 +46,9 @@ This document tracks implementation progress, decisions, and user feedback for t
     - strict schema behavior for optional params
     - context param exclusion in tool schema
     - `convert_tools_list` mixed inputs
-    - `forking_tool` wrappers
-    - `Agent.tool_action` deferred and forking semantics
-    - invalid forking child ID validation
+    - legacy child-spawn tool wrappers
+    - `Agent.tool_action` deferred and child-wait semantics
+    - invalid child task ID validation
 - Validation status:
   - lints: clean for new files
   - syntax: `python -m py_compile tests/unit/test_tools_phase0_regression.py` passed
@@ -83,15 +83,14 @@ This document tracks implementation progress, decisions, and user feedback for t
     - wait instruction builders
 - Refined `src/factorial/tools.py` toward new-primary API style:
   - `ToolResult` is now the canonical result model
-  - legacy `FunctionToolActionResult` kept as a compatibility alias to `ToolResult`
-  - introduced canonical `ToolAction*` type aliases with legacy aliases preserved
-  - `function_tool` now explicitly documented/implemented as a legacy alias path
+  - removed the old `FunctionToolActionResult` naming in favor of `ToolResult`
+  - canonicalized on the `ToolAction*` types
+  - `tool(...)` is the single public decorator path
   - conversion helpers now route callable conversion through the primary `tool(...)` interface
 - Further canonicalization pass for tool internals:
   - introduced canonical `ToolDefinition` class
-  - `FunctionTool` is now a compatibility alias (`FunctionTool = ToolDefinition`)
-  - internal factory and conversion paths now construct/use `ToolDefinition`, not `FunctionTool`
-  - `function_tool(...)` now emits a `DeprecationWarning` and remains compatibility-only
+  - removed `FunctionTool`/`function_tool(...)` compatibility aliases
+  - internal factory and conversion paths now construct/use `ToolDefinition`
   - `agent.py` internal typing switched to canonical names (`ToolDefinition`, `ToolResult`)
   - removed remaining old-path typing/wording references in `tools.py` internals
 - Current unit validation after Phase 1:
@@ -341,7 +340,7 @@ This document tracks implementation progress, decisions, and user feedback for t
     - `cancellation.lua` now clears scheduled queue + wait metadata.
     - `paused` tasks are cancelled immediately (same behavior class as `backoff`/parked states).
   - API/runtime ergonomics updates:
-    - `wait.cron(..., tz="UTC")` alias supported in addition to `timezone=...`.
+    - `wait.cron(..., timezone="UTC")` is the supported timezone-aware cron API.
     - direct tool returns of `WaitInstruction` now produce readable tool-result text in `Agent.tool_action(...)`.
   - Added high-signal Phase 5 tests:
     - unit:
@@ -465,7 +464,7 @@ This document tracks implementation progress, decisions, and user feedback for t
 - Docs and examples migration to v2 API:
   - Updated runtime example to canonical subagent orchestration:
     - `examples/multi_agent/agent.py`
-      - replaced `function_tool` + `forking_tool` + `ExecutionContext.spawn_child_tasks`
+      - replaced `function_tool` + legacy child-spawn tool wrappers + `ExecutionContext.spawn_child_tasks`
         with `@tool` + `subagents.spawn(...)` + `return wait.jobs(...)`
   - Updated docs to remove deprecated API patterns and reflect v2 semantics:
     - `docs/docs/tools.md`

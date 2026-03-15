@@ -6,7 +6,9 @@ from typing import Any, cast
 import redis.asyncio as redis
 
 from factorial.agent import BaseAgent
+from factorial.agent.tools.runtime import process_child_task_results
 from factorial.core.events import AgentEvent, BatchEvent, EventPublisher
+from factorial.core.exceptions import CorruptedTaskDataError
 from factorial.core.utils import serialize_data
 from factorial.queue.keys import PENDING_SENTINEL, RedisKeys
 from factorial.queue.lua import (
@@ -42,9 +44,9 @@ from factorial.queue.operations import (
 from factorial.queue.task import (
     Batch,
     Task,
-    effective_team_id,
     get_batch_data,
     get_task_data,
+    task_team_id,
 )
 
 from .common import CompletionAction, logger
@@ -361,7 +363,7 @@ class TaskRuntimeOps:
             completed_results.append((child_task_id, json.loads(result_str)))
 
         if all_ready and completed_results:
-            self.task.payload = self.agent.process_child_task_results(
+            self.task.payload = process_child_task_results(
                 self.task.payload,
                 completed_results,
             ).context
@@ -420,6 +422,10 @@ class TaskRuntimeOps:
         child_payload: Any,
         task_id: str | None = None,
     ) -> str:
+        parent_team_id = self.task.metadata.team_id
+        if parent_team_id is None:
+            raise CorruptedTaskDataError(self.task.id, ["metadata.team_id"])
+
         child_task: Task[Any] = Task.create(
             owner_id=self.task.metadata.owner_id,
             agent=child_agent.name,
@@ -429,7 +435,7 @@ class TaskRuntimeOps:
             child_task.id = task_id
 
         child_task.metadata.parent_id = self.task.id
-        child_task.metadata.team_id = self.task.metadata.team_id or self.task.id
+        child_task.metadata.team_id = parent_team_id
 
         await enqueue_task(
             redis_client=self.redis_client,
@@ -446,6 +452,10 @@ class TaskRuntimeOps:
         task_ids: list[str] | None = None,
         batch_id: str | None = None,
     ) -> Batch:
+        parent_team_id = self.task.metadata.team_id
+        if parent_team_id is None:
+            raise CorruptedTaskDataError(self.task.id, ["metadata.team_id"])
+
         return await create_batch_and_enqueue(
             redis_client=self.redis_client,
             namespace=self.namespace,
@@ -453,7 +463,7 @@ class TaskRuntimeOps:
             payloads=payloads,
             owner_id=self.task.metadata.owner_id,
             parent_id=self.task.id,
-            team_id=self.task.metadata.team_id or self.task.id,
+            team_id=parent_team_id,
             task_ids=task_ids,
             batch_id=batch_id,
         )
@@ -648,12 +658,14 @@ class TaskRuntimeOps:
         child_parent_id = child_metadata.get("parent_id")
         if child_parent_id != self.task.id:
             raise PermissionError(
-                f"{operation} can only target direct child tasks "
-                "of the current task"
+                f"{operation} can only target direct child tasks of the current task"
             )
 
-        parent_team_id = self.task.metadata.team_id or self.task.id
-        child_team_id = effective_team_id(
+        parent_team_id = self.task.metadata.team_id
+        if parent_team_id is None:
+            raise CorruptedTaskDataError(self.task.id, ["metadata.team_id"])
+
+        child_team_id = task_team_id(
             task_id=child_task_id,
             metadata=child_metadata,
         )
@@ -881,4 +893,3 @@ class TaskRuntimeOps:
             task_id=self.task.id,
             receipt_ids=receipt_ids,
         )
-

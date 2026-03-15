@@ -12,7 +12,7 @@ from factorial.agent import BaseAgent
 from factorial.agent.context import VerificationState
 from factorial.ai.messages import normalize_message
 from factorial.core.events import AgentEvent, EventPublisher
-from factorial.core.exceptions import InvalidTaskIdError
+from factorial.core.exceptions import CorruptedTaskDataError, InvalidTaskIdError
 from factorial.core.logging import get_logger
 from factorial.core.utils import is_valid_task_id, serialize_data
 from factorial.queue.keys import RedisKeys
@@ -322,9 +322,13 @@ async def resume_task(
         resumed_task.id = deterministic_resumed_task_id
 
     # Keep operational parent linkage while adding revision lineage.
+    source_team_id = source_task.metadata.team_id
+    if source_team_id is None:
+        raise CorruptedTaskDataError(source_task.id, ["metadata.team_id"])
+
     resumed_task.metadata.parent_id = source_task.metadata.parent_id
     resumed_task.metadata.resumed_from_task_id = source_task.id
-    resumed_task.metadata.team_id = source_task.metadata.team_id or source_task.id
+    resumed_task.metadata.team_id = source_team_id
 
     task_keys = RedisKeys.format(namespace=namespace, agent=agent.name)
     resume_enqueue_script = await create_resume_enqueue_script(redis_client)

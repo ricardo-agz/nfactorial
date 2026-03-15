@@ -162,7 +162,3 @@ def extract_wait_instructions(
         if isinstance(result, WaitInstruction):
             waits.append((tool_call.id, result))
     return waits
-
-
-# Backward-compatibility alias for tests and downstream imports.
-_steering_message_sort_key = steering_message_sort_key

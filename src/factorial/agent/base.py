@@ -5,21 +5,16 @@ import contextlib
 import hashlib
 import inspect
 import json
-import random
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
-from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from functools import wraps
 from typing import (
-    Annotated,
     Any,
     Generic,
     Literal,
     cast,
     get_args,
     get_origin,
-    overload,
 )
 
 import httpx
@@ -30,7 +25,7 @@ from openai.types.chat import (
 from openai.types.chat.chat_completion_message_function_tool_call import (
     ChatCompletionMessageFunctionToolCall,
 )
-from pydantic import BaseModel, TypeAdapter
+from pydantic import TypeAdapter
 from typing_extensions import TypeVar
 
 from factorial.agent.context import (
@@ -38,6 +33,41 @@ from factorial.agent.context import (
     ContextType,
     EmptyMetadata,
     EmptyState,
+)
+from factorial.agent.helpers import (
+    _DirectEventPublisher,
+    _maybe_call_prepare_turn,
+    _RunFailureError,
+    chain_prepare_turn,
+    invoke_callable_non_blocking,
+    retry,
+)
+from factorial.agent.stop import (
+    StopCondition,
+    StopWhen,
+    _infer_turn_limit_hint,
+    all_of,
+    any_of,
+    no_tool_calls,
+    stop,
+    tool_called,
+    total_tokens_exceed,
+    turn_count_is,
+)
+from factorial.agent.tools.core import (
+    ToolDefinition,
+    _ToolResultInternal,
+    convert_tools_list,
+)
+from factorial.agent.tools.runtime import execute_tools
+from factorial.agent.types import (
+    Callbacks,
+    EventCallback,
+    PrepareTurnHook,
+    ToolChoice,
+    ToolExecutionResults,
+    Turn,
+    TurnCompletion,
 )
 from factorial.ai.messages import (
     Message,
@@ -49,7 +79,6 @@ from factorial.ai.messages import (
     system,
     tool_call as message_tool_call,
     tool_calls as message_tool_calls,
-    tool_result,
 )
 from factorial.ai.models import Model, MultiClient
 from factorial.core.events import (
@@ -66,7 +95,6 @@ from factorial.core.events import (
     WaitEvent,
 )
 from factorial.core.exceptions import (
-    RETRYABLE_EXCEPTIONS,
     FatalAgentError,
 )
 from factorial.core.logging import get_logger
@@ -82,484 +110,19 @@ from factorial.core.run_types import (
     VerifierRetry,
     verify,
 )
-from factorial.core.utils import is_valid_task_id, serialize_data, to_snake_case
+from factorial.core.utils import serialize_data, to_snake_case
 from factorial.execution.context import (
     ExecutionContext,
     execution_context,
 )
-from factorial.execution.hooks import (
-    HookRequestContext,
-    HookSessionNode,
-    HookSessionRecord,
-    PendingHook,
-    build_request_builder_kwargs,
-)
-from factorial.execution.tools import (
-    ToolDefinition,
-    _ToolResultInternal,
-    convert_tools_list,
-    serialize_for_client,
-    serialize_for_model,
-)
-from factorial.execution.waits import WaitInstruction
 
 logger = get_logger(__name__)
 
-T = TypeVar("T")
 StateT = TypeVar("StateT")
 MetadataT = TypeVar("MetadataT", default=EmptyMetadata)
 VerificationMetaT = TypeVar("VerificationMetaT")
 
-ToolChoice = str | dict[str, Any] | None
-
-
-async def _invoke_callable_non_blocking(
-    fn: Callable[..., Any],
-    *args: Any,
-    **kwargs: Any,
-) -> Any:
-    if asyncio.iscoroutinefunction(fn):
-        async_fn = cast(Callable[..., Awaitable[Any]], fn)
-        return await async_fn(*args, **kwargs)
-    return await asyncio.to_thread(fn, *args, **kwargs)
-
-
-@overload
-def retry(
-    func: Callable[..., Awaitable[T]],
-) -> Callable[..., Awaitable[T]]: ...
-
-
-@overload
-def retry(
-    func: None = None,
-    *,
-    max_attempts: int = 3,
-    delay: float = 1.0,
-    max_delay: float = 60.0,
-    exponential_base: float = 2.0,
-    jitter: bool = True,
-) -> Callable[[Callable[..., Awaitable[T]]], Callable[..., Awaitable[T]]]: ...
-
-
-def retry(
-    func: Callable[..., Awaitable[T]] | None = None,
-    *,
-    max_attempts: int = 3,
-    delay: float = 1.0,
-    max_delay: float = 60.0,
-    exponential_base: float = 2.0,
-    jitter: bool = True,
-) -> (
-    Callable[..., Awaitable[T]]
-    | Callable[[Callable[..., Awaitable[T]]], Callable[..., Awaitable[T]]]
-):
-    def _create_retry_decorator(
-        the_func: Callable[..., Awaitable[T]],
-    ) -> Callable[..., Awaitable[T]]:
-        sig = inspect.signature(the_func)
-
-        ctx_param_name: str | None = None
-        ctx_pos: int | None = None
-        for idx, param in enumerate(sig.parameters.values()):
-            ann = param.annotation
-            if (
-                ann is not inspect.Parameter.empty
-                and isinstance(ann, type)
-                and issubclass(ann, AgentContext)
-            ):
-                ctx_param_name = param.name
-                ctx_pos = idx - 1
-                break
-
-        if ctx_param_name is None and "agent_ctx" in sig.parameters:
-            ctx_param_name = "agent_ctx"
-            ctx_pos = list(sig.parameters).index("agent_ctx") - 1
-
-        @wraps(the_func)
-        async def wrapper(self: BaseAgent[Any], *args: Any, **kwargs: Any) -> T:
-            if max_attempts <= 0:
-                raise ValueError("max_attempts must be greater than 0")
-
-            agent_ctx_obj: Any | None = None
-            if ctx_param_name is not None:
-                if ctx_param_name in kwargs:
-                    agent_ctx_obj = kwargs[ctx_param_name]
-                elif ctx_pos is not None and ctx_pos < len(args):
-                    agent_ctx_obj = args[ctx_pos]
-
-            last_exception: Exception | None = None
-            for attempt_index in range(max_attempts):
-                if isinstance(agent_ctx_obj, AgentContext):
-                    agent_ctx_obj.attempt_number = attempt_index + 1
-
-                try:
-                    return await the_func(self, *args, **kwargs)
-                except Exception as exc:
-                    if isinstance(exc, RETRYABLE_EXCEPTIONS):
-                        last_exception = exc
-                        if attempt_index < max_attempts - 1:
-                            backoff_delay = min(
-                                delay * (exponential_base**attempt_index),
-                                max_delay,
-                            )
-                            if jitter:
-                                backoff_delay *= random.uniform(0.5, 1.5)
-                            await asyncio.sleep(backoff_delay)
-                            continue
-                    raise
-
-            raise last_exception or RuntimeError("Retry failed unexpectedly")
-
-        return wrapper
-
-    if func is not None:
-        return _create_retry_decorator(func)
-    return _create_retry_decorator
-
-
-@dataclass
-class Turn(Generic[ContextType]):
-    model: Model
-    messages: list[Message]
-    tools: list[ToolDefinition[ContextType]]
-    tool_choice: ToolChoice = "auto"
-    parallel_tool_calls: bool | None = None
-    temperature: float | None = None
-    max_output_tokens: int | None = None
-
-
-@dataclass
-class TurnCompletion(Generic[ContextType]):
-    is_done: bool
-    context: ContextType
-    output: Any = None
-    tool_call_results: list[tuple[ChatCompletionMessageToolCall, Any | Exception]] = field(
-        default_factory=list
-    )
-    pending_tool_call_ids: list[str] = field(default_factory=list)
-    pending_child_task_ids: list[str] = field(default_factory=list)
-    finish_reason: str = "continue"
-    usage: UsageSummary = field(default_factory=UsageSummary.zero)
-    turn_summary: TurnSummary | None = None
-    verification_summary: VerificationSummary[Any] | None = None
-
-
-@dataclass
-class ToolExecutionResults:
-    new_messages: list[Message]
-    tool_call_results: list[tuple[ChatCompletionMessageToolCall, Any | Exception]]
-    resolved_results: list[
-        tuple[ChatCompletionMessageToolCall, _ToolResultInternal | Exception]
-    ]
-    pending_tool_call_ids: list[str]
-    pending_child_task_ids: list[str]
-
-
-EventCallback = Callable[..., Awaitable[None] | None]
-
-
-@dataclass
-class Callbacks:
-    on_start: EventCallback | None = None
-    on_turn_start: EventCallback | None = None
-    on_model_start: EventCallback | None = None
-    on_model_finish: EventCallback | None = None
-    on_tool_start: EventCallback | None = None
-    on_tool_finish: EventCallback | None = None
-    on_wait: EventCallback | None = None
-    on_turn_finish: EventCallback | None = None
-    on_finish: EventCallback | None = None
-
-
-StopWhen = Callable[[AgentContext[Any, Any], ExecutionContext], bool]
-PrepareTurnHook = Callable[..., Any]
 Verifier = Callable[..., Any]
-
-
-class StopCondition:
-    def __call__(self, agent_ctx: AgentContext[Any, Any], execution_ctx: ExecutionContext) -> bool:
-        raise NotImplementedError
-
-
-@dataclass(frozen=True)
-class NoToolCallsCondition(StopCondition):
-    def __call__(
-        self,
-        agent_ctx: AgentContext[Any, Any],
-        execution_ctx: ExecutionContext,
-    ) -> bool:
-        last_turn = execution_ctx.last_turn
-        if last_turn is None:
-            return False
-        return not last_turn.finish_reason.startswith("tool_called:")
-
-
-@dataclass(frozen=True)
-class TurnCountIsCondition(StopCondition):
-    limit: int
-
-    def __call__(
-        self,
-        agent_ctx: AgentContext[Any, Any],
-        execution_ctx: ExecutionContext,
-    ) -> bool:
-        return agent_ctx.turn_number >= self.limit
-
-
-@dataclass(frozen=True)
-class ToolCalledCondition(StopCondition):
-    name: str
-
-    def __call__(
-        self,
-        agent_ctx: AgentContext[Any, Any],
-        execution_ctx: ExecutionContext,
-    ) -> bool:
-        last_turn = execution_ctx.last_turn
-        if last_turn is None or not last_turn.finish_reason.startswith("tool_called:"):
-            return False
-        suffix = last_turn.finish_reason.removeprefix("tool_called:")
-        return self.name in {value for value in suffix.split(",") if value}
-
-
-@dataclass(frozen=True)
-class TotalTokensExceedCondition(StopCondition):
-    limit: int
-
-    def __call__(
-        self,
-        agent_ctx: AgentContext[Any, Any],
-        execution_ctx: ExecutionContext,
-    ) -> bool:
-        return execution_ctx.usage.total_tokens > self.limit
-
-
-@dataclass(frozen=True)
-class AnyOfCondition(StopCondition):
-    conditions: tuple[StopWhen | StopCondition, ...]
-
-    def __call__(
-        self,
-        agent_ctx: AgentContext[Any, Any],
-        execution_ctx: ExecutionContext,
-    ) -> bool:
-        return any(
-            condition(agent_ctx, execution_ctx) for condition in self.conditions
-        )
-
-
-@dataclass(frozen=True)
-class AllOfCondition(StopCondition):
-    conditions: tuple[StopWhen | StopCondition, ...]
-
-    def __call__(
-        self,
-        agent_ctx: AgentContext[Any, Any],
-        execution_ctx: ExecutionContext,
-    ) -> bool:
-        return all(
-            condition(agent_ctx, execution_ctx) for condition in self.conditions
-        )
-
-
-class stop:
-    @staticmethod
-    def no_tool_calls() -> StopCondition:
-        return NoToolCallsCondition()
-
-    @staticmethod
-    def turn_count_is(limit: int) -> StopCondition:
-        return TurnCountIsCondition(limit=limit)
-
-    @staticmethod
-    def tool_called(name: str) -> StopCondition:
-        return ToolCalledCondition(name=name)
-
-    @staticmethod
-    def total_tokens_exceed(limit: int) -> StopCondition:
-        return TotalTokensExceedCondition(limit=limit)
-
-    @staticmethod
-    def any_of(*conditions: StopWhen | StopCondition) -> StopCondition:
-        return AnyOfCondition(conditions=conditions)
-
-    @staticmethod
-    def all_of(*conditions: StopWhen | StopCondition) -> StopCondition:
-        return AllOfCondition(conditions=conditions)
-
-
-def no_tool_calls() -> StopCondition:
-    return stop.no_tool_calls()
-
-
-def turn_count_is(limit: int) -> StopCondition:
-    return stop.turn_count_is(limit)
-
-
-def tool_called(name: str) -> StopCondition:
-    return stop.tool_called(name)
-
-
-def total_tokens_exceed(limit: int) -> StopCondition:
-    return stop.total_tokens_exceed(limit)
-
-
-def any_of(*conditions: StopWhen | StopCondition) -> StopCondition:
-    return stop.any_of(*conditions)
-
-
-def all_of(*conditions: StopWhen | StopCondition) -> StopCondition:
-    return stop.all_of(*conditions)
-
-
-async def _maybe_call_prepare_turn(
-    func: PrepareTurnHook | None,
-    turn: Turn[Any],
-    agent_ctx: AgentContext[Any, Any],
-    execution_ctx: ExecutionContext,
-) -> Turn[Any]:
-    if func is None:
-        return turn
-    signature = inspect.signature(func)
-    params = list(signature.parameters.values())
-    if not params:
-        raise TypeError("prepare_turn must accept at least one argument for turn")
-
-    first = params[0]
-    if first.kind not in (
-        inspect.Parameter.POSITIONAL_ONLY,
-        inspect.Parameter.POSITIONAL_OR_KEYWORD,
-    ):
-        raise TypeError("prepare_turn must accept the turn as its first parameter")
-
-    args: list[Any] = [turn]
-    kwargs: dict[str, Any] = {}
-    for param in params[1:]:
-        if param.kind in (
-            inspect.Parameter.VAR_POSITIONAL,
-            inspect.Parameter.VAR_KEYWORD,
-        ):
-            continue
-
-        annotation = param.annotation
-        annotation_origin = get_origin(annotation)
-        injected_value: Any | None = None
-        if (
-            param.name == "agent_ctx"
-            or annotation is AgentContext
-            or annotation_origin is AgentContext
-        ):
-            injected_value = agent_ctx
-        elif (
-            param.name == "execution_ctx"
-            or annotation is ExecutionContext
-            or annotation_origin is ExecutionContext
-        ):
-            injected_value = execution_ctx
-        elif (
-            annotation is not inspect.Parameter.empty
-            and isinstance(annotation, type)
-            and issubclass(annotation, AgentContext)
-        ):
-            injected_value = agent_ctx
-        elif (
-            annotation is not inspect.Parameter.empty
-            and isinstance(annotation, type)
-            and issubclass(annotation, ExecutionContext)
-        ):
-            injected_value = execution_ctx
-        elif param.default is not inspect.Parameter.empty:
-            continue
-        else:
-            raise TypeError(
-                f"Unsupported required prepare_turn parameter '{param.name}'. "
-                "Only turn (first arg), agent_ctx, and execution_ctx are supported."
-            )
-
-        if param.kind in (
-            inspect.Parameter.POSITIONAL_ONLY,
-            inspect.Parameter.POSITIONAL_OR_KEYWORD,
-        ):
-            args.append(injected_value)
-        else:
-            kwargs[param.name] = injected_value
-
-    result = func(*args, **kwargs)
-    if inspect.isawaitable(result):
-        result = await cast(Awaitable[Any], result)
-    if isinstance(result, Turn):
-        return result
-    return turn
-
-
-def chain_prepare_turn(
-    *functions: PrepareTurnHook,
-) -> PrepareTurnHook:
-    async def _chained(
-        turn: Turn[Any],
-        agent_ctx: AgentContext[Any, Any],
-        execution_ctx: ExecutionContext,
-    ) -> Turn[Any]:
-        current = turn
-        for function in functions:
-            current = await _maybe_call_prepare_turn(
-                function,
-                current,
-                agent_ctx,
-                execution_ctx,
-            )
-        return current
-
-    return _chained
-
-
-def _infer_turn_limit_hint(
-    condition: StopWhen | StopCondition | None,
-) -> int | None:
-    if condition is None:
-        return None
-    if isinstance(condition, TurnCountIsCondition):
-        return condition.limit
-    if isinstance(condition, AnyOfCondition):
-        limits = [
-            limit
-            for limit in (
-                _infer_turn_limit_hint(child) for child in condition.conditions
-            )
-            if limit is not None
-        ]
-        return min(limits) if limits else None
-    if isinstance(condition, AllOfCondition):
-        limits = [
-            limit
-            for limit in (
-                _infer_turn_limit_hint(child) for child in condition.conditions
-            )
-            if limit is not None
-        ]
-        return max(limits) if limits else None
-    return None
-
-
-class _DirectEventPublisher:
-    def __init__(self, sink: Callable[[BaseEvent], Awaitable[None]] | None = None):
-        self._sink = sink
-
-    async def publish_event(self, event: BaseEvent) -> None:
-        if self._sink is not None:
-            await self._sink(event)
-
-
-class _RunFailureError(FatalAgentError):
-    def __init__(
-        self,
-        message: str,
-        *,
-        verification_summary: VerificationSummary[Any] | None = None,
-    ) -> None:
-        super().__init__(message)
-        self.verification_summary = verification_summary
 
 
 class BaseAgent(Generic[ContextType]):
@@ -582,7 +145,6 @@ class BaseAgent(Generic[ContextType]):
         http_client: httpx.AsyncClient | None = None,
         client: MultiClient | None = None,
         request_timeout: float = 120.0,
-        parse_tool_args: bool = True,
     ):
         self.name = to_snake_case(name or self.__class__.__name__)
         self.description = description or self.__class__.__name__
@@ -597,13 +159,12 @@ class BaseAgent(Generic[ContextType]):
         self.default_temperature = temperature
         self.default_max_output_tokens = max_output_tokens
         self.prepare_turn = prepare_turn
-        self.stop_when = stop_when or stop.any_of(
-            stop.no_tool_calls(),
-            stop.turn_count_is(10),
+        self.stop_when = stop_when or any_of(
+            no_tool_calls(),
+            turn_count_is(10),
         )
         self.verifier = verifier
         self.callbacks = callbacks or Callbacks()
-        self.parse_tool_args = parse_tool_args
         self.max_turns = _infer_turn_limit_hint(self.stop_when)
 
         if self.model is None:
@@ -689,14 +250,6 @@ class BaseAgent(Generic[ContextType]):
             metadata_type=metadata_type,
         )
 
-    def context_from_json(self, json_str: str) -> AgentContext[Any, Any]:
-        state_type, metadata_type = self._resolve_state_and_metadata_types()
-        return AgentContext.from_json(
-            json_str,
-            state_type=state_type,
-            metadata_type=metadata_type,
-        )
-
     def resolve_model(self, agent_ctx: ContextType) -> Model:
         model_or_factory = self.model
         if callable(model_or_factory):
@@ -707,7 +260,9 @@ class BaseAgent(Generic[ContextType]):
             raise TypeError("Resolved model must be a factorial.ai.models.Model")
         return model
 
-    def resolve_tools(self, agent_ctx: ContextType) -> list[ToolDefinition[ContextType]]:
+    def resolve_tools(
+        self, agent_ctx: ContextType
+    ) -> list[ToolDefinition[ContextType]]:
         return [
             tool
             for tool in self.tools
@@ -850,554 +405,6 @@ class BaseAgent(Generic[ContextType]):
             await execution_ctx.events.publish_event(event)
         await self._dispatch_callbacks(event, agent_ctx, execution_ctx)
 
-    @staticmethod
-    def _stringify_for_model(value: Any) -> str:
-        if value is None:
-            return ""
-        if isinstance(value, str):
-            return value
-        serialized = serialize_data(value)
-        if isinstance(serialized, str):
-            return serialized
-        try:
-            return json.dumps(serialized, ensure_ascii=False, sort_keys=True)
-        except (TypeError, ValueError):
-            return str(serialized)
-
-    @classmethod
-    def _wait_model_output(cls, wait_instr: WaitInstruction) -> str:
-        if wait_instr.data is not None:
-            if isinstance(wait_instr.data, BaseModel):
-                return cls._stringify_for_model(serialize_for_model(wait_instr.data))
-            return cls._stringify_for_model(wait_instr.data)
-        if wait_instr.kind == "sleep":
-            return f"Waiting for {wait_instr.sleep_s or 0}s"
-        if wait_instr.kind == "cron":
-            expr = wait_instr.cron or "<cron>"
-            tz = wait_instr.timezone or "UTC"
-            return f"Waiting for next cron tick '{expr}' ({tz})"
-        if wait_instr.kind == "jobs":
-            return "Waiting for spawned jobs"
-        if wait_instr.kind == "activity":
-            return "Waiting for activity"
-        if wait_instr.kind == "signal":
-            return "Waiting for signal"
-        return "Waiting"
-
-    def _normalize_tool_result(
-        self,
-        result: Any,
-        tool_call: ChatCompletionMessageToolCall,
-        pending_child_task_ids: list[str] | None = None,
-    ) -> _ToolResultInternal:
-        if isinstance(result, _ToolResultInternal):
-            result.tool_call = tool_call
-            if pending_child_task_ids:
-                existing = result.pending_child_task_ids or []
-                result.pending_child_task_ids = list(
-                    dict.fromkeys([*existing, *pending_child_task_ids])
-                )
-            return result
-
-        if isinstance(result, WaitInstruction):
-            return _ToolResultInternal(
-                tool_call=tool_call,
-                model_output=self._wait_model_output(result),
-                client_output=result,
-                pending_child_task_ids=pending_child_task_ids,
-            )
-
-        if isinstance(result, BaseModel):
-            return _ToolResultInternal(
-                tool_call=tool_call,
-                model_output=self._stringify_for_model(serialize_for_model(result)),
-                client_output=serialize_for_client(result),
-                pending_child_task_ids=pending_child_task_ids,
-            )
-
-        if result is None:
-            return _ToolResultInternal(
-                tool_call=tool_call,
-                model_output="",
-                client_output=None,
-                pending_child_task_ids=pending_child_task_ids,
-            )
-
-        return _ToolResultInternal(
-            tool_call=tool_call,
-            model_output=self._stringify_for_model(result),
-            client_output=result,
-            pending_child_task_ids=pending_child_task_ids,
-        )
-
-    async def tool_action(
-        self,
-        tool_call: ChatCompletionMessageToolCall,
-        agent_ctx: ContextType,
-    ) -> _ToolResultInternal:
-        tool_name = tool_call.function.name
-        tool_args = tool_call.function.arguments
-        action = self.tool_actions.get(tool_name)
-        tool_def = next((tool for tool in self.tools if tool.name == tool_name), None)
-        hook_plan = tool_def.hook_plan if tool_def else None
-
-        execution_ctx = ExecutionContext.current()
-
-        if action is None:
-            raise ValueError(f"Agent {self.name} has no tool action for {tool_name}")
-
-        is_forking_tool = getattr(action, "forking_tool", False)
-
-        if not self.parse_tool_args:
-            result = await _invoke_callable_non_blocking(action, tool_args, agent_ctx)
-        else:
-            raw_tool_args = json.loads(tool_args)
-            parsed_tool_args = dict(raw_tool_args)
-
-            for param_name, param in inspect.signature(action).parameters.items():
-                if param_name in parsed_tool_args:
-                    continue
-                if param_name == "agent_ctx":
-                    parsed_tool_args[param_name] = agent_ctx
-                    continue
-                if (
-                    param.annotation
-                    and param.annotation is not inspect.Parameter.empty
-                    and isinstance(param.annotation, type)
-                    and issubclass(param.annotation, AgentContext)
-                ):
-                    parsed_tool_args[param_name] = agent_ctx
-                    continue
-                if param_name == "execution_ctx":
-                    parsed_tool_args[param_name] = execution_ctx
-                    continue
-                if (
-                    param.annotation
-                    and param.annotation is not inspect.Parameter.empty
-                    and isinstance(param.annotation, type)
-                    and issubclass(param.annotation, ExecutionContext)
-                ):
-                    parsed_tool_args[param_name] = execution_ctx
-                    continue
-
-            for param_name, param in inspect.signature(action).parameters.items():
-                if param_name not in parsed_tool_args:
-                    continue
-                expected = param.annotation
-                if expected is inspect.Parameter.empty:
-                    continue
-
-                try:
-                    if get_origin(expected) is Annotated:
-                        annotated_args = get_args(expected)
-                        if annotated_args:
-                            expected = annotated_args[0]
-                    origin = get_origin(expected)
-                    if (
-                        isinstance(expected, type)
-                        and issubclass(expected, BaseModel)
-                        and isinstance(parsed_tool_args[param_name], dict)
-                    ):
-                        parsed_tool_args[param_name] = expected(
-                            **parsed_tool_args[param_name]
-                        )
-                    elif origin is list:
-                        item_type = get_args(expected)[0] if get_args(expected) else None
-                        if (
-                            item_type
-                            and isinstance(item_type, type)
-                            and issubclass(item_type, BaseModel)
-                            and isinstance(parsed_tool_args[param_name], list)
-                        ):
-                            parsed_tool_args[param_name] = [
-                                item_type(**item)
-                                if not isinstance(item, item_type)
-                                else item
-                                for item in parsed_tool_args[param_name]
-                            ]
-                except Exception as exc:
-                    logger.debug(
-                        "Failed to coerce argument '%s' to %s: %s",
-                        param_name,
-                        expected,
-                        exc,
-                    )
-
-            if hook_plan is not None:
-                hook_param_names = list(hook_plan.hook_order)
-                present_hook_params = [
-                    param_name
-                    for param_name in hook_param_names
-                    if param_name in parsed_tool_args
-                ]
-                if present_hook_params and len(present_hook_params) != len(
-                    hook_param_names
-                ):
-                    raise ValueError(
-                        f"Tool '{tool_name}' continuation received partial hook "
-                        f"payloads: {present_hook_params}. Expected all of "
-                        f"{hook_param_names}."
-                    )
-
-                if not present_hook_params:
-                    request_tool_args = {
-                        key: parsed_tool_args[key]
-                        for key in raw_tool_args.keys()
-                        if key in parsed_tool_args
-                    }
-                    serialized_tool_args = cast(
-                        dict[str, Any], serialize_data(request_tool_args)
-                    )
-                    now_ts = datetime.now(timezone.utc).timestamp()
-                    session_seed = f"{execution_ctx.task_id}:{tool_call.id}:{tool_name}"
-                    session_id = hashlib.sha256(
-                        session_seed.encode("utf-8")
-                    ).hexdigest()
-                    session_nodes: dict[str, HookSessionNode] = {}
-                    for hook_param_name in hook_plan.hook_order:
-                        node_spec = hook_plan.nodes[hook_param_name]
-                        session_nodes[hook_param_name] = HookSessionNode(
-                            param_name=hook_param_name,
-                            mode=node_spec.mode,
-                            hook_type=node_spec.hook_type.__name__,
-                            depends_on=node_spec.depends_on,
-                        )
-
-                    first_stage = hook_plan.stages[0] if hook_plan.stages else ()
-                    if not first_stage:
-                        raise ValueError(
-                            f"Hook plan for tool '{tool_name}' has no requestable stage."
-                        )
-
-                    request_ctx = HookRequestContext(
-                        task_id=execution_ctx.task_id,
-                        owner_id=execution_ctx.owner_id,
-                        agent_name=self.name,
-                        tool_name=tool_name,
-                        tool_call_id=tool_call.id,
-                        args=serialized_tool_args,
-                    )
-                    requested_hooks: list[dict[str, Any]] = []
-                    for hook_param_name in first_stage:
-                        node_spec = hook_plan.nodes[hook_param_name]
-                        request_kwargs = build_request_builder_kwargs(
-                            request_builder=node_spec.request_builder,
-                            request_ctx=request_ctx,
-                            tool_args=request_tool_args,
-                            resolved_hook_payloads={},
-                        )
-                        pending_hook = await _invoke_callable_non_blocking(
-                            node_spec.request_builder,
-                            **request_kwargs,
-                        )
-                        if not isinstance(pending_hook, PendingHook):
-                            raise TypeError(
-                                f"Hook request builder for '{hook_param_name}' must "
-                                "return PendingHook[...]"
-                            )
-
-                        stable_hook_id = f"{session_id}:{hook_param_name}"
-                        pending_hook.hook_id = stable_hook_id
-
-                        node_state = session_nodes[hook_param_name]
-                        node_state.status = "requested"
-                        node_state.hook_id = stable_hook_id
-                        node_state.requested_at = now_ts
-
-                        requested_hooks.append(
-                            {
-                                "param_name": hook_param_name,
-                                "mode": node_spec.mode,
-                                "hook_type": node_spec.hook_type.__name__,
-                                "depends_on": list(node_spec.depends_on),
-                                "hook_id": stable_hook_id,
-                                "submit_url": pending_hook.submit_url,
-                                "token": pending_hook.token,
-                                "expires_at": pending_hook.expires_at.timestamp(),
-                                "title": pending_hook.title,
-                                "metadata": pending_hook.metadata,
-                            }
-                        )
-
-                    session = HookSessionRecord(
-                        session_id=session_id,
-                        task_id=execution_ctx.task_id,
-                        tool_call_id=tool_call.id,
-                        tool_name=tool_name,
-                        tool_args=serialized_tool_args,
-                        nodes=session_nodes,
-                        status="active",
-                        created_at=now_ts,
-                        updated_at=now_ts,
-                    )
-
-                    await execution_ctx.persist_hook_session(
-                        {
-                            "kind": "hook_session_init",
-                            "session": session.to_dict(),
-                            "requested_hooks": requested_hooks,
-                        }
-                    )
-                    return _ToolResultInternal(
-                        tool_call=tool_call,
-                        model_output="Awaiting hook dependency resolution",
-                        client_output={
-                            "kind": "hook_session_pending",
-                            "session_id": session_id,
-                            "requested_hooks": requested_hooks,
-                        },
-                        pending_result=True,
-                    )
-
-            result = await _invoke_callable_non_blocking(action, **parsed_tool_args)
-
-        pending_child_task_ids: list[str] = []
-        if is_forking_tool:
-            candidate_ids: list[str] | tuple[str, ...] | None
-            if isinstance(result, _ToolResultInternal):
-                if not result.pending_child_task_ids:
-                    raise ValueError(
-                        f"Forking tool '{tool_call.function.name}' returned an "
-                        "_ToolResultInternal without pending_child_task_ids."
-                    )
-                candidate_ids = result.pending_child_task_ids
-            elif isinstance(result, (list, tuple)) and all(
-                isinstance(item, str) for item in result
-            ):
-                candidate_ids = result
-            else:
-                raise ValueError(
-                    f"Forking tool '{tool_call.function.name}' must return "
-                    "list[str] or tuple[str, ...] of task IDs."
-                )
-
-            if not all(
-                isinstance(item, str) and is_valid_task_id(item)
-                for item in candidate_ids
-            ):
-                raise ValueError(
-                    f"Forking tool '{tool_call.function.name}' "
-                    f"returned invalid task IDs: {candidate_ids}"
-                )
-            pending_child_task_ids = list(candidate_ids)
-
-        return self._normalize_tool_result(
-            result,
-            tool_call,
-            pending_child_task_ids or None,
-        )
-
-    @retry(max_attempts=3, delay=0.5)
-    async def _tool_action_with_retry(
-        self,
-        tool_call: ChatCompletionMessageToolCall,
-        agent_ctx: ContextType,
-    ) -> _ToolResultInternal:
-        return await self.tool_action(tool_call, agent_ctx)
-
-    async def execute_tools(
-        self,
-        tool_calls: list[ChatCompletionMessageToolCall],
-        agent_ctx: ContextType,
-    ) -> ToolExecutionResults:
-        new_messages: list[Message] = []
-        pending_tool_call_ids: list[str] = []
-        all_pending_child_task_ids: list[str] = []
-        tool_call_results: list[tuple[ChatCompletionMessageToolCall, Any | Exception]] = []
-        resolved_results: list[
-            tuple[ChatCompletionMessageToolCall, _ToolResultInternal | Exception]
-        ] = []
-        execution_ctx = ExecutionContext.current()
-
-        for tool_call in tool_calls:
-            await self._emit_event(
-                ToolStartEvent(
-                    task_id=execution_ctx.task_id,
-                    owner_id=execution_ctx.owner_id,
-                    agent_name=self.name,
-                    turn=agent_ctx.turn_number,
-                    tool_name=tool_call.function.name,
-                    tool_call_id=tool_call.id,
-                ),
-                agent_ctx,
-                execution_ctx,
-            )
-
-        results = await asyncio.gather(
-            *[
-                self._tool_action_with_retry(tool_call, agent_ctx)
-                for tool_call in tool_calls
-            ],
-            return_exceptions=True,
-        )
-
-        for tool_call, result in zip(tool_calls, results, strict=True):
-            resolved_results.append(
-                (
-                    tool_call,
-                    cast(_ToolResultInternal | Exception, result),
-                )
-            )
-            tool_call_results.append(
-                (
-                    tool_call,
-                    result
-                    if isinstance(result, Exception)
-                    else result.client_output,
-                )
-            )
-
-            if (
-                isinstance(result, _ToolResultInternal)
-                and result.pending_child_task_ids
-            ):
-                all_pending_child_task_ids.extend(result.pending_child_task_ids)
-
-            if isinstance(result, Exception):
-                logger.error(
-                    "Tool %s failed: %s",
-                    tool_call.function.name,
-                    result,
-                    exc_info=result,
-                )
-                new_messages.append(
-                    tool_result(
-                        tool_call.id,
-                        str(result),
-                        tool_name=tool_call.function.name,
-                        is_error=True,
-                        model_output=str(result),
-                    )
-                )
-                await self._emit_event(
-                    ToolFinishEvent(
-                        task_id=execution_ctx.task_id,
-                        owner_id=execution_ctx.owner_id,
-                        agent_name=self.name,
-                        turn=agent_ctx.turn_number,
-                        tool_name=tool_call.function.name,
-                        tool_call_id=tool_call.id,
-                        output=str(result),
-                        is_error=True,
-                    ),
-                    agent_ctx,
-                    execution_ctx,
-                )
-            elif result.pending_result:
-                pending_tool_call_ids.append(tool_call.id)
-                await self._emit_event(
-                    ToolFinishEvent(
-                        task_id=execution_ctx.task_id,
-                        owner_id=execution_ctx.owner_id,
-                        agent_name=self.name,
-                        turn=agent_ctx.turn_number,
-                        tool_name=tool_call.function.name,
-                        tool_call_id=tool_call.id,
-                        output=result.client_output,
-                        is_error=False,
-                    ),
-                    agent_ctx,
-                    execution_ctx,
-                )
-            else:
-                new_messages.append(
-                    tool_result(
-                        tool_call.id,
-                        result.client_output,
-                        tool_name=tool_call.function.name,
-                        is_error=False,
-                        model_output=result.model_output,
-                    )
-                )
-                await self._emit_event(
-                    ToolFinishEvent(
-                        task_id=execution_ctx.task_id,
-                        owner_id=execution_ctx.owner_id,
-                        agent_name=self.name,
-                        turn=agent_ctx.turn_number,
-                        tool_name=tool_call.function.name,
-                        tool_call_id=tool_call.id,
-                        output=result.client_output,
-                        is_error=False,
-                    ),
-                    agent_ctx,
-                    execution_ctx,
-                )
-
-            if isinstance(result, FatalAgentError):
-                raise result
-
-        return ToolExecutionResults(
-            new_messages=new_messages,
-            tool_call_results=tool_call_results,
-            resolved_results=resolved_results,
-            pending_tool_call_ids=pending_tool_call_ids,
-            pending_child_task_ids=all_pending_child_task_ids,
-        )
-
-    def process_deferred_tool_results(
-        self,
-        agent_ctx: ContextType,
-        tool_call_results: list[tuple[str, Any]],
-    ) -> TurnCompletion[ContextType]:
-        updated_messages = list(agent_ctx.messages)
-        for tool_call_id, result in tool_call_results:
-            if isinstance(result, Exception):
-                updated_messages.append(
-                    tool_result(
-                        tool_call_id,
-                        str(result),
-                        is_error=True,
-                        model_output=str(result),
-                    )
-                )
-            else:
-                updated_messages.append(
-                    tool_result(
-                        tool_call_id,
-                        result,
-                        model_output=self._stringify_for_model(result),
-                    )
-                )
-        agent_ctx.messages = updated_messages
-        return TurnCompletion(is_done=False, context=agent_ctx)
-
-    def format_child_task_result(
-        self,
-        child_task_id: str,
-        result: Any | Exception,
-    ) -> str:
-        if isinstance(result, Exception):
-            return (
-                f'<sub_task_error sub_task_id="{child_task_id}">\n'
-                f"Error running sub task:\n{result}\n</sub_task_error>"
-            )
-        return (
-            f'<sub_task_result sub_task_id="{child_task_id}">\n'
-            f"{str(result)}\n</sub_task_result>"
-        )
-
-    def process_child_task_results(
-        self,
-        agent_ctx: ContextType,
-        child_task_results: list[tuple[str, Any]],
-    ) -> TurnCompletion[ContextType]:
-        updated_messages = list(agent_ctx.messages)
-        formatted_results = [
-            self.format_child_task_result(child_task_id, result)
-            for child_task_id, result in child_task_results
-        ]
-        if formatted_results:
-            updated_messages.append(
-                assistant(
-                    "<sub_task_results>\n"
-                    + "\n\n".join(formatted_results)
-                    + "\n</sub_task_results>"
-                )
-            )
-        agent_ctx.messages = updated_messages
-        return TurnCompletion(is_done=False, context=agent_ctx)
-
     def _response_tool_calls(
         self,
         response: ChatCompletion,
@@ -1426,9 +433,7 @@ class BaseAgent(Generic[ContextType]):
                     *[
                         message_tool_call(
                             tool_call.function.name,
-                            json.loads(tool_call.function.arguments)
-                            if self.parse_tool_args
-                            else tool_call.function.arguments,
+                            json.loads(tool_call.function.arguments),
                             call_id=tool_call.id,
                         )
                         for tool_call in function_tool_calls
@@ -1462,7 +467,9 @@ class BaseAgent(Generic[ContextType]):
         function_tool_calls: list[ChatCompletionMessageFunctionToolCall],
     ) -> str:
         if function_tool_calls:
-            tool_names = ",".join(tool_call.function.name for tool_call in function_tool_calls)
+            tool_names = ",".join(
+                tool_call.function.name for tool_call in function_tool_calls
+            )
             return f"tool_called:{tool_names}"
         return str(response.choices[0].finish_reason or "stop")
 
@@ -1524,7 +531,8 @@ class BaseAgent(Generic[ContextType]):
             if param.default is inspect.Parameter.empty:
                 raise TypeError(
                     f"Unsupported required verifier parameter '{param.name}'. "
-                    "Only output (first arg), agent_ctx, and execution_ctx are supported."
+                    "Only output (first arg), agent_ctx, and execution_ctx "
+                    "are supported."
                 )
         return kwargs
 
@@ -1537,7 +545,7 @@ class BaseAgent(Generic[ContextType]):
         if self.verifier is None:
             return "accept", None
 
-        decision = await _invoke_callable_non_blocking(
+        decision = await invoke_callable_non_blocking(
             self.verifier,
             candidate_output,
             **self._resolve_verifier_injected_kwargs(agent_ctx, execution_ctx),
@@ -1626,8 +634,8 @@ class BaseAgent(Generic[ContextType]):
         turn_usage = UsageSummary.from_provider_usage(getattr(response, "usage", None))
         execution_ctx.usage = execution_ctx.usage.add(turn_usage)
 
-        canonical_response_messages, function_tool_calls = self._canonical_response_messages(
-            response
+        canonical_response_messages, function_tool_calls = (
+            self._canonical_response_messages(response)
         )
         assistant_content = response.choices[0].message.content or ""
         updated_messages = [*agent_ctx.messages, *canonical_response_messages]
@@ -1655,7 +663,7 @@ class BaseAgent(Generic[ContextType]):
             pending_child_task_ids=[],
         )
         if function_tool_calls:
-            tool_results = await self.execute_tools(function_tool_calls, agent_ctx)
+            tool_results = await execute_tools(self, function_tool_calls, agent_ctx)
             updated_messages.extend(tool_results.new_messages)
 
         agent_ctx.messages = updated_messages
@@ -1729,7 +737,9 @@ class BaseAgent(Generic[ContextType]):
                         finish_reason=finish_reason,
                         output=candidate_output,
                         pending_tool_call_ids=tuple(tool_results.pending_tool_call_ids),
-                        pending_child_task_ids=tuple(tool_results.pending_child_task_ids),
+                        pending_child_task_ids=tuple(
+                            tool_results.pending_child_task_ids
+                        ),
                         usage=turn_usage,
                     ),
                     agent_ctx,
@@ -1773,15 +783,10 @@ class BaseAgent(Generic[ContextType]):
         execution_ctx: ExecutionContext,
     ) -> ContextType:
         del execution_ctx
-        agent_ctx.messages.extend(normalize_message(cast(MessageLike, message)) for message in messages)
+        agent_ctx.messages.extend(
+            normalize_message(cast(MessageLike, message)) for message in messages
+        )
         return agent_ctx
-
-    async def cancel(
-        self,
-        agent_ctx: ContextType,
-        execution_ctx: ExecutionContext,
-    ) -> None:
-        del agent_ctx, execution_ctx
 
     async def run(
         self,
@@ -1819,7 +824,10 @@ class BaseAgent(Generic[ContextType]):
                 completion = await self.run_turn(agent_ctx)
                 if completion.verification_summary is not None:
                     last_verification_summary = completion.verification_summary
-                if completion.pending_tool_call_ids or completion.pending_child_task_ids:
+                if (
+                    completion.pending_tool_call_ids
+                    or completion.pending_child_task_ids
+                ):
                     raise RuntimeError(
                         "Direct agent.run(...) does not support pending tool results "
                         "or pending child-task continuations"
@@ -1837,7 +845,9 @@ class BaseAgent(Generic[ContextType]):
                         metadata=agent_ctx.metadata,
                         messages=tuple(agent_ctx.messages),
                         usage=execution_ctx.usage,
-                        turn_count=completion.turn_summary.turn_number if completion.turn_summary else agent_ctx.turn_number,
+                        turn_count=completion.turn_summary.turn_number
+                        if completion.turn_summary
+                        else agent_ctx.turn_number,
                         last_turn=completion.turn_summary,
                         verification=last_verification_summary,
                         started_at=started_at,
@@ -1872,7 +882,9 @@ class BaseAgent(Generic[ContextType]):
                 metadata=agent_ctx.metadata,
                 messages=tuple(agent_ctx.messages),
                 usage=execution_ctx.usage,
-                turn_count=execution_ctx.last_turn.turn_number if execution_ctx.last_turn else max(agent_ctx.turn_number - 1, 0),
+                turn_count=execution_ctx.last_turn.turn_number
+                if execution_ctx.last_turn
+                else max(agent_ctx.turn_number - 1, 0),
                 last_turn=execution_ctx.last_turn,
                 verification=exc.verification_summary or last_verification_summary,
                 started_at=started_at,
@@ -1907,7 +919,9 @@ class BaseAgent(Generic[ContextType]):
                 metadata=agent_ctx.metadata,
                 messages=tuple(agent_ctx.messages),
                 usage=execution_ctx.usage,
-                turn_count=execution_ctx.last_turn.turn_number if execution_ctx.last_turn else max(agent_ctx.turn_number - 1, 0),
+                turn_count=execution_ctx.last_turn.turn_number
+                if execution_ctx.last_turn
+                else max(agent_ctx.turn_number - 1, 0),
                 last_turn=execution_ctx.last_turn,
                 verification=last_verification_summary,
                 started_at=started_at,
@@ -1971,7 +985,10 @@ class BaseAgent(Generic[ContextType]):
                     completion = await self.run_turn(agent_ctx)
                     if completion.verification_summary is not None:
                         last_verification_summary = completion.verification_summary
-                    if completion.pending_tool_call_ids or completion.pending_child_task_ids:
+                    if (
+                        completion.pending_tool_call_ids
+                        or completion.pending_child_task_ids
+                    ):
                         raise RuntimeError(
                             "Direct agent.stream(...) does not support pending tool "
                             "results or pending child-task continuations"
@@ -1988,7 +1005,9 @@ class BaseAgent(Generic[ContextType]):
                             metadata=agent_ctx.metadata,
                             messages=tuple(agent_ctx.messages),
                             usage=execution_ctx.usage,
-                            turn_count=completion.turn_summary.turn_number if completion.turn_summary else agent_ctx.turn_number,
+                            turn_count=completion.turn_summary.turn_number
+                            if completion.turn_summary
+                            else agent_ctx.turn_number,
                             last_turn=completion.turn_summary,
                             verification=last_verification_summary,
                             started_at=started_at,
@@ -2017,7 +1036,9 @@ class BaseAgent(Generic[ContextType]):
                         agent_name=self.name,
                         status=RunStatus.FAILED,
                         run_error=error,
-                        turn_count=execution_ctx.last_turn.turn_number if execution_ctx.last_turn else max(agent_ctx.turn_number - 1, 0),
+                        turn_count=execution_ctx.last_turn.turn_number
+                        if execution_ctx.last_turn
+                        else max(agent_ctx.turn_number - 1, 0),
                         usage=execution_ctx.usage,
                     ),
                     agent_ctx,
@@ -2032,7 +1053,9 @@ class BaseAgent(Generic[ContextType]):
                         agent_name=self.name,
                         status=RunStatus.FAILED,
                         run_error=error,
-                        turn_count=execution_ctx.last_turn.turn_number if execution_ctx.last_turn else max(agent_ctx.turn_number - 1, 0),
+                        turn_count=execution_ctx.last_turn.turn_number
+                        if execution_ctx.last_turn
+                        else max(agent_ctx.turn_number - 1, 0),
                         usage=execution_ctx.usage,
                     ),
                     agent_ctx,
@@ -2055,20 +1078,6 @@ class BaseAgent(Generic[ContextType]):
                 runner.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await runner
-
-    async def execute(
-        self,
-        agent_ctx: ContextType,
-        execution_ctx: ExecutionContext,
-    ) -> TurnCompletion[ContextType]:
-        token = execution_context.set(execution_ctx)
-        try:
-            return await self.run_turn(agent_ctx)
-        finally:
-            execution_context.reset(token)
-
-    def get_execution_context(self) -> ExecutionContext:
-        return ExecutionContext.current()
 
 
 class Agent(

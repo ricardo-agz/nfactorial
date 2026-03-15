@@ -72,7 +72,7 @@ agent = Agent(
 
 **`prepare_turn`** (Callable): Optional hook that runs before each model call. It always receives `turn`, and `agent_ctx` / `execution_ctx` are injected only if your function declares them.
 
-**`stop_when`** (Callable | StopCondition): When to stop the loop. Default: `stop.any_of(stop.no_tool_calls(), stop.turn_count_is(10))`. Use `stop.turn_count_is(n)` or `stop.tool_called("done")` for custom behavior.
+**`stop_when`** (Callable | StopCondition): When to stop the loop. Default: `any_of(no_tool_calls(), turn_count_is(10))`. Use `turn_count_is(n)` or `tool_called("done")` for custom behavior.
 
 **`verifier`** (Callable): Optional sync/async callable that validates output before completion. Returns `verify.accept()`, `verify.retry(message=...)`, or `verify.fail(message=...)`.
 If you want a retry cap, enforce it inside the verifier with `agent_ctx.verification.attempts_used`.
@@ -86,7 +86,7 @@ If you want a retry cap, enforce it inside the verifier with `agent_ctx.verifica
 Use `prepare_turn` to set per-turn `tool_choice`, `temperature`, or other model settings:
 
 ```python
-from factorial import Agent, stop
+from factorial import Agent, any_of, no_tool_calls, turn_count_is
 
 def my_prepare_turn(turn, agent_ctx):
     if agent_ctx.turn_number == 1:
@@ -100,7 +100,7 @@ agent = Agent(
     model=gpt_41,
     tools=[plan, search],
     prepare_turn=my_prepare_turn,
-    stop_when=stop.any_of(stop.no_tool_calls(), stop.turn_count_is(12)),
+    stop_when=any_of(no_tool_calls(), turn_count_is(12)),
 )
 ```
 

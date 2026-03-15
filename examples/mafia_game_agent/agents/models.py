@@ -108,7 +108,7 @@ class MafiaPlayerState:
     night_alive_werewolf_count: int = 1
 
 
-# Aliases for backwards compatibility in tool signatures
+# Context aliases for agent tool signatures
 MafiaGameContext: TypeAlias = AgentContext[MafiaGameState]
 MafiaPlayerContext: TypeAlias = AgentContext[MafiaPlayerState]
 

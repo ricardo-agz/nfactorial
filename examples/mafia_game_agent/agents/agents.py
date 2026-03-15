@@ -80,12 +80,12 @@ Behavior contract:
   reasonable choice.
 """
 
-def _player_prepare_turn(turn, agent_ctx, execution_ctx):
+def _player_prepare_turn(turn, agent_ctx):
     turn.tool_choice = _player_tool_choice(agent_ctx)
     turn.parallel_tool_calls = False
 
 
-def _gm_prepare_turn(turn, agent_ctx, execution_ctx):
+def _gm_prepare_turn(turn, agent_ctx):
     turn.tool_choice = _gm_tool_choice(agent_ctx)
     turn.parallel_tool_calls = False
 

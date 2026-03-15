@@ -14,6 +14,8 @@ from openai.types.chat.chat_completion_message_function_tool_call import (
 )
 
 from factorial import Agent, AgentContext, hook, tool
+from factorial.agent.tools.core import _ToolResultInternal
+from factorial.agent.tools.runtime import tool_action
 from factorial.core.exceptions import HookExpiredError, HookTokenValidationError
 from factorial.core.utils import decode
 from factorial.execution.context import (
@@ -28,7 +30,6 @@ from factorial.execution.hooks import (
     HookSessionRecord,
     PendingHook,
 )
-from factorial.execution.tools import _ToolResultInternal
 from factorial.queue.keys import PENDING_SENTINEL, RedisKeys
 from factorial.queue.operations import (
     enqueue_task,
@@ -1049,10 +1050,7 @@ class TestHookResolutionFlow:
             manager: Annotated[ManagerApproval, hook.requires(request_manager)],
             finance: Annotated[FinanceApproval, hook.requires(request_finance)],
         ) -> str:
-            return (
-                f"transfer-approved:{amount}:"
-                f"{manager.approved}:{finance.approved}"
-            )
+            return f"transfer-approved:{amount}:{manager.approved}:{finance.approved}"
 
         from tests.integration.conftest import MOCK_MODEL
 
@@ -1067,7 +1065,9 @@ class TestHookResolutionFlow:
         task = Task.create(
             owner_id=test_owner_id,
             agent=hook_agent.name,
-            payload=AgentContext(messages=[{"role": "user", "content": "approve transfer"}]),
+            payload=AgentContext(
+                messages=[{"role": "user", "content": "approve transfer"}]
+            ),
         )
         task_id = await self._setup_processing_task(
             redis_client=redis_client,
@@ -1102,7 +1102,8 @@ class TestHookResolutionFlow:
         )
         token = execution_context.set(exec_ctx)
         try:
-            initial_result = await hook_agent.tool_action(
+            initial_result = await tool_action(
+                hook_agent,
                 synthetic_tool_call,
                 task.payload,
             )
@@ -1614,7 +1615,8 @@ class TestHookResolutionFlow:
         )
         token = execution_context.set(exec_ctx)
         try:
-            initial_result = await hook_agent.tool_action(
+            initial_result = await tool_action(
+                hook_agent,
                 synthetic_tool_call,
                 task.payload,
             )

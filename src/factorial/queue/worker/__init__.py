@@ -1,6 +1,5 @@
 from .common import (
     CompletionAction,
-    _steering_message_sort_key,
     classify_failure,
     steering_message_sort_key,
 )
@@ -21,7 +20,6 @@ __all__ = [
     "CompletionAction",
     "classify_failure",
     "steering_message_sort_key",
-    "_steering_message_sort_key",
     "process_task",
     "worker_loop",
 ]

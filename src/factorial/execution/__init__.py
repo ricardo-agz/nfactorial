@@ -28,7 +28,6 @@ from .messaging import (
 )
 from .signals import SignalEnvelope, SignalsNamespace, signals
 from .subagents import JobRef, SignalDeliveryReport, SubagentsNamespace, subagents
-from .tools import Hidden, ToolDefinition, tool
 from .waits import WaitInstruction, WaitNamespace, wait
 
 __all__ = [
@@ -61,9 +60,6 @@ __all__ = [
     "SignalDeliveryReport",
     "SubagentsNamespace",
     "subagents",
-    "Hidden",
-    "ToolDefinition",
-    "tool",
     "WaitInstruction",
     "WaitNamespace",
     "wait",

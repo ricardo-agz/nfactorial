@@ -14,7 +14,7 @@
 
 ## Problem Statement
 
-Current patterns around deferred and forking tools are powerful but can feel implicit:
+Current patterns around deferred tools and child-task waiting are powerful but can feel implicit:
 
 - behavior is inferred from decorators and function attributes
 - return-shape conventions (for example tuples) are not fully explicit in type contracts
@@ -648,7 +648,7 @@ async def monitor_release(...):
     if cooling_down:
         return wait.sleep(300, data="Cooling down")
     if awaiting_next_tick:
-        return wait.cron("*/5 * * * *", tz="UTC", data="Waiting for next tick")
+        return wait.cron("*/5 * * * *", timezone="UTC", data="Waiting for next tick")
     jobs = await subagents.spawn(agent=search_agent, inputs=payloads, key="search")
     return wait.jobs(jobs)
 ```

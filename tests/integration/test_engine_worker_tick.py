@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from factorial.execution.context import AgentContext
+from factorial.agent.context import AgentContext
 from factorial.queue.operations import enqueue_task
 from factorial.queue.task import Task, TaskStatus, get_task_status
 from factorial.queue.worker.tick import WorkerTickContext, worker_tick
@@ -22,7 +22,7 @@ async def test_worker_tick_processes_enqueued_task(
     task = Task.create(
         owner_id="owner-123",
         agent=test_agent.name,
-        payload=AgentContext(query="run once", messages=[], turn=0),
+        payload=AgentContext(messages=[{"role": "user", "content": "run once"}]),
     )
     await enqueue_task(
         redis_client=redis_client,

@@ -81,7 +81,7 @@ class TaskRuntimeOps:
                     task_id=self.task.id,
                     action=action.value,
                     updated_task_payload_json=self.task.payload.to_json(),
-                    current_turn=self.task.payload.turn,
+                    current_turn=self.task.payload.turn_number,
                     parent_task_id=self.task.metadata.parent_id,
                     pending_tool_call_ids=pending_tool_call_ids,
                     pending_child_task_ids=pending_child_task_ids,
@@ -409,7 +409,7 @@ class TaskRuntimeOps:
                 task_id=self.task.id,
                 owner_id=self.task.metadata.owner_id,
                 agent_name=self.agent.name,
-                turn=self.task.payload.turn,
+                turn=self.task.payload.turn_number,
                 data=event_data,
             )
         )

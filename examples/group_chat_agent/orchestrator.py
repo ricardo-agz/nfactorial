@@ -7,7 +7,7 @@ from factorial import AgentWorkerConfig, Orchestrator
 orchestrator = Orchestrator()
 
 for agent in [parent_agent, researcher_agent, skeptic_agent, synthesizer_agent]:
-    orchestrator.register_runner(
+    orchestrator.register(
         agent=agent,
         agent_worker_config=AgentWorkerConfig(
             workers=20,

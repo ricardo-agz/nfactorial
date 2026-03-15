@@ -6,8 +6,9 @@ import uuid
 from dataclasses import dataclass
 from typing import Any
 
+from factorial.agent.context import AgentContext
 from factorial.core.utils import serialize_data
-from factorial.execution.context import AgentContext, ExecutionContext
+from factorial.execution.context import ExecutionContext
 from factorial.execution.waits import WaitInstruction, wait
 
 # Readable UUID namespace tree for deterministic spawn IDs.
@@ -60,36 +61,49 @@ class SignalDeliveryReport:
 
 
 def _coerce_inputs_for_agent(agent: Any, inputs: list[Any]) -> list[AgentContext]:
-    context_class = getattr(agent, "context_class", None)
-    if (
-        not isinstance(context_class, type)
-        or not issubclass(context_class, AgentContext)
-    ):
+    context_from_dict = getattr(agent, "context_from_dict", None)
+    build_context = getattr(agent, "build_context", None)
+    if not callable(context_from_dict) or not callable(build_context):
         raise TypeError(
-            f"Subagent '{getattr(agent, 'name', '<unknown>')}' has invalid "
-            f"context_class '{context_class}'."
+            f"Subagent '{getattr(agent, 'name', '<unknown>')}' cannot coerce v2 inputs."
         )
 
     coerced_inputs: list[AgentContext] = []
     for input_item in inputs:
-        if isinstance(input_item, context_class):
+        if isinstance(input_item, AgentContext):
             coerced_inputs.append(input_item)
             continue
 
+        if isinstance(input_item, str):
+            coerced_inputs.append(build_context(input_item))
+            continue
+
+        if isinstance(input_item, list) and all(
+            isinstance(message, dict) for message in input_item
+        ):
+            coerced_inputs.append(build_context(input_item))
+            continue
+
         if isinstance(input_item, dict):
-            coerced_inputs.append(context_class.from_dict(input_item))
+            if isinstance(input_item.get("role"), str):
+                coerced_inputs.append(build_context([input_item]))
+            else:
+                coerced_inputs.append(context_from_dict(input_item))
             continue
 
         model_dump = getattr(input_item, "model_dump", None)
         if callable(model_dump):
             dumped = model_dump()
             if isinstance(dumped, dict):
-                coerced_inputs.append(context_class.from_dict(dumped))
+                if isinstance(dumped.get("role"), str):
+                    coerced_inputs.append(build_context([dumped]))
+                else:
+                    coerced_inputs.append(context_from_dict(dumped))
                 continue
 
         raise TypeError(
-            "subagents.spawn inputs must be context instances, dicts, "
-            f"or pydantic models. Got {type(input_item).__name__}."
+            "subagents.spawn inputs must be context instances, strings, message "
+            f"lists, dicts, or pydantic models. Got {type(input_item).__name__}."
         )
 
     return coerced_inputs

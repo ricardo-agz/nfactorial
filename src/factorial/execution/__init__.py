@@ -1,4 +1,4 @@
-from .context import AgentContext, ContextType, ExecutionContext, VerificationState
+from .context import ExecutionContext
 from .hooks import (
     Hook,
     HookDependency,
@@ -32,10 +32,7 @@ from .tools import Hidden, ToolDefinition, tool
 from .waits import WaitInstruction, WaitNamespace, wait
 
 __all__ = [
-    "AgentContext",
-    "ContextType",
     "ExecutionContext",
-    "VerificationState",
     "Hook",
     "HookDependency",
     "HookRequestBuilder",

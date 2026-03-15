@@ -9,7 +9,7 @@ from factorial.core.exceptions import (
     MessagingPermissionError,
     MessagingScopeError,
 )
-from factorial.execution.context import AgentContext
+from factorial.agent.context import AgentContext
 from factorial.queue.keys import RedisKeys
 from factorial.queue.operations import (
     enqueue_task,
@@ -50,7 +50,7 @@ async def _enqueue_root_task(
     task = Task.create(
         owner_id=owner_id,
         agent=agent.name,
-        payload=AgentContext(query=query),
+        payload=AgentContext(messages=[{"role": "user", "content": query}]),
     )
     await enqueue_task(
         redis_client=redis_client,
@@ -80,7 +80,7 @@ async def test_group_create_get_and_list_are_team_scoped(
     teammate = Task.create(
         owner_id=test_owner_id,
         agent=test_agent.name,
-        payload=AgentContext(query="teammate"),
+        payload=AgentContext(messages=[{"role": "user", "content": "teammate"}]),
     )
     teammate.metadata.team_id = team_id
     await enqueue_task(
@@ -192,7 +192,7 @@ async def test_group_send_fanout_and_history_persistence(
         teammate = Task.create(
             owner_id=test_owner_id,
             agent=test_agent.name,
-            payload=AgentContext(query=f"teammate-{idx}"),
+            payload=AgentContext(messages=[{"role": "user", "content": f"teammate-{idx}"}]),
         )
         teammate.metadata.team_id = team_id
         await enqueue_task(
@@ -300,7 +300,7 @@ async def test_group_send_skips_inactive_members(
     teammate = Task.create(
         owner_id=test_owner_id,
         agent=test_agent.name,
-        payload=AgentContext(query="teammate"),
+        payload=AgentContext(messages=[{"role": "user", "content": "teammate"}]),
     )
     teammate.metadata.team_id = team_id
     await enqueue_task(
@@ -353,7 +353,7 @@ async def test_group_add_members_requires_sender_membership(
     non_member = Task.create(
         owner_id=test_owner_id,
         agent=test_agent.name,
-        payload=AgentContext(query="non-member"),
+        payload=AgentContext(messages=[{"role": "user", "content": "non-member"}]),
     )
     non_member.metadata.team_id = team_id
     await enqueue_task(
@@ -366,7 +366,7 @@ async def test_group_add_members_requires_sender_membership(
     to_add = Task.create(
         owner_id=test_owner_id,
         agent=test_agent.name,
-        payload=AgentContext(query="to-add"),
+        payload=AgentContext(messages=[{"role": "user", "content": "to-add"}]),
     )
     to_add.metadata.team_id = team_id
     await enqueue_task(
@@ -427,7 +427,7 @@ async def test_group_remove_members_requires_sender_membership(
     target = Task.create(
         owner_id=test_owner_id,
         agent=test_agent.name,
-        payload=AgentContext(query="target"),
+        payload=AgentContext(messages=[{"role": "user", "content": "target"}]),
     )
     target.metadata.team_id = team_id
     await enqueue_task(
@@ -440,7 +440,7 @@ async def test_group_remove_members_requires_sender_membership(
     non_member = Task.create(
         owner_id=test_owner_id,
         agent=test_agent.name,
-        payload=AgentContext(query="non-member"),
+        payload=AgentContext(messages=[{"role": "user", "content": "non-member"}]),
     )
     non_member.metadata.team_id = team_id
     await enqueue_task(
@@ -487,7 +487,7 @@ async def test_group_remove_members_and_leave_update_membership(
     teammate = Task.create(
         owner_id=test_owner_id,
         agent=test_agent.name,
-        payload=AgentContext(query="teammate"),
+        payload=AgentContext(messages=[{"role": "user", "content": "teammate"}]),
     )
     teammate.metadata.team_id = team_id
     await enqueue_task(
@@ -571,7 +571,7 @@ async def test_group_send_prunes_missing_members(
     stale_member = Task.create(
         owner_id=test_owner_id,
         agent=test_agent.name,
-        payload=AgentContext(query="stale-member"),
+        payload=AgentContext(messages=[{"role": "user", "content": "stale-member"}]),
     )
     stale_member.metadata.team_id = team_id
     await enqueue_task(
@@ -692,7 +692,7 @@ async def test_human_group_send_supports_all_target_selectors(
     teammate = Task.create(
         owner_id=test_owner_id,
         agent=test_agent.name,
-        payload=AgentContext(query="teammate"),
+        payload=AgentContext(messages=[{"role": "user", "content": "teammate"}]),
     )
     teammate.metadata.team_id = team_id
     await enqueue_task(
@@ -776,7 +776,7 @@ async def test_group_history_and_thread_list_support_pagination(
     teammate = Task.create(
         owner_id=test_owner_id,
         agent=test_agent.name,
-        payload=AgentContext(query="teammate"),
+        payload=AgentContext(messages=[{"role": "user", "content": "teammate"}]),
     )
     teammate.metadata.team_id = team_id
     await enqueue_task(
@@ -868,7 +868,7 @@ async def test_direct_history_and_thread_list_are_symmetric(
     task_b = Task.create(
         owner_id=test_owner_id,
         agent=test_agent.name,
-        payload=AgentContext(query="task-b"),
+        payload=AgentContext(messages=[{"role": "user", "content": "task-b"}]),
     )
     task_b.metadata.team_id = team_id
     await enqueue_task(
@@ -881,7 +881,7 @@ async def test_direct_history_and_thread_list_are_symmetric(
     task_c = Task.create(
         owner_id=test_owner_id,
         agent=test_agent.name,
-        payload=AgentContext(query="task-c"),
+        payload=AgentContext(messages=[{"role": "user", "content": "task-c"}]),
     )
     task_c.metadata.team_id = team_id
     await enqueue_task(
@@ -975,7 +975,7 @@ async def test_direct_inbox_peek_mark_read_and_receipts_flow(
     recipient = Task.create(
         owner_id=test_owner_id,
         agent=test_agent.name,
-        payload=AgentContext(query="recipient"),
+        payload=AgentContext(messages=[{"role": "user", "content": "recipient"}]),
     )
     recipient.metadata.team_id = team_id
     await enqueue_task(
@@ -1069,7 +1069,7 @@ async def test_group_inbox_peek_mark_read_and_data_roundtrip(
     teammate = Task.create(
         owner_id=test_owner_id,
         agent=test_agent.name,
-        payload=AgentContext(query="teammate"),
+        payload=AgentContext(messages=[{"role": "user", "content": "teammate"}]),
     )
     teammate.metadata.team_id = team_id
     await enqueue_task(

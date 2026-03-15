@@ -14,7 +14,7 @@ orchestrator = Orchestrator(
 )
 
 # Register your agent
-orchestrator.register_runner(
+orchestrator.register(
     agent=my_agent,
     agent_worker_config=AgentWorkerConfig(workers=10),
     maintenance_worker_config=MaintenanceWorkerConfig(),
@@ -77,13 +77,11 @@ config = MaintenanceWorkerConfig(
 
 ```python
 import asyncio
-from factorial import AgentContext
 
 async def submit_task():
-    context = AgentContext(query="Analyze this data")
-    task = await orchestrator.create_agent_task(
-        agent=agent,
-        payload=context,
+    task = await orchestrator.enqueue(
+        agent,
+        input="Analyze this data",
         owner_id="user123",
         idempotency_key="request-123",  # optional
     )
@@ -91,6 +89,8 @@ async def submit_task():
 
 task_id = asyncio.run(submit_task())
 ```
+
+`enqueue` returns a `TaskHandle`; use `task.snapshot()` to check status and `task.wait()` to block for the result.
 
 If you retry the same enqueue call with the same `idempotency_key` and payload,
 the orchestrator returns the same `task_id` instead of creating a duplicate task.

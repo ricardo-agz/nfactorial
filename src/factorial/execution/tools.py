@@ -1,6 +1,6 @@
 import asyncio
 import inspect
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from enum import Enum
 from functools import wraps
@@ -19,7 +19,8 @@ from typing import (
 from openai.types.chat import ChatCompletionMessageToolCall
 from pydantic import BaseModel
 
-from factorial.execution.context import AgentContext, ExecutionContext
+from factorial.agent.context import AgentContext
+from factorial.execution.context import ExecutionContext
 from factorial.execution.hooks import (
     HookExecutionPlan,
     compile_hook_plan,
@@ -391,7 +392,7 @@ tool = _ToolDecorator()
 # ---------------------------------------------------------------------------
 
 def convert_tools_list(
-    tools: list[ToolDefinition[ContextT] | F],
+    tools: Sequence[ToolDefinition[ContextT] | F],
 ) -> tuple[list[ToolDefinition[ContextT]], dict[str, ToolAction]]:
     """Convert mixed list of tool definitions and callables to schemas."""
     tool_schemas: list[ToolDefinition[ContextT]] = []
@@ -407,19 +408,6 @@ def convert_tools_list(
         tool_actions[tool_instance.name] = tool_instance.on_invoke_tool
 
     return tool_schemas, tool_actions
-
-
-def create_final_output_tool(output_type: type[BaseModel]) -> dict[str, Any]:
-    return {
-        "type": "function",
-        "function": {
-            "name": "final_output",
-            "description": "Complete the task and return the final output to the user",
-            "parameters": output_type.model_json_schema(),
-        },
-    }
-
-
 def forking_tool(
     timeout: float,
 ) -> Callable[

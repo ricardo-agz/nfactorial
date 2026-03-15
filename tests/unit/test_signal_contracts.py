@@ -86,8 +86,7 @@ async def test_subagents_signal_routes_single_target_callback() -> None:
     ctx = ExecutionContext(
         task_id="parent-task",
         owner_id="owner",
-        retries=0,
-        iterations=0,
+        retry_count=0,
         events=cast(EventPublisher, _NoopEvents()),
         subagents=SubagentsExecutionNamespace(signal_callback=_signal_child),
     )
@@ -132,8 +131,7 @@ async def test_subagents_signal_routes_batch_callback_with_dedupe() -> None:
     ctx = ExecutionContext(
         task_id="parent-task",
         owner_id="owner",
-        retries=0,
-        iterations=0,
+        retry_count=0,
         events=cast(EventPublisher, _NoopEvents()),
         subagents=SubagentsExecutionNamespace(signal_many_callback=_signal_children),
     )
@@ -160,8 +158,7 @@ def test_signals_namespace_reads_current_envelope_and_wake_reason() -> None:
     ctx = ExecutionContext(
         task_id="child-task",
         owner_id="owner",
-        retries=0,
-        iterations=0,
+        retry_count=0,
         events=cast(EventPublisher, _NoopEvents()),
         signals=SignalsExecutionNamespace(
             current_signal={
@@ -194,8 +191,7 @@ def test_signals_namespace_returns_timeout_wake_without_current_signal() -> None
     ctx = ExecutionContext(
         task_id="child-task",
         owner_id="owner",
-        retries=0,
-        iterations=0,
+        retry_count=0,
         events=cast(EventPublisher, _NoopEvents()),
         signals=SignalsExecutionNamespace(
             current_signal=None,

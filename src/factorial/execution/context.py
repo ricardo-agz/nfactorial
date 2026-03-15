@@ -4,19 +4,17 @@ import builtins
 from collections.abc import Awaitable, Callable
 from contextvars import ContextVar
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, TypeVar
+from typing import TYPE_CHECKING, Any
 
-from pydantic import BaseModel, Field
-
+from factorial.agent.context import ContextType
 from factorial.core.events import EventPublisher
+from factorial.core.run_types import TurnSummary, UsageSummary
 
 if TYPE_CHECKING:
     from factorial.agent import BaseAgent  # pragma: no cover
     from factorial.queue.task import Batch  # pragma: no cover
 
 execution_context: ContextVar[ExecutionContext] = ContextVar("execution_context")
-
-ContextType = TypeVar("ContextType", bound="AgentContext")
 
 
 EnqueueChildTaskCallback = Callable[
@@ -267,7 +265,7 @@ class MessagingGroupsExecutionNamespace:
     async def create(
         self,
         group_name: str,
-        member_task_ids: list[str] | None,
+        member_task_ids: builtins.list[str] | None,
     ) -> dict[str, Any]:
         callback = self.create_callback
         if callback is None:
@@ -284,7 +282,7 @@ class MessagingGroupsExecutionNamespace:
             )
         return await callback(group_name)
 
-    async def list(self) -> list[dict[str, Any]]:
+    async def list(self) -> builtins.list[dict[str, Any]]:
         callback = self.list_callback
         if callback is None:
             raise RuntimeError(
@@ -519,13 +517,15 @@ class SignalsExecutionNamespace:
 
 @dataclass
 class ExecutionContext:
-    """Per-request context (not stored on agent)"""
+    """Runtime-owned context for one active execution."""
 
     task_id: str
     owner_id: str
-    retries: int
-    iterations: int
-    events: EventPublisher
+    retry_count: int = 0
+    wake_reason: str | None = None
+    usage: UsageSummary = field(default_factory=UsageSummary.zero)
+    last_turn: TurnSummary | None = None
+    events: EventPublisher | None = None
     subagents: SubagentsExecutionNamespace = field(
         default_factory=SubagentsExecutionNamespace
     )
@@ -534,11 +534,13 @@ class ExecutionContext:
         default_factory=MessagingExecutionNamespace
     )
     inbox: InboxExecutionNamespace = field(default_factory=InboxExecutionNamespace)
-    signals: SignalsExecutionNamespace = field(default_factory=SignalsExecutionNamespace)
+    signals: SignalsExecutionNamespace = field(
+        default_factory=SignalsExecutionNamespace
+    )
 
     @classmethod
     def current(cls) -> ExecutionContext:
-        """Get current execution context"""
+        """Get the runtime context for the current executing task."""
         return execution_context.get()
 
     async def spawn_child_task(
@@ -596,44 +598,16 @@ class ExecutionContext:
         await self.hooks.persist_runtime(runtime_payload)
 
 
-class VerificationState(BaseModel):
-    attempts_used: int = 0
-    last_candidate_hash: str | None = None
-    last_outcome: str | None = None
-
-
-class AgentContext(BaseModel):
-    """
-    Agent state passed to the agent for turn execution.
-
-    Base Fields:
-    - query: str
-    - messages: list[dict[str, Any]] = []
-    - turn: int = 0
-    - output: Any = None
-    """
-
-    query: str
-    messages: list[dict[str, Any]] = []
-    turn: int = 0
-    output: Any = None
-    attempt: int = 0
-    verification: VerificationState = Field(default_factory=VerificationState)
-
-    class Config:
-        extra = "allow"  # Users can add extra fields
-        arbitrary_types_allowed = True  # For Any type flexibility
-
-    def to_dict(self) -> dict[str, Any]:
-        return self.model_dump()
-
-    @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> AgentContext:
-        return cls(**data)
-
-    def to_json(self) -> str:
-        return self.model_dump_json()
-
-    @classmethod
-    def from_json(cls, json_str: str) -> AgentContext:
-        return cls.model_validate_json(json_str)
+__all__ = [
+    "ExecutionContext",
+    "HooksExecutionNamespace",
+    "InboxDirectExecutionNamespace",
+    "InboxExecutionNamespace",
+    "InboxGroupExecutionNamespace",
+    "InboxReceiptsExecutionNamespace",
+    "MessagingExecutionNamespace",
+    "MessagingGroupsExecutionNamespace",
+    "SignalsExecutionNamespace",
+    "SubagentsExecutionNamespace",
+    "execution_context",
+]

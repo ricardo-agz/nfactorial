@@ -1,13 +1,12 @@
 from __future__ import annotations
 
 from agents import mafia_game_master_agent, mafia_player_agent
-
 from factorial import AgentWorkerConfig, MaintenanceWorkerConfig, Orchestrator
 
 orchestrator = Orchestrator()
 
 for agent in [mafia_game_master_agent, mafia_player_agent]:
-    orchestrator.register_runner(
+    orchestrator.register(
         agent=agent,
         agent_worker_config=AgentWorkerConfig(
             workers=24,

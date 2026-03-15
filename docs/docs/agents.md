@@ -7,7 +7,7 @@ Agents are the core building blocks of Factorial applications. They are LLMs equ
 The simplest way to create an agent:
 
 ```python
-from factorial import Agent, AgentContext
+from factorial import Agent
 
 def get_weather(location: str) -> str:
     """Get the current weather for a location"""
@@ -56,8 +56,8 @@ agent = Agent(
 )
 
 # Dynamic model based on context
-def choose_model(agent_ctx: AgentContext) -> Model:
-    return gpt_41 if agent_ctx.turn == 0 else gpt_41_mini
+def choose_model(agent_ctx) -> Model:
+    return gpt_41 if agent_ctx.turn_number == 1 else gpt_41_mini
 
 agent = Agent(
     description="Assistant", 
@@ -66,279 +66,134 @@ agent = Agent(
 )
 ```
 
-**`model_settings`** (ModelSettings): Configuration for model parameters like temperature, tool choice, etc.
+**`temperature`** (float): Model temperature (0.0–2.0).
 
-**`max_turns`** (int): Maximum number of conversation turns before the agent must complete. Useful for preventing infinite loops.
+**`tool_choice`** (str | dict): Tool choice for the model (`"auto"`, `"required"`, `"none"`, or a specific tool).
 
-**`output_type`** (BaseModel): Pydantic model for structured output. When set, the agent must use the `final_output` tool to complete.
+**`prepare_turn`** (Callable): Optional hook that runs before each model call. It always receives `turn`, and `agent_ctx` / `execution_ctx` are injected only if your function declares them.
 
-**`verifier`** (Callable): Optional sync/async callable that validates the parsed `output_type` value before completion. The first argument is the validated output model instance. Raise `VerificationRejected` to request a revision.
+**`stop_when`** (Callable | StopCondition): When to stop the loop. Default: `stop.any_of(stop.no_tool_calls(), stop.turn_count_is(10))`. Use `stop.turn_count_is(n)` or `stop.tool_called("done")` for custom behavior.
 
-**`verifier_max_attempts`** (int): Maximum number of counted verification rejections before the task fails (default: 3).
-
-**`context_class`** (type): Custom context class to use instead of the default `AgentContext`.
-
-**`context_window_limit`** (int): Maximum number of tokens in the context window.
+**`verifier`** (Callable): Optional sync/async callable that validates output before completion. Returns `verify.accept()`, `verify.retry(message=...)`, or `verify.fail(message=...)`.
+If you want a retry cap, enforce it inside the verifier with `agent_ctx.verification.attempts_used`.
 
 **`request_timeout`** (float): HTTP timeout for LLM requests in seconds (default: 120.0).
 
 **`parse_tool_args`** (bool): Whether to parse tool arguments as JSON (default: True).
 
-## Model Settings
+## Dynamic Turn Configuration
 
-Use `ModelSettings` to configure LLM behavior:
+Use `prepare_turn` to set per-turn `tool_choice`, `temperature`, or other model settings:
 
 ```python
-from factorial import ModelSettings, AgentContext
+from factorial import Agent, stop
+
+def my_prepare_turn(turn, agent_ctx):
+    if agent_ctx.turn_number == 1:
+        turn.tool_choice = {"type": "function", "function": {"name": "plan"}}
+    else:
+        turn.tool_choice = "required"
+    turn.temperature = 0.2
 
 agent = Agent(
-    description="Creative Writer",
-    instructions="You write creative stories",
-    model_settings=ModelSettings[AgentContext](
-        temperature=0.8, 
-        max_completion_tokens=1000,
-        tool_choice="auto",
-        parallel_tool_calls=True,
-    ),
+    instructions="You plan then execute.",
+    model=gpt_41,
+    tools=[plan, search],
+    prepare_turn=my_prepare_turn,
+    stop_when=stop.any_of(stop.no_tool_calls(), stop.turn_count_is(12)),
 )
 ```
 
-### Dynamic Model Settings
+## Typed Output
 
-Model settings can be functions that receive the agent context:
-
-```python
-agent = Agent(
-    description="Adaptive Assistant",
-    instructions="You adapt your behavior based on conversation progress",
-    model_settings=ModelSettings(
-        temperature=lambda ctx: 0 if ctx.turn == 0 else 1,
-        tool_choice=lambda ctx: (
-            {
-                "type": "function",
-                "function": {"name": "plan"},
-            }
-            if ctx.turn == 0
-            else "required"
-        ),
-    ),
-)
-```
-
-## Structured Output
-
-Define structured output using Pydantic models:
+For structured output, define a finish tool and use `stop_when=tool_called("done")`:
 
 ```python
-from factorial.core.utils import BaseModel
+from pydantic import BaseModel
+from factorial import Agent, stop, tool
 
 class Joke(BaseModel):
     setup: str
     punchline: str
 
+@tool
+def done(result: Joke) -> Joke:
+    return result
+
 agent = Agent(
-    description="Joke Agent",
-    instructions="Funny agent",
-    tools=[search_web],
-    output_type=Joke,
+    instructions="Tell a joke, then call done with the result.",
+    tools=[search_web, done],
+    stop_when=stop.tool_called("done"),
 )
 ```
 
-When `output_type` is set, the agent automatically creates a `final_output` tool that the agent must call to complete.
-
 ## Output Verification
 
-You can gate completion by passing a verifier callable to `Agent(...)`.
-The verifier can be sync or async.
+Use `verify.accept()`, `verify.retry()`, or `verify.fail()` in your verifier:
 
 ```python
-from pydantic import BaseModel
-from factorial import Agent, AgentContext, ExecutionContext, VerificationRejected
+from factorial import Agent, verify
 
-
-class AgentOutput(BaseModel):
-    summary: str
-    score: int
-
-
-class FinalResult(BaseModel):
-    summary: str
-    verified: bool
-
-
-async def verify_output(
-    output: AgentOutput,
-    agent_ctx: AgentContext,
-    execution_ctx: ExecutionContext,
-) -> FinalResult:
+def verify_output(output: AgentOutput, *, agent_ctx):
     if output.score < 80:
-        raise VerificationRejected(
+        return verify.fail(
             message="Score below acceptance threshold",
             code="score_low",
             metadata={"score": output.score, "minimum": 80},
         )
-    return FinalResult(summary=output.summary, verified=True)
+    return verify.accept()
+```
 
+## Enqueueing Tasks
 
-agent = Agent(
-    description="Verified agent",
-    instructions="Return structured output only.",
-    output_type=AgentOutput,
-    verifier=verify_output,
-    verifier_max_attempts=5,
+Enqueue tasks through the orchestrator:
+
+```python
+task = await orchestrator.enqueue(
+    agent,
+    input="What's the weather in San Francisco?",
+    owner_id="user123",
 )
+# task is a TaskHandle; use task.snapshot(), task.wait(), task.updates()
 ```
 
-Verification semantics:
+## Typed State and AgentContext
 
-- `verifier` returns -> task completes with verifier return value.
-- `verifier` raises `VerificationRejected` -> agent continues with verifier feedback.
-- counted attempts are bounded by `verifier_max_attempts`.
-- `FatalAgentError` inside verifier fails immediately.
-
-## Creating and Running Tasks
-
-Agents don't run directly - they process tasks through an orchestrator:
+Use `Agent[StateT, MetadataT]` with a state dataclass for typed state. `AgentContext` exposes `messages`, `state`, and `metadata`:
 
 ```python
-from factorial import AgentContext
+from dataclasses import dataclass
+from factorial import Agent
 
-task = agent.create_task(
-    owner_id="user123", 
-    payload=AgentContext(
-        query="What's the weather like in San Francisco?"
-    )
-)
-
-# Enqueue the task (see the orchestrator section on how to set up the orchestrator)
-await orchestrator.enqueue_task(agent=agent, task=task)
-```
-
-## Custom Agent Classes
-
-For advanced use cases, extend `BaseAgent` or `Agent`:
-
-```python
-from factorial import BaseAgent, AgentContext, ExecutionContext
-
-class CustomAgent(BaseAgent[AgentContext]):
-    async def completion(
-        self, 
-        agent_ctx: AgentContext, 
-        messages: list[dict[str, Any]]
-    ) -> ChatCompletion:
-        """Override to customize LLM completion"""
-        # Add custom logic before completion
-        print(f"Making completion request for turn {agent_ctx.turn}")
-        
-        # Call parent implementation
-        response = await super().completion(agent_ctx, messages)
-        
-        # Add custom logic after completion
-        print(f"Received response with {len(response.choices)} choices")
-        
-        return response
-    
-    async def tool_action(
-        self, 
-        tool_call: ChatCompletionMessageToolCall, 
-        agent_ctx: AgentContext
-    ):
-        """Override to customize tool execution"""
-        print(f"Executing tool: {tool_call.function.name}")
-        
-        return await super().tool_action(tool_call, agent_ctx)
-    
-    async def run_turn(
-        self, 
-        agent_ctx: AgentContext
-    ) -> TurnCompletion[AgentContext]:
-        """Override to customize turn logic"""
-        execution_ctx = self.get_execution_context()
-        
-        # Custom logic before turn
-        if agent_ctx.turn > 5:
-            # Force completion after 5 turns
-            return TurnCompletion(
-                is_done=True,
-                context=agent_ctx,
-                output="Conversation limit reached"
-            )
-        
-        return await super().run_turn(agent_ctx)
-```
-
-## Custom Context Classes
-
-Create custom context classes for specialized agents:
-
-```python
-from factorial import AgentContext, BaseAgent
-
-class ResearchContext(AgentContext):
+@dataclass
+class ResearchState:
     research_topic: str = ""
     sources_found: list[str] = []
     confidence_level: float = 0.0
 
-class ResearchAgent(BaseAgent[ResearchContext]):
-    def __init__(self):
-        super().__init__(
-            description="Research specialist",
-            instructions="You conduct thorough research",
-            tools=[search_web, analyze_source],
-            context_class=ResearchContext,
-        )
-    
-    async def run_turn(self, agent_ctx: ResearchContext) -> TurnCompletion[ResearchContext]:
-        # Access custom context fields
-        print(f"Researching: {agent_ctx.research_topic}")
-        print(f"Sources found: {len(agent_ctx.sources_found)}")
-        
-        return await super().run_turn(agent_ctx)
-
-# Usage
-research_context = ResearchContext(
-    query="Research the impact of AI on education",
-    research_topic="AI in Education",
-    messages=[],
-    turn=0,
+research_agent = Agent[ResearchState](
+    description="Research specialist",
+    instructions="You conduct thorough research",
+    tools=[search_web, analyze_source],
 )
 
-task = research_agent.create_task(
+# Enqueue with initial state
+task = await orchestrator.enqueue(
+    research_agent,
+    input="Research the impact of AI on education",
     owner_id="researcher123",
-    payload=research_context
+    state=ResearchState(research_topic="AI in Education"),
 )
 ```
 
-## Error Handling and Retries
-
-Agents include built-in retry logic with exponential backoff:
-
-```python
-from factorial import retry, publish_progress
-
-class RobustAgent(BaseAgent[AgentContext]):
-    @retry(max_attempts=5, delay=2.0, exponential_base=1.5)
-    async def custom_method(self, data: str) -> str:
-        """This method will retry up to 5 times on failure"""
-        # Your logic here
-        return "processed"
-    
-    @publish_progress(func_name="data_processing")
-    async def process_data(self, agent_ctx: AgentContext) -> str:
-        """This method publishes progress events automatically"""
-        # Events published:
-        # - progress_update_data_processing_started
-        # - progress_update_data_processing_completed (or _failed)
-        return await self.custom_method("some data")
-```
+In tools, access state via `agent_ctx.state.*`.
 
 ## Agent Lifecycle
 
 Understanding the agent execution lifecycle:
 
-1. **Task Creation**: Create a task with initial context
-2. **Task Enqueueing**: Add task to the processing queue
+1. **Enqueue**: Call `orchestrator.enqueue(agent, input=..., owner_id=..., state=...)` to create a task
+2. **Task Processing**: Task is added to the processing queue
 3. **Turn Execution**: Agent processes one turn at a time
    - Prepare messages (system prompt + conversation history)
    - Make LLM completion request

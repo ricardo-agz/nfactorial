@@ -54,7 +54,7 @@ orchestrator = Orchestrator(
     redis_db=0,
     redis_max_connections=50,
 )
-orchestrator.register_runner(
+orchestrator.register(
     agent=agent, agent_worker_config=AgentWorkerConfig(workers=1)
 )
 
@@ -70,19 +70,18 @@ In another terminal or script:
 
 ```python
 import asyncio
-from factorial import AgentContext
 
 async def main():
-    # Create task
-    context = AgentContext(query="What's the weather in San Francisco?")
-    task = agent.create_task(owner_id="user123", payload=context)
-    
-    # Submit to orchestrator
-    await orchestrator.enqueue_task(agent, task)
+    # Enqueue task
+    task = await orchestrator.enqueue(
+        agent,
+        input="What's the weather in San Francisco?",
+        owner_id="user123",
+    )
     
     # Check status
-    status = await orchestrator.get_task_status(task.id)
-    print(f"Task status: {status}")
+    snapshot = await task.snapshot()
+    print(f"Task status: {snapshot.status}")
 
 asyncio.run(main())
 ```

@@ -6,7 +6,7 @@ from typing import Any
 
 import pytest
 
-from factorial.execution.context import AgentContext
+from factorial.agent.context import AgentContext
 from factorial.queue.task import Task, TaskMetadata, TaskStatus
 
 
@@ -170,7 +170,7 @@ class TestTask:
 
     def test_create_factory(self, owner_id: str, agent_name: str) -> None:
         """Test Task.create factory method."""
-        context = AgentContext(query="Test query")
+        context = AgentContext(messages=[{"role": "user", "content": "Test query"}])
 
         task = Task.create(
             owner_id=owner_id,
@@ -182,7 +182,7 @@ class TestTask:
 
         assert task.status == TaskStatus.QUEUED
         assert task.agent == agent_name
-        assert task.payload.query == "Test query"
+        assert task.payload.messages == [{"role": "user", "content": "Test query"}]
         assert task.metadata.owner_id == owner_id
         assert task.metadata.max_turns == 10
         assert task.pickups == 0
@@ -205,14 +205,14 @@ class TestTask:
     def test_from_dict(self, sample_task: Task[AgentContext]) -> None:
         """Test Task deserialization from dict."""
         data = sample_task.to_dict()
-        restored = Task.from_dict(data, context_class=AgentContext)
+        restored = Task.from_dict(data, payload_parser=AgentContext.from_dict)
 
         assert restored.id == sample_task.id
         assert restored.status == sample_task.status
         assert restored.agent == sample_task.agent
         assert restored.pickups == sample_task.pickups
         assert restored.retries == sample_task.retries
-        assert restored.payload.query == sample_task.payload.query
+        assert restored.payload.messages == sample_task.payload.messages
 
     def test_to_json(self, sample_task: Task[AgentContext]) -> None:
         """Test Task serialization to JSON string."""
@@ -225,7 +225,7 @@ class TestTask:
     def test_from_json(self, sample_task: Task[AgentContext]) -> None:
         """Test Task deserialization from JSON string."""
         json_str = sample_task.to_json()
-        restored = Task.from_json(json_str, context_class=AgentContext)
+        restored = Task.from_json(json_str, payload_parser=AgentContext.from_dict)
 
         assert restored.id == sample_task.id
         assert restored.status == sample_task.status
@@ -234,7 +234,7 @@ class TestTask:
     def test_from_json_bytes(self, sample_task: Task[AgentContext]) -> None:
         """Test Task deserialization from JSON bytes."""
         json_bytes = sample_task.to_json().encode("utf-8")
-        restored = Task.from_json(json_bytes, context_class=AgentContext)
+        restored = Task.from_json(json_bytes, payload_parser=AgentContext.from_dict)
 
         assert restored.id == sample_task.id
 
@@ -256,7 +256,7 @@ class TestTask:
                 retries=0,
             )
             data = task.to_dict()
-            restored = Task.from_dict(data, context_class=AgentContext)
+            restored = Task.from_dict(data, payload_parser=AgentContext.from_dict)
             assert restored.status == status
 
     def test_with_pickups_and_retries(
@@ -277,7 +277,7 @@ class TestTask:
         )
 
         data = task.to_dict()
-        restored = Task.from_dict(data, context_class=AgentContext)
+        restored = Task.from_dict(data, payload_parser=AgentContext.from_dict)
 
         assert restored.pickups == 3
         assert restored.retries == 2
@@ -287,12 +287,11 @@ class TestTask:
     ) -> None:
         """Test task with context containing messages."""
         context = AgentContext(
-            query="Test query",
             messages=[
                 {"role": "user", "content": "Hello"},
                 {"role": "assistant", "content": "Hi there!"},
             ],
-            turn=1,
+            turn_number=2,
             output="Some output",
         )
 
@@ -307,10 +306,10 @@ class TestTask:
         )
 
         data = task.to_dict()
-        restored = Task.from_dict(data, context_class=AgentContext)
+        restored = Task.from_dict(data, payload_parser=AgentContext.from_dict)
 
         assert len(restored.payload.messages) == 2
-        assert restored.payload.turn == 1
+        assert restored.payload.turn_number == 2
         assert restored.payload.output == "Some output"
 
     def test_minimal_payload_dict(
@@ -321,16 +320,18 @@ class TestTask:
             "id": str(uuid.uuid4()),
             "status": "queued",
             "agent": agent_name,
-            "payload": {"query": "minimal query"},  # Minimal required fields
+            "payload": {
+                "messages": [{"role": "user", "content": "minimal query"}]
+            },
             "pickups": 0,
             "retries": 0,
             "metadata": sample_metadata.to_dict(),
         }
 
-        task = Task.from_dict(data, context_class=AgentContext)
+        task = Task.from_dict(data, payload_parser=AgentContext.from_dict)
         assert task.payload is not None
-        assert task.payload.query == "minimal query"
-        assert task.payload.turn == 0  # Default value
+        assert task.payload.messages == [{"role": "user", "content": "minimal query"}]
+        assert task.payload.turn_number == 1
 
     def test_from_dict_defaults_missing_team_id_to_task_id(
         self,
@@ -345,11 +346,11 @@ class TestTask:
                 "id": task_id,
                 "status": "queued",
                 "agent": agent_name,
-                "payload": {"query": "hello"},
+                "payload": {"messages": [{"role": "user", "content": "hello"}]},
                 "pickups": 0,
                 "retries": 0,
                 "metadata": metadata,
             },
-            context_class=AgentContext,
+            payload_parser=AgentContext.from_dict,
         )
         assert task.metadata.team_id == task_id

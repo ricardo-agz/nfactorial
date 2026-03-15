@@ -5,7 +5,7 @@ from typing import Any, cast
 import pytest
 import redis.asyncio as redis
 
-from factorial.execution.context import AgentContext
+from factorial.agent.context import AgentContext
 from factorial.queue.keys import RedisKeys
 from factorial.queue.lua import EnqueueTaskScript
 from factorial.queue.operations import create_batch_and_enqueue, enqueue_task
@@ -77,7 +77,13 @@ class TestEnqueueTask:
 
         task_data = await get_task_data(redis_client, test_namespace, task_id)
 
-        assert task_data["payload"]["query"] == sample_task.payload.query
+        first_user = next(
+            (m["content"] for m in sample_task.payload.messages if m.get("role") == "user"),
+            None,
+        )
+        assert first_user is not None
+        payload_msgs = task_data["payload"].get("messages", [])
+        assert any(m.get("content") == first_user for m in payload_msgs if m.get("role") == "user")
         assert task_data["agent"] == test_agent.name
 
     async def test_enqueue_task_stores_metadata(
@@ -114,7 +120,7 @@ class TestEnqueueTask:
         task = Task.create(
             owner_id=test_owner_id,
             agent=test_agent.name,
-            payload=AgentContext(query="explicit team"),
+            payload=AgentContext(messages=[{"role": "user", "content": "explicit team"}]),
         )
         task.metadata.team_id = explicit_team_id
         task_id = await enqueue_task(
@@ -138,7 +144,7 @@ class TestEnqueueTask:
 
         task_ids = []
         for i in range(5):
-            ctx = AgentContext(query=f"Query {i}")
+            ctx = AgentContext(messages=[{"role": "user", "content": f"Query {i}"}])
             task = Task.create(
                 owner_id=test_owner_id,
                 agent=test_agent.name,
@@ -192,7 +198,7 @@ class TestEnqueueTask:
 
         task_ids = []
         for i in range(3):
-            ctx = AgentContext(query=f"Query {i}")
+            ctx = AgentContext(messages=[{"role": "user", "content": f"Query {i}"}])
             task = Task.create(
                 owner_id=test_owner_id,
                 agent=test_agent.name,
@@ -221,12 +227,12 @@ class TestEnqueueTask:
         first_task = Task.create(
             owner_id=test_owner_id,
             agent=test_agent.name,
-            payload=AgentContext(query="idempotent enqueue"),
+            payload=AgentContext(messages=[{"role": "user", "content": "idempotent enqueue"}]),
         )
         second_task = Task.create(
             owner_id=test_owner_id,
             agent=test_agent.name,
-            payload=AgentContext(query="idempotent enqueue"),
+            payload=AgentContext(messages=[{"role": "user", "content": "idempotent enqueue"}]),
         )
 
         first_id = await enqueue_task(
@@ -262,7 +268,7 @@ class TestEnqueueTask:
             task=Task.create(
                 owner_id=test_owner_id,
                 agent=test_agent.name,
-                payload=AgentContext(query="first payload"),
+                payload=AgentContext(messages=[{"role": "user", "content": "first payload"}]),
             ),
             idempotency_key="enqueue-conflict",
         )
@@ -275,7 +281,7 @@ class TestEnqueueTask:
                 task=Task.create(
                     owner_id=test_owner_id,
                     agent=test_agent.name,
-                    payload=AgentContext(query="second payload"),
+                    payload=AgentContext(messages=[{"role": "user", "content": "second payload"}]),
                 ),
                 idempotency_key="enqueue-conflict",
             )
@@ -294,7 +300,7 @@ class TestEnqueueBatch:
     ) -> None:
         """Test that batch enqueue creates all tasks."""
         payloads = [
-            AgentContext(query=f"Batch query {i}")
+            AgentContext(messages=[{"role": "user", "content": f"Batch query {i}"}])
             for i in range(5)
         ]
 
@@ -321,7 +327,10 @@ class TestEnqueueBatch:
         test_owner_id: str,
     ) -> None:
         """Test that batch enqueue creates batch metadata."""
-        payloads = [AgentContext(query=f"Query {i}") for i in range(3)]
+        payloads = [
+            AgentContext(messages=[{"role": "user", "content": f"Query {i}"}])
+            for i in range(3)
+        ]
 
         batch = await create_batch_and_enqueue(
             redis_client=redis_client,
@@ -345,7 +354,9 @@ class TestEnqueueBatch:
         test_owner_id: str,
     ) -> None:
         """Test that batch tasks reference the batch ID."""
-        payloads = [AgentContext(query="Test query")]
+        payloads = [
+            AgentContext(messages=[{"role": "user", "content": "Test query"}])
+        ]
 
         batch = await create_batch_and_enqueue(
             redis_client=redis_client,
@@ -370,7 +381,9 @@ class TestEnqueueBatch:
     ) -> None:
         """Test batch enqueue with parent task ID."""
         parent_id = str(uuid.uuid4())
-        payloads = [AgentContext(query="Child query")]
+        payloads = [
+            AgentContext(messages=[{"role": "user", "content": "Child query"}])
+        ]
 
         batch = await create_batch_and_enqueue(
             redis_client=redis_client,
@@ -395,7 +408,10 @@ class TestEnqueueBatch:
         test_owner_id: str,
     ) -> None:
         """Test that batch remaining tasks list is properly initialized."""
-        payloads = [AgentContext(query=f"Query {i}") for i in range(3)]
+        payloads = [
+            AgentContext(messages=[{"role": "user", "content": f"Query {i}"}])
+            for i in range(3)
+        ]
 
         batch = await create_batch_and_enqueue(
             redis_client=redis_client,
@@ -416,7 +432,10 @@ class TestEnqueueBatch:
         test_owner_id: str,
     ) -> None:
         """Re-enqueueing an existing deterministic batch preserves progress state."""
-        payloads = [AgentContext(query=f"Query {i}") for i in range(2)]
+        payloads = [
+            AgentContext(messages=[{"role": "user", "content": f"Query {i}"}])
+            for i in range(2)
+        ]
         task_ids = [str(uuid.uuid4()), str(uuid.uuid4())]
         batch_id = str(uuid.uuid4())
 
@@ -468,7 +487,10 @@ class TestEnqueueBatch:
         test_agent: SimpleTestAgent,
         test_owner_id: str,
     ) -> None:
-        payloads = [AgentContext(query=f"Query {i}") for i in range(2)]
+        payloads = [
+            AgentContext(messages=[{"role": "user", "content": f"Query {i}"}])
+            for i in range(2)
+        ]
         first = await create_batch_and_enqueue(
             redis_client=redis_client,
             namespace=test_namespace,
@@ -515,7 +537,9 @@ class TestEnqueueBatch:
             redis_client=redis_client,
             namespace=test_namespace,
             agent=test_agent,
-            payloads=[AgentContext(query="first")],
+            payloads=[
+                AgentContext(messages=[{"role": "user", "content": "first"}]),
+            ],
             owner_id=test_owner_id,
             idempotency_key="batch-enqueue-conflict",
         )
@@ -525,7 +549,9 @@ class TestEnqueueBatch:
                 redis_client=redis_client,
                 namespace=test_namespace,
                 agent=test_agent,
-                payloads=[AgentContext(query="second")],
+                payloads=[
+                AgentContext(messages=[{"role": "user", "content": "second"}]),
+            ],
                 owner_id=test_owner_id,
                 idempotency_key="batch-enqueue-conflict",
             )
@@ -546,7 +572,7 @@ class TestEnqueueScript:
         """Test that the Lua enqueue script sets all required fields."""
         keys = RedisKeys.format(namespace=test_namespace, agent=test_agent.name)
         task_id = str(uuid.uuid4())
-        payload = AgentContext(query="Test query")
+        payload = AgentContext(messages=[{"role": "user", "content": "Test query"}])
         metadata = {
             "owner_id": test_owner_id,
             "parent_id": None,

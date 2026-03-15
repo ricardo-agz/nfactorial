@@ -21,8 +21,7 @@ def _base_ctx() -> ExecutionContext:
     return ExecutionContext(
         task_id="task-reader",
         owner_id="owner-1",
-        retries=0,
-        iterations=0,
+        retry_count=0,
         events=cast(EventPublisher, _NoopEvents()),
     )
 

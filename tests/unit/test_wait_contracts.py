@@ -131,8 +131,7 @@ def test_wait_jobs_builds_join_instruction() -> None:
     ctx = ExecutionContext(
         task_id="parent-task",
         owner_id="owner",
-        retries=0,
-        iterations=0,
+        retry_count=0,
         events=cast(EventPublisher, _NoopEvents()),
     )
     token = execution_context.set(ctx)
@@ -176,8 +175,7 @@ def test_wait_jobs_accepts_model_dump_refs() -> None:
     ctx = ExecutionContext(
         task_id="parent-task",
         owner_id="owner",
-        retries=0,
-        iterations=0,
+        retry_count=0,
         events=cast(EventPublisher, _NoopEvents()),
     )
     token = execution_context.set(ctx)
@@ -202,8 +200,7 @@ def test_wait_jobs_rejects_foreign_parent_refs() -> None:
     ctx = ExecutionContext(
         task_id="parent-task",
         owner_id="owner",
-        retries=0,
-        iterations=0,
+        retry_count=0,
         events=cast(EventPublisher, _NoopEvents()),
     )
     token = execution_context.set(ctx)
@@ -226,8 +223,7 @@ def test_wait_jobs_rejects_missing_parent_ref_in_execution_context() -> None:
     ctx = ExecutionContext(
         task_id="parent-task",
         owner_id="owner",
-        retries=0,
-        iterations=0,
+        retry_count=0,
         events=cast(EventPublisher, _NoopEvents()),
     )
     token = execution_context.set(ctx)

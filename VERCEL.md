@@ -559,14 +559,14 @@ from agent import my_agent
 from factorial import Orchestrator
 
 orchestrator = Orchestrator()  # auto-selects vercel host when VERCEL=1
-orchestrator.register_runner(agent=my_agent)
+orchestrator.register(agent=my_agent)
 ```
 
 `orchestrator.py`:
 
 ```python
 orchestrator = Orchestrator()
-orchestrator.register_runner(agent=my_agent)
+orchestrator.register(agent=my_agent)
 ```
 
 This is the intended DX: app repos import framework adapters and do not copy nfactorial internals.
@@ -829,7 +829,7 @@ Required telemetry to ship with runtime:
 App author writes:
 
 1. `agents.py` with one or more `Agent(...)` definitions.
-2. `orchestrator.py` that creates one shared `orchestrator` and calls `register_runner(...)`.
+2. `orchestrator.py` that creates one shared `orchestrator` and calls `register(...)`.
 3. Tiny Vercel entrypoints:
    - `orchestrator.create_app(...)`
    - worker service entrypoint points to `orchestrator.py` (runtime calls `orchestrator.bootstrap_vercel_worker_app()` automatically)

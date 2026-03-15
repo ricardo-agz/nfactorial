@@ -7,10 +7,11 @@ from typing import Any
 import redis.asyncio as redis
 
 from factorial.agent import BaseAgent
+from factorial.agent.context import ContextType
 from factorial.core.events import AgentEvent, EventPublisher
 from factorial.core.exceptions import RETRYABLE_EXCEPTIONS, FatalAgentError
 from factorial.core.logging import get_logger
-from factorial.execution.context import ContextType, ExecutionContext
+from factorial.execution.context import ExecutionContext
 from factorial.execution.waits import WaitInstruction
 from factorial.queue.keys import RedisKeys
 from factorial.queue.lua import TaskSteeringScript

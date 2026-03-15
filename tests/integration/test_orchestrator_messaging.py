@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 import redis.asyncio as redis
 
-from factorial.execution.context import AgentContext
+from factorial.agent.context import AgentContext
 from factorial.orchestrator import Orchestrator
 from factorial.orchestrator.messaging import (
     DirectConversationListPage,
@@ -33,7 +33,7 @@ async def _enqueue_root_task(
     task = Task.create(
         owner_id=owner_id,
         agent=agent.name,
-        payload=AgentContext(query=query),
+        payload=AgentContext(messages=[{"role": "user", "content": query}]),
     )
     await enqueue_task(
         redis_client=redis_client,
@@ -63,7 +63,7 @@ async def test_orchestrator_group_messaging_namespace_lists_and_reads_history(
     teammate = Task.create(
         owner_id=test_owner_id,
         agent=test_agent.name,
-        payload=AgentContext(query="teammate"),
+        payload=AgentContext(messages=[{"role": "user", "content": "teammate"}]),
     )
     teammate.metadata.team_id = team_id
     await enqueue_task(
@@ -130,7 +130,7 @@ async def test_orchestrator_direct_messaging_namespace_history_is_symmetric(
     task_b = Task.create(
         owner_id=test_owner_id,
         agent=test_agent.name,
-        payload=AgentContext(query="task-b"),
+        payload=AgentContext(messages=[{"role": "user", "content": "task-b"}]),
     )
     task_b.metadata.team_id = team_id
     await enqueue_task(

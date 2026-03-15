@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-from typing import Any, Literal
+from dataclasses import dataclass, field
+from typing import Any, Literal, TypeAlias
 
+from constants import TOWN_GROUP_NAME, WOLF_GROUP_NAME
 from pydantic import BaseModel, Field
 
 from factorial import AgentContext
-
-from constants import HUMAN_PLAYER_ID, TOWN_GROUP_NAME, WOLF_GROUP_NAME
 
 
 class PlayerRecord(BaseModel):
@@ -27,6 +27,8 @@ class GameStateSnapshot(BaseModel):
     alive_total: int
     alive_villagers: int
     alive_werewolves: int
+    vote_calls_received: int = 0
+    vote_calls_threshold: int = 0
     players_public: list[dict[str, Any]]
     players_omniscient: list[dict[str, Any]]
     human_player_id: str | None = None
@@ -55,56 +57,71 @@ class PlayerFinalOutput(BaseModel):
     final_output: str
 
 
-class MafiaGameContext(AgentContext):
+@dataclass
+class MafiaGameState:
+    """State for the game master agent."""
+
     phase: str = "init"
     game_name: str = "Mafia in nfactorial"
     include_human: bool = True
     human_name: str = "You"
     human_role_preference: Literal["random", "werewolf", "villager"] = "random"
-    ai_player_count: int = 5
-    day_discussion_seconds: int = 25
+    ai_player_count: int = 7
+    day_discussion_seconds: int = 90
     day_vote_seconds: int = 35
     night_seconds: int = 25
     round_no: int = 1
     town_group_name: str = TOWN_GROUP_NAME
     wolf_group_name: str = WOLF_GROUP_NAME
-    players: list[PlayerRecord] = Field(default_factory=list)
-    task_id_to_player_id: dict[str, str] = Field(default_factory=dict)
-    pending_day_votes: dict[str, str] = Field(default_factory=dict)
-    pending_night_actions: dict[str, str] = Field(default_factory=dict)
+    players: list[PlayerRecord] = field(default_factory=list)
+    task_id_to_player_id: dict[str, str] = field(default_factory=dict)
+    pending_vote_calls: dict[str, bool] = field(default_factory=dict)
+    pending_day_votes: dict[str, str] = field(default_factory=dict)
+    pending_night_actions: dict[str, str] = field(default_factory=dict)
     day_discussion_deadline_ts: float | None = None
     day_vote_deadline_ts: float | None = None
     night_deadline_ts: float | None = None
     winner: str | None = None
     winner_reason: str | None = None
-    elimination_log: list[dict[str, Any]] = Field(default_factory=list)
+    elimination_log: list[dict[str, Any]] = field(default_factory=list)
+    query: str = ""
 
 
-class MafiaPlayerContext(AgentContext):
+@dataclass
+class MafiaPlayerState:
+    """State for a player agent."""
+
     player_id: str = ""
     display_name: str = ""
     parent_task_id: str = ""
     role: Literal["villager", "werewolf"] = "villager"
-    phase: str = "await_game_start"
+    phase: str = "await_day_discussion"
     round_no: int = 1
     town_group_name: str = TOWN_GROUP_NAME
     wolf_group_name: str = WOLF_GROUP_NAME
     discussion_round_no: int = 0
     discussion_messages_sent: int = 0
-    pending_day_prompt: str | None = None
-    day_vote_poll_round_no: int = 0
-    day_vote_poll_count: int = 0
-    day_vote_allowed_targets: list[str] = Field(default_factory=list)
+    has_called_vote: bool = False
+    day_vote_allowed_targets: list[str] = field(default_factory=list)
+    day_vote_deadline_ts: float | None = None
+    night_kill_allowed_targets: list[str] = field(default_factory=list)
+    night_alive_werewolf_count: int = 1
+
+
+# Aliases for backwards compatibility in tool signatures
+MafiaGameContext: TypeAlias = AgentContext[MafiaGameState]
+MafiaPlayerContext: TypeAlias = AgentContext[MafiaPlayerState]
 
 
 __all__ = [
-    "HUMAN_PLAYER_ID",
     "PlayerRecord",
     "GameStateSnapshot",
     "GameActionResult",
     "PlayerActionResult",
     "FinalGameOutput",
     "PlayerFinalOutput",
+    "MafiaGameState",
+    "MafiaPlayerState",
     "MafiaGameContext",
     "MafiaPlayerContext",
 ]

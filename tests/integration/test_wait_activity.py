@@ -15,7 +15,15 @@ from openai.types.chat.chat_completion_message_function_tool_call import (
 )
 
 from factorial.agent import BaseAgent, TurnCompletion
-from factorial.execution.context import AgentContext
+from factorial.ai.models import Model, Provider
+from factorial.agent.context import AgentContext
+
+MOCK_MODEL = Model(
+    name="mock-model",
+    provider=Provider.OPENAI,
+    provider_model_id="mock-v1",
+    context_window=128000,
+)
 from factorial.execution.waits import wait
 from factorial.queue.keys import PENDING_SENTINEL, RedisKeys
 from factorial.queue.lua import (
@@ -56,14 +64,14 @@ class _WaitActivityAgent(BaseAgent[AgentContext]):
         super().__init__(
             name=name,
             instructions="Activity wait agent",
-            context_class=AgentContext,
+            model=MOCK_MODEL,
         )
 
     async def run_turn(
         self,
         agent_ctx: AgentContext,
     ) -> TurnCompletion[AgentContext]:
-        agent_ctx.turn += 1
+        agent_ctx.turn_number += 1
         return TurnCompletion(
             is_done=False,
             context=agent_ctx,
@@ -86,7 +94,7 @@ class _WaitActivityWithTimeoutAgent(BaseAgent[AgentContext]):
         super().__init__(
             name=name,
             instructions="Activity wait with timeout agent",
-            context_class=AgentContext,
+            model=MOCK_MODEL,
         )
         self._timeout = timeout
 
@@ -94,7 +102,7 @@ class _WaitActivityWithTimeoutAgent(BaseAgent[AgentContext]):
         self,
         agent_ctx: AgentContext,
     ) -> TurnCompletion[AgentContext]:
-        agent_ctx.turn += 1
+        agent_ctx.turn_number += 1
         return TurnCompletion(
             is_done=False,
             context=agent_ctx,
@@ -202,7 +210,7 @@ async def test_process_task_parks_wait_activity(
     task = Task.create(
         owner_id=test_owner_id,
         agent=agent.name,
-        payload=AgentContext(query="wait on activity"),
+        payload=AgentContext(messages=[{"role": "user", "content": "wait on activity"}]),
         max_turns=10,
     )
     task_id = await enqueue_task(
@@ -257,7 +265,9 @@ async def test_process_task_parks_wait_activity_with_sleep_timeout(
     task = Task.create(
         owner_id=test_owner_id,
         agent=agent.name,
-        payload=AgentContext(query="wait on activity or timeout"),
+        payload=AgentContext(
+            messages=[{"role": "user", "content": "wait on activity or timeout"}]
+        ),
         max_turns=10,
     )
     task_id = await enqueue_task(
@@ -319,7 +329,9 @@ async def test_process_task_parks_wait_activity_with_cron_timeout(
     task = Task.create(
         owner_id=test_owner_id,
         agent=agent.name,
-        payload=AgentContext(query="wait on activity or cron"),
+        payload=AgentContext(
+            messages=[{"role": "user", "content": "wait on activity or cron"}]
+        ),
         max_turns=10,
     )
     task_id = await enqueue_task(
@@ -375,7 +387,9 @@ async def test_activity_wait_wake_clears_scheduled_timeout_state(
     task = Task.create(
         owner_id=test_owner_id,
         agent=agent.name,
-        payload=AgentContext(query="wake me before timeout"),
+        payload=AgentContext(
+            messages=[{"role": "user", "content": "wake me before timeout"}]
+        ),
         max_turns=10,
     )
     task_id = await enqueue_task(
@@ -434,7 +448,9 @@ async def test_activity_wait_sleep_timeout_recovers_via_scheduled_queue(
     task = Task.create(
         owner_id=test_owner_id,
         agent=agent.name,
-        payload=AgentContext(query="timeout immediately"),
+        payload=AgentContext(
+            messages=[{"role": "user", "content": "timeout immediately"}]
+        ),
         max_turns=10,
     )
     task_id = await enqueue_task(
@@ -505,7 +521,7 @@ async def test_steer_task_wakes_activity_wait_task(
     task = Task.create(
         owner_id=test_owner_id,
         agent=agent.name,
-        payload=AgentContext(query="wake me"),
+        payload=AgentContext(messages=[{"role": "user", "content": "wake me"}]),
         max_turns=10,
     )
     task_id = await enqueue_task(
@@ -560,13 +576,13 @@ async def test_direct_message_wakes_activity_waiting_recipient_across_agents(
     sender_task = Task.create(
         owner_id=test_owner_id,
         agent=sender_agent.name,
-        payload=AgentContext(query="sender"),
+        payload=AgentContext(messages=[{"role": "user", "content": "sender"}]),
         team_id=team_id,
     )
     recipient_task = Task.create(
         owner_id=test_owner_id,
         agent=recipient_agent.name,
-        payload=AgentContext(query="recipient"),
+        payload=AgentContext(messages=[{"role": "user", "content": "recipient"}]),
         team_id=team_id,
     )
     await enqueue_task(
@@ -631,19 +647,19 @@ async def test_subtree_idle_and_child_terminal_wake_parent_activity_wait(
     parent_task = Task.create(
         owner_id=test_owner_id,
         agent=parent_agent.name,
-        payload=AgentContext(query="parent"),
+        payload=AgentContext(messages=[{"role": "user", "content": "parent"}]),
         team_id=team_id,
     )
     child_one = Task.create(
         owner_id=test_owner_id,
         agent=child_agent.name,
-        payload=AgentContext(query="child-1"),
+        payload=AgentContext(messages=[{"role": "user", "content": "child-1"}]),
         team_id=team_id,
     )
     child_two = Task.create(
         owner_id=test_owner_id,
         agent=child_agent.name,
-        payload=AgentContext(query="child-2"),
+        payload=AgentContext(messages=[{"role": "user", "content": "child-2"}]),
         team_id=team_id,
     )
     child_one.metadata.parent_id = parent_task.id
@@ -799,7 +815,7 @@ async def test_subtree_idle_and_child_terminal_wake_parent_activity_wait(
         updated_task_payload_json=child_one.payload.to_json(),
         metrics_ttl=3600,
         pending_sentinel=PENDING_SENTINEL,
-        current_turn=child_one.payload.turn,
+        current_turn=child_one.payload.turn_number,
         final_output_json=json.dumps({"ok": True}),
         activity_wait_meta_key=root_keys.activity_wait_meta,
         task_steering_key_template=steering_template,
@@ -834,13 +850,13 @@ async def test_root_activity_wait_self_wakes_when_children_already_waiting(
     root_task = Task.create(
         owner_id=test_owner_id,
         agent=root_agent.name,
-        payload=AgentContext(query="root"),
+        payload=AgentContext(messages=[{"role": "user", "content": "root"}]),
         team_id=team_id,
     )
     child_task = Task.create(
         owner_id=test_owner_id,
         agent=child_agent.name,
-        payload=AgentContext(query="child"),
+        payload=AgentContext(messages=[{"role": "user", "content": "child"}]),
         team_id=team_id,
     )
     child_task.metadata.parent_id = root_task.id
@@ -921,19 +937,19 @@ async def test_root_activity_wait_self_wakes_when_children_already_terminal(
     root_task = Task.create(
         owner_id=test_owner_id,
         agent=root_agent.name,
-        payload=AgentContext(query="root"),
+        payload=AgentContext(messages=[{"role": "user", "content": "root"}]),
         team_id=team_id,
     )
     child_one = Task.create(
         owner_id=test_owner_id,
         agent=child_agent.name,
-        payload=AgentContext(query="child-1"),
+        payload=AgentContext(messages=[{"role": "user", "content": "child-1"}]),
         team_id=team_id,
     )
     child_two = Task.create(
         owner_id=test_owner_id,
         agent=child_agent.name,
-        payload=AgentContext(query="child-2"),
+        payload=AgentContext(messages=[{"role": "user", "content": "child-2"}]),
         team_id=team_id,
     )
     child_one.metadata.parent_id = root_task.id
@@ -1027,13 +1043,13 @@ async def test_group_message_wakes_activity_waiting_member(
     sender_task = Task.create(
         owner_id=test_owner_id,
         agent=sender_agent.name,
-        payload=AgentContext(query="sender"),
+        payload=AgentContext(messages=[{"role": "user", "content": "sender"}]),
         team_id=team_id,
     )
     recipient_task = Task.create(
         owner_id=test_owner_id,
         agent=recipient_agent.name,
-        payload=AgentContext(query="recipient"),
+        payload=AgentContext(messages=[{"role": "user", "content": "recipient"}]),
         team_id=team_id,
     )
 
@@ -1103,7 +1119,9 @@ async def test_cancellation_clears_activity_wait_state(
     task = Task.create(
         owner_id=test_owner_id,
         agent=agent.name,
-        payload=AgentContext(query="cancel while paused"),
+        payload=AgentContext(
+            messages=[{"role": "user", "content": "cancel while paused"}]
+        ),
         max_turns=10,
     )
     await enqueue_task(
@@ -1160,13 +1178,13 @@ async def test_activity_wait_concurrent_wake_signals_do_not_duplicate_queue_entr
     sender_task = Task.create(
         owner_id=test_owner_id,
         agent=sender_agent.name,
-        payload=AgentContext(query="sender"),
+        payload=AgentContext(messages=[{"role": "user", "content": "sender"}]),
         team_id=team_id,
     )
     recipient_task = Task.create(
         owner_id=test_owner_id,
         agent=recipient_agent.name,
-        payload=AgentContext(query="recipient"),
+        payload=AgentContext(messages=[{"role": "user", "content": "recipient"}]),
         team_id=team_id,
     )
     await enqueue_task(

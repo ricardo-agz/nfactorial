@@ -23,6 +23,7 @@ dependencies = [
     "python-dotenv>=1.0.0",
     "openai>=2.0.0",
     "pydantic>=2.10,<3",
+    "typing-extensions>=4.12.2",
     "redis>=6.1.0",
     "fastapi>=0.110.0,<1",
     "uvicorn[standard]>=0.34.2",

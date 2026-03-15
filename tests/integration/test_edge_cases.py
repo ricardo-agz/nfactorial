@@ -1,7 +1,7 @@
 import pytest
 import redis.asyncio as redis
 
-from factorial.execution.context import AgentContext
+from factorial.agent.context import AgentContext
 from factorial.queue.keys import PENDING_SENTINEL, RedisKeys
 from factorial.queue.operations import enqueue_task
 from factorial.queue.task import Task, TaskStatus, get_task_status
@@ -241,7 +241,9 @@ class TestCorruptedAndMissingTaskData:
         result = await script_runner.complete(
             task_id=fake_task_id,
             action=CompletionAction.COMPLETE,
-            payload_json=AgentContext(query="test").to_json(),
+            payload_json=AgentContext(
+            messages=[{"role": "user", "content": "test"}]
+        ).to_json(),
             final_output={"result": "done"},
         )
 
@@ -442,7 +444,7 @@ class TestBatchOperationEdgeCases:
 
         # Create more tasks than batch size
         for i in range(10):
-            ctx = AgentContext(query=f"Query {i}")
+            ctx = AgentContext(messages=[{"role": "user", "content": f"Query {i}"}])
             task = Task.create(
                 owner_id=test_owner_id,
                 agent=test_agent.name,
@@ -481,7 +483,7 @@ class TestBatchOperationEdgeCases:
         keys = script_runner.keys
 
         # Create valid task
-        ctx = AgentContext(query="Valid task")
+        ctx = AgentContext(messages=[{"role": "user", "content": "Valid task"}])
         task = Task.create(
             owner_id=test_owner_id,
             agent=test_agent.name,

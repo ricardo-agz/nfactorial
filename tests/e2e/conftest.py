@@ -16,8 +16,8 @@ import pytest_asyncio
 import redis.asyncio as redis
 
 from factorial.agent import BaseAgent, TurnCompletion
-from factorial.execution.context import AgentContext
-from factorial.llm.models import Model, Provider
+from factorial.ai.models import Model, Provider
+from factorial.agent.context import AgentContext
 from tests.mocks.llm import (
     MockLLMClient,
     MockResponse,
@@ -50,7 +50,6 @@ class MockLLMAgent(BaseAgent[AgentContext]):
             name=name,
             instructions="You are a test agent.",
             model=model or MOCK_MODEL,
-            context_class=AgentContext,
             **kwargs,
         )
         self._mock_client = mock_client
@@ -78,7 +77,7 @@ class ScriptedAgent(BaseAgent[AgentContext]):
         super().__init__(
             name=name,
             instructions="Scripted test agent",
-            context_class=AgentContext,
+            model=kwargs.pop("model", MOCK_MODEL),
             **kwargs,
         )
         self.turns_until_done = turns_until_done
@@ -91,14 +90,14 @@ class ScriptedAgent(BaseAgent[AgentContext]):
         self,
         agent_ctx: AgentContext,
     ) -> TurnCompletion[AgentContext]:
-        agent_ctx.turn += 1
+        agent_ctx.turn_number += 1
 
         # Fail on specific turn if configured
-        if self.fail_on_turn is not None and agent_ctx.turn == self.fail_on_turn:
+        if self.fail_on_turn is not None and agent_ctx.turn_number == self.fail_on_turn:
             raise self.fail_exception
 
         # Return pending tool calls on first turn if configured
-        if agent_ctx.turn == 1 and self.pending_tool_ids:
+        if agent_ctx.turn_number == 1 and self.pending_tool_ids:
             return TurnCompletion(
                 is_done=False,
                 context=agent_ctx,
@@ -106,7 +105,7 @@ class ScriptedAgent(BaseAgent[AgentContext]):
             )
 
         # Return pending child tasks on first turn if configured
-        if agent_ctx.turn == 1 and self.pending_child_ids:
+        if agent_ctx.turn_number == 1 and self.pending_child_ids:
             return TurnCompletion(
                 is_done=False,
                 context=agent_ctx,
@@ -114,11 +113,11 @@ class ScriptedAgent(BaseAgent[AgentContext]):
             )
 
         # Check if we're done
-        if agent_ctx.turn >= self.turns_until_done:
+        if agent_ctx.turn_number >= self.turns_until_done:
             return TurnCompletion(
                 is_done=True,
                 context=agent_ctx,
-                output={"result": "completed", "turns": agent_ctx.turn},
+                output={"result": "completed", "turns": agent_ctx.turn_number},
             )
 
         # Continue

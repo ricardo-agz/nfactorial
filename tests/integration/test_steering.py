@@ -3,7 +3,7 @@ import json
 import pytest
 import redis.asyncio as redis
 
-from factorial.execution.context import AgentContext
+from factorial.agent.context import AgentContext
 from factorial.queue.keys import RedisKeys
 from factorial.queue.operations import enqueue_task
 from factorial.queue.task import Task, TaskStatus, get_task_status
@@ -45,7 +45,6 @@ class TestSteeringMessageApplication:
 
         # Apply steering with updated payload
         updated_payload = AgentContext(
-            query="Updated query with steering",
             messages=[
                 {"role": "user", "content": "Please focus on X"},
                 {"role": "user", "content": "Also consider Y"},
@@ -65,8 +64,9 @@ class TestSteeringMessageApplication:
         payload_json = await redis_client.hget(keys.task_payload, task_id)
         assert payload_json is not None
         payload_data = json.loads(payload_json)
-        assert payload_data["query"] == "Updated query with steering"
         assert len(payload_data["messages"]) == 2
+        assert payload_data["messages"][0]["content"] == "Please focus on X"
+        assert payload_data["messages"][1]["content"] == "Also consider Y"
 
         # Verify steering messages were deleted
         remaining_messages = await redis_client.hgetall(task_keys.task_steering)
@@ -105,7 +105,9 @@ class TestSteeringMessageApplication:
             json.dumps({"role": "user", "content": "New direction"}),
         )
 
-        updated_payload = AgentContext(query="Steered query")
+        updated_payload = AgentContext(
+            messages=[{"role": "user", "content": "Steered query"}],
+        )
         result = await script_runner.steer(
             task_id=task_id,
             steering_message_ids=[message_id],
@@ -147,7 +149,9 @@ class TestSteeringMessageApplication:
             json.dumps({"role": "user", "content": "Urgent update"}),
         )
 
-        updated_payload = AgentContext(query="Steered while pending")
+        updated_payload = AgentContext(
+        messages=[{"role": "user", "content": "Steered while pending"}]
+    )
         result = await script_runner.steer(
             task_id=task_id,
             steering_message_ids=[message_id],
@@ -178,7 +182,9 @@ class TestSteeringMessageApplication:
         result = await script_runner.steer(
             task_id=fake_task_id,
             steering_message_ids=[message_id],
-            payload_json=AgentContext(query="test").to_json(),
+            payload_json=AgentContext(
+            messages=[{"role": "user", "content": "test"}]
+        ).to_json(),
         )
 
         assert not result.success
@@ -215,7 +221,9 @@ class TestSteeringMessageApplication:
             )
 
         # Apply all steering messages
-        updated_payload = AgentContext(query="All messages applied")
+        updated_payload = AgentContext(
+        messages=[{"role": "user", "content": "All messages applied"}]
+    )
         result = await script_runner.steer(
             task_id=task_id,
             steering_message_ids=message_ids,
@@ -258,7 +266,9 @@ class TestSteeringMessageApplication:
         result = await script_runner.steer(
             task_id=task_id,
             steering_message_ids=["msg_1", "msg_2"],
-            payload_json=AgentContext(query="Partial steering").to_json(),
+            payload_json=AgentContext(
+            messages=[{"role": "user", "content": "Partial steering"}]
+        ).to_json(),
         )
 
         assert result.success
@@ -281,7 +291,9 @@ class TestSteeringMessageApplication:
         task_id = await script_runner.enqueue_and_pickup(test_agent, sample_task)
 
         # Apply steering with no message IDs
-        updated_payload = AgentContext(query="Updated without messages")
+        updated_payload = AgentContext(
+            messages=[{"role": "user", "content": "Updated without messages"}],
+        )
         result = await script_runner.steer(
             task_id=task_id,
             steering_message_ids=[],
@@ -293,7 +305,7 @@ class TestSteeringMessageApplication:
         # Payload should still be updated
         payload_json = await redis_client.hget(keys.task_payload, task_id)
         payload_data = json.loads(payload_json)
-        assert payload_data["query"] == "Updated without messages"
+        assert payload_data["messages"][0]["content"] == "Updated without messages"
 
 
 @pytest.mark.asyncio
@@ -327,7 +339,9 @@ class TestSteeringWithTaskStateValidation:
         result = await script_runner.steer(
             task_id=task_id,
             steering_message_ids=[message_id],
-            payload_json=AgentContext(query="Steered while queued").to_json(),
+            payload_json=AgentContext(
+            messages=[{"role": "user", "content": "Steered while queued"}]
+        ).to_json(),
         )
 
         assert result.success
@@ -366,7 +380,9 @@ class TestSteeringWithTaskStateValidation:
         result = await script_runner.steer(
             task_id=task_id,
             steering_message_ids=[message_id],
-            payload_json=AgentContext(query="Steered in backoff").to_json(),
+            payload_json=AgentContext(
+            messages=[{"role": "user", "content": "Steered in backoff"}]
+        ).to_json(),
         )
 
         assert result.success
@@ -406,7 +422,9 @@ class TestSteeringWithTaskStateValidation:
         result = await script_runner.steer(
             task_id=task_id,
             steering_message_ids=[message_id],
-            payload_json=AgentContext(query="Steered completed").to_json(),
+            payload_json=AgentContext(
+            messages=[{"role": "user", "content": "Steered completed"}]
+        ).to_json(),
         )
 
         # Script succeeds - it's up to the caller to check if steering makes sense

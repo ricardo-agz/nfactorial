@@ -775,12 +775,14 @@ class TestChildTaskCompletion:
         )
 
         # Create updated payload with child results
-        from factorial.execution.context import AgentContext
+        from factorial.agent.context import AgentContext
 
         updated_context = AgentContext(
-            query=sample_task.payload.query,
-            messages=[{"role": "assistant", "content": "With child results"}],
-            turn=1,
+            messages=[
+                *sample_task.payload.messages,
+                {"role": "assistant", "content": "With child results"},
+            ],
+            turn_number=1,
         )
 
         await child_completion_script.execute(
@@ -802,8 +804,8 @@ class TestChildTaskCompletion:
         payload_json = await redis_client.hget(keys.task_payload, task_id)
         assert payload_json is not None
         payload = json.loads(payload_json)
-        assert payload["turn"] == 1
-        assert len(payload["messages"]) == 1
+        assert payload["turn_number"] == 1
+        assert len(payload["messages"]) == 2  # user + assistant with child results
 
     async def test_child_completion_cleans_up_pending_hash(
         self,

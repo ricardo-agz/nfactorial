@@ -8,9 +8,9 @@ from typing import Any
 import redis.asyncio as redis
 
 from factorial.agent import BaseAgent
-from factorial.core.events import AgentEvent, EventPublisher
+from factorial.agent.context import ContextType
+from factorial.core.events import EventPublisher, StartEvent
 from factorial.execution.context import (
-    ContextType,
     ExecutionContext,
     HooksExecutionNamespace,
     InboxDirectExecutionNamespace,
@@ -130,7 +130,8 @@ async def process_task(
 
     try:
         task: Task[ContextType] = Task.from_dict(
-            task_data, context_class=agent.context_class
+            task_data,
+            payload_parser=agent.context_from_dict,
         )
         keys = RedisKeys.format(
             namespace=namespace,
@@ -194,8 +195,7 @@ async def process_task(
             execution_ctx = ExecutionContext(
                 task_id=task.id,
                 owner_id=task.metadata.owner_id,
-                retries=task.retries,
-                iterations=task.payload.turn,
+                retry_count=task.retries,
                 events=event_publisher,
                 subagents=SubagentsExecutionNamespace(
                     enqueue_callback=runtime.enqueue_child_task,
@@ -238,16 +238,16 @@ async def process_task(
                 signals=SignalsExecutionNamespace(),
             )
 
-            if task.payload.turn == 0 and task.retries == 0:
-                await event_publisher.publish_event(
-                    AgentEvent(
-                        event_type="run_started",
+            if task.payload.turn_number == 1 and task.retries == 0:
+                await agent._emit_event(
+                    StartEvent(
                         task_id=task.id,
                         owner_id=task.metadata.owner_id,
                         agent_name=agent.name,
-                    )
+                    ),
+                    task.payload,
+                    execution_ctx,
                 )
-                await agent._safe_call(agent.on_run_start, task.payload, execution_ctx)
 
             task = await apply_steering_if_available(
                 redis_client=redis_client,

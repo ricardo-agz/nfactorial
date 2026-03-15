@@ -8,7 +8,7 @@ from typing import Any
 import pytest
 import redis.asyncio as redis
 
-from factorial.execution.context import AgentContext, VerificationState
+from factorial.agent.context import AgentContext, VerificationState
 from factorial.queue.keys import RedisKeys
 from factorial.queue.operations import resume_task
 from factorial.queue.task import Task, TaskStatus, get_task_data, get_task_status
@@ -52,11 +52,10 @@ class TestResumeTask:
             }
         ]
         source_ctx = AgentContext(
-            query="Market research",
             messages=list(source_messages),
-            turn=5,
+            turn_number=5,
             output={"summary": "first pass"},
-            attempt=2,
+            attempt_number=2,
             verification=VerificationState(
                 attempts_used=2,
                 last_candidate_hash="abc123",
@@ -102,11 +101,10 @@ class TestResumeTask:
             redis_client, test_namespace, resumed_task.id
         )
         resumed_payload = resumed_data["payload"]
-        assert resumed_payload["query"] == source_ctx.query
         assert resumed_payload["messages"] == [*source_messages, *feedback_messages]
-        assert resumed_payload["turn"] == 0
+        assert resumed_payload["turn_number"] == 1
         assert resumed_payload["output"] is None
-        assert resumed_payload["attempt"] == 0
+        assert resumed_payload["attempt_number"] == 1
         assert resumed_payload["verification"]["attempts_used"] == 0
         assert resumed_payload["verification"]["last_candidate_hash"] is None
         assert resumed_payload["verification"]["last_outcome"] is None
@@ -139,7 +137,7 @@ class TestResumeTask:
         source_task = Task.create(
             owner_id=test_owner_id,
             agent=test_agent.name,
-            payload=AgentContext(query="idempotent resume"),
+            payload=AgentContext(messages=[{"role": "user", "content": "idempotent resume"}]),
         )
         await _store_task_with_status(
             redis_client=redis_client,
@@ -189,7 +187,7 @@ class TestResumeTask:
         source_task = Task.create(
             owner_id=test_owner_id,
             agent=test_agent.name,
-            payload=AgentContext(query="conflict"),
+            payload=AgentContext(messages=[{"role": "user", "content": "conflict"}]),
         )
         await _store_task_with_status(
             redis_client=redis_client,
@@ -227,7 +225,7 @@ class TestResumeTask:
         source_task = Task.create(
             owner_id=test_owner_id,
             agent=test_agent.name,
-            payload=AgentContext(query="concurrent resume"),
+            payload=AgentContext(messages=[{"role": "user", "content": "concurrent resume"}]),
         )
         await _store_task_with_status(
             redis_client=redis_client,
@@ -264,7 +262,7 @@ class TestResumeTask:
         source_task = Task.create(
             owner_id=test_owner_id,
             agent=test_agent.name,
-            payload=AgentContext(query="still running"),
+            payload=AgentContext(messages=[{"role": "user", "content": "still running"}]),
         )
         await _store_task_with_status(
             redis_client=redis_client,
@@ -292,7 +290,7 @@ class TestResumeTask:
         source_task = Task.create(
             owner_id=test_owner_id,
             agent=test_agent.name,
-            payload=AgentContext(query="done"),
+            payload=AgentContext(messages=[{"role": "user", "content": "done"}]),
         )
         await _store_task_with_status(
             redis_client=redis_client,

@@ -23,8 +23,9 @@ from typing import (
 
 from pydantic import BaseModel, ConfigDict
 
+from factorial.agent.context import AgentContext
 from factorial.core.utils import decode
-from factorial.execution.context import AgentContext, ExecutionContext
+from factorial.execution.context import ExecutionContext
 
 HookT = TypeVar("HookT", bound="Hook")
 HookRequestBuilder = Callable[..., "PendingHook[Any] | Awaitable[PendingHook[Any]]"]

@@ -10,7 +10,7 @@ from typing import Any
 import pytest
 import redis.asyncio as redis
 
-from factorial.execution.context import AgentContext
+from factorial.agent.context import AgentContext
 from factorial.queue.keys import RedisKeys
 from factorial.queue.lua import (
     create_batch_pickup_script,
@@ -37,7 +37,7 @@ class TestWorkerProcessTask:
     ) -> None:
         """Test that a simple task is processed to completion."""
         # Create task
-        ctx = AgentContext(query="Test query")
+        ctx = AgentContext(messages=[{"role": "user", "content": "Test query"}])
         task = Task.create(
             owner_id=test_owner_id,
             agent=scripted_agent.name,
@@ -116,7 +116,7 @@ class TestWorkerProcessTask:
         keys = RedisKeys.format(namespace=test_namespace, agent=agent.name)
 
         # Create task
-        ctx = AgentContext(query="Multi-turn query")
+        ctx = AgentContext(messages=[{"role": "user", "content": "Multi-turn query"}])
         task = Task.create(
             owner_id=test_owner_id,
             agent=agent.name,
@@ -183,7 +183,7 @@ class TestWorkerProcessTask:
 
         # Verify turn count in payload
         task_data = await get_task_data(redis_client, test_namespace, task.id)
-        assert task_data["payload"]["turn"] == 3
+        assert task_data["payload"]["turn_number"] == 3
 
     async def test_failing_task_retries_then_fails(
         self,
@@ -195,12 +195,12 @@ class TestWorkerProcessTask:
         # Create agent that fails on every turn
         agent = ScriptedAgent(
             name="always_failing",
-            fail_on_turn=1,  # Fail immediately
+            fail_on_turn=2,  # Fail on first turn (turn_number incremented before check)
         )
         keys = RedisKeys.format(namespace=test_namespace, agent=agent.name)
 
         # Create task
-        ctx = AgentContext(query="Will fail")
+        ctx = AgentContext(messages=[{"role": "user", "content": "Will fail"}])
         task = Task.create(
             owner_id=test_owner_id,
             agent=agent.name,
@@ -285,7 +285,7 @@ class TestWorkerCancellation:
         keys = RedisKeys.format(namespace=test_namespace, agent=scripted_agent.name)
 
         # Create and enqueue task
-        ctx = AgentContext(query="To be cancelled")
+        ctx = AgentContext(messages=[{"role": "user", "content": "To be cancelled"}])
         task = Task.create(
             owner_id=test_owner_id,
             agent=scripted_agent.name,
@@ -348,7 +348,7 @@ class TestWorkerBatchProcessing:
         # Enqueue 5 tasks
         task_ids = []
         for i in range(5):
-            ctx = AgentContext(query=f"Query {i}")
+            ctx = AgentContext(messages=[{"role": "user", "content": f"Query {i}"}])
             task = Task.create(
                 owner_id=test_owner_id,
                 agent=agent.name,

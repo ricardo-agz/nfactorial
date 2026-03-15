@@ -25,6 +25,7 @@ from factorial import (
     ToolDefinition,
     tool,
 )
+from factorial.ai.models import Model, Provider
 from factorial.core.events import EventPublisher
 from factorial.execution.context import execution_context
 from factorial.execution.tools import (
@@ -60,18 +61,32 @@ def _set_test_execution_context() -> Token[ExecutionContext]:
     ctx = ExecutionContext(
         task_id=str(uuid.uuid4()),
         owner_id="test-owner",
-        retries=0,
-        iterations=0,
+        retry_count=0,
         events=cast(EventPublisher, _NoopEvents()),
     )
     return execution_context.set(ctx)
 
 
+MOCK_MODEL = Model(
+    name="mock-model",
+    provider=Provider.OPENAI,
+    provider_model_id="mock-v1",
+    context_window=128000,
+)
+
+
 def _make_agent_with_tools(
     tools: list[ToolDefinition[AgentContext] | Callable[..., Any]],
 ) -> Agent:
+    from tests.mocks.llm import MockLLMClient
+
     http_client = httpx.AsyncClient(verify=False, trust_env=False)
-    return Agent(tools=tools, http_client=http_client)
+    return Agent(
+        model=MOCK_MODEL,
+        client=MockLLMClient(),
+        tools=tools,
+        http_client=http_client,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -179,7 +194,15 @@ def test_tool_schema_excludes_injected_context_params() -> None:
         agent_ctx: AgentContext,
         execution_ctx: ExecutionContext,
     ) -> str:
-        return f"{query}:{agent_ctx.query}:{execution_ctx.task_id}"
+        first_user = next(
+            (m for m in agent_ctx.messages if m.get("role") == "user"), None
+        )
+        user_content = (
+            first_user["content"]
+            if first_user and isinstance(first_user.get("content"), str)
+            else ""
+        )
+        return f"{query}:{user_content}:{execution_ctx.task_id}"
 
     assert set(contextual.params_json_schema["properties"]) == {"query"}
 
@@ -216,7 +239,7 @@ async def test_tool_action_plain_string_return() -> None:
     token = _set_test_execution_context()
     try:
         tool_call = _make_tool_call("echo", {"text": "hello"})
-        result = await agent.tool_action(tool_call, AgentContext(query="q"))
+        result = await agent.tool_action(tool_call, AgentContext(messages=[{"role": "user", "content": "q"}]))
         assert isinstance(result, _ToolResultInternal)
         assert result.model_output == "echo: hello"
         assert result.client_output == "echo: hello"
@@ -234,7 +257,7 @@ async def test_tool_action_dict_return() -> None:
     token = _set_test_execution_context()
     try:
         tool_call = _make_tool_call("get_data")
-        result = await agent.tool_action(tool_call, AgentContext(query="q"))
+        result = await agent.tool_action(tool_call, AgentContext(messages=[{"role": "user", "content": "q"}]))
         assert isinstance(result, _ToolResultInternal)
         assert result.client_output == {"key": "value", "count": 42}
         assert "key" in result.model_output
@@ -253,7 +276,7 @@ async def test_tool_action_none_return() -> None:
     token = _set_test_execution_context()
     try:
         tool_call = _make_tool_call("noop")
-        result = await agent.tool_action(tool_call, AgentContext(query="q"))
+        result = await agent.tool_action(tool_call, AgentContext(messages=[{"role": "user", "content": "q"}]))
         assert isinstance(result, _ToolResultInternal)
         assert result.model_output == ""
         assert result.client_output is None
@@ -281,7 +304,7 @@ async def test_tool_action_basemodel_with_hidden() -> None:
     token = _set_test_execution_context()
     try:
         tool_call = _make_tool_call("edit")
-        result = await agent.tool_action(tool_call, AgentContext(query="q"))
+        result = await agent.tool_action(tool_call, AgentContext(messages=[{"role": "user", "content": "q"}]))
         assert isinstance(result, _ToolResultInternal)
         # Model sees only non-hidden fields
         assert "summary" in result.model_output
@@ -306,7 +329,7 @@ async def test_tool_action_basemodel_without_hidden() -> None:
     token = _set_test_execution_context()
     try:
         tool_call = _make_tool_call("get_info")
-        result = await agent.tool_action(tool_call, AgentContext(query="q"))
+        result = await agent.tool_action(tool_call, AgentContext(messages=[{"role": "user", "content": "q"}]))
         assert isinstance(result, _ToolResultInternal)
         # Both model and client see all fields
         assert "name" in result.model_output
@@ -326,7 +349,7 @@ async def test_tool_action_wait_instruction_with_data() -> None:
     token = _set_test_execution_context()
     try:
         tool_call = _make_tool_call("wait_tool")
-        result = await agent.tool_action(tool_call, AgentContext(query="q"))
+        result = await agent.tool_action(tool_call, AgentContext(messages=[{"role": "user", "content": "q"}]))
         assert isinstance(result, _ToolResultInternal)
         assert result.model_output == "Cooling down"
         assert isinstance(result.client_output, WaitInstruction)
@@ -345,7 +368,7 @@ async def test_tool_action_wait_instruction_default_message() -> None:
     token = _set_test_execution_context()
     try:
         tool_call = _make_tool_call("wait_tool")
-        result = await agent.tool_action(tool_call, AgentContext(query="q"))
+        result = await agent.tool_action(tool_call, AgentContext(messages=[{"role": "user", "content": "q"}]))
         assert isinstance(result, _ToolResultInternal)
         assert "60" in result.model_output
         assert isinstance(result.client_output, WaitInstruction)
@@ -385,7 +408,7 @@ async def test_tool_action_extracts_child_ids_from_forking_list_return() -> None
     token = _set_test_execution_context()
     try:
         tool_call = _make_tool_call("spawn_children")
-        result = await agent.tool_action(tool_call, AgentContext(query="q"))
+        result = await agent.tool_action(tool_call, AgentContext(messages=[{"role": "user", "content": "q"}]))
         assert result.pending_child_task_ids == child_ids
     finally:
         execution_context.reset(token)
@@ -405,7 +428,7 @@ async def test_tool_action_offloads_sync_callbacks_to_worker_thread() -> None:
     token = _set_test_execution_context()
     try:
         tool_call = _make_tool_call("sync_search", {"query": "weather"})
-        result = await agent.tool_action(tool_call, AgentContext(query="q"))
+        result = await agent.tool_action(tool_call, AgentContext(messages=[{"role": "user", "content": "q"}]))
         assert result.model_output == "result:weather"
         assert callback_thread_ids
         assert callback_thread_ids[0] != loop_thread_id
@@ -427,7 +450,7 @@ async def test_tool_action_rejects_legacy_forking_tuple_return() -> None:
     try:
         tool_call = _make_tool_call("spawn_children_with_message")
         with pytest.raises(ValueError, match="must return list\\[str\\]"):
-            await agent.tool_action(tool_call, AgentContext(query="q"))
+            await agent.tool_action(tool_call, AgentContext(messages=[{"role": "user", "content": "q"}]))
     finally:
         execution_context.reset(token)
         await agent.http_client.aclose()
@@ -444,7 +467,7 @@ async def test_tool_action_rejects_invalid_forking_child_ids() -> None:
     try:
         tool_call = _make_tool_call("spawn_children_invalid")
         with pytest.raises(ValueError, match="invalid task IDs"):
-            await agent.tool_action(tool_call, AgentContext(query="q"))
+            await agent.tool_action(tool_call, AgentContext(messages=[{"role": "user", "content": "q"}]))
     finally:
         execution_context.reset(token)
         await agent.http_client.aclose()

@@ -30,7 +30,6 @@ from pydantic import BaseModel
 load_dotenv()
 
 
-# Type alias for tool calls that matches what the SDK expects
 ToolCallList = list[
     ChatCompletionMessageFunctionToolCall | ChatCompletionMessageCustomToolCall
 ]
@@ -65,18 +64,13 @@ class Model:
     custom_tool_support: ToolSupportWrapper | None = None
 
 
-# ------------------------------------------------------------
-# Helper utilities
-# ------------------------------------------------------------
-
-
 def fallback_models(*models: "Model") -> Callable[[Any], "Model"]:  # noqa: D401
     """Return a model-selection callable cycling through *models* by retry attempt.
 
     The callable can be passed to the ``model`` parameter of
     :class:`factorial.agent.BaseAgent`. Inside the agent, the current retry
-    index is exposed via ``agent_ctx.attempt`` which is automatically updated
-    by the built-in ``@retry`` decorator. The selector will return
+    index is exposed via ``agent_ctx.attempt_number`` which is automatically
+    updated by the built-in ``@retry`` decorator. The selector will return
     ``models[attempt]`` for the *n*-th retry, falling back to the last model
     once the list is exhausted.
 
@@ -93,8 +87,7 @@ def fallback_models(*models: "Model") -> Callable[[Any], "Model"]:  # noqa: D401
     model_sequence = list(models)
 
     def _selector(agent_ctx: Any) -> "Model":
-        # ``attempt`` is injected by the retry wrapper (defaults to 0 on first try).
-        attempt_idx = getattr(agent_ctx, "attempt", 0)
+        attempt_idx = getattr(agent_ctx, "attempt_number", 1) - 1
         if attempt_idx < 0:
             attempt_idx = 0
         if attempt_idx >= len(model_sequence):
@@ -113,14 +106,13 @@ def ai_gateway(model: Model) -> Model:
     Example
     -------
     >>> agent = Agent(
-    ...     model=ai_gateway(gpt_5)  # Route GPT-5 through AI Gateway
+    ...     model=ai_gateway(gpt_5)
     ... )
     >>> agent = Agent(
-    ...     model=ai_gateway(claude_35_sonnet)  # Route Claude through AI Gateway
+    ...     model=ai_gateway(claude_35_sonnet)
     ... )
     """
     if model.provider == Provider.AI_GATEWAY:
-        # Already an AI Gateway model, return as-is
         return model
 
     return Model(
@@ -193,7 +185,6 @@ class MultiClient:
             )
 
     def _get_client(self, model_obj: Model) -> AsyncOpenAI:
-        """Get the appropriate OpenAI-compatible client for the model's provider."""
         if model_obj.provider == Provider.OPENAI:
             if not self.openai:
                 raise ValueError("OpenAI client not initialized")
@@ -236,7 +227,6 @@ class MultiClient:
                 "when custom tool support is provided"
             )
 
-        # Prepare messages (potentially with custom tool instructions)
         final_messages = messages
         if model.custom_tool_support and tools:
             custom_system_message = [
@@ -252,16 +242,11 @@ class MultiClient:
             final_messages = custom_system_message + messages
 
         client = self._get_client(model)
-
-        # Build request parameters - start with any extra kwargs passed through
         request_params: dict[str, Any] = {**kwargs}
-
-        # Set core required parameters
         request_params["model"] = model.provider_model_id
         request_params["messages"] = final_messages
         request_params["stream"] = stream
 
-        # Add optional parameters only if provided
         if max_completion_tokens is not None:
             request_params["max_completion_tokens"] = max_completion_tokens
         if temperature is not None:
@@ -279,9 +264,7 @@ class MultiClient:
             await client.chat.completions.create(**request_params)
         )
 
-        # Post-process for custom tool support
         if model.custom_tool_support:
-            # Custom tool support only works with non-streaming responses
             assert isinstance(response, ChatCompletion)
             for choice in response.choices:
                 raw_content = choice.message.content or ""
@@ -292,7 +275,6 @@ class MultiClient:
         return response
 
     async def close(self) -> None:
-        """Close HTTP clients to clean up connections"""
         if hasattr(self, "openai") and self.openai and self.openai._client:
             await self.openai._client.aclose()
         if hasattr(self, "xai") and self.xai and self.xai._client:
@@ -391,64 +373,44 @@ def base_tool_instructions(
 
 
 def base_tool_parser(response: str) -> tuple[str, ToolCallList]:
-    # pattern for qwen models
     pattern_a = re.compile(
-        r"<tool_call>(?P<json>.*?)</tool_call>", re.DOTALL | re.IGNORECASE
+        r"<tool_call>(?P<json>.*?)</tool_call>",
+        re.DOTALL | re.IGNORECASE,
     )
-
-    # pattern for kimi k2
     pattern_b = re.compile(
-        r"<\|tool_call_begin\|>(?P<func>[^<]+?)"  # function name + optional id
-        r"<\|tool_call_argument_begin\|>(?P<args>.*?)"  # JSON args
+        r"<\|tool_call_begin\|>(?P<func>[^<]+?)"
+        r"<\|tool_call_argument_begin\|>(?P<args>.*?)"
         r"<\|tool_call_end\|>",
         re.DOTALL | re.IGNORECASE,
     )
-
-    # pattern for simplified openai format:
-    # <|tool_call|>FUNC<|tool_call_argument|>{...}<|tool_call|>
     pattern_c = re.compile(
-        r"<\|tool_call\|>(?P<func>[^<]+?)"  # function name + optional id
-        r"<\|tool_call_argument\|>(?P<args>.*?)"  # JSON args
+        r"<\|tool_call\|>(?P<func>[^<]+?)"
+        r"<\|tool_call_argument\|>(?P<args>.*?)"
         r"<\|tool_call\|>",
         re.DOTALL | re.IGNORECASE,
     )
 
-    # Each entry holds (start_idx, end_idx, parsed_tool_dict)
     extracted: list[tuple[int, int, dict[str, Any]]] = []
 
-    # Legacy matches -------------------------------------------------------
-    for m in pattern_a.finditer(response):
-        json_str = m.group("json")
+    for match in pattern_a.finditer(response):
+        json_str = match.group("json")
         first, last = json_str.find("{"), json_str.rfind("}")
         if first == -1 or last == -1 or last <= first:
-            # Malformed – skip
             continue
         try:
             tool_dict = json.loads(json_str[first : last + 1])
             if not isinstance(tool_dict, dict):
                 continue
-            extracted.append((m.start(), m.end(), tool_dict))
+            extracted.append((match.start(), match.end(), tool_dict))
         except json.JSONDecodeError:
-            # Ignore malformed JSON so we don't crash the pipeline.
             continue
 
-    # ---------------------------------------------------------------------
-    # Fallback for *missing* closing tag ("</tool_call>").
-    # We look for the opening "<tool_call>" marker, then try to locate a
-    # *balanced* JSON object immediately afterwards. This lets us recover
-    # calls that look like:
-    #   <tool_call>{ ... }  \n  (no terminator)
-    # ---------------------------------------------------------------------
     pattern_incomplete = re.compile(r"<tool_call>\s*", re.IGNORECASE)
-    for m in pattern_incomplete.finditer(response):
-        start_idx = m.end()
-        # Quick skip if this span was already covered by a proper match
-        if any(s <= m.start() < e for s, e, _ in extracted):
+    for match in pattern_incomplete.finditer(response):
+        start_idx = match.end()
+        if any(start <= match.start() < end for start, end, _ in extracted):
             continue
 
-        # Scan forward from the first '{' and keep a brace counter to find
-        # the matching closing brace. This is more reliable than a regex
-        # when nested braces may appear inside strings.
         brace_level = 0
         json_start = None
         json_end = None
@@ -463,56 +425,58 @@ def base_tool_parser(response: str) -> tuple[str, ToolCallList]:
                 if brace_level == 0 and json_start is not None:
                     json_end = idx
                     break
-        # If we found a balanced JSON object try to parse it.
         if json_start is not None and json_end is not None:
             json_str = response[json_start : json_end + 1]
             try:
                 tool_dict = json.loads(json_str)
                 if isinstance(tool_dict, dict):
-                    extracted.append((m.start(), json_end + 1, tool_dict))
+                    extracted.append((match.start(), json_end + 1, tool_dict))
             except json.JSONDecodeError:
                 continue
 
-    # New-style matches ----------------------------------------------------
-    for m in pattern_b.finditer(response):
-        func_name_part: str = m.group("func").strip()
-        # Drop prefix ("functions.") if present and id suffix after ':'
+    for match in pattern_b.finditer(response):
+        func_name_part: str = match.group("func").strip()
         if func_name_part.startswith("functions."):
             func_name_part = func_name_part[len("functions.") :]
         func_name = func_name_part.split(":", 1)[0]
 
-        args_str = m.group("args").strip()
+        args_str = match.group("args").strip()
         try:
             args_dict = json.loads(args_str)
             if not isinstance(args_dict, dict):
                 continue
             extracted.append(
-                (m.start(), m.end(), {"name": func_name, "arguments": args_dict})
+                (
+                    match.start(),
+                    match.end(),
+                    {"name": func_name, "arguments": args_dict},
+                )
             )
         except json.JSONDecodeError:
             continue
 
-    # Simplified openai style matches -------------------------------------
-    for m in pattern_c.finditer(response):
-        func_name_c_part: str = m.group("func").strip()
-        # Drop prefix ("functions.") if present and id suffix after ':'
+    for match in pattern_c.finditer(response):
+        func_name_c_part: str = match.group("func").strip()
         if func_name_c_part.startswith("functions."):
             func_name_c_part = func_name_c_part[len("functions.") :]
         func_name = func_name_c_part.split(":", 1)[0]
 
-        args_str = m.group("args").strip()
+        args_str = match.group("args").strip()
         try:
             args_dict = json.loads(args_str)
             if not isinstance(args_dict, dict):
                 continue
             extracted.append(
-                (m.start(), m.end(), {"name": func_name, "arguments": args_dict})
+                (
+                    match.start(),
+                    match.end(),
+                    {"name": func_name, "arguments": args_dict},
+                )
             )
         except json.JSONDecodeError:
             continue
 
     if not extracted:
-        # Fast-path: no tool calls – just clean up content and return.
         clean_content = (
             response.replace("<think>", "")
             .replace("</think>", "")
@@ -529,12 +493,10 @@ def base_tool_parser(response: str) -> tuple[str, ToolCallList]:
     tool_dicts: list[dict[str, Any]] = []
 
     for start, end, tool_dict in extracted:
-        # Keep everything before the tool-call markup
         content_parts.append(response[cursor:start])
-        cursor = end  # Skip over the markup
+        cursor = end
         tool_dicts.append(tool_dict)
 
-    # Remainder after the last tool call
     content_parts.append(response[cursor:])
 
     content = "".join(content_parts)
@@ -565,13 +527,10 @@ def base_tool_parser(response: str) -> tuple[str, ToolCallList]:
                 )
             )
         except (KeyError, TypeError):
-            # Skip malformed entries silently
             continue
 
     return content, parsed_tool_calls
 
-
-# ---------- OPENAI MODELS ----------
 
 gpt_52 = Model(
     name="gpt-5.2",
@@ -636,9 +595,6 @@ gpt_41_nano = Model(
     context_window=1_047_576,
 )
 
-# ---------- ANTHROPIC MODELS ----------
-
-# Claude 4.5 family
 claude_45_opus = Model(
     name="claude-4.5-opus",
     provider=Provider.ANTHROPIC,
@@ -660,7 +616,6 @@ claude_45_haiku = Model(
     context_window=200_000,
 )
 
-# Claude 4 family
 claude_4_opus = Model(
     name="claude-4-opus",
     provider=Provider.ANTHROPIC,
@@ -696,8 +651,6 @@ claude_35_haiku = Model(
     context_window=200_000,
 )
 
-# ---------- XAI MODELS ----------
-
 grok_4 = Model(
     name="grok-4",
     provider=Provider.XAI,
@@ -719,15 +672,12 @@ grok_3_mini = Model(
     context_window=1_047_576,
 )
 
-# ---------- FIREWORKS MODELS ----------
-
 fireworks_kimi_k2 = Model(
     name="kimi-k2-instruct",
     provider=Provider.FIREWORKS,
     provider_model_id="accounts/fireworks/models/kimi-k2-instruct",
     context_window=128_000,
 )
-
 
 fireworks_qwen_3_235b = Model(
     name="qwen-3-235b",
@@ -753,7 +703,6 @@ fireworks_qwen_3_coder_480b = Model(
 
 
 MODELS = [
-    # OpenAI (direct)
     gpt_52,
     gpt_5,
     gpt_5_mini,
@@ -763,7 +712,6 @@ MODELS = [
     gpt_41,
     gpt_41_mini,
     gpt_41_nano,
-    # Anthropic (direct)
     claude_45_opus,
     claude_45_sonnet,
     claude_45_haiku,
@@ -772,11 +720,9 @@ MODELS = [
     claude_37_sonnet,
     claude_35_sonnet,
     claude_35_haiku,
-    # xAI (direct)
     grok_4,
     grok_3,
     grok_3_mini,
-    # Fireworks (direct)
     fireworks_kimi_k2,
     fireworks_qwen_3_235b,
     fireworks_qwen_3_coder_480b,

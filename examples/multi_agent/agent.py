@@ -1,4 +1,5 @@
 import os
+from dataclasses import dataclass
 from typing import Annotated, Any
 
 from dotenv import load_dotenv
@@ -7,18 +8,16 @@ from pydantic import BaseModel
 
 from factorial import (
     Agent,
-    AgentContext,
-    BaseAgent,
+    EmptyMetadata,
     Hidden,
-    ModelSettings,
-    VerificationRejected,
     WaitInstruction,
-    ai_gateway,
-    gpt_41_mini,
+    stop,
     subagents,
     tool,
+    verify,
     wait,
 )
+from factorial.ai.models import ai_gateway, gpt_41_mini
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
 env_path = os.path.join(current_dir, ".env")
@@ -33,7 +32,7 @@ class PlanResult(BaseModel):
 
 
 def plan(
-    overview: str, steps: list[str], agent_ctx: AgentContext
+    overview: str, steps: list[str], agent_ctx
 ) -> PlanResult:
     """Structure your plan to accomplish the task.
 
@@ -46,7 +45,7 @@ def plan(
     )
 
 
-def reflect(reflection: str, agent_ctx: AgentContext) -> str:
+def reflect(reflection: str, agent_ctx) -> str:
     """Reflect on a task"""
     return reflection
 
@@ -79,98 +78,81 @@ class FinalOutput(BaseModel):
     final_output: str
 
 
-class SearchOutput(BaseModel):
-    findings: list[str]
+@dataclass
+class MainAgentState:
+    has_used_research: bool = False
 
 
-search_agent = Agent(
+def verify_final_output(
+    output: FinalOutput | str,
+    *,
+    agent_ctx,
+):
+    if isinstance(output, str):
+        output = FinalOutput(final_output=output)
+    text = output.final_output.strip()
+    if not text:
+        return verify.fail(
+            message="Final output cannot be empty.",
+            code="empty_output",
+        )
+    if len(text) < 40:
+        return verify.fail(
+            message="Final output is too short; provide a more complete response.",
+            code="output_too_short",
+            metadata={"min_chars": 40, "actual_chars": len(text)},
+        )
+    if not agent_ctx.state.has_used_research:
+        return verify.fail(
+            message="Use the research tool at least once before finalizing.",
+            code="research_required",
+        )
+    return verify.accept()
+
+
+def _research_enabled(agent_ctx) -> bool:
+    return not agent_ctx.state.has_used_research
+
+
+@tool(is_enabled=_research_enabled)
+async def research(
+    queries: list[str],
+    agent_ctx,
+) -> WaitInstruction:
+    """Spawn child search tasks and block until they all complete."""
+    payloads = [search_agent.build_context(input=q) for q in queries]
+    jobs = await subagents.spawn(agent=search_agent, inputs=payloads, key="research")
+    agent_ctx.state.has_used_research = True
+    return wait.jobs(jobs, data="Waiting on research subagents")
+
+
+def _main_prepare_turn(turn, agent_ctx, execution_ctx):
+    if agent_ctx.turn_number == 1:
+        turn.tool_choice = {"type": "function", "function": {"name": "plan"}}
+    else:
+        turn.tool_choice = "required"
+    turn.parallel_tool_calls = False
+    turn.temperature = 0.0
+
+
+search_agent = Agent[Any, Any](
     name="research_subagent",
     description="Research Sub-Agent",
     model=ai_gateway(gpt_41_mini),
     instructions="You are an intelligent research assistant.",
     tools=[reflect, search],
-    output_type=SearchOutput,
-    model_settings=ModelSettings[AgentContext](
-        temperature=1.0,
-        tool_choice="required",
-    ),
-    max_turns=10,
+    temperature=1.0,
+    tool_choice="required",
+    stop_when=stop.any_of(stop.no_tool_calls(), stop.turn_count_is(10)),
 )
 
-
-class MainAgentContext(AgentContext):
-    has_used_research: bool = False
-
-
-def verify_final_output(
-    output: FinalOutput,
-    agent_ctx: MainAgentContext,
-) -> dict[str, Any]:
-    text = output.final_output.strip()
-    if not text:
-        raise VerificationRejected(
-            message="Final output cannot be empty.",
-            code="empty_output",
-        )
-    if len(text) < 40:
-        raise VerificationRejected(
-            message="Final output is too short; provide a more complete response.",
-            code="output_too_short",
-            metadata={"min_chars": 40, "actual_chars": len(text)},
-        )
-    if not agent_ctx.has_used_research:
-        raise VerificationRejected(
-            message="Use the research tool at least once before finalizing.",
-            code="research_required",
-        )
-
-    return {
-        "final_output": text,
-        "verification": {
-            "used_research": agent_ctx.has_used_research,
-            "char_count": len(text),
-        },
-    }
-
-
-@tool(is_enabled=lambda context: not context.has_used_research)
-async def research(
-    queries: list[str],
-    agent_ctx: MainAgentContext,
-) -> WaitInstruction:
-    """Spawn child search tasks and block until they all complete."""
-    payloads = [AgentContext(query=q) for q in queries]
-    jobs = await subagents.spawn(agent=search_agent, inputs=payloads, key="research")
-    agent_ctx.has_used_research = True
-    return wait.jobs(jobs, data="Waiting on research subagents")
-
-
-class MainAgent(BaseAgent[MainAgentContext]):
-    def __init__(self):
-        super().__init__(
-            name="main_agent",
-            description="Main Agent",
-            model=ai_gateway(gpt_41_mini),
-            instructions="You are a helpful assistant. Always start by making a plan.",
-            tools=[plan, reflect, research, search],
-            model_settings=ModelSettings[MainAgentContext](
-                temperature=0.0,
-                tool_choice=lambda context: (
-                    {
-                        "type": "function",
-                        "function": {"name": "plan"},
-                    }
-                    if context.turn == 0
-                    else "required"
-                ),
-                parallel_tool_calls=False,
-            ),
-            context_class=MainAgentContext,
-            output_type=FinalOutput,
-            verifier=verify_final_output,
-            verifier_max_attempts=3,
-            max_turns=15,
-        )
-
-
-basic_agent = MainAgent()
+basic_agent = Agent[MainAgentState, EmptyMetadata](
+    name="main_agent",
+    description="Main Agent",
+    model=ai_gateway(gpt_41_mini),
+    instructions="You are a helpful assistant. Always start by making a plan.",
+    tools=[plan, reflect, research, search],
+    prepare_turn=_main_prepare_turn,
+    verifier=verify_final_output,
+    stop_when=stop.any_of(stop.no_tool_calls(), stop.turn_count_is(15)),
+)

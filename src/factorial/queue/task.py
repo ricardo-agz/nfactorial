@@ -1,5 +1,6 @@
 import json
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
@@ -7,6 +8,7 @@ from typing import Any, Generic, cast
 
 import redis.asyncio as redis
 
+from factorial.agent.context import ContextType
 from factorial.core.exceptions import (
     BatchNotFoundError,
     CorruptedTaskDataError,
@@ -14,7 +16,6 @@ from factorial.core.exceptions import (
     TaskNotFoundError,
 )
 from factorial.core.utils import decode, is_valid_task_id
-from factorial.execution.context import ContextType
 from factorial.queue.keys import RedisKeys
 
 
@@ -118,7 +119,7 @@ class Task(Generic[ContextType]):
     def from_dict(
         cls,
         data: dict[str, Any],
-        context_class: type[ContextType],
+        payload_parser: Callable[[dict[str, Any]], ContextType],
     ) -> "Task[ContextType]":
         status = TaskStatus(data["status"])
         metadata = TaskMetadata.from_dict(data["metadata"])
@@ -129,13 +130,13 @@ class Task(Generic[ContextType]):
         if data["payload"]:
             if isinstance(data["payload"], dict):
                 payload_dict = cast(dict[str, Any], data["payload"])
-                payload = cast(ContextType, context_class.from_dict(payload_dict))
+                payload = payload_parser(payload_dict)
             else:
                 payload_str = decode(data["payload"])
                 payload_dict = json.loads(payload_str)
-                payload = cast(ContextType, context_class.from_dict(payload_dict))
+                payload = payload_parser(payload_dict)
         else:
-            payload = cast(ContextType, context_class.from_dict({}))
+            payload = payload_parser({})
 
         return cls(
             id=data["id"],
@@ -149,10 +150,12 @@ class Task(Generic[ContextType]):
 
     @classmethod
     def from_json(
-        cls, json_str: str | bytes, context_class: type[ContextType]
+        cls,
+        json_str: str | bytes,
+        payload_parser: Callable[[dict[str, Any]], ContextType],
     ) -> "Task[ContextType]":
         data = json.loads(decode(json_str))
-        return cls.from_dict(data, context_class)
+        return cls.from_dict(data, payload_parser)
 
 
 def effective_team_id(*, task_id: str, metadata: dict[str, Any]) -> str:

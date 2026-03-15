@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
@@ -12,6 +12,7 @@ from factorial.core.exceptions import (
     MessagingScopeError,
     TaskNotFoundError,
 )
+from factorial.queue import Task
 
 from .models import (
     EnqueueRequest,
@@ -51,17 +52,22 @@ def register_control_plane_routes(
                 detail=f"Agent '{request.agent_name}' is not registered",
             )
         try:
-            context = cast(Any, agent.context_class).from_dict(request.payload)
+            context = agent.context_from_dict(request.payload)
         except Exception as exc:
             raise HTTPException(
                 status_code=400,
                 detail=f"Invalid payload for agent '{request.agent_name}': {exc}",
             ) from exc
 
-        task = await orchestrator.create_agent_task(
-            agent=agent,
-            payload=context,
+        task = Task.create(
             owner_id=request.owner_id,
+            agent=agent.name,
+            payload=context,
+            max_turns=agent.max_turns,
+        )
+        task.id = await orchestrator.enqueue_task(
+            agent=agent,
+            task=task,
             idempotency_key=request.idempotency_key,
         )
         return EnqueueResponse(task_id=task.id)

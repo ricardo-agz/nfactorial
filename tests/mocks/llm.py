@@ -25,8 +25,8 @@ from openai.types.chat.chat_completion_message_function_tool_call import (
 )
 from openai.types.completion_usage import CompletionUsage
 
-from factorial.execution.context import AgentContext
-from factorial.llm.models import Model
+from factorial.ai.models import Model
+from factorial.agent.context import AgentContext
 
 
 @dataclass
@@ -125,7 +125,7 @@ class MockLLMClient:
 
         # Dynamic responses based on context
         def dynamic_response(messages, ctx):
-            if ctx.turn == 0:
+            if ctx.turn_number == 1:
                 return MockResponse(content="First turn!")
             return MockResponse(content="Done!", is_final=True)
 
@@ -173,8 +173,11 @@ class MockLLMClient:
         response: MockResponse
 
         if self.response_generator:
-            # Extract context from messages if possible (for dynamic responses)
-            ctx = AgentContext(query="mock")  # Default context
+            # Build minimal context for dynamic responses (turn_number defaults to 1)
+            ctx = AgentContext(
+                messages=[{"role": "user", "content": "mock"}] if not messages else messages,
+                turn_number=1,
+            )
             response = self.response_generator(messages, ctx)
         elif self._response_index < len(self.responses):
             response = self.responses[self._response_index]
@@ -258,7 +261,7 @@ def create_multi_turn_mock(
 
 
 def create_final_output_tool_mock(output: dict[str, Any]) -> MockLLMClient:
-    """Create a mock that uses the final_output tool (for agents with output_type)."""
+    """Create a mock that simulates structured completion-style payloads."""
     return MockLLMClient(
         responses=[
             MockResponse(

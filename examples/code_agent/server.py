@@ -2,7 +2,7 @@ import json
 from collections.abc import Callable
 from typing import Any
 
-from agent import IdeAgentContext, ide_agent
+from agent import IdeAgentState, ide_agent
 from fastapi import FastAPI
 from fastapi.exceptions import HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -66,17 +66,13 @@ class CancelRequest(BaseModel):
 @app.post("/enqueue")
 @app.post("/api/enqueue")
 async def enqueue(request: EnqueueRequest):
-    payload = IdeAgentContext(
-        messages=request.message_history,
-        query=request.query,
-        turn=0,
-        code=request.code,
-    )
+    state = IdeAgentState(code=request.code, query=request.query)
 
-    task = await orchestrator.create_agent_task(
-        agent=ide_agent,
+    task = await orchestrator.enqueue(
+        ide_agent,
+        input=request.message_history if request.message_history else request.query,
         owner_id=request.user_id,
-        payload=payload,
+        state=state,
     )
 
     return {"task_id": task.id}

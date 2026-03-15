@@ -1,10 +1,12 @@
 import asyncio
+import json
 import os
 import signal
 import weakref
 from collections.abc import AsyncGenerator, AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Literal, cast
 
 import httpx
@@ -13,16 +15,34 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from factorial.agent import BaseAgent
-from factorial.core.exceptions import TaskNotFoundError
+from factorial.agent.context import ContextType
+from factorial.ai.messages import Message, normalize_messages_input, system
+from factorial.ai.models import MultiClient
+from factorial.core.exceptions import (
+    BatchNotFoundError,
+    InactiveTaskError,
+    TaskNotFoundError,
+)
 from factorial.core.logging import get_logger
+from factorial.core.run_types import RunResult, RunStatus, UsageSummary
 from factorial.core.utils import to_snake_case
-from factorial.execution.context import ContextType
-from factorial.execution.hooks import HookResolutionResult, PendingHook
-from factorial.llm.models import MultiClient
+from factorial.execution.hooks import HookRecord, HookResolutionResult, PendingHook
+from factorial.orchestrator.handles import (
+    BatchHandle,
+    BatchSnapshot,
+    HookMode,
+    InputWithContext,
+    PendingHookSnapshot,
+    TaskHandle,
+    TaskSnapshot,
+    TaskSnapshotStatus,
+    WaitKind,
+    WaitSnapshot,
+)
 from factorial.orchestrator.messaging import OrchestratorMessagingNamespace
 from factorial.platforms.process.maintenance_loop import maintenance_loop
 from factorial.platforms.process.worker_loop import worker_loop
-from factorial.queue import Task
+from factorial.queue import Task, TaskStatus
 from factorial.queue.keys import RedisKeys
 
 from .wake_dispatch import NoopWakeDispatch, WakeDispatch
@@ -524,7 +544,7 @@ class Orchestrator:
                     logger.error(f"Error receiving message from channel {channel}: {e}")
                     continue
 
-    def register_runner(
+    def _register_agent_runner(
         self,
         agent: BaseAgent[Any],
         agent_worker_config: AgentWorkerConfig | None = None,
@@ -568,6 +588,30 @@ class Orchestrator:
     def get_agent(self, agent_name: str) -> BaseAgent[Any] | None:
         """Get an agent by name"""
         return self.agents_by_name.get(agent_name)
+
+    def _resolve_agent(self, agent: str | BaseAgent[Any]) -> BaseAgent[Any]:
+        if isinstance(agent, BaseAgent):
+            return agent
+        resolved = self.get_agent(agent)
+        if resolved is None:
+            raise ValueError(
+                f"Agent '{agent}' is not registered. Register it before enqueueing."
+            )
+        return resolved
+
+    def register(
+        self,
+        agent: BaseAgent[Any],
+        *,
+        agent_worker_config: AgentWorkerConfig | None = None,
+        maintenance_worker_config: MaintenanceWorkerConfig | None = None,
+    ) -> BaseAgent[Any]:
+        self._register_agent_runner(
+            agent=agent,
+            agent_worker_config=agent_worker_config,
+            maintenance_worker_config=maintenance_worker_config,
+        )
+        return agent
 
     async def wake_agent(
         self,
@@ -756,21 +800,98 @@ class Orchestrator:
         finally:
             await redis_client.close()
 
-    async def create_agent_task(
+    def _task_handle_from_task(
         self,
-        agent: BaseAgent[Any],
-        payload: ContextType,
+        task: Task[Any],
+    ) -> TaskHandle[Any, Any, Any]:
+        return TaskHandle(
+            orchestrator=self,
+            task_id=task.id,
+            agent_name=task.agent,
+            owner_id=task.metadata.owner_id,
+            batch_id=task.metadata.batch_id,
+        )
+
+    async def enqueue(
+        self,
+        agent: str | BaseAgent[Any],
+        input: str | list[Any],
+        *,
         owner_id: str,
+        state: Any = None,
+        metadata: Any = None,
         idempotency_key: str | None = None,
-    ) -> Task[ContextType]:
-        """Create a task with the correct context type for this agent"""
-        task = Task.create(owner_id=owner_id, agent=agent.name, payload=payload)
+    ) -> TaskHandle[Any, Any, Any]:
+        resolved_agent = self._resolve_agent(agent)
+        payload = resolved_agent.build_context(
+            input=input,
+            state=state,
+            metadata=metadata,
+        )
+        task = Task.create(
+            owner_id=owner_id,
+            agent=resolved_agent.name,
+            payload=payload,
+            max_turns=resolved_agent.max_turns,
+        )
         task.id = await self.enqueue_task(
-            agent,
+            resolved_agent,
             task,
             idempotency_key=idempotency_key,
         )
-        return task
+        return self._task_handle_from_task(task)
+
+    async def enqueue_many(
+        self,
+        agent: str | BaseAgent[Any],
+        inputs: list[str | list[Any] | InputWithContext[Any, Any]],
+        *,
+        owner_id: str,
+        state: Any = None,
+        metadata: Any = None,
+        idempotency_key: str | None = None,
+    ) -> BatchHandle[Any, Any, Any]:
+        if not inputs:
+            raise ValueError("enqueue_many requires at least one input")
+
+        resolved_agent = self._resolve_agent(agent)
+        tasks: list[Task[Any]] = []
+        for item in inputs:
+            if isinstance(item, InputWithContext):
+                item_input = item.input
+                item_state = item.state if item.state is not None else state
+                item_metadata = item.metadata if item.metadata is not None else metadata
+            else:
+                item_input = item
+                item_state = state
+                item_metadata = metadata
+
+            payload = resolved_agent.build_context(
+                input=cast(str | list[Message], item_input),
+                state=item_state,
+                metadata=item_metadata,
+            )
+            tasks.append(
+                Task.create(
+                    owner_id=owner_id,
+                    agent=resolved_agent.name,
+                    payload=payload,
+                    max_turns=resolved_agent.max_turns,
+                )
+            )
+
+        batch = await self.enqueue_batch(
+            resolved_agent,
+            tasks,
+            idempotency_key=idempotency_key,
+        )
+        return BatchHandle(
+            orchestrator=self,
+            batch_id=batch.id,
+            agent_name=resolved_agent.name,
+            owner_id=owner_id,
+            task_ids=tuple(batch.task_ids),
+        )
 
     async def enqueue_task(
         self,
@@ -899,6 +1020,55 @@ class Orchestrator:
             )
             return resumed_task
 
+    async def branch_task(
+        self,
+        *,
+        task_id: str,
+        input: str | list[Any],
+        state: Any = None,
+        metadata: Any = None,
+        idempotency_key: str | None = None,
+    ) -> TaskHandle[Any, Any, Any]:
+        source_task_data = await self.get_task_data(task_id)
+        if source_task_data is None:
+            raise TaskNotFoundError(task_id)
+
+        source_status = TaskStatus(source_task_data["status"])
+        if source_status not in {
+            TaskStatus.COMPLETED,
+            TaskStatus.FAILED,
+            TaskStatus.CANCELLED,
+        }:
+            raise ValueError("branch() requires a terminal task")
+
+        source_agent_name = str(source_task_data["agent"])
+        source_agent = self._resolve_agent(source_agent_name)
+        source_payload = source_agent.context_from_dict(source_task_data["payload"])
+        source_metadata = Task.from_dict(
+            source_task_data,
+            payload_parser=source_agent.context_from_dict,
+        ).metadata
+
+        payload = source_agent.build_context(
+            input=input,
+            state=source_payload.state if state is None else state,
+            metadata=source_payload.metadata if metadata is None else metadata,
+        )
+        task = Task.create(
+            owner_id=source_metadata.owner_id,
+            agent=source_agent.name,
+            payload=payload,
+            max_turns=source_agent.max_turns,
+            team_id=source_metadata.team_id,
+        )
+        task.metadata.parent_id = task_id
+        task.id = await self.enqueue_task(
+            source_agent,
+            task,
+            idempotency_key=idempotency_key,
+        )
+        return self._task_handle_from_task(task)
+
     async def cancel_task(
         self,
         task_id: str,
@@ -911,6 +1081,18 @@ class Orchestrator:
                 redis_client=redis_client,
                 namespace=self.namespace,
                 task_id=task_id,
+                agents_by_name=self.agents_by_name,
+                metrics_retention_duration=self.metrics_config.retention_duration,
+            )
+
+    async def cancel_batch(self, batch_id: str) -> None:
+        from factorial.queue.operations.control import cancel_batch as q_cancel_batch
+
+        async with self.redis_client_context() as redis_client:
+            await q_cancel_batch(
+                redis_client=redis_client,
+                namespace=self.namespace,
+                batch_id=batch_id,
                 agents_by_name=self.agents_by_name,
                 metrics_retention_duration=self.metrics_config.retention_duration,
             )
@@ -945,6 +1127,94 @@ class Orchestrator:
                     reason="steer",
                     task_id=task_id,
                 )
+
+    async def steer_task_input(
+        self,
+        *,
+        task_id: str,
+        input: str | list[Any],
+    ) -> None:
+        await self.steer_task(
+            task_id=task_id,
+            messages=cast(
+                list[dict[str, Any]],
+                normalize_messages_input(cast(Any, input)),
+            ),
+        )
+
+    def _manual_wake_messages(
+        self,
+        *,
+        wait_kind: WaitKind,
+        input: str | list[Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        messages: list[dict[str, Any]] = [
+            cast(
+                dict[str, Any],
+                system(
+                    "Runtime note: task was manually resumed and interrupted "
+                    f"a {wait_kind.value} wait."
+                ),
+            )
+        ]
+        if input is not None:
+            messages.extend(
+                cast(
+                    list[dict[str, Any]],
+                    normalize_messages_input(cast(Any, input)),
+                )
+            )
+        return messages
+
+    async def wake_task(
+        self,
+        *,
+        task_id: str,
+        input: str | list[Any] | None = None,
+    ) -> bool:
+        snapshot = await self.snapshot_task(task_id)
+        if snapshot.status is TaskSnapshotStatus.BACKOFF:
+            raise ValueError("wake() cannot resume tasks that are in backoff")
+        if snapshot.status is not TaskSnapshotStatus.WAITING:
+            raise ValueError("wake() requires a task that is currently waiting")
+        if snapshot.pending_hooks:
+            raise ValueError("wake() does not apply to pending hooks")
+        if snapshot.pending_child_task_ids:
+            raise ValueError("wake() does not apply to pending child tasks")
+        if snapshot.wait is None:
+            raise ValueError("wake() requires a wakeable wait")
+
+        wake_messages = self._manual_wake_messages(
+            wait_kind=snapshot.wait.kind,
+            input=input,
+        )
+        if snapshot.wait.kind is WaitKind.SIGNAL:
+            from factorial.queue import signal_task as q_signal_task
+
+            if snapshot.wait.signal_id is None:
+                raise ValueError("signal waits require a pending signal_id")
+
+            async with self.redis_client_context() as redis_client:
+                try:
+                    await q_signal_task(
+                        redis_client=redis_client,
+                        namespace=self.namespace,
+                        sender_task_id=task_id,
+                        task_id=task_id,
+                        signal_id=snapshot.wait.signal_id,
+                        payload={"kind": "manual_wake"},
+                    )
+                except (InactiveTaskError, TaskNotFoundError):
+                    return False
+
+            await self.steer_task(task_id=task_id, messages=wake_messages)
+            return True
+
+        try:
+            await self.steer_task(task_id=task_id, messages=wake_messages)
+        except (InactiveTaskError, TaskNotFoundError):
+            return False
+        return True
 
     async def message_task(
         self,
@@ -1107,6 +1377,234 @@ class Orchestrator:
             return None
 
         return self.get_agent(agent_name)
+
+    def _datetime_from_unix(self, value: Any) -> datetime | None:
+        if value is None:
+            return None
+        try:
+            return datetime.fromtimestamp(float(value), tz=timezone.utc)
+        except (TypeError, ValueError):
+            return None
+
+    def _normalize_public_status(self, status: TaskStatus) -> TaskSnapshotStatus:
+        if status is TaskStatus.QUEUED:
+            return TaskSnapshotStatus.QUEUED
+        if status in {TaskStatus.PROCESSING, TaskStatus.ACTIVE}:
+            return TaskSnapshotStatus.RUNNING
+        if status in {
+            TaskStatus.PAUSED,
+            TaskStatus.PENDING_TOOL_RESULTS,
+            TaskStatus.PENDING_CHILD_TASKS,
+        }:
+            return TaskSnapshotStatus.WAITING
+        if status is TaskStatus.BACKOFF:
+            return TaskSnapshotStatus.BACKOFF
+        if status is TaskStatus.COMPLETED:
+            return TaskSnapshotStatus.COMPLETED
+        if status is TaskStatus.FAILED:
+            return TaskSnapshotStatus.FAILED
+        if status is TaskStatus.CANCELLED:
+            return TaskSnapshotStatus.CANCELLED
+        raise ValueError(f"Unsupported task status: {status}")
+
+    async def _task_wait_snapshot(
+        self,
+        *,
+        redis_client: redis.Redis,
+        task_id: str,
+    ) -> WaitSnapshot | None:
+        root_keys = RedisKeys.format(namespace=self.namespace)
+        pipe = redis_client.pipeline(transaction=True)
+        pipe.multi()
+        pipe.hget(root_keys.signal_wait_meta, task_id)
+        pipe.hget(root_keys.activity_wait_meta, task_id)
+        pipe.hget(root_keys.scheduled_wait_meta, task_id)
+        signal_wait_raw, activity_wait_raw, scheduled_wait_raw = await pipe.execute()
+
+        if signal_wait_raw:
+            payload = json.loads(signal_wait_raw)
+            return WaitSnapshot(
+                kind=WaitKind.SIGNAL,
+                signal_id=payload.get("signal_id"),
+                source_tool_call_ids=tuple(payload.get("source_tool_call_ids") or ()),
+                data=payload.get("data"),
+            )
+
+        if activity_wait_raw:
+            payload = json.loads(activity_wait_raw)
+            return WaitSnapshot(
+                kind=WaitKind.ACTIVITY,
+                wake_at=self._datetime_from_unix(payload.get("deadline_at")),
+                source_tool_call_ids=tuple(payload.get("source_tool_call_ids") or ()),
+                data=payload.get("data"),
+            )
+
+        if scheduled_wait_raw:
+            payload = json.loads(scheduled_wait_raw)
+            kind = payload.get("kind")
+            if kind == "cron":
+                wait_kind = WaitKind.CRON
+            elif kind == "sleep":
+                wait_kind = WaitKind.SLEEP
+            elif kind == "activity_timeout":
+                wait_kind = WaitKind.ACTIVITY
+            elif kind == "signal_timeout":
+                wait_kind = WaitKind.SIGNAL
+            else:
+                return None
+            return WaitSnapshot(
+                kind=wait_kind,
+                wake_at=self._datetime_from_unix(payload.get("wake_at")),
+                signal_id=payload.get("signal_id"),
+                source_tool_call_ids=tuple(payload.get("source_tool_call_ids") or ()),
+                data=payload.get("data"),
+            )
+
+        return None
+
+    async def _pending_hook_snapshots(
+        self,
+        *,
+        redis_client: redis.Redis,
+        task_id: str,
+    ) -> tuple[PendingHookSnapshot, ...]:
+        task_keys = RedisKeys.format(namespace=self.namespace, task_id=task_id)
+        hook_ids = sorted(await redis_client.smembers(task_keys.hooks_by_task))  # type: ignore[arg-type]
+        if not hook_ids:
+            return ()
+
+        records_raw = await redis_client.hmget(task_keys.hooks_index, hook_ids)  # type: ignore[arg-type]
+        snapshots: list[PendingHookSnapshot] = []
+        for record_raw in records_raw:
+            if not record_raw:
+                continue
+            record = HookRecord.from_json(record_raw)
+            if record.resolved_at is not None:
+                continue
+            snapshots.append(
+                PendingHookSnapshot(
+                    id=record.hook_id,
+                    hook_type=record.hook_type,
+                    mode=HookMode(record.mode),
+                    title=cast(str | None, record.metadata.get("title")),
+                    tool_name=record.tool_name,
+                    param_name=record.hook_param_name,
+                    expires_at=datetime.fromtimestamp(
+                        record.expires_at,
+                        tz=timezone.utc,
+                    ),
+                    metadata=dict(record.metadata),
+                )
+            )
+        return tuple(snapshots)
+
+    async def snapshot_task(self, task_id: str) -> TaskSnapshot[Any, Any]:
+        task_data = await self.get_task_data(task_id)
+        if task_data is None:
+            raise TaskNotFoundError(task_id)
+
+        agent_name = str(task_data["agent"])
+        agent = self._resolve_agent(agent_name)
+        task = Task.from_dict(task_data, payload_parser=agent.context_from_dict)
+        public_status = self._normalize_public_status(task.status)
+
+        async with self.redis_client_context() as redis_client:
+            wait = await self._task_wait_snapshot(
+                redis_client=redis_client,
+                task_id=task_id,
+            )
+            pending_hooks = await self._pending_hook_snapshots(
+                redis_client=redis_client,
+                task_id=task_id,
+            )
+            task_keys = RedisKeys.format(
+                namespace=self.namespace,
+                task_id=task_id,
+                agent=agent_name,
+            )
+            pending_child_task_ids = tuple(
+                sorted(await redis_client.smembers(task_keys.pending_child_wait_ids))  # type: ignore[arg-type]
+            )
+            backoff_score = await redis_client.zscore(task_keys.queue_backoff, task_id)
+
+        return TaskSnapshot(
+            id=task.id,
+            agent_name=task.agent,
+            owner_id=task.metadata.owner_id,
+            batch_id=task.metadata.batch_id,
+            status=public_status,
+            state=task.payload.state,
+            metadata=task.payload.metadata,
+            output=task.payload.output,
+            retry_count=task.retries,
+            turn_number=task.payload.turn_number,
+            wait=wait,
+            pending_hooks=pending_hooks,
+            pending_child_task_ids=pending_child_task_ids,
+            backoff_until=self._datetime_from_unix(backoff_score),
+        )
+
+    async def snapshot_batch(self, batch_id: str) -> BatchSnapshot:
+        from factorial.queue.task import get_batch_data as q_get_batch_data
+
+        async with self.redis_client_context() as redis_client:
+            try:
+                batch = await q_get_batch_data(
+                    redis_client=redis_client,
+                    namespace=self.namespace,
+                    batch_id=batch_id,
+                )
+            except BatchNotFoundError:
+                raise
+
+        return BatchSnapshot(
+            id=batch.id,
+            owner_id=batch.metadata.owner_id,
+            total_tasks=batch.metadata.total_tasks,
+            remaining_tasks=len(batch.remaining_task_ids),
+            progress=batch.progress,
+            is_finished=batch.metadata.status != "active",
+        )
+
+    async def task_result(self, task_id: str) -> RunResult[Any, Any, Any]:
+        task_data = await self.get_task_data(task_id)
+        if task_data is None:
+            raise TaskNotFoundError(task_id)
+
+        agent_name = str(task_data["agent"])
+        agent = self._resolve_agent(agent_name)
+        task = Task.from_dict(task_data, payload_parser=agent.context_from_dict)
+        snapshot = await self.snapshot_task(task_id)
+        if task.status not in {
+            TaskStatus.COMPLETED,
+            TaskStatus.FAILED,
+            TaskStatus.CANCELLED,
+        }:
+            raise ValueError("RunResult is only available for terminal tasks")
+
+        if task.status is TaskStatus.COMPLETED:
+            run_status = RunStatus.COMPLETED
+        elif task.status is TaskStatus.FAILED:
+            run_status = RunStatus.FAILED
+        else:
+            run_status = RunStatus.CANCELLED
+
+        return RunResult(
+            run_id=task.id,
+            task_id=task.id,
+            agent_name=task.agent,
+            owner_id=task.metadata.owner_id,
+            status=run_status,
+            output=task.payload.output,
+            state=task.payload.state,
+            metadata=task.payload.metadata,
+            messages=tuple(task.payload.messages),
+            usage=UsageSummary.zero(),
+            turn_count=snapshot.turn_number,
+            last_turn=snapshot.last_turn,
+            started_at=task.metadata.created_at,
+            finished_at=datetime.now(timezone.utc),
+        )
 
     def create_observability_app(self) -> FastAPI:
         """Create the observability FastAPI app (minimal, clean, robust)"""

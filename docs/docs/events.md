@@ -8,15 +8,12 @@ To enqueue a task, you must pass in an _owner_id_, e.g.:
 ```python
 @app.post("/api/enqueue")
 async def enqueue(request: EnqueueRequest):
-    task = basic_agent.create_task(
+    input_data = request.message_history if request.message_history else request.query
+    task = await orchestrator.enqueue(
+        basic_agent,
+        input=input_data,
         owner_id=request.user_id,
-        payload=AgentContext(
-            messages=request.message_history,
-            query=request.query,
-        ),
     )
-
-    await orchestrator.enqueue_task(agent=my_agent, task=task)
     return {"task_id": task.id}
 ```
 
@@ -214,24 +211,9 @@ Published when verifier validation rejects output and asks the model to revise.
 
 #### `verification_exhausted`
 
-Published when `verifier_max_attempts` is reached and the task is about to fail.
-
-```python
-{
-    "event_type": "verification_exhausted",
-    "task_id": "task-123",
-    "owner_id": "user-456",
-    "agent_name": "my_agent",
-    "turn": 5,
-    "timestamp": "2024-01-01T12:05:00Z",
-    "data": {
-        "attempts_used": 3,
-        "max_attempts": 3,
-        "message": "Score below acceptance threshold",
-        "code": "score_low",
-    },
-}
-```
+There is no built-in verification retry budget. If you want retry exhaustion behavior,
+enforce it inside your verifier with `agent_ctx.verification.attempts_used` and return
+`verify.fail(...)` when the limit is reached.
 
 ### Agent Progress Events
 

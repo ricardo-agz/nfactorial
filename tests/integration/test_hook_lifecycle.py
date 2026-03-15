@@ -1054,18 +1054,20 @@ class TestHookResolutionFlow:
                 f"{manager.approved}:{finance.approved}"
             )
 
+        from tests.integration.conftest import MOCK_MODEL
+
         hook_agent = Agent(
             name="hook_runtime_agent",
             instructions="test",
+            model=MOCK_MODEL,
             tools=[wire_transfer],
-            context_class=AgentContext,
             http_client=httpx.AsyncClient(verify=False, trust_env=False),
         )
 
         task = Task.create(
             owner_id=test_owner_id,
             agent=hook_agent.name,
-            payload=AgentContext(query="approve transfer"),
+            payload=AgentContext(messages=[{"role": "user", "content": "approve transfer"}]),
         )
         task_id = await self._setup_processing_task(
             redis_client=redis_client,
@@ -1087,8 +1089,7 @@ class TestHookResolutionFlow:
         exec_ctx = ExecutionContext(
             task_id=task_id,
             owner_id=test_owner_id,
-            retries=0,
-            iterations=0,
+            retry_count=0,
             events=_NoopEvents(),  # type: ignore[arg-type]
             hooks=HooksExecutionNamespace(
                 persist_runtime_callback=lambda payload: persist_hook_runtime_payload(
@@ -1189,12 +1190,11 @@ class TestHookResolutionFlow:
             metrics_ttl=3600,
         )
         task_data = await get_task_data(redis_client, test_namespace, task_id)
-        picked_task = Task.from_dict(task_data, context_class=hook_agent.context_class)
+        picked_task = Task.from_dict(task_data, payload_parser=AgentContext.from_dict)
         exec_ctx_tick = ExecutionContext(
             task_id=task_id,
             owner_id=test_owner_id,
-            retries=picked_task.retries,
-            iterations=picked_task.payload.turn,
+            retry_count=picked_task.retries,
             events=_NoopEvents(),  # type: ignore[arg-type]
             hooks=HooksExecutionNamespace(
                 persist_runtime_callback=lambda payload: persist_hook_runtime_payload(
@@ -1244,7 +1244,7 @@ class TestHookResolutionFlow:
             updated_task_payload_json=picked_task.payload.to_json(),
             metrics_ttl=3600,
             pending_sentinel=PENDING_SENTINEL,
-            current_turn=picked_task.payload.turn,
+            current_turn=picked_task.payload.turn_number,
             pending_tool_call_ids_json=json.dumps(tick_1.pending_tool_call_ids),
         )
         assert await get_task_status(redis_client, test_namespace, task_id) == (
@@ -1301,12 +1301,11 @@ class TestHookResolutionFlow:
             metrics_ttl=3600,
         )
         task_data = await get_task_data(redis_client, test_namespace, task_id)
-        picked_task = Task.from_dict(task_data, context_class=hook_agent.context_class)
+        picked_task = Task.from_dict(task_data, payload_parser=AgentContext.from_dict)
         exec_ctx_tick_2 = ExecutionContext(
             task_id=task_id,
             owner_id=test_owner_id,
-            retries=picked_task.retries,
-            iterations=picked_task.payload.turn,
+            retry_count=picked_task.retries,
             events=_NoopEvents(),  # type: ignore[arg-type]
             hooks=HooksExecutionNamespace(
                 persist_runtime_callback=lambda payload: persist_hook_runtime_payload(
@@ -1393,12 +1392,11 @@ class TestHookResolutionFlow:
         await redis_client.hset(keys.hook_runtime_ready, tool_call_id, session_id)
 
         task_data = await get_task_data(redis_client, test_namespace, task_id)
-        task = Task.from_dict(task_data, context_class=test_agent.context_class)
+        task = Task.from_dict(task_data, payload_parser=AgentContext.from_dict)
         exec_ctx = ExecutionContext(
             task_id=task_id,
             owner_id=sample_task.metadata.owner_id,
-            retries=task.retries,
-            iterations=task.payload.turn,
+            retry_count=task.retries,
             events=_NoopEvents(),  # type: ignore[arg-type]
         )
         tick = await process_hook_runtime_wake_requests(
@@ -1500,12 +1498,11 @@ class TestHookResolutionFlow:
             metrics_ttl=3600,
         )
         task_data = await get_task_data(redis_client, test_namespace, task_id)
-        task = Task.from_dict(task_data, context_class=test_agent.context_class)
+        task = Task.from_dict(task_data, payload_parser=AgentContext.from_dict)
         exec_ctx = ExecutionContext(
             task_id=task_id,
             owner_id=sample_task.metadata.owner_id,
-            retries=task.retries,
-            iterations=task.payload.turn,
+            retry_count=task.retries,
             events=_NoopEvents(),  # type: ignore[arg-type]
         )
         tick = await process_hook_runtime_wake_requests(
@@ -1564,17 +1561,21 @@ class TestHookResolutionFlow:
                 pending_child_task_ids=child_ids,
             )
 
+        from tests.integration.conftest import MOCK_MODEL
+
         hook_agent = Agent(
             name="hook_child_continuation_agent",
             instructions="test",
+            model=MOCK_MODEL,
             tools=[spawn_after_approval],
-            context_class=AgentContext,
             http_client=httpx.AsyncClient(verify=False, trust_env=False),
         )
         task = Task.create(
             owner_id=test_owner_id,
             agent=hook_agent.name,
-            payload=AgentContext(query="spawn children after approval"),
+            payload=AgentContext(
+                messages=[{"role": "user", "content": "spawn children after approval"}]
+            ),
         )
         task_id = await self._setup_processing_task(
             redis_client=redis_client,
@@ -1600,8 +1601,7 @@ class TestHookResolutionFlow:
         exec_ctx = ExecutionContext(
             task_id=task_id,
             owner_id=test_owner_id,
-            retries=0,
-            iterations=0,
+            retry_count=0,
             events=_NoopEvents(),  # type: ignore[arg-type]
             hooks=HooksExecutionNamespace(
                 persist_runtime_callback=lambda payload: persist_hook_runtime_payload(

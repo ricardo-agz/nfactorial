@@ -4,16 +4,17 @@ import hashlib
 import json
 import time
 import uuid
-from typing import Any, cast
+from typing import Any
 
 import redis.asyncio as redis
 
 from factorial.agent import BaseAgent
+from factorial.agent.context import VerificationState
+from factorial.ai.messages import normalize_message
 from factorial.core.events import AgentEvent, EventPublisher
 from factorial.core.exceptions import InvalidTaskIdError
 from factorial.core.logging import get_logger
 from factorial.core.utils import is_valid_task_id, serialize_data
-from factorial.execution.context import VerificationState
 from factorial.queue.keys import RedisKeys
 from factorial.queue.lua import (
     EnqueueBatchScript,
@@ -260,7 +261,7 @@ async def resume_task(
     for message in messages:
         if not isinstance(message, dict):
             raise TypeError("resume_task messages must be a list of dict objects")
-        normalized_messages.append(dict(message))
+        normalized_messages.append(normalize_message(dict(message)))
 
     source_task_data = await get_task_data(redis_client, namespace, task_id)
     source_status = TaskStatus(source_task_data["status"])
@@ -277,10 +278,9 @@ async def resume_task(
             f"Expected '{agent.name}', got '{source_agent_name}'."
         )
 
-    context_class = cast(Any, agent.context_class)
     source_task: Task[Any] = Task.from_dict(
         source_task_data,
-        context_class=context_class,
+        payload_parser=agent.context_from_dict,
     )
     root_keys = RedisKeys.format(namespace=namespace)
     resume_request_hash = _resume_request_hash(messages=normalized_messages)
@@ -299,7 +299,7 @@ async def resume_task(
             normalized_idempotency_key,
         )
 
-    resumed_payload = context_class.from_dict(source_task.payload.to_dict())
+    resumed_payload = agent.context_from_dict(source_task.payload.to_dict())
 
     existing_messages = (
         list(resumed_payload.messages)
@@ -307,9 +307,9 @@ async def resume_task(
         else []
     )
     resumed_payload.messages = [*existing_messages, *normalized_messages]
-    resumed_payload.turn = 0
+    resumed_payload.turn_number = 1
     resumed_payload.output = None
-    resumed_payload.attempt = 0
+    resumed_payload.attempt_number = 1
     resumed_payload.verification = VerificationState()
 
     resumed_task: Task[Any] = Task.create(
@@ -365,7 +365,7 @@ async def resume_task(
         )
         return Task.from_dict(
             existing_task_data,
-            context_class=context_class,
+            payload_parser=agent.context_from_dict,
         )
 
     resumed_task.id = resume_result.resumed_task_id

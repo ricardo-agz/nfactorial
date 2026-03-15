@@ -19,7 +19,20 @@ import pytest
 import redis.asyncio as redis
 
 from factorial.agent import BaseAgent, TurnCompletion
-from factorial.execution.context import AgentContext, ExecutionContext
+from factorial.agent.context import (
+    AgentContext,
+    EmptyMetadata,
+    EmptyState,
+)
+from factorial.ai.models import Model, Provider
+from factorial.execution.context import ExecutionContext
+
+MOCK_MODEL = Model(
+    name="mock-model",
+    provider=Provider.OPENAI,
+    provider_model_id="mock-v1",
+    context_window=128000,
+)
 from factorial.queue.keys import RedisKeys
 from factorial.queue.lua import (
     create_batch_pickup_script,
@@ -44,18 +57,74 @@ async def _await_redis(call: object) -> Any:
 # =============================================================================
 
 
+@dataclass
 class OrchestratorContext(AgentContext):
     """Context for an orchestrator agent that spawns child tasks."""
 
-    child_task_ids: list[str] = []
-    child_results: dict[str, Any] = {}
+    child_task_ids: list[str] = field(default_factory=list)
+    child_results: dict[str, Any] = field(default_factory=dict)
     phase: str = "initial"
 
+    def to_dict(self) -> dict[str, Any]:
+        d = super().to_dict()
+        d["child_task_ids"] = self.child_task_ids
+        d["child_results"] = self.child_results
+        d["phase"] = self.phase
+        return d
 
+    @classmethod
+    def from_dict(
+        cls,
+        data: dict[str, Any],
+        *,
+        state_type: Any = EmptyState,
+        metadata_type: Any = EmptyMetadata,
+    ) -> OrchestratorContext:
+        base = AgentContext.from_dict(data, state_type=state_type, metadata_type=metadata_type)
+        return cls(
+            messages=base.messages,
+            turn_number=base.turn_number,
+            output=base.output,
+            attempt_number=base.attempt_number,
+            state=base.state,
+            metadata=base.metadata,
+            verification=base.verification,
+            child_task_ids=data.get("child_task_ids") or [],
+            child_results=data.get("child_results") or {},
+            phase=data.get("phase", "initial"),
+        )
+
+
+@dataclass
 class WorkerContext(AgentContext):
     """Context for a worker agent that performs actual work."""
 
     work_type: str = "default"
+
+    def to_dict(self) -> dict[str, Any]:
+        d = super().to_dict()
+        d["work_type"] = self.work_type
+        return d
+
+    @classmethod
+    def from_dict(
+        cls,
+        data: dict[str, Any],
+        *,
+        state_type: Any = EmptyState,
+        metadata_type: Any = EmptyMetadata,
+    ) -> WorkerContext:
+        base = AgentContext.from_dict(data, state_type=state_type, metadata_type=metadata_type)
+        return cls(
+            messages=base.messages,
+            turn_number=base.turn_number,
+            output=base.output,
+            attempt_number=base.attempt_number,
+            state=base.state,
+            metadata=base.metadata,
+            verification=base.verification,
+            work_type=data.get("work_type", "default"),
+        )
 
 
 # =============================================================================
@@ -74,21 +143,24 @@ class ChildSpawningAgent(BaseAgent[OrchestratorContext]):
 
     num_children: int = 2
     child_agent_name: str = "worker_agent"
-    spawn_on_turn: int = 1
+    spawn_on_turn: int = 2  # turn_number is incremented before check
     _spawned: bool = field(default=False, init=False)
 
     def __post_init__(self) -> None:
         super().__init__(
             name="orchestrator_agent",
             instructions="Orchestrator that spawns child tasks",
-            context_class=OrchestratorContext,
+            model=MOCK_MODEL,
         )
+
+    def context_from_dict(self, data: dict[str, Any]) -> OrchestratorContext:
+        return OrchestratorContext.from_dict(data)
 
     async def run_turn(
         self,
         agent_ctx: OrchestratorContext,
     ) -> TurnCompletion[OrchestratorContext]:
-        agent_ctx.turn += 1
+        agent_ctx.turn_number += 1
 
         # Check if we have child results (resume after children complete)
         if agent_ctx.child_results:
@@ -106,7 +178,7 @@ class ChildSpawningAgent(BaseAgent[OrchestratorContext]):
             )
 
         # First turn: spawn children
-        if agent_ctx.turn == self.spawn_on_turn and not self._spawned:
+        if agent_ctx.turn_number == self.spawn_on_turn and not self._spawned:
             ctx = ExecutionContext.current()
             child_ids = []
 
@@ -143,25 +215,28 @@ class SimpleWorkerAgent(BaseAgent[WorkerContext]):
         super().__init__(
             name=name,
             instructions="Worker agent that performs work",
-            context_class=WorkerContext,
+            model=MOCK_MODEL,
         )
         self.work_value = work_value
         self.turns_to_complete = turns_to_complete
+
+    def context_from_dict(self, data: dict[str, Any]) -> WorkerContext:
+        return WorkerContext.from_dict(data)
 
     async def run_turn(
         self,
         agent_ctx: WorkerContext,
     ) -> TurnCompletion[WorkerContext]:
-        agent_ctx.turn += 1
+        agent_ctx.turn_number += 1
 
-        if agent_ctx.turn >= self.turns_to_complete:
+        if agent_ctx.turn_number >= self.turns_to_complete:
             return TurnCompletion(
                 is_done=True,
                 context=agent_ctx,
                 output={
                     "value": self.work_value,
                     "work_type": agent_ctx.work_type,
-                    "completed_turn": agent_ctx.turn,
+                    "completed_turn": agent_ctx.turn_number,
                 },
             )
 
@@ -180,7 +255,7 @@ class HandoffAgent(BaseAgent[AgentContext]):
         super().__init__(
             name=name,
             instructions="Agent that hands off to another agent",
-            context_class=AgentContext,
+            model=MOCK_MODEL,
         )
         self.handoff_to = handoff_to
         self.turns_before_handoff = turns_before_handoff
@@ -189,9 +264,9 @@ class HandoffAgent(BaseAgent[AgentContext]):
         self,
         agent_ctx: AgentContext,
     ) -> TurnCompletion[AgentContext]:
-        agent_ctx.turn += 1
+        agent_ctx.turn_number += 1
 
-        if self.handoff_to and agent_ctx.turn >= self.turns_before_handoff:
+        if self.handoff_to and agent_ctx.turn_number >= self.turns_before_handoff:
             # Create a child task for the handoff agent
             ctx = ExecutionContext.current()
             if ctx.subagents.enqueue_callback:
@@ -205,7 +280,7 @@ class HandoffAgent(BaseAgent[AgentContext]):
         return TurnCompletion(
             is_done=True,
             context=agent_ctx,
-            output={"handled_by": self.name, "turns": agent_ctx.turn},
+            output={"handled_by": self.name, "turns": agent_ctx.turn_number},
         )
 
 
@@ -258,14 +333,20 @@ class TestMultiAgentBasicFlow:
         )
 
         # Create tasks for both agents
-        ctx1 = WorkerContext(query="Task for agent 1", work_type="type_a")
+        ctx1 = WorkerContext(
+            messages=[{"role": "user", "content": "Task for agent 1"}],
+            work_type="type_a",
+        )
         task1 = Task.create(
             owner_id=test_owner_id,
             agent=worker_agent.name,
             payload=ctx1,
         )
 
-        ctx2 = WorkerContext(query="Task for agent 2", work_type="type_b")
+        ctx2 = WorkerContext(
+            messages=[{"role": "user", "content": "Task for agent 2"}],
+            work_type="type_b",
+        )
         task2 = Task.create(
             owner_id=test_owner_id,
             agent=second_worker_agent.name,
@@ -355,9 +436,9 @@ class TestMultiAgentBasicFlow:
         task1_data = await get_task_data(redis_client, test_namespace, task1.id)
         task2_data = await get_task_data(redis_client, test_namespace, task2.id)
 
-        # Each agent completed in 1 turn
-        assert task1_data["payload"]["turn"] == 1
-        assert task2_data["payload"]["turn"] == 1
+        # Each agent completed in 1 turn (turn_number is incremented before completion)
+        assert task1_data["payload"]["turn_number"] == 2
+        assert task2_data["payload"]["turn_number"] == 2
 
 
 @pytest.mark.asyncio
@@ -380,7 +461,9 @@ class TestParentChildAgentFlow:
         )
 
         # Create orchestrator task
-        ctx = OrchestratorContext(query="Orchestrate work")
+        ctx = OrchestratorContext(
+            messages=[{"role": "user", "content": "Orchestrate work"}]
+        )
         task = Task.create(
             owner_id=test_owner_id,
             agent=orchestrator.name,
@@ -487,8 +570,8 @@ class TestParentChildAgentFlow:
                 parent_keys.task_payload,
                 parent_id,
                 json.dumps({
-                    "query": "parent task",
-                    "turn": 1,
+                    "messages": [{"role": "user", "content": "parent task"}],
+                    "turn_number": 1,
                     "child_task_ids": child_ids,
                 }),
             )
@@ -541,7 +624,10 @@ class TestParentChildAgentFlow:
                 redis_client.hset(
                     child_keys.task_payload,
                     child_id,
-                    json.dumps({"query": f"child task {i}", "turn": 1}),
+                    json.dumps({
+                        "messages": [{"role": "user", "content": f"child task {i}"}],
+                        "turn_number": 1,
+                    }),
                 )
             )
             await _await_redis(
@@ -603,8 +689,8 @@ class TestParentChildAgentFlow:
                 task_id=child_id,
                 action="complete",
                 updated_task_payload_json=json.dumps({
-                    "query": f"child {i}",
-                    "turn": 1,
+                    "messages": [{"role": "user", "content": f"child {i}"}],
+                    "turn_number": 1,
                 }),
                 metrics_ttl=3600,
                 pending_sentinel=PENDING_SENTINEL,
@@ -697,7 +783,9 @@ class TestMultiAgentConcurrency:
                 redis_client.hset(
                     parent_keys_obj.task_payload,
                     parent_id,
-                    json.dumps({"query": f"parent {parent_id[:8]}"}),
+                    json.dumps({
+                        "messages": [{"role": "user", "content": f"parent {parent_id[:8]}"}],
+                    }),
                 )
             )
             await _await_redis(
@@ -856,14 +944,18 @@ class TestAgentRegistration:
         )
 
         # Create tasks explicitly assigned to different agents
-        ctx1 = WorkerContext(query="For agent 1")
+        ctx1 = WorkerContext(
+            messages=[{"role": "user", "content": "For agent 1"}]
+        )
         task1 = Task.create(
             owner_id=test_owner_id,
             agent=worker_agent.name,
             payload=ctx1,
         )
 
-        ctx2 = WorkerContext(query="For agent 2")
+        ctx2 = WorkerContext(
+            messages=[{"role": "user", "content": "For agent 2"}]
+        )
         task2 = Task.create(
             owner_id=test_owner_id,
             agent=second_worker_agent.name,

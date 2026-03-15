@@ -2,14 +2,15 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 import pytest
 import redis.asyncio as redis
 from pydantic import BaseModel
 
-from factorial.core.exceptions import VerificationRejected
-from factorial.execution.context import AgentContext
+from factorial import verify
+from factorial.agent.context import AgentContext
 from factorial.queue.keys import RedisKeys
 from factorial.queue.lua import (
     create_batch_pickup_script,
@@ -19,7 +20,7 @@ from factorial.queue.lua import (
 from factorial.queue.operations import enqueue_task
 from factorial.queue.task import Task, TaskStatus, get_task_data, get_task_status
 from factorial.queue.worker import process_task
-from tests.mocks.llm import MockLLMClient, MockResponse, MockToolCall
+from tests.mocks.llm import MockLLMClient, MockResponse
 
 from .conftest import MOCK_MODEL, MockLLMAgent
 
@@ -64,36 +65,34 @@ async def test_verifier_rejection_persists_then_completes_on_revision(
     mock_client = MockLLMClient(
         responses=[
             MockResponse(
-                tool_calls=[
-                    MockToolCall(
-                        name="final_output",
-                        arguments={"summary": "first attempt", "score": 1},
-                    )
-                ]
+                content=json.dumps({"summary": "first attempt", "score": 1}),
+                is_final=True,
             ),
             MockResponse(
-                tool_calls=[
-                    MockToolCall(
-                        name="final_output",
-                        arguments={"summary": "second attempt", "score": 10},
-                    )
-                ]
+                content=json.dumps({"summary": "second attempt", "score": 10}),
+                is_final=True,
             ),
         ]
     )
 
-    async def verifier(output: VerificationOutput) -> dict[str, Any]:
-        if output.score < 5:
-            raise VerificationRejected(message="score too low", code="score_low")
-        return {"summary": output.summary, "verified": True}
+    async def verifier(output: Any):
+        parsed = (
+            VerificationOutput.model_validate(json.loads(output))
+            if isinstance(output, str)
+            else output
+        )
+        if parsed.score < 5:
+            return verify.retry(
+                message="score too low",
+                code="score_low",
+            )
+        return verify.accept(metadata={"summary": parsed.summary, "verified": True})
 
     agent = MockLLMAgent(
         mock_client=mock_client,
         name="verification_agent",
         model=MOCK_MODEL,
-        output_type=VerificationOutput,
         verifier=verifier,
-        verifier_max_attempts=3,
     )
     try:
         keys = RedisKeys.format(namespace=test_namespace, agent=agent.name)
@@ -104,7 +103,9 @@ async def test_verifier_rejection_persists_then_completes_on_revision(
         task = Task.create(
             owner_id=test_owner_id,
             agent=agent.name,
-            payload=AgentContext(query="verify this output"),
+            payload=AgentContext(
+                messages=[{"role": "user", "content": "verify this output"}]
+            ),
         )
         task_id = await enqueue_task(
             redis_client=redis_client,
@@ -142,11 +143,11 @@ async def test_verifier_rejection_persists_then_completes_on_revision(
         )
         payload_after_rejection = task_data_after_rejection["payload"]
         assert payload_after_rejection["verification"]["attempts_used"] == 1
-        assert payload_after_rejection["verification"]["last_outcome"] == "rejected"
+        assert payload_after_rejection["verification"]["last_outcome"] == "retry_requested"
         assert any(
-            "verification_rejected" in message.get("content", "")
+            "Verifier feedback" in str(message.get("content", ""))
             for message in payload_after_rejection["messages"]
-            if message.get("role") == "user"
+            if message.get("role") == "system"
         )
 
         second_pick = await _pickup_single_task(redis_client=redis_client, keys=keys)
@@ -171,10 +172,9 @@ async def test_verifier_rejection_persists_then_completes_on_revision(
 
         final_task_data = await get_task_data(redis_client, test_namespace, task_id)
         final_payload = final_task_data["payload"]
-        assert final_payload["output"] == {
-            "summary": "second attempt",
-            "verified": True,
-        }
+        assert final_payload["output"] == json.dumps(
+            {"summary": "second attempt", "score": 10}
+        )
         assert final_payload["verification"]["attempts_used"] == 1
         assert final_payload["verification"]["last_outcome"] == "passed"
     finally:
@@ -182,7 +182,7 @@ async def test_verifier_rejection_persists_then_completes_on_revision(
 
 
 @pytest.mark.asyncio
-async def test_verifier_exhaustion_fails_task(
+async def test_verifier_can_fail_task_after_attempt_threshold(
     redis_client: redis.Redis,
     test_namespace: str,
     test_owner_id: str,
@@ -190,26 +190,29 @@ async def test_verifier_exhaustion_fails_task(
     mock_client = MockLLMClient(
         responses=[
             MockResponse(
-                tool_calls=[
-                    MockToolCall(
-                        name="final_output",
-                        arguments={"summary": "bad", "score": 0},
-                    )
-                ]
-            )
+                content=json.dumps({"summary": "bad", "score": 0}),
+                is_final=True,
+            ),
+            MockResponse(
+                content=json.dumps({"summary": "still bad", "score": 0}),
+                is_final=True,
+            ),
         ]
     )
 
-    async def verifier(_output: VerificationOutput) -> dict[str, Any]:
-        raise VerificationRejected(message="not acceptable", code="tests_failed")
+    async def verifier(_output: Any, *, agent_ctx: AgentContext):
+        if agent_ctx.verification.attempts_used >= 1:
+            return verify.fail(
+                message="verification retry limit reached",
+                code="tests_failed",
+            )
+        return verify.retry(message="not acceptable", code="tests_failed")
 
     agent = MockLLMAgent(
         mock_client=mock_client,
         name="verification_exhaustion_agent",
         model=MOCK_MODEL,
-        output_type=VerificationOutput,
         verifier=verifier,
-        verifier_max_attempts=1,
     )
     try:
         keys = RedisKeys.format(namespace=test_namespace, agent=agent.name)
@@ -220,7 +223,9 @@ async def test_verifier_exhaustion_fails_task(
         task = Task.create(
             owner_id=test_owner_id,
             agent=agent.name,
-            payload=AgentContext(query="reject until exhausted"),
+            payload=AgentContext(
+                messages=[{"role": "user", "content": "reject until exhausted"}]
+            ),
         )
         task_id = await enqueue_task(
             redis_client=redis_client,
@@ -229,22 +234,27 @@ async def test_verifier_exhaustion_fails_task(
             task=task,
         )
 
-        picked = await _pickup_single_task(redis_client=redis_client, keys=keys)
-        assert picked == [task_id]
-
-        await process_task(
-            redis_client=redis_client,
-            namespace=test_namespace,
-            task_id=task_id,
-            completion_script=completion_script,
-            steering_script=steering_script,
-            agent=agent,
-            agents_by_name=agents_by_name,
-            max_retries=3,
-            heartbeat_interval=5,
-            task_timeout=60,
-            metrics_retention_duration=3600,
-        )
+        # Process until terminal (verifier retry puts task back in queue; exhaust on 2nd turn)
+        for _ in range(5):
+            picked = await _pickup_single_task(redis_client=redis_client, keys=keys)
+            if not picked:
+                break
+            await process_task(
+                redis_client=redis_client,
+                namespace=test_namespace,
+                task_id=task_id,
+                completion_script=completion_script,
+                steering_script=steering_script,
+                agent=agent,
+                agents_by_name=agents_by_name,
+                max_retries=3,
+                heartbeat_interval=5,
+                task_timeout=60,
+                metrics_retention_duration=3600,
+            )
+            status = await get_task_status(redis_client, test_namespace, task_id)
+            if status in (TaskStatus.COMPLETED, TaskStatus.FAILED):
+                break
 
         status = await get_task_status(redis_client, test_namespace, task_id)
         assert status == TaskStatus.FAILED

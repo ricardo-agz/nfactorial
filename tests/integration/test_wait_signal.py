@@ -13,7 +13,15 @@ from openai.types.chat.chat_completion_message_function_tool_call import (
 )
 
 from factorial.agent import BaseAgent, TurnCompletion
-from factorial.execution.context import AgentContext
+from factorial.ai.models import Model, Provider
+from factorial.agent.context import AgentContext
+
+MOCK_MODEL = Model(
+    name="mock-model",
+    provider=Provider.OPENAI,
+    provider_model_id="mock-v1",
+    context_window=128000,
+)
 from factorial.execution.signals import signals
 from factorial.execution.waits import wait
 from factorial.queue.keys import RedisKeys
@@ -50,7 +58,7 @@ class _WaitForSignalAgent(BaseAgent[AgentContext]):
         super().__init__(
             name=name,
             instructions="Signal wait agent",
-            context_class=AgentContext,
+            model=MOCK_MODEL,
         )
         self._signal_id = signal_id
         self._timeout = timeout
@@ -59,7 +67,7 @@ class _WaitForSignalAgent(BaseAgent[AgentContext]):
         self,
         agent_ctx: AgentContext,
     ) -> TurnCompletion[AgentContext]:
-        agent_ctx.turn += 1
+        agent_ctx.turn_number += 1
         current_signal = signals.current()
         if current_signal is not None and current_signal.signal_id == self._signal_id:
             return TurnCompletion(
@@ -134,7 +142,7 @@ async def test_process_task_parks_wait_until_signal(
     task = Task.create(
         owner_id=test_owner_id,
         agent=agent.name,
-        payload=AgentContext(query="wait for signal"),
+        payload=AgentContext(messages=[{"role": "user", "content": "wait for signal"}]),
         max_turns=10,
     )
     task_id = await enqueue_task(
@@ -194,13 +202,13 @@ async def test_signal_task_wakes_waiting_signal_task(
     sender_task = Task.create(
         owner_id=test_owner_id,
         agent=sender_agent.name,
-        payload=AgentContext(query="sender"),
+        payload=AgentContext(messages=[{"role": "user", "content": "sender"}]),
         max_turns=5,
     )
     receiver_task = Task.create(
         owner_id=test_owner_id,
         agent=receiver_agent.name,
-        payload=AgentContext(query="receiver"),
+        payload=AgentContext(messages=[{"role": "user", "content": "receiver"}]),
         max_turns=5,
     )
     await enqueue_task(
@@ -308,7 +316,9 @@ async def test_wait_until_signal_timeout_exposes_timeout_wake_reason(
     task = Task.create(
         owner_id=test_owner_id,
         agent=agent.name,
-        payload=AgentContext(query="timeout on signal wait"),
+        payload=AgentContext(
+            messages=[{"role": "user", "content": "timeout on signal wait"}]
+        ),
         max_turns=10,
     )
     task_id = await enqueue_task(

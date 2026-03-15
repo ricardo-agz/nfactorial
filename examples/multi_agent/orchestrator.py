@@ -26,7 +26,7 @@ orchestrator = Orchestrator(
     ),
 )
 
-orchestrator.register_runner(
+orchestrator.register(
     agent=search_agent,
     agent_worker_config=AgentWorkerConfig(
         workers=25,
@@ -39,7 +39,7 @@ orchestrator.register_runner(
     ),
 )
 
-orchestrator.register_runner(
+orchestrator.register(
     agent=basic_agent,
     agent_worker_config=AgentWorkerConfig(
         workers=50,

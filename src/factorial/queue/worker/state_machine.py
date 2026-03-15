@@ -1,16 +1,23 @@
 import asyncio
 import time
-from datetime import datetime, timezone
 from enum import Enum
 from typing import Any
 
 import redis.asyncio as redis
 
-from factorial.agent import BaseAgent, RunCompletion
-from factorial.core.events import AgentEvent, EventPublisher, QueueEvent
+from factorial.agent import BaseAgent
+from factorial.agent.context import ContextType
+from factorial.core.events import (
+    AgentEvent,
+    EventPublisher,
+    FinishEvent,
+    QueueEvent,
+    ToolFinishEvent,
+)
 from factorial.core.logging import colored
+from factorial.core.run_types import RunError, RunStatus
 from factorial.core.utils import serialize_data
-from factorial.execution.context import ContextType, ExecutionContext
+from factorial.execution.context import ExecutionContext
 from factorial.execution.tools import _ToolResultInternal
 from factorial.execution.waits import WaitInstruction, next_cron_wake_timestamp
 from factorial.queue.operations import (
@@ -61,12 +68,25 @@ async def handle_hook_state(
             task.payload,
             hook_tick.completed_results,
         ).context
-        await agent._safe_call(
-            agent.on_pending_tool_results,
-            task.payload,
-            execution_ctx,
-            hook_tick.completed_results,
-        )
+        for tool_call_id, hook_result in hook_tick.completed_results:
+            client_output = (
+                hook_result.client_output
+                if isinstance(hook_result, _ToolResultInternal)
+                else hook_result
+            )
+            await agent._emit_event(
+                ToolFinishEvent(
+                    task_id=task.id,
+                    owner_id=task.metadata.owner_id,
+                    agent_name=agent.name,
+                    turn=task.payload.turn_number,
+                    tool_call_id=tool_call_id,
+                    output=client_output,
+                    is_error=False,
+                ),
+                task.payload,
+                execution_ctx,
+            )
 
     if hook_tick.should_repark:
         if hook_pending_child_task_ids:
@@ -90,7 +110,7 @@ async def handle_hook_state(
                 task_id=task.id,
                 owner_id=task.metadata.owner_id,
                 agent_name=agent.name,
-                turn=task.payload.turn,
+                turn=task.payload.turn_number,
             )
         )
         return True
@@ -249,7 +269,7 @@ async def handle_wait_state(
                 task_id=task.id,
                 owner_id=task.metadata.owner_id,
                 agent_name=agent.name,
-                turn=task.payload.turn,
+                turn=task.payload.turn_number,
                 data=event_data,
             )
         )
@@ -356,7 +376,7 @@ async def handle_wait_state(
                 task_id=task.id,
                 owner_id=task.metadata.owner_id,
                 agent_name=agent.name,
-                turn=task.payload.turn,
+                turn=task.payload.turn_number,
                 data=event_data,
             )
         )
@@ -416,7 +436,7 @@ async def handle_wait_state(
             task_id=task.id,
             owner_id=task.metadata.owner_id,
             agent_name=agent.name,
-            turn=task.payload.turn,
+            turn=task.payload.turn_number,
             data={
                 "wait_kind": wait_kind,
                 "wake_timestamp": wake_timestamp,
@@ -467,7 +487,7 @@ async def handle_completion_state(
                 task_id=task.id,
                 owner_id=task.metadata.owner_id,
                 agent_name=agent.name,
-                turn=task.payload.turn,
+                turn=task.payload.turn_number,
                 data=serialize_data(turn_completion),
             )
         )
@@ -491,17 +511,6 @@ async def handle_completion_state(
             final_output=turn_completion.output,
         )
 
-        await agent._safe_call(
-            agent.on_run_end,
-            turn_completion.context,
-            execution_ctx,
-            RunCompletion(
-                output=turn_completion.output,
-                started_at=task.metadata.created_at,
-                finished_at=datetime.now(timezone.utc),
-            ),
-        )
-
         if parent_task_id:
             await resume_if_no_remaining_child_tasks(
                 redis_client=redis_client,
@@ -510,15 +519,22 @@ async def handle_completion_state(
                 task_id=parent_task_id,
             )
 
-        await event_publisher.publish_event(
-            AgentEvent(
-                event_type="run_completed",
+        await agent._emit_event(
+            FinishEvent(
                 task_id=task.id,
                 owner_id=task.metadata.owner_id,
                 agent_name=agent.name,
-                turn=task.payload.turn,
-                data=serialize_data(turn_completion),
-            )
+                status=RunStatus.COMPLETED,
+                output=turn_completion.output,
+                turn_count=(
+                    turn_completion.turn_summary.turn_number
+                    if turn_completion.turn_summary is not None
+                    else task.payload.turn_number
+                ),
+                usage=turn_completion.usage,
+            ),
+            turn_completion.context,
+            execution_ctx,
         )
 
         if task.metadata.batch_id:
@@ -671,16 +687,22 @@ async def handle_failure_state(
     )
 
     if failure_action is CompletionAction.FAIL:
-        await agent._safe_call(
-            agent.on_run_end,
+        await agent._emit_event(
+            FinishEvent(
+                task_id=task.id,
+                owner_id=task.metadata.owner_id,
+                agent_name=agent.name,
+                status=RunStatus.FAILED,
+                run_error=RunError.from_exception(error),
+                turn_count=(
+                    execution_ctx.last_turn.turn_number
+                    if execution_ctx.last_turn is not None
+                    else max(task.payload.turn_number - 1, 0)
+                ),
+                usage=execution_ctx.usage,
+            ),
             task.payload,
             execution_ctx,
-            RunCompletion(
-                output=None,
-                error=error,
-                started_at=task.metadata.created_at,
-                finished_at=datetime.now(timezone.utc),
-            ),
         )
 
     if parent_task_id and failure_action is CompletionAction.FAIL:
@@ -705,14 +727,17 @@ async def emit_failure_outcome_events(
     if failure_action is CompletionAction.FAIL or task.retries >= max_retries:
         logger.error(f"❌ Task failed permanently {colored(f'[{task.id}]', 'dim')}")
         await event_publisher.publish_event(
-            AgentEvent(
-                event_type="run_failed",
+            FinishEvent(
                 task_id=task.id,
                 owner_id=task.metadata.owner_id,
                 agent_name=agent.name,
-                error=(
-                    f"Agent {agent.name} failed to complete "
-                    f"task {task.id} (max retries: {max_retries})"
+                status=RunStatus.FAILED,
+                run_error=RunError(
+                    type="TaskFailure",
+                    message=(
+                        f"Agent {agent.name} failed to complete "
+                        f"task {task.id} (max retries: {max_retries})"
+                    ),
                 ),
             )
         )

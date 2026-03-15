@@ -62,17 +62,17 @@ weather_agent = Agent(
 
 # Set up orchestrator
 orchestrator = Orchestrator()
-orchestrator.register_runner(
+orchestrator.register(
     agent=weather_agent,
     agent_worker_config=AgentWorkerConfig(workers=2, batch_size=10),
 )
 
 # Enqueue a task
-task = weather_agent.create_task(
+task = await orchestrator.enqueue(
+    weather_agent,
+    input="What's the weather in San Francisco?",
     owner_id="user123",
-    payload=AgentContext(query="What's the weather in San Francisco?"),
 )
-await orchestrator.enqueue_task(agent=weather_agent, task=task)
 
 # Subscribe to results
 async for update in orchestrator.subscribe_to_updates(owner_id="user123"):

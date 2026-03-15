@@ -42,7 +42,7 @@ orchestrator = Orchestrator(
     redis_db=0,
     redis_max_connections=50,
 )
-orchestrator.register_runner(
+orchestrator.register(
     agent=agent, agent_worker_config=AgentWorkerConfig(workers=1)
 )
 

@@ -1,54 +1,20 @@
 # Context
 
-Agents are stateless, Context is used to track the state of execution throughout each turn.
+Agents are stateless. `AgentContext` tracks execution state for each turn.
 
 ## AgentContext
 
-The default base context class for agents:
+`AgentContext` exposes `messages`, `state`, and `metadata`:
 
 ```python
-from factorial import AgentContext
-
-context = AgentContext(
-    query="Tell me a joke",
-    messages=[],  # Conversation history
-    turn=0,       # Current turn number
-)
+# In tools or prepare_turn, agent_ctx provides:
+agent_ctx.messages   # Conversation history (list of message dicts)
+agent_ctx.state     # Typed state (from Agent[StateT])
+agent_ctx.metadata  # Typed metadata
+agent_ctx.turn_number  # Current turn (1-based)
 ```
 
-## Custom Agent Context
-
-Create a custom agent context classes for specialized agents:
-
-```python
-from typing import Any
-from factorial import AgentContext
-
-class DualAgentContext(AgentContext):
-    agent_a_messages: list[dict[str, Any]] = []
-    agent_b_messages: list[dict[str, Any]] = []
-```
-
-## Using Custom Agent Context
-
-```python
-from factorial import BaseAgent
-
-class ABTestableAgent(BaseAgent[DualAgentContext]): # For the type checker
-    def __init__(self):
-        super().__init__(
-            description="Executes two agents side by side",
-            instructions="You are a helpful assistant",
-            tools=tools,
-            context_class=DualAgentContext,  # For task serialization
-        )
-
-# Create tasks with custom context
-context = DualAgentContext(
-    query="Research AI developments",
-)
-task = agent.create_task(owner_id="user123", payload=context)
-```
+For typed state, use `Agent[StateT]` with a dataclass and pass `state=...` to `orchestrator.enqueue()`.
 
 ## Execution Context
 
@@ -73,21 +39,21 @@ class MyAgent(Agent):
 
 ## Using Context in Tools
 
-The agent automatically injects the agent and execution context to tools that require them
-as arguments. 
+Tools can receive `agent_ctx` and `execution_ctx` as arguments:
 
 ```python
 def stateless_tool(input_args: str) -> str:
     ...
 
-def stateful_tool(input_args: str, agent_ctx: AgentContext) -> str:
+def stateful_tool(input_args: str, agent_ctx) -> str:
     if len(agent_ctx.messages) > 10:
         return run_tool_b(input_args)
     return run_tool_a(input_args)
 
-def tool_with_fallbacks(input_args: str, agent_ctx: AgentContext, execution_ctx: ExecutionContext) -> str:
-    if execution_context.retries > 0:
+def tool_with_fallbacks(input_args: str, agent_ctx, execution_ctx) -> str:
+    if execution_ctx.retries > 0:
         return run_tool_b(input_args)
-
     return run_tool_a(input_args)
 ```
+
+Access typed state via `agent_ctx.state.*` when using `Agent[StateT]`.

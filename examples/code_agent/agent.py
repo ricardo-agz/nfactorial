@@ -1,20 +1,22 @@
 import os
+from dataclasses import dataclass
 from typing import Annotated, Any
 
 from dotenv import load_dotenv
 from pydantic import BaseModel
 
 from factorial import (
+    Agent,
     AgentContext,
-    BaseAgent,
     Hidden,
     Hook,
     HookRequestContext,
-    ModelSettings,
     PendingHook,
+    Turn,
     ai_gateway,
     gpt_41,
     hook,
+    user,
 )
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -23,8 +25,13 @@ env_path = os.path.join(current_dir, ".env")
 load_dotenv(env_path, override=True)
 
 
-class IdeAgentContext(AgentContext):
-    code: str
+@dataclass
+class IdeAgentState:
+    code: str = ""
+    query: str = ""
+
+
+IdeAgentContext = AgentContext[IdeAgentState]
 
 
 def think(thoughts: str) -> str:
@@ -55,7 +62,7 @@ def edit_code(
     find_end_line: The end line number where the 'find' text is located
     replace: The text to replace the 'find' text with
     """
-    lines = agent_ctx.code.split("\n")
+    lines = agent_ctx.state.code.split("\n")
 
     # Convert to 0-based indexing
     start_idx = find_start_line - 1
@@ -84,8 +91,8 @@ def edit_code(
     # Replace the lines in the code
     new_lines = lines[:start_idx] + new_text.split("\n") + lines[end_idx + 1 :]
 
-    # Update the agent context with the modified code
-    agent_ctx.code = "\n".join(new_lines)
+    # Update the agent state with the modified code
+    agent_ctx.state.code = "\n".join(new_lines)
 
     line_range = f"{find_start_line}-{find_end_line}"
     return EditResult(
@@ -93,7 +100,7 @@ def edit_code(
             f"Code successfully edited: replaced '{find}' with '{replace}' "
             f"at lines {line_range}"
         ),
-        new_code=agent_ctx.code,
+        new_code=agent_ctx.state.code,
         old_text=existing_text,
         new_text=new_text,
     )
@@ -186,7 +193,7 @@ async def request_code_execution(
             executed=False,
         )
 
-    execution = await execute_code(agent_ctx.code)
+    execution = await execute_code(agent_ctx.state.code)
     success = execution["exit_code"] == 0
 
     if success:
@@ -237,45 +244,31 @@ diff editor.
 """
 
 
-class IDEAgent(BaseAgent[IdeAgentContext]):
-    def __init__(self):
-        super().__init__(
-            context_class=IdeAgentContext,
-            instructions=instructions,
-            tools=[think, edit_code, request_code_execution],
-            model=ai_gateway(gpt_41),
-            model_settings=ModelSettings(
-                temperature=0.1,
-            ),
+def _display_code_with_line_numbers(code: str) -> str:
+    """Display code with line numbers"""
+    return "\n".join(
+        [f"[{i + 1}]{line}" for i, line in enumerate(code.split("\n"))]
+    )
+
+
+def _prepare_turn(
+    turn: Turn[IdeAgentContext],
+    agent_ctx: IdeAgentContext,
+) -> None:
+    if agent_ctx.turn_number == 1 and agent_ctx.state.code:
+        code_display = _display_code_with_line_numbers(agent_ctx.state.code)
+        user_content = (
+            f"Code file with line numbers:\n{code_display}\n"
+            f"---\nQuery: {agent_ctx.state.query}"
         )
-
-    def prepare_messages(self, agent_ctx: IdeAgentContext) -> list[dict[str, Any]]:
-        if agent_ctx.turn == 0:
-            messages = [{"role": "system", "content": self.instructions}]
-            if agent_ctx.messages:
-                messages.extend(
-                    [message for message in agent_ctx.messages if message["content"]]
-                )
-            code_display = self.display_code_with_line_numbers(agent_ctx.code)
-            messages.append(
-                {
-                    "role": "user",
-                    "content": (
-                        f"Code file with line numbers:\n{code_display}\n"
-                        f"---\nQuery: {agent_ctx.query}"
-                    ),
-                }
-            )
-        else:
-            messages = agent_ctx.messages
-
-        return messages
-
-    def display_code_with_line_numbers(self, code: str) -> str:
-        """Display code with line numbers"""
-        return "\n".join(
-            [f"[{i + 1}]{line}" for i, line in enumerate(code.split("\n"))]
-        )
+        turn.messages = list(agent_ctx.messages) + [user(user_content)]
+    turn.temperature = 0.1
 
 
-ide_agent = IDEAgent()
+ide_agent = Agent[IdeAgentState](
+    name="ide_agent",
+    instructions=instructions,
+    tools=[think, edit_code, request_code_execution],
+    model=ai_gateway(gpt_41),
+    prepare_turn=_prepare_turn,
+)

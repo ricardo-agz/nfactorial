@@ -1,4 +1,5 @@
 import os
+from dataclasses import dataclass, field
 from typing import Any
 
 from dotenv import load_dotenv
@@ -6,16 +7,16 @@ from pydantic import BaseModel, Field
 
 from factorial import (
     Agent,
-    AgentContext,
+    EmptyMetadata,
     ExecutionContext,
-    ModelSettings,
-    VerificationRejected,
     WaitInstruction,
     ai_gateway,
     gpt_41_mini,
     messaging,
+    stop,
     subagents,
     tool,
+    verify,
     wait,
 )
 
@@ -26,14 +27,15 @@ load_dotenv(env_path, override=True)
 TEAM_GROUP_NAME = "team_room"
 
 
-class DemoContext(AgentContext):
+@dataclass
+class DemoState:
     role_name: str = "parent"
     phase: str = "init"
     topic: str = ""
     group_name: str = TEAM_GROUP_NAME
-    roster: dict[str, str] = Field(default_factory=dict)
-    group_member_task_ids: list[str] = Field(default_factory=list)
-    child_jobs: list[dict[str, Any]] = Field(default_factory=list)
+    roster: dict[str, str] = field(default_factory=dict)
+    group_member_task_ids: list[str] = field(default_factory=list)
+    child_jobs: list[dict[str, Any]] = field(default_factory=list)
     dm_target_task_id: str | None = None
     wait_count: int = 0
     children_wait_requested: bool = False
@@ -83,37 +85,39 @@ class FinalOutput(BaseModel):
     final_output: str
 
 
-def verify_parent_output(output: FinalOutput, agent_ctx: DemoContext) -> dict[str, Any]:
+def verify_parent_output(output: FinalOutput | str, *, agent_ctx):
+    if isinstance(output, str):
+        output = FinalOutput(final_output=output)
     text = output.final_output.strip()
     if not text:
-        raise VerificationRejected(
+        return verify.fail(
             message="Final output cannot be empty.",
             code="empty_output",
         )
 
-    if agent_ctx.role_name != "parent":
-        return {"final_output": text}
+    if agent_ctx.state.role_name != "parent":
+        return verify.accept()
 
-    if not agent_ctx.children_wait_requested:
-        raise VerificationRejected(
+    if not agent_ctx.state.children_wait_requested:
+        return verify.fail(
             message=(
                 "Parent must wait for all subagents to complete before finalizing."
             ),
             code="children_wait_required",
         )
 
-    expected_roles = sorted(role for role in agent_ctx.roster.keys() if role != "parent")
+    expected_roles = sorted(role for role in agent_ctx.state.roster.keys() if role != "parent")
 
     lowered = text.lower()
     if "credit" not in lowered:
-        raise VerificationRejected(
+        return verify.fail(
             message="Include an explicit credits section in the final deliverable.",
             code="credits_required",
         )
 
     missing_mentions = [role for role in expected_roles if role not in lowered]
     if missing_mentions:
-        raise VerificationRejected(
+        return verify.fail(
             message=(
                 "Final deliverable must credit every subagent by role name. "
                 f"Missing mentions: {', '.join(missing_mentions)}."
@@ -122,12 +126,12 @@ def verify_parent_output(output: FinalOutput, agent_ctx: DemoContext) -> dict[st
             metadata={"missing_roles": missing_mentions},
         )
 
-    return {"final_output": text}
+    return verify.accept()
 
 
-async def _sync_group_membership(agent_ctx: DemoContext) -> dict[str, str]:
+async def _sync_group_membership(agent_ctx) -> dict[str, str]:
     group_state = await ExecutionContext.current().messaging.groups.get(
-        agent_ctx.group_name
+        agent_ctx.state.group_name
     )
     raw_members = group_state.get("member_task_ids", [])
     if not isinstance(raw_members, list):
@@ -151,13 +155,13 @@ async def _sync_group_membership(agent_ctx: DemoContext) -> dict[str, str]:
         member_task_ids.append(current_task_id)
         member_task_ids.sort()
 
-    roster = dict(agent_ctx.roster)
+    roster = dict(agent_ctx.state.roster)
     roster["parent"] = parent_task_id.strip()
-    roster[agent_ctx.role_name] = current_task_id
-    agent_ctx.roster = roster
-    agent_ctx.group_member_task_ids = member_task_ids
+    roster[agent_ctx.state.role_name] = current_task_id
+    agent_ctx.state.roster = roster
+    agent_ctx.state.group_member_task_ids = member_task_ids
 
-    if agent_ctx.role_name != "parent":
+    if agent_ctx.state.role_name != "parent":
         candidate_child_ids = [
             task_id
             for task_id in member_task_ids
@@ -176,13 +180,13 @@ async def _sync_group_membership(agent_ctx: DemoContext) -> dict[str, str]:
                 target_task_id = ordered_child_ids[target_index]
                 if target_task_id == current_task_id:
                     target_task_id = candidate_child_ids[0]
-                agent_ctx.dm_target_task_id = target_task_id
+                agent_ctx.state.dm_target_task_id = target_task_id
             else:
-                agent_ctx.dm_target_task_id = candidate_child_ids[0]
+                agent_ctx.state.dm_target_task_id = candidate_child_ids[0]
         else:
-            agent_ctx.dm_target_task_id = None
+            agent_ctx.state.dm_target_task_id = None
 
-    return agent_ctx.roster
+    return agent_ctx.state.roster
 
 
 def _resolve_dm_target(raw_target: str, roster: dict[str, str]) -> str:
@@ -206,19 +210,19 @@ def _resolve_dm_target(raw_target: str, roster: dict[str, str]) -> str:
 
 
 @tool
-async def spawn_team(topic: str, agent_ctx: DemoContext) -> SpawnTeamResult:
+async def spawn_team(topic: str, agent_ctx) -> SpawnTeamResult:
     """
     Parent-only: spawn researcher/skeptic/synthesizer subagents and create a team chat group.
     """
-    if agent_ctx.role_name != "parent":
+    if agent_ctx.state.role_name != "parent":
         raise ValueError("Only the parent coordinator can spawn the team.")
-    if agent_ctx.roster:
+    if agent_ctx.state.roster:
         return SpawnTeamResult(
             summary="Team already exists in context.",
-            group_name=agent_ctx.group_name,
-            roster=agent_ctx.roster,
+            group_name=agent_ctx.state.group_name,
+            roster=agent_ctx.state.roster,
             child_task_ids=[
-                task_id for role, task_id in agent_ctx.roster.items() if role != "parent"
+                task_id for role, task_id in agent_ctx.state.roster.items() if role != "parent"
             ],
         )
 
@@ -226,26 +230,36 @@ async def spawn_team(topic: str, agent_ctx: DemoContext) -> SpawnTeamResult:
     if not normalized_topic:
         normalized_topic = agent_ctx.query.strip() or "multi-agent coordination demo"
 
-    researcher_payload = DemoContext(
-        query=f"Topic: {normalized_topic}",
+    researcher_state = DemoState(
         role_name="researcher",
         phase="start",
         topic=normalized_topic,
-        group_name=agent_ctx.group_name,
+        group_name=agent_ctx.state.group_name,
     )
-    skeptic_payload = DemoContext(
-        query=f"Topic: {normalized_topic}",
+    skeptic_state = DemoState(
         role_name="skeptic",
         phase="start",
         topic=normalized_topic,
-        group_name=agent_ctx.group_name,
+        group_name=agent_ctx.state.group_name,
     )
-    synthesizer_payload = DemoContext(
-        query=f"Topic: {normalized_topic}",
+    synthesizer_state = DemoState(
         role_name="synthesizer",
         phase="start",
         topic=normalized_topic,
-        group_name=agent_ctx.group_name,
+        group_name=agent_ctx.state.group_name,
+    )
+
+    researcher_payload = researcher_agent.build_context(
+        input=f"Topic: {normalized_topic}",
+        state=researcher_state,
+    )
+    skeptic_payload = skeptic_agent.build_context(
+        input=f"Topic: {normalized_topic}",
+        state=skeptic_state,
+    )
+    synthesizer_payload = synthesizer_agent.build_context(
+        input=f"Topic: {normalized_topic}",
+        state=synthesizer_state,
     )
 
     researcher_job = (
@@ -271,7 +285,7 @@ async def spawn_team(topic: str, agent_ctx: DemoContext) -> SpawnTeamResult:
     )[0]
 
     jobs = [researcher_job, skeptic_job, synthesizer_job]
-    await messaging.groups.create(agent_ctx.group_name, members=jobs)
+    await messaging.groups.create(agent_ctx.state.group_name, members=jobs)
 
     parent_task_id = ExecutionContext.current().task_id
     roster = {
@@ -281,19 +295,19 @@ async def spawn_team(topic: str, agent_ctx: DemoContext) -> SpawnTeamResult:
         "synthesizer": synthesizer_job.task_id,
     }
 
-    agent_ctx.topic = normalized_topic
-    agent_ctx.roster = roster
-    agent_ctx.group_member_task_ids = sorted(roster.values())
-    agent_ctx.child_jobs = [job.to_dict() for job in jobs]
-    agent_ctx.children_wait_requested = False
-    agent_ctx.phase = "kickoff_group"
+    agent_ctx.state.topic = normalized_topic
+    agent_ctx.state.roster = roster
+    agent_ctx.state.group_member_task_ids = sorted(roster.values())
+    agent_ctx.state.child_jobs = [j.to_dict() for j in jobs]
+    agent_ctx.state.children_wait_requested = False
+    agent_ctx.state.phase = "kickoff_group"
 
     return SpawnTeamResult(
         summary=(
             "Spawned 3 subagents, created a shared group channel, and stored "
             "the team roster."
         ),
-        group_name=agent_ctx.group_name,
+        group_name=agent_ctx.state.group_name,
         roster=roster,
         child_task_ids=[
             researcher_job.task_id,
@@ -304,16 +318,16 @@ async def spawn_team(topic: str, agent_ctx: DemoContext) -> SpawnTeamResult:
 
 
 @tool
-async def get_roster(agent_ctx: DemoContext) -> RosterResult | WaitInstruction:
+async def get_roster(agent_ctx) -> RosterResult | WaitInstruction:
     """
     Load parent/member information from messaging group state.
     """
-    if agent_ctx.roster and agent_ctx.group_member_task_ids:
-        if agent_ctx.phase == "start":
-            agent_ctx.phase = "share_intro"
+    if agent_ctx.state.roster and agent_ctx.state.group_member_task_ids:
+        if agent_ctx.state.phase == "start":
+            agent_ctx.state.phase = "share_intro"
         return RosterResult(
             summary="Roster loaded from context.",
-            roster=agent_ctx.roster,
+            roster=agent_ctx.state.roster,
         )
 
     try:
@@ -323,12 +337,12 @@ async def get_roster(agent_ctx: DemoContext) -> RosterResult | WaitInstruction:
         return wait.activity(
             data={
                 "reason": "waiting_for_group_membership",
-                "role_name": agent_ctx.role_name,
+                "role_name": agent_ctx.state.role_name,
             }
         )
 
-    if agent_ctx.phase == "start":
-        agent_ctx.phase = "share_intro"
+    if agent_ctx.state.phase == "start":
+        agent_ctx.state.phase = "share_intro"
 
     return RosterResult(
         summary="Roster derived from messaging group membership.",
@@ -337,7 +351,7 @@ async def get_roster(agent_ctx: DemoContext) -> RosterResult | WaitInstruction:
 
 
 @tool
-async def post_group(message: str, agent_ctx: DemoContext) -> GroupPostResult:
+async def post_group(message: str, agent_ctx) -> GroupPostResult:
     """
     Send a group message to the shared team room.
     """
@@ -347,29 +361,29 @@ async def post_group(message: str, agent_ctx: DemoContext) -> GroupPostResult:
     final_message = message.strip()
 
     report = await messaging.groups.send(
-        agent_ctx.group_name,
+        agent_ctx.state.group_name,
         final_message,
         metadata={
-            "role_name": agent_ctx.role_name,
-            "phase": agent_ctx.phase,
-            "topic": agent_ctx.topic,
+            "role_name": agent_ctx.state.role_name,
+            "phase": agent_ctx.state.phase,
+            "topic": agent_ctx.state.topic,
         },
     )
 
-    if agent_ctx.role_name == "parent":
-        if agent_ctx.phase == "kickoff_group":
-            agent_ctx.phase = "wait_one"
-        elif agent_ctx.phase in {"engage_optional_dm", "followup_group"}:
-            agent_ctx.phase = "wait_two"
+    if agent_ctx.state.role_name == "parent":
+        if agent_ctx.state.phase == "kickoff_group":
+            agent_ctx.state.phase = "wait_one"
+        elif agent_ctx.state.phase in {"engage_optional_dm", "followup_group"}:
+            agent_ctx.state.phase = "wait_two"
     else:
-        if agent_ctx.phase == "share_intro":
-            agent_ctx.phase = "send_dm"
-        elif agent_ctx.phase in {"optional_parent_reply", "share_after_wake"}:
-            agent_ctx.phase = "finalize"
+        if agent_ctx.state.phase == "share_intro":
+            agent_ctx.state.phase = "send_dm"
+        elif agent_ctx.state.phase in {"optional_parent_reply", "share_after_wake"}:
+            agent_ctx.state.phase = "finalize"
 
     return GroupPostResult(
-        summary=f"Posted message to #{agent_ctx.group_name}.",
-        group_name=agent_ctx.group_name,
+        summary=f"Posted message to #{agent_ctx.state.group_name}.",
+        group_name=agent_ctx.state.group_name,
         message=final_message,
         delivered_task_ids=report.delivered_task_ids,
         skipped_inactive_task_ids=report.skipped_inactive_task_ids,
@@ -378,44 +392,44 @@ async def post_group(message: str, agent_ctx: DemoContext) -> GroupPostResult:
 
 
 @tool
-async def post_dm(to_task_id: str, message: str, agent_ctx: DemoContext) -> DirectPostResult:
+async def post_dm(to_task_id: str, message: str, agent_ctx) -> DirectPostResult:
     """
     Send a direct message to exactly one teammate.
     """
     if not isinstance(message, str) or not message.strip():
         raise ValueError("message must be a non-empty string")
 
-    if agent_ctx.role_name != "parent" and agent_ctx.phase == "send_dm":
-        if not agent_ctx.group_member_task_ids:
+    if agent_ctx.state.role_name != "parent" and agent_ctx.state.phase == "send_dm":
+        if not agent_ctx.state.group_member_task_ids:
             await _sync_group_membership(agent_ctx)
-        if not agent_ctx.dm_target_task_id:
+        if not agent_ctx.state.dm_target_task_id:
             raise ValueError(
                 "No eligible teammate target found in group membership for child DM."
             )
-        resolved_target = agent_ctx.dm_target_task_id
+        resolved_target = agent_ctx.state.dm_target_task_id
     else:
-        if not agent_ctx.roster:
+        if not agent_ctx.state.roster:
             await _sync_group_membership(agent_ctx)
-        if not agent_ctx.roster:
+        if not agent_ctx.state.roster:
             raise ValueError("No roster available yet. Call get_roster first.")
-        resolved_target = _resolve_dm_target(to_task_id, agent_ctx.roster)
+        resolved_target = _resolve_dm_target(to_task_id, agent_ctx.state.roster)
     report = await messaging.send(
         resolved_target,
         message.strip(),
         metadata={
-            "role_name": agent_ctx.role_name,
-            "phase": agent_ctx.phase,
-            "topic": agent_ctx.topic,
+            "role_name": agent_ctx.state.role_name,
+            "phase": agent_ctx.state.phase,
+            "topic": agent_ctx.state.topic,
         },
     )
 
-    if agent_ctx.role_name == "parent":
-        if agent_ctx.phase == "engage_optional_dm":
-            agent_ctx.phase = "wait_two"
-    elif agent_ctx.phase == "send_dm":
-        agent_ctx.phase = "awaiting_activity"
-    elif agent_ctx.phase == "optional_parent_reply":
-        agent_ctx.phase = "share_after_wake"
+    if agent_ctx.state.role_name == "parent":
+        if agent_ctx.state.phase == "engage_optional_dm":
+            agent_ctx.state.phase = "wait_two"
+    elif agent_ctx.state.phase == "send_dm":
+        agent_ctx.state.phase = "awaiting_activity"
+    elif agent_ctx.state.phase == "optional_parent_reply":
+        agent_ctx.state.phase = "share_after_wake"
 
     return DirectPostResult(
         summary=f"Direct message sent to {resolved_target}.",
@@ -430,30 +444,30 @@ async def post_dm(to_task_id: str, message: str, agent_ctx: DemoContext) -> Dire
 @tool
 async def parent_followup_decision(
     should_send_dm: bool,
-    agent_ctx: DemoContext,
+    agent_ctx,
     to_role: str | None = None,
     message: str | None = None,
 ) -> ParentFollowupResult:
     """
     Parent-only: optionally send one DM after first wake, then advance workflow.
     """
-    if agent_ctx.role_name != "parent":
+    if agent_ctx.state.role_name != "parent":
         raise ValueError("Only the parent coordinator can make this decision.")
 
     if not should_send_dm:
-        agent_ctx.phase = "await_children_completion"
+        agent_ctx.state.phase = "await_children_completion"
         return ParentFollowupResult(
             summary="Parent skipped optional DM and moved to child-completion wait.",
             action="skipped_dm",
         )
 
-    if not agent_ctx.roster:
+    if not agent_ctx.state.roster:
         raise ValueError("Roster is missing; spawn team and kickoff first.")
 
     raw_target = to_role.strip() if isinstance(to_role, str) else "researcher"
     if not raw_target:
         raw_target = "researcher"
-    resolved_target = _resolve_dm_target(raw_target, agent_ctx.roster)
+    resolved_target = _resolve_dm_target(raw_target, agent_ctx.state.roster)
 
     dm_message = message.strip() if isinstance(message, str) else ""
     if not dm_message:
@@ -465,13 +479,13 @@ async def parent_followup_decision(
         resolved_target,
         dm_message,
         metadata={
-            "role_name": agent_ctx.role_name,
-            "phase": agent_ctx.phase,
-            "topic": agent_ctx.topic,
+            "role_name": agent_ctx.state.role_name,
+            "phase": agent_ctx.state.phase,
+            "topic": agent_ctx.state.topic,
             "followup_dm": True,
         },
     )
-    agent_ctx.phase = "wait_two"
+    agent_ctx.state.phase = "wait_two"
 
     return ParentFollowupResult(
         summary=f"Parent sent optional DM to {resolved_target}.",
@@ -485,80 +499,80 @@ async def parent_followup_decision(
 
 
 @tool
-def wait_for_activity(reason: str, agent_ctx: DemoContext) -> WaitInstruction:
+def wait_for_activity(reason: str, agent_ctx) -> WaitInstruction:
     """
     Parent uses wait.activity; children use a short bounded pause to avoid deadlocks.
     """
     normalized_reason = reason.strip() if isinstance(reason, str) else ""
-    agent_ctx.wait_count += 1
+    agent_ctx.state.wait_count += 1
 
-    if agent_ctx.role_name == "parent":
+    if agent_ctx.state.role_name == "parent":
         if not normalized_reason:
             normalized_reason = "waiting_for_peer_activity"
-        if agent_ctx.phase == "wait_one":
-            agent_ctx.phase = "engage_optional_dm"
-        elif agent_ctx.phase == "wait_two":
-            agent_ctx.phase = "await_children_completion"
+        if agent_ctx.state.phase == "wait_one":
+            agent_ctx.state.phase = "engage_optional_dm"
+        elif agent_ctx.state.phase == "wait_two":
+            agent_ctx.state.phase = "await_children_completion"
         return wait.activity(
             data={
                 "reason": normalized_reason,
-                "role_name": agent_ctx.role_name,
-                "wait_count": agent_ctx.wait_count,
+                "role_name": agent_ctx.state.role_name,
+                "wait_count": agent_ctx.state.wait_count,
             }
         )
 
     # Children should never block indefinitely while parent is waiting on wait.jobs.
-    if agent_ctx.phase == "awaiting_activity":
-        agent_ctx.phase = "optional_parent_reply"
+    if agent_ctx.state.phase == "awaiting_activity":
+        agent_ctx.state.phase = "optional_parent_reply"
     if not normalized_reason:
         normalized_reason = "bounded_pause_before_optional_parent_reply"
     return wait.sleep(
         3,
         data={
             "reason": normalized_reason,
-            "role_name": agent_ctx.role_name,
-            "wait_count": agent_ctx.wait_count,
+            "role_name": agent_ctx.state.role_name,
+            "wait_count": agent_ctx.state.wait_count,
         },
     )
 
 
 @tool
-def wait_for_children_completion(agent_ctx: DemoContext) -> WaitInstruction:
+def wait_for_children_completion(agent_ctx) -> WaitInstruction:
     """
     Parent-only: block completion until all spawned children have completed.
     """
-    if agent_ctx.role_name != "parent":
+    if agent_ctx.state.role_name != "parent":
         raise ValueError("Only the parent coordinator can wait on child completion.")
-    if not agent_ctx.child_jobs:
+    if not agent_ctx.state.child_jobs:
         parent_task_id = ExecutionContext.current().task_id
         rebuilt_jobs = [
             {
                 "task_id": task_id,
                 "agent_name": f"{role}_agent",
                 "parent_task_id": parent_task_id,
-                "key": f"{agent_ctx.topic}:{role}",
+                "key": f"{agent_ctx.state.topic}:{role}",
             }
-            for role, task_id in agent_ctx.roster.items()
+            for role, task_id in agent_ctx.state.roster.items()
             if role != "parent"
         ]
         if not rebuilt_jobs:
             raise ValueError("No child jobs found in context. Call spawn_team first.")
-        agent_ctx.child_jobs = rebuilt_jobs
+        agent_ctx.state.child_jobs = rebuilt_jobs
 
-    agent_ctx.children_wait_requested = True
-    agent_ctx.phase = "finalize"
+    agent_ctx.state.children_wait_requested = True
+    agent_ctx.state.phase = "finalize"
     return wait.jobs(
-        agent_ctx.child_jobs,
+        agent_ctx.state.child_jobs,
         data={
             "reason": "waiting_for_all_children_to_complete",
-            "role_name": agent_ctx.role_name,
-            "expected_children": len(agent_ctx.child_jobs),
+            "role_name": agent_ctx.state.role_name,
+            "expected_children": len(agent_ctx.state.child_jobs),
         },
     )
 
 
-def _parent_tool_choice(agent_ctx: AgentContext) -> str | dict[str, Any]:
-    phase = str(getattr(agent_ctx, "phase", ""))
+def _parent_tool_choice(agent_ctx) -> str | dict[str, Any]:
+    phase = str(agent_ctx.state.phase)
     if phase == "init":
         return {"type": "function", "function": {"name": "spawn_team"}}
     if phase == "kickoff_group":
@@ -578,8 +592,8 @@ def _parent_tool_choice(agent_ctx: AgentContext) -> str | dict[str, Any]:
     return "auto"
 
 
-def _child_tool_choice(agent_ctx: AgentContext) -> str | dict[str, Any]:
-    phase = str(getattr(agent_ctx, "phase", ""))
+def _child_tool_choice(agent_ctx) -> str | dict[str, Any]:
+    phase = str(agent_ctx.state.phase)
     if phase == "start":
         return {"type": "function", "function": {"name": "get_roster"}}
     if phase == "share_intro":
@@ -639,12 +653,23 @@ Keep all content brief and concrete.
 """
 
 
-parent_agent = Agent(
+def _parent_prepare_turn(turn, agent_ctx, execution_ctx):
+    turn.tool_choice = _parent_tool_choice(agent_ctx)
+    turn.parallel_tool_calls = False
+    turn.temperature = 0.1
+
+
+def _child_prepare_turn(turn, agent_ctx, execution_ctx):
+    turn.tool_choice = _child_tool_choice(agent_ctx)
+    turn.parallel_tool_calls = False
+    turn.temperature = 0.1
+
+
+parent_agent = Agent[DemoState, EmptyMetadata](
     name="parent_coordinator",
     description="Parent coordinator agent",
     model=ai_gateway(gpt_41_mini),
     instructions=PARENT_INSTRUCTIONS,
-    context_class=DemoContext,
     tools=[
         spawn_team,
         post_group,
@@ -652,76 +677,52 @@ parent_agent = Agent(
         parent_followup_decision,
         wait_for_children_completion,
     ],
-    output_type=FinalOutput,
-    model_settings=ModelSettings(
-        temperature=0.1,
-        tool_choice=_parent_tool_choice,
-        parallel_tool_calls=False,
-    ),
+    prepare_turn=_parent_prepare_turn,
     verifier=verify_parent_output,
-    verifier_max_attempts=3,
-    max_turns=16,
+    stop_when=stop.any_of(stop.no_tool_calls(), stop.turn_count_is(16)),
 )
 
-researcher_agent = Agent(
+researcher_agent = Agent[DemoState, EmptyMetadata](
     name="researcher_agent",
     description="Researcher subagent",
     model=ai_gateway(gpt_41_mini),
     instructions=_child_instructions("researcher"),
-    context_class=DemoContext,
     tools=[
         get_roster,
         post_group,
         post_dm,
         wait_for_activity,
     ],
-    output_type=FinalOutput,
-    model_settings=ModelSettings(
-        temperature=0.1,
-        tool_choice=_child_tool_choice,
-        parallel_tool_calls=False,
-    ),
-    max_turns=12,
+    prepare_turn=_child_prepare_turn,
+    stop_when=stop.any_of(stop.no_tool_calls(), stop.turn_count_is(12)),
 )
 
-skeptic_agent = Agent(
+skeptic_agent = Agent[DemoState, EmptyMetadata](
     name="skeptic_agent",
     description="Skeptic subagent",
     model=ai_gateway(gpt_41_mini),
     instructions=_child_instructions("skeptic"),
-    context_class=DemoContext,
     tools=[
         get_roster,
         post_group,
         post_dm,
         wait_for_activity,
     ],
-    output_type=FinalOutput,
-    model_settings=ModelSettings(
-        temperature=0.1,
-        tool_choice=_child_tool_choice,
-        parallel_tool_calls=False,
-    ),
-    max_turns=12,
+    prepare_turn=_child_prepare_turn,
+    stop_when=stop.any_of(stop.no_tool_calls(), stop.turn_count_is(12)),
 )
 
-synthesizer_agent = Agent(
+synthesizer_agent = Agent[DemoState, EmptyMetadata](
     name="synthesizer_agent",
     description="Synthesizer subagent",
     model=ai_gateway(gpt_41_mini),
     instructions=_child_instructions("synthesizer"),
-    context_class=DemoContext,
     tools=[
         get_roster,
         post_group,
         post_dm,
         wait_for_activity,
     ],
-    output_type=FinalOutput,
-    model_settings=ModelSettings(
-        temperature=0.1,
-        tool_choice=_child_tool_choice,
-        parallel_tool_calls=False,
-    ),
-    max_turns=12,
+    prepare_turn=_child_prepare_turn,
+    stop_when=stop.any_of(stop.no_tool_calls(), stop.turn_count_is(12)),
 )

@@ -6,7 +6,7 @@ from factorial import AgentWorkerConfig, Orchestrator
 
 orchestrator = Orchestrator()
 
-orchestrator.register_runner(
+orchestrator.register(
     agent=ide_agent,
     agent_worker_config=AgentWorkerConfig(
         workers=20,

@@ -10,8 +10,6 @@ from pydantic import BaseModel
 from redis.asyncio.client import PubSub, Redis as RedisType
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
-from factorial import AgentContext
-
 WS_REDIS_SUB_TIMEOUT = 5.0  # seconds
 
 
@@ -106,15 +104,10 @@ class SteerRequest(BaseModel):
 
 @app.post("/api/enqueue")
 async def enqueue(request: EnqueueRequest):
-    payload = AgentContext(
-        messages=request.message_history,
-        query=request.query,
-        turn=0,
-    )
-    task = await orchestrator.create_agent_task(
-        agent=basic_agent,
+    task = await orchestrator.enqueue(
+        basic_agent,
+        input=request.message_history if request.message_history else request.query,
         owner_id=request.user_id,
-        payload=payload,
     )
 
     return {"task_id": task.id}

@@ -8,9 +8,9 @@ from typing import Any, cast
 
 import pytest
 
+from factorial.agent.context import AgentContext
 from factorial.core.events import EventPublisher
 from factorial.execution.context import (
-    AgentContext,
     ExecutionContext,
     SubagentsExecutionNamespace,
     execution_context,
@@ -25,12 +25,20 @@ class _NoopEvents:
 
 class _DummyChildAgent:
     name = "child-agent"
-    context_class = AgentContext
+
+    def context_from_dict(self, data: dict) -> AgentContext:
+        return AgentContext.from_dict(data)
+
+    def build_context(self, input: str | list) -> AgentContext:
+        from factorial.ai.messages import normalize_messages_input
+
+        return AgentContext(messages=normalize_messages_input(input))
 
 
 class _InvalidContextChildAgent:
+    """Agent without context_from_dict/build_context for error-path testing."""
+
     name = "child-agent"
-    context_class = object
 
 
 @pytest.mark.asyncio
@@ -51,8 +59,7 @@ async def test_spawn_enqueues_children_and_returns_job_refs() -> None:
     ctx = ExecutionContext(
         task_id="parent-1",
         owner_id="owner-1",
-        retries=0,
-        iterations=0,
+        retry_count=0,
         events=cast(EventPublisher, _NoopEvents()),
         subagents=SubagentsExecutionNamespace(
             enqueue_callback=_enqueue_child_task,
@@ -62,7 +69,10 @@ async def test_spawn_enqueues_children_and_returns_job_refs() -> None:
     try:
         jobs = await subagents.spawn(
             agent=_DummyChildAgent(),
-            inputs=[{"query": "q1"}, {"query": "q2"}],
+            inputs=[
+                {"messages": [{"role": "user", "content": "q1"}]},
+                {"messages": [{"role": "user", "content": "q2"}]},
+            ],
             key="research",
         )
     finally:
@@ -84,7 +94,14 @@ async def test_spawn_enqueues_children_and_returns_job_refs() -> None:
     assert jobs[0].task_id != jobs[1].task_id
     uuid.UUID(jobs[0].task_id)
     uuid.UUID(jobs[1].task_id)
-    assert [payload.query for payload in captured_payloads] == ["q1", "q2"]
+
+    def _first_user_content(p: AgentContext) -> str:
+        for m in p.messages:
+            if m.get("role") == "user" and isinstance(m.get("content"), str):
+                return m["content"]
+        return ""
+
+    assert [_first_user_content(p) for p in captured_payloads] == ["q1", "q2"]
 
 
 @pytest.mark.asyncio
@@ -103,8 +120,7 @@ async def test_run_returns_wait_jobs_instruction() -> None:
     ctx = ExecutionContext(
         task_id="parent-1",
         owner_id="owner-1",
-        retries=0,
-        iterations=0,
+        retry_count=0,
         events=cast(EventPublisher, _NoopEvents()),
         subagents=SubagentsExecutionNamespace(
             enqueue_callback=_enqueue_child_task,
@@ -114,7 +130,7 @@ async def test_run_returns_wait_jobs_instruction() -> None:
     try:
         instruction = await subagents.run(
             agent=_DummyChildAgent(),
-            inputs=[{"query": "q1"}],
+            inputs=[{"messages": [{"role": "user", "content": "q1"}]}],
             key="research",
             data="waiting for research",
         )
@@ -142,8 +158,7 @@ async def test_spawn_is_deterministic_for_repeated_call_with_same_key() -> None:
     ctx = ExecutionContext(
         task_id="parent-1",
         owner_id="owner-1",
-        retries=0,
-        iterations=2,
+        retry_count=0,
         events=cast(EventPublisher, _NoopEvents()),
         subagents=SubagentsExecutionNamespace(
             enqueue_callback=_enqueue_child_task,
@@ -153,12 +168,18 @@ async def test_spawn_is_deterministic_for_repeated_call_with_same_key() -> None:
     try:
         first = await subagents.spawn(
             agent=_DummyChildAgent(),
-            inputs=[{"query": "q1"}, {"query": "q2"}],
+            inputs=[
+                {"messages": [{"role": "user", "content": "q1"}]},
+                {"messages": [{"role": "user", "content": "q2"}]},
+            ],
             key="research",
         )
         second = await subagents.spawn(
             agent=_DummyChildAgent(),
-            inputs=[{"query": "q1"}, {"query": "q2"}],
+            inputs=[
+                {"messages": [{"role": "user", "content": "q1"}]},
+                {"messages": [{"role": "user", "content": "q2"}]},
+            ],
             key="research",
         )
     finally:
@@ -180,8 +201,7 @@ async def test_spawn_requires_non_empty_key() -> None:
     ctx = ExecutionContext(
         task_id="parent-1",
         owner_id="owner-1",
-        retries=0,
-        iterations=0,
+        retry_count=0,
         events=cast(EventPublisher, _NoopEvents()),
         subagents=SubagentsExecutionNamespace(
             enqueue_callback=_enqueue_child_task,
@@ -192,7 +212,7 @@ async def test_spawn_requires_non_empty_key() -> None:
         with pytest.raises(ValueError, match="non-empty key"):
             await subagents.spawn(
                 agent=_DummyChildAgent(),
-                inputs=[{"query": "q1"}],
+                inputs=[{"messages": [{"role": "user", "content": "q1"}]}],
                 key="",
             )
     finally:
@@ -212,8 +232,7 @@ async def test_spawn_strips_key_before_persisting_job_refs() -> None:
     ctx = ExecutionContext(
         task_id="parent-1",
         owner_id="owner-1",
-        retries=0,
-        iterations=0,
+        retry_count=0,
         events=cast(EventPublisher, _NoopEvents()),
         subagents=SubagentsExecutionNamespace(
             enqueue_callback=_enqueue_child_task,
@@ -223,7 +242,7 @@ async def test_spawn_strips_key_before_persisting_job_refs() -> None:
     try:
         jobs = await subagents.spawn(
             agent=_DummyChildAgent(),
-            inputs=[{"query": "q1"}],
+            inputs=[{"messages": [{"role": "user", "content": "q1"}]}],
             key="  research  ",
         )
     finally:
@@ -237,8 +256,7 @@ async def test_spawn_returns_empty_list_for_empty_inputs() -> None:
     ctx = ExecutionContext(
         task_id="parent-1",
         owner_id="owner-1",
-        retries=0,
-        iterations=0,
+        retry_count=0,
         events=cast(EventPublisher, _NoopEvents()),
     )
     token = execution_context.set(ctx)
@@ -264,8 +282,7 @@ async def test_spawn_rejects_inputs_that_cannot_be_coerced_to_agent_context() ->
     ctx = ExecutionContext(
         task_id="parent-1",
         owner_id="owner-1",
-        retries=0,
-        iterations=0,
+        retry_count=0,
         events=cast(EventPublisher, _NoopEvents()),
         subagents=SubagentsExecutionNamespace(
             enqueue_callback=_enqueue_child_task,
@@ -284,7 +301,7 @@ async def test_spawn_rejects_inputs_that_cannot_be_coerced_to_agent_context() ->
 
 
 @pytest.mark.asyncio
-async def test_spawn_rejects_agent_with_invalid_context_class() -> None:
+async def test_spawn_rejects_agent_with_invalid_v2_input_coercion() -> None:
     async def _enqueue_child_task(
         _agent: Any,
         _payload: Any,
@@ -295,8 +312,7 @@ async def test_spawn_rejects_agent_with_invalid_context_class() -> None:
     ctx = ExecutionContext(
         task_id="parent-1",
         owner_id="owner-1",
-        retries=0,
-        iterations=0,
+        retry_count=0,
         events=cast(EventPublisher, _NoopEvents()),
         subagents=SubagentsExecutionNamespace(
             enqueue_callback=_enqueue_child_task,
@@ -304,10 +320,10 @@ async def test_spawn_rejects_agent_with_invalid_context_class() -> None:
     )
     token = execution_context.set(ctx)
     try:
-        with pytest.raises(TypeError, match="invalid context_class"):
+        with pytest.raises(TypeError, match="cannot coerce v2 inputs"):
             await subagents.spawn(
                 agent=_InvalidContextChildAgent(),
-                inputs=[{"query": "q1"}],
+                inputs=[{"messages": [{"role": "user", "content": "q1"}]}],
                 key="research",
             )
     finally:
@@ -334,8 +350,7 @@ async def test_spawn_uses_batch_enqueue_with_deterministic_ids() -> None:
     ctx = ExecutionContext(
         task_id="parent-1",
         owner_id="owner-1",
-        retries=0,
-        iterations=0,
+        retry_count=0,
         events=cast(EventPublisher, _NoopEvents()),
         subagents=SubagentsExecutionNamespace(
             enqueue_batch_callback=_enqueue_batch,
@@ -345,12 +360,18 @@ async def test_spawn_uses_batch_enqueue_with_deterministic_ids() -> None:
     try:
         first = await subagents.spawn(
             agent=_DummyChildAgent(),
-            inputs=[{"query": "q1"}, {"query": "q2"}],
+            inputs=[
+                {"messages": [{"role": "user", "content": "q1"}]},
+                {"messages": [{"role": "user", "content": "q2"}]},
+            ],
             key="research",
         )
         second = await subagents.spawn(
             agent=_DummyChildAgent(),
-            inputs=[{"query": "q1"}, {"query": "q2"}],
+            inputs=[
+                {"messages": [{"role": "user", "content": "q1"}]},
+                {"messages": [{"role": "user", "content": "q2"}]},
+            ],
             key="research",
         )
     finally:
@@ -393,8 +414,7 @@ async def test_execution_context_subagents_namespace_routes_callbacks() -> None:
     ctx = ExecutionContext(
         task_id="parent-1",
         owner_id="owner-1",
-        retries=0,
-        iterations=0,
+        retry_count=0,
         events=cast(EventPublisher, _NoopEvents()),
         subagents=SubagentsExecutionNamespace(
             enqueue_callback=_enqueue_child_task,
@@ -406,12 +426,15 @@ async def test_execution_context_subagents_namespace_routes_callbacks() -> None:
 
     child_task_id = await ctx.subagents.enqueue(
         _DummyChildAgent(),
-        AgentContext(query="q1"),
+        AgentContext(messages=[{"role": "user", "content": "q1"}]),
         task_id="child-1",
     )
     batch = await ctx.subagents.enqueue_batch(
         _DummyChildAgent(),
-        [AgentContext(query="q1"), AgentContext(query="q2")],
+        [
+            AgentContext(messages=[{"role": "user", "content": "q1"}]),
+            AgentContext(messages=[{"role": "user", "content": "q2"}]),
+        ],
         task_ids=["child-1", "child-2"],
         batch_id="batch-1",
     )
@@ -434,8 +457,7 @@ async def test_subagents_cancel_routes_to_execution_context_callback() -> None:
     ctx = ExecutionContext(
         task_id="parent-1",
         owner_id="owner-1",
-        retries=0,
-        iterations=0,
+        retry_count=0,
         events=cast(EventPublisher, _NoopEvents()),
         subagents=SubagentsExecutionNamespace(cancel_callback=_cancel_child),
     )
@@ -459,8 +481,7 @@ async def test_subagents_cancel_accepts_job_ref_like_target() -> None:
     ctx = ExecutionContext(
         task_id="parent-1",
         owner_id="owner-1",
-        retries=0,
-        iterations=0,
+        retry_count=0,
         events=cast(EventPublisher, _NoopEvents()),
         subagents=SubagentsExecutionNamespace(cancel_callback=_cancel_child),
     )
@@ -489,8 +510,7 @@ async def test_subagents_cancel_accepts_list_and_uses_batch_callback() -> None:
     ctx = ExecutionContext(
         task_id="parent-1",
         owner_id="owner-1",
-        retries=0,
-        iterations=0,
+        retry_count=0,
         events=cast(EventPublisher, _NoopEvents()),
         subagents=SubagentsExecutionNamespace(cancel_many_callback=_cancel_children),
     )
@@ -519,8 +539,7 @@ async def test_subagents_cancel_returns_empty_list_for_empty_targets() -> None:
     ctx = ExecutionContext(
         task_id="parent-1",
         owner_id="owner-1",
-        retries=0,
-        iterations=0,
+        retry_count=0,
         events=cast(EventPublisher, _NoopEvents()),
     )
     token = execution_context.set(ctx)
@@ -537,8 +556,7 @@ async def test_subagents_cancel_rejects_invalid_target() -> None:
     ctx = ExecutionContext(
         task_id="parent-1",
         owner_id="owner-1",
-        retries=0,
-        iterations=0,
+        retry_count=0,
         events=cast(EventPublisher, _NoopEvents()),
     )
     token = execution_context.set(ctx)

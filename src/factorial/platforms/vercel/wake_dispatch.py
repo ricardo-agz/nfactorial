@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 
 from vercel.workers.aio import send as send_async  # type: ignore
 
+
 @dataclass
 class VercelQueueWakeDispatch:
     topic: str

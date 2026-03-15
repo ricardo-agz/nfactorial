@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import inspect
 import json
 import random
 import uuid
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from functools import wraps
@@ -15,49 +16,74 @@ from typing import (
     Any,
     Generic,
     Literal,
-    TypeVar,
     cast,
-    final,
     get_args,
     get_origin,
     overload,
 )
 
 import httpx
-from openai import AsyncStream
 from openai.types.chat import (
     ChatCompletion,
-    ChatCompletionChunk,
-    ChatCompletionMessage,
     ChatCompletionMessageToolCall,
-)
-from openai.types.chat.chat_completion import Choice
-from openai.types.chat.chat_completion_message_custom_tool_call import (
-    ChatCompletionMessageCustomToolCall,
 )
 from openai.types.chat.chat_completion_message_function_tool_call import (
     ChatCompletionMessageFunctionToolCall,
-    Function as ToolCallFunction,
 )
-from pydantic import BaseModel
+from pydantic import BaseModel, TypeAdapter
+from typing_extensions import TypeVar
 
-from factorial.core.events import AgentEvent, EventPublisher
+from factorial.agent.context import (
+    AgentContext,
+    ContextType,
+    EmptyMetadata,
+    EmptyState,
+)
+from factorial.ai.messages import (
+    Message,
+    MessageLike,
+    assistant,
+    messages_to_chat_messages,
+    normalize_message,
+    normalize_messages_input,
+    system,
+    tool_call as message_tool_call,
+    tool_calls as message_tool_calls,
+    tool_result,
+)
+from factorial.ai.models import Model, MultiClient
+from factorial.core.events import (
+    BaseEvent,
+    EventPublisher,
+    FinishEvent,
+    ModelFinishEvent,
+    ModelStartEvent,
+    StartEvent,
+    ToolFinishEvent,
+    ToolStartEvent,
+    TurnFinishEvent,
+    TurnStartEvent,
+    WaitEvent,
+)
 from factorial.core.exceptions import (
     RETRYABLE_EXCEPTIONS,
     FatalAgentError,
-    InvalidLLMResponseError,
-    VerificationRejected,
 )
 from factorial.core.logging import get_logger
-from factorial.core.utils import (
-    is_valid_task_id,
-    serialize_data,
-    to_snake_case,
-    validate_callback_signature as _vcs,
+from factorial.core.run_types import (
+    RunError,
+    RunResult,
+    RunStatus,
+    TurnSummary,
+    UsageSummary,
+    VerificationSummary,
+    VerifierAccept,
+    VerifierFail,
+    VerifierRetry,
+    verify,
 )
+from factorial.core.utils import is_valid_task_id, serialize_data, to_snake_case
 from factorial.execution.context import (
-    AgentContext,
-    ContextType,
     ExecutionContext,
     execution_context,
 )
@@ -72,16 +98,19 @@ from factorial.execution.tools import (
     ToolDefinition,
     _ToolResultInternal,
     convert_tools_list,
-    create_final_output_tool,
     serialize_for_client,
     serialize_for_model,
 )
 from factorial.execution.waits import WaitInstruction
-from factorial.llm.models import Model, MultiClient
 
 logger = get_logger(__name__)
 
 T = TypeVar("T")
+StateT = TypeVar("StateT")
+MetadataT = TypeVar("MetadataT", default=EmptyMetadata)
+VerificationMetaT = TypeVar("VerificationMetaT")
+
+ToolChoice = str | dict[str, Any] | None
 
 
 async def _invoke_callable_non_blocking(
@@ -89,11 +118,6 @@ async def _invoke_callable_non_blocking(
     *args: Any,
     **kwargs: Any,
 ) -> Any:
-    """Invoke callback without blocking the event loop.
-
-    Async callbacks are awaited directly. Sync callbacks are always executed in a
-    worker thread so tool and hook callback code cannot stall heartbeats.
-    """
     if asyncio.iscoroutinefunction(fn):
         async_fn = cast(Callable[..., Awaitable[Any]], fn)
         return await async_fn(*args, **kwargs)
@@ -130,33 +154,13 @@ def retry(
     Callable[..., Awaitable[T]]
     | Callable[[Callable[..., Awaitable[T]]], Callable[..., Awaitable[T]]]
 ):
-    """Decorator to add retry logic to agent methods.
-
-    Can be used as a decorator with or without arguments:
-
-    @retry
-    async def my_method(self, ...):
-        ...
-
-    @retry(max_attempts=5, delay=2.0)
-    async def my_method(self, ...):
-        ...
-    """
-
     def _create_retry_decorator(
         the_func: Callable[..., Awaitable[T]],
     ) -> Callable[..., Awaitable[T]]:
-        # ------------------------------------------------------------------
-        # Determine which parameter (if any) represents the AgentContext so we
-        # can update its ``attempt`` field on each retry.  We do this *once* at
-        # decoration time to avoid repeated introspection.
-        # ------------------------------------------------------------------
-
         sig = inspect.signature(the_func)
 
-        _ctx_param_name: str | None = None
-        _ctx_pos: int | None = None  # Positional index of the context parameter
-
+        ctx_param_name: str | None = None
+        ctx_pos: int | None = None
         for idx, param in enumerate(sig.parameters.values()):
             ann = param.annotation
             if (
@@ -164,202 +168,65 @@ def retry(
                 and isinstance(ann, type)
                 and issubclass(ann, AgentContext)
             ):
-                _ctx_param_name = param.name
-                _ctx_pos = idx - 1  # subtract 1 to account for ``self``
+                ctx_param_name = param.name
+                ctx_pos = idx - 1
                 break
 
-        # Fallback to conventional name if annotation is missing.
-        if _ctx_param_name is None and "agent_ctx" in sig.parameters:
-            _ctx_param_name = "agent_ctx"
-            _ctx_pos = list(sig.parameters).index("agent_ctx") - 1
-
-        # If still None, the wrapped function doesn't take an AgentContext; we
-        # can skip all bookkeeping in that case.
+        if ctx_param_name is None and "agent_ctx" in sig.parameters:
+            ctx_param_name = "agent_ctx"
+            ctx_pos = list(sig.parameters).index("agent_ctx") - 1
 
         @wraps(the_func)
         async def wrapper(self: BaseAgent[Any], *args: Any, **kwargs: Any) -> T:
             if max_attempts <= 0:
                 raise ValueError("max_attempts must be greater than 0")
 
-            # --------------------------------------------------------------
-            # Resolve the AgentContext **once** per invocation so we don't
-            # repeat the same extraction logic on every retry attempt.  The
-            # reference is reused within the loop so we only update its
-            # ``attempt`` field each iteration.
-            # --------------------------------------------------------------
             agent_ctx_obj: Any | None = None
-            if _ctx_param_name is not None:
-                # Prefer keyword argument – fastest lookup.
-                if _ctx_param_name in kwargs:
-                    agent_ctx_obj = kwargs[_ctx_param_name]
-                # Fallback to positional args tuple.
-                elif _ctx_pos is not None and _ctx_pos < len(args):
-                    agent_ctx_obj = args[_ctx_pos]
+            if ctx_param_name is not None:
+                if ctx_param_name in kwargs:
+                    agent_ctx_obj = kwargs[ctx_param_name]
+                elif ctx_pos is not None and ctx_pos < len(args):
+                    agent_ctx_obj = args[ctx_pos]
 
             last_exception: Exception | None = None
-            for attempt in range(max_attempts):
-                # Best-effort: annotate the current attempt on the context so
-                # downstream helpers (e.g. model fallbacks) can react.
-                if agent_ctx_obj is not None and isinstance(
-                    agent_ctx_obj, AgentContext
-                ):
-                    try:
-                        agent_ctx_obj.attempt = attempt
-                    except Exception:
-                        # Never let bookkeeping failure break the retry logic.
-                        pass
+            for attempt_index in range(max_attempts):
+                if isinstance(agent_ctx_obj, AgentContext):
+                    agent_ctx_obj.attempt_number = attempt_index + 1
 
                 try:
                     return await the_func(self, *args, **kwargs)
-                except Exception as e:
-                    if isinstance(e, RETRYABLE_EXCEPTIONS):
-                        last_exception = e
-                        if attempt < max_attempts - 1:
+                except Exception as exc:
+                    if isinstance(exc, RETRYABLE_EXCEPTIONS):
+                        last_exception = exc
+                        if attempt_index < max_attempts - 1:
                             backoff_delay = min(
-                                delay * (exponential_base**attempt), max_delay
+                                delay * (exponential_base**attempt_index),
+                                max_delay,
                             )
                             if jitter:
                                 backoff_delay *= random.uniform(0.5, 1.5)
                             await asyncio.sleep(backoff_delay)
-                    else:
-                        raise e
+                            continue
+                    raise
 
-            raise last_exception or Exception("Retry failed")
+            raise last_exception or RuntimeError("Retry failed unexpectedly")
 
         return wrapper
 
-    # If func is provided, we were used as @retry (no parentheses)
     if func is not None:
         return _create_retry_decorator(func)
-
-    # Otherwise, we were used as @retry(...), so return a decorator
     return _create_retry_decorator
 
 
-@overload
-def publish_progress(
-    func: Callable[..., Awaitable[T]],
-) -> Callable[..., Awaitable[T]]: ...
-
-
-@overload
-def publish_progress(
-    func: None = None,
-    *,
-    func_name: str | None = None,
-    include_context: bool = True,
-    include_args: bool = True,
-    include_result: bool = True,
-) -> Callable[[Callable[..., Awaitable[T]]], Callable[..., Awaitable[T]]]: ...
-
-
-def publish_progress(
-    func: Callable[..., Awaitable[T]] | None = None,
-    *,
-    func_name: str | None = None,
-    include_context: bool = True,
-    include_args: bool = True,
-    include_result: bool = True,
-) -> (
-    Callable[..., Awaitable[T]]
-    | Callable[[Callable[..., Awaitable[T]]], Callable[..., Awaitable[T]]]
-):
-    """Decorator to publish progress events for agent methods.
-
-    Can be used as a decorator with or without arguments:
-
-    @publish_progress
-    async def my_method(self, ...):
-        ...
-
-    @publish_progress(func_name="custom_name", include_result=False)
-    async def my_method(self, ...):
-        ...
-    """
-
-    def _create_progress_decorator(
-        the_func: Callable[..., Awaitable[T]],
-    ) -> Callable[..., Awaitable[T]]:
-        actual_func_name = func_name or getattr(the_func, "__name__", "unknown")
-
-        @wraps(the_func)
-        async def wrapper(self: BaseAgent[Any], *args: Any, **kwargs: Any) -> T:
-            async def publish(
-                event_suffix: str,
-                data: dict[str, Any] | None = None,
-                error: str | None = None,
-            ) -> None:
-                try:
-                    ctx = ExecutionContext.current()
-
-                    event_data: dict[str, Any] = {}
-                    if data:
-                        event_data.update(data)
-                    if include_context and ctx:
-                        event_data["context"] = ctx
-
-                    await ctx.events.publish_event(
-                        AgentEvent(
-                            event_type=f"progress_update_{actual_func_name}_{event_suffix}",
-                            task_id=ctx.task_id,
-                            owner_id=ctx.owner_id,
-                            agent_name=self.name,
-                            data=serialize_data(event_data) if event_data else None,
-                            error=error,
-                        )
-                    )
-                except Exception:
-                    logger.exception("Failed to publish progress update", exc_info=True)
-                    pass
-
-            start_data: dict[str, Any] = {}
-            if include_args:
-                start_data.update(
-                    {
-                        "args": args,
-                        "kwargs": kwargs,
-                    }
-                )
-            await publish("started", start_data)
-
-            try:
-                result = await the_func(self, *args, **kwargs)
-
-                completion_data: dict[str, Any] = {}
-                if include_args:
-                    completion_data.update(
-                        {
-                            "args": args,
-                            "kwargs": kwargs,
-                        }
-                    )
-                if include_result:
-                    completion_data["result"] = serialize_data(result)
-
-                await publish("completed", completion_data if completion_data else None)
-                return result
-            except Exception as e:
-                failed_data: dict[str, Any] = {}
-                if include_args:
-                    failed_data.update(
-                        {
-                            "args": args,
-                            "kwargs": kwargs,
-                        }
-                    )
-                await publish(
-                    "failed", failed_data if failed_data else None, error=str(e)
-                )
-                raise
-
-        return wrapper
-
-    # If func is provided, we were used as @publish_progress (no parentheses)
-    if func is not None:
-        return _create_progress_decorator(func)
-
-    # Otherwise, we were used as @publish_progress(...), so return a decorator
-    return _create_progress_decorator
+@dataclass
+class Turn(Generic[ContextType]):
+    model: Model
+    messages: list[Message]
+    tools: list[ToolDefinition[ContextType]]
+    tool_choice: ToolChoice = "auto"
+    parallel_tool_calls: bool | None = None
+    temperature: float | None = None
+    max_output_tokens: int | None = None
 
 
 @dataclass
@@ -367,132 +234,355 @@ class TurnCompletion(Generic[ContextType]):
     is_done: bool
     context: ContextType
     output: Any = None
-    tool_call_results: list[tuple[ChatCompletionMessageToolCall, Any | Exception]] = (
-        field(default_factory=list)
+    tool_call_results: list[tuple[ChatCompletionMessageToolCall, Any | Exception]] = field(
+        default_factory=list
     )
     pending_tool_call_ids: list[str] = field(default_factory=list)
     pending_child_task_ids: list[str] = field(default_factory=list)
-
-
-@dataclass
-class RunCompletion(Generic[ContextType]):
-    """Summary object for the *entire* run passed to ``on_run_end``.
-
-    Timestamps are stored instead of a raw *duration* so consumers can
-    calculate different metrics, and we expose a convenience ``duration``
-    property.
-    """
-
-    output: Any | None
-    started_at: datetime
-    finished_at: datetime
-    error: Exception | None = None
-
-    @property
-    def duration(self) -> float:
-        """Runtime in **seconds**."""
-
-        return (self.finished_at - self.started_at).total_seconds()
-
-    @property
-    def succeeded(self) -> bool:
-        return self.error is None
-
-
-@dataclass
-class ModelSettings(Generic[ContextType]):
-    temperature: float | Callable[[ContextType], float] | None = None
-    tool_choice: (
-        str
-        | dict[str, Any]
-        | Callable[[ContextType], str | dict[str, Any] | None]
-        | None
-    ) = None
-    parallel_tool_calls: bool | Callable[[ContextType], bool] | None = None
-    max_completion_tokens: int | Callable[[ContextType], int] | None = None
-
-    def resolve(self, agent_ctx: ContextType) -> ResolvedModelSettings:
-        return ResolvedModelSettings(
-            temperature=self.temperature(agent_ctx)
-            if callable(self.temperature)
-            else self.temperature,
-            tool_choice=self.tool_choice(agent_ctx)
-            if callable(self.tool_choice)
-            else self.tool_choice,
-            parallel_tool_calls=self.parallel_tool_calls(agent_ctx)
-            if callable(self.parallel_tool_calls)
-            else self.parallel_tool_calls,
-            max_completion_tokens=self.max_completion_tokens(agent_ctx)
-            if callable(self.max_completion_tokens)
-            else self.max_completion_tokens,
-        )
-
-
-@dataclass
-class ResolvedModelSettings:
-    temperature: float | None
-    tool_choice: str | dict[str, Any] | None
-    parallel_tool_calls: bool | None
-    max_completion_tokens: int | None
+    finish_reason: str = "continue"
+    usage: UsageSummary = field(default_factory=UsageSummary.zero)
+    turn_summary: TurnSummary | None = None
+    verification_summary: VerificationSummary[Any] | None = None
 
 
 @dataclass
 class ToolExecutionResults:
-    new_messages: list[dict[str, Any]]
+    new_messages: list[Message]
     tool_call_results: list[tuple[ChatCompletionMessageToolCall, Any | Exception]]
+    resolved_results: list[
+        tuple[ChatCompletionMessageToolCall, _ToolResultInternal | Exception]
+    ]
     pending_tool_call_ids: list[str]
     pending_child_task_ids: list[str]
+
+
+EventCallback = Callable[..., Awaitable[None] | None]
+
+
+@dataclass
+class Callbacks:
+    on_start: EventCallback | None = None
+    on_turn_start: EventCallback | None = None
+    on_model_start: EventCallback | None = None
+    on_model_finish: EventCallback | None = None
+    on_tool_start: EventCallback | None = None
+    on_tool_finish: EventCallback | None = None
+    on_wait: EventCallback | None = None
+    on_turn_finish: EventCallback | None = None
+    on_finish: EventCallback | None = None
+
+
+StopWhen = Callable[[AgentContext[Any, Any], ExecutionContext], bool]
+PrepareTurnHook = Callable[..., Any]
+Verifier = Callable[..., Any]
+
+
+class StopCondition:
+    def __call__(self, agent_ctx: AgentContext[Any, Any], execution_ctx: ExecutionContext) -> bool:
+        raise NotImplementedError
+
+
+@dataclass(frozen=True)
+class NoToolCallsCondition(StopCondition):
+    def __call__(
+        self,
+        agent_ctx: AgentContext[Any, Any],
+        execution_ctx: ExecutionContext,
+    ) -> bool:
+        last_turn = execution_ctx.last_turn
+        if last_turn is None:
+            return False
+        return not last_turn.finish_reason.startswith("tool_called:")
+
+
+@dataclass(frozen=True)
+class TurnCountIsCondition(StopCondition):
+    limit: int
+
+    def __call__(
+        self,
+        agent_ctx: AgentContext[Any, Any],
+        execution_ctx: ExecutionContext,
+    ) -> bool:
+        return agent_ctx.turn_number >= self.limit
+
+
+@dataclass(frozen=True)
+class ToolCalledCondition(StopCondition):
+    name: str
+
+    def __call__(
+        self,
+        agent_ctx: AgentContext[Any, Any],
+        execution_ctx: ExecutionContext,
+    ) -> bool:
+        last_turn = execution_ctx.last_turn
+        if last_turn is None or not last_turn.finish_reason.startswith("tool_called:"):
+            return False
+        suffix = last_turn.finish_reason.removeprefix("tool_called:")
+        return self.name in {value for value in suffix.split(",") if value}
+
+
+@dataclass(frozen=True)
+class TotalTokensExceedCondition(StopCondition):
+    limit: int
+
+    def __call__(
+        self,
+        agent_ctx: AgentContext[Any, Any],
+        execution_ctx: ExecutionContext,
+    ) -> bool:
+        return execution_ctx.usage.total_tokens > self.limit
+
+
+@dataclass(frozen=True)
+class AnyOfCondition(StopCondition):
+    conditions: tuple[StopWhen | StopCondition, ...]
+
+    def __call__(
+        self,
+        agent_ctx: AgentContext[Any, Any],
+        execution_ctx: ExecutionContext,
+    ) -> bool:
+        return any(
+            condition(agent_ctx, execution_ctx) for condition in self.conditions
+        )
+
+
+@dataclass(frozen=True)
+class AllOfCondition(StopCondition):
+    conditions: tuple[StopWhen | StopCondition, ...]
+
+    def __call__(
+        self,
+        agent_ctx: AgentContext[Any, Any],
+        execution_ctx: ExecutionContext,
+    ) -> bool:
+        return all(
+            condition(agent_ctx, execution_ctx) for condition in self.conditions
+        )
+
+
+class stop:
+    @staticmethod
+    def no_tool_calls() -> StopCondition:
+        return NoToolCallsCondition()
+
+    @staticmethod
+    def turn_count_is(limit: int) -> StopCondition:
+        return TurnCountIsCondition(limit=limit)
+
+    @staticmethod
+    def tool_called(name: str) -> StopCondition:
+        return ToolCalledCondition(name=name)
+
+    @staticmethod
+    def total_tokens_exceed(limit: int) -> StopCondition:
+        return TotalTokensExceedCondition(limit=limit)
+
+    @staticmethod
+    def any_of(*conditions: StopWhen | StopCondition) -> StopCondition:
+        return AnyOfCondition(conditions=conditions)
+
+    @staticmethod
+    def all_of(*conditions: StopWhen | StopCondition) -> StopCondition:
+        return AllOfCondition(conditions=conditions)
+
+
+def no_tool_calls() -> StopCondition:
+    return stop.no_tool_calls()
+
+
+def turn_count_is(limit: int) -> StopCondition:
+    return stop.turn_count_is(limit)
+
+
+def tool_called(name: str) -> StopCondition:
+    return stop.tool_called(name)
+
+
+def total_tokens_exceed(limit: int) -> StopCondition:
+    return stop.total_tokens_exceed(limit)
+
+
+def any_of(*conditions: StopWhen | StopCondition) -> StopCondition:
+    return stop.any_of(*conditions)
+
+
+def all_of(*conditions: StopWhen | StopCondition) -> StopCondition:
+    return stop.all_of(*conditions)
+
+
+async def _maybe_call_prepare_turn(
+    func: PrepareTurnHook | None,
+    turn: Turn[Any],
+    agent_ctx: AgentContext[Any, Any],
+    execution_ctx: ExecutionContext,
+) -> Turn[Any]:
+    if func is None:
+        return turn
+    signature = inspect.signature(func)
+    params = list(signature.parameters.values())
+    if not params:
+        raise TypeError("prepare_turn must accept at least one argument for turn")
+
+    first = params[0]
+    if first.kind not in (
+        inspect.Parameter.POSITIONAL_ONLY,
+        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+    ):
+        raise TypeError("prepare_turn must accept the turn as its first parameter")
+
+    args: list[Any] = [turn]
+    kwargs: dict[str, Any] = {}
+    for param in params[1:]:
+        if param.kind in (
+            inspect.Parameter.VAR_POSITIONAL,
+            inspect.Parameter.VAR_KEYWORD,
+        ):
+            continue
+
+        annotation = param.annotation
+        annotation_origin = get_origin(annotation)
+        injected_value: Any | None = None
+        if (
+            param.name == "agent_ctx"
+            or annotation is AgentContext
+            or annotation_origin is AgentContext
+        ):
+            injected_value = agent_ctx
+        elif (
+            param.name == "execution_ctx"
+            or annotation is ExecutionContext
+            or annotation_origin is ExecutionContext
+        ):
+            injected_value = execution_ctx
+        elif (
+            annotation is not inspect.Parameter.empty
+            and isinstance(annotation, type)
+            and issubclass(annotation, AgentContext)
+        ):
+            injected_value = agent_ctx
+        elif (
+            annotation is not inspect.Parameter.empty
+            and isinstance(annotation, type)
+            and issubclass(annotation, ExecutionContext)
+        ):
+            injected_value = execution_ctx
+        elif param.default is not inspect.Parameter.empty:
+            continue
+        else:
+            raise TypeError(
+                f"Unsupported required prepare_turn parameter '{param.name}'. "
+                "Only turn (first arg), agent_ctx, and execution_ctx are supported."
+            )
+
+        if param.kind in (
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        ):
+            args.append(injected_value)
+        else:
+            kwargs[param.name] = injected_value
+
+    result = func(*args, **kwargs)
+    if inspect.isawaitable(result):
+        result = await cast(Awaitable[Any], result)
+    if isinstance(result, Turn):
+        return result
+    return turn
+
+
+def chain_prepare_turn(
+    *functions: PrepareTurnHook,
+) -> PrepareTurnHook:
+    async def _chained(
+        turn: Turn[Any],
+        agent_ctx: AgentContext[Any, Any],
+        execution_ctx: ExecutionContext,
+    ) -> Turn[Any]:
+        current = turn
+        for function in functions:
+            current = await _maybe_call_prepare_turn(
+                function,
+                current,
+                agent_ctx,
+                execution_ctx,
+            )
+        return current
+
+    return _chained
+
+
+def _infer_turn_limit_hint(
+    condition: StopWhen | StopCondition | None,
+) -> int | None:
+    if condition is None:
+        return None
+    if isinstance(condition, TurnCountIsCondition):
+        return condition.limit
+    if isinstance(condition, AnyOfCondition):
+        limits = [
+            limit
+            for limit in (
+                _infer_turn_limit_hint(child) for child in condition.conditions
+            )
+            if limit is not None
+        ]
+        return min(limits) if limits else None
+    if isinstance(condition, AllOfCondition):
+        limits = [
+            limit
+            for limit in (
+                _infer_turn_limit_hint(child) for child in condition.conditions
+            )
+            if limit is not None
+        ]
+        return max(limits) if limits else None
+    return None
+
+
+class _DirectEventPublisher:
+    def __init__(self, sink: Callable[[BaseEvent], Awaitable[None]] | None = None):
+        self._sink = sink
+
+    async def publish_event(self, event: BaseEvent) -> None:
+        if self._sink is not None:
+            await self._sink(event)
+
+
+class _RunFailureError(FatalAgentError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        verification_summary: VerificationSummary[Any] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.verification_summary = verification_summary
 
 
 class BaseAgent(Generic[ContextType]):
     def __init__(
         self,
+        *,
         name: str | None = None,
-        instructions: str | Callable[..., str] | None = None,
+        instructions: str | None = None,
         description: str | None = None,
-        tools: list[ToolDefinition[ContextType] | Callable[..., Any]] | None = None,
+        tools: Sequence[ToolDefinition[ContextType] | Callable[..., Any]] | None = None,
         model: Model | Callable[[ContextType], Model] | None = None,
-        model_settings: ModelSettings[ContextType] | None = None,
-        stream: bool = False,
-        context_window_limit: int | None = None,
-        max_turns: int | None = None,
+        tool_choice: ToolChoice = "auto",
+        parallel_tool_calls: bool | None = None,
+        temperature: float | None = None,
+        max_output_tokens: int | None = None,
+        prepare_turn: PrepareTurnHook | None = None,
+        stop_when: StopWhen | StopCondition | None = None,
+        verifier: Verifier | None = None,
+        callbacks: Callbacks | None = None,
         http_client: httpx.AsyncClient | None = None,
         client: MultiClient | None = None,
         request_timeout: float = 120.0,
         parse_tool_args: bool = True,
-        context_class: type = AgentContext,
-        output_type: type[BaseModel] | None = None,
-        verifier: Callable[..., Any] | None = None,
-        verifier_max_attempts: int = 3,
-        # ---- Lifecycle callbacks ---- #
-        on_run_start: Callable[[ContextType, ExecutionContext], Awaitable[None] | None]
-        | None = None,
-        on_run_end: Callable[
-            [ContextType, ExecutionContext, RunCompletion[ContextType]],
-            Awaitable[None] | None,
-        ]
-        | None = None,
-        on_turn_start: Callable[[ContextType, ExecutionContext], Awaitable[None] | None]
-        | None = None,
-        on_turn_end: Callable[
-            [ContextType, ExecutionContext, TurnCompletion[ContextType]],
-            Awaitable[None] | None,
-        ]
-        | None = None,
-        on_pending_tool_call: Callable[
-            [ContextType, ExecutionContext, ChatCompletionMessageToolCall],
-            Awaitable[None] | None,
-        ]
-        | None = None,
-        on_pending_tool_results: Callable[
-            [ContextType, ExecutionContext, list[tuple[str, Any]]],
-            Awaitable[None] | None,
-        ]
-        | None = None,
-        on_run_cancelled: Callable[
-            [ContextType, ExecutionContext], Awaitable[None] | None
-        ]
-        | None = None,
     ):
         self.name = to_snake_case(name or self.__class__.__name__)
         self.description = description or self.__class__.__name__
@@ -501,273 +591,350 @@ class BaseAgent(Generic[ContextType]):
         self.http_client = http_client or httpx.AsyncClient(timeout=request_timeout)
         self.client = client or MultiClient(http_client=self.http_client)
         self.request_timeout = request_timeout
-        self.event_publisher: EventPublisher | None = None
         self.model = model
-        self.model_settings = model_settings or ModelSettings()
-        self.stream = stream
-        self.context_window_limit = context_window_limit
-        self.max_turns = max_turns
-        self.parse_tool_args = parse_tool_args
-        self.context_class = context_class
-        self.output_type = output_type
+        self.default_tool_choice = tool_choice
+        self.default_parallel_tool_calls = parallel_tool_calls
+        self.default_temperature = temperature
+        self.default_max_output_tokens = max_output_tokens
+        self.prepare_turn = prepare_turn
+        self.stop_when = stop_when or stop.any_of(
+            stop.no_tool_calls(),
+            stop.turn_count_is(10),
+        )
         self.verifier = verifier
-        self.verifier_max_attempts = verifier_max_attempts
-        self.final_output_tool = (
-            create_final_output_tool(self.output_type) if self.output_type else None
+        self.callbacks = callbacks or Callbacks()
+        self.parse_tool_args = parse_tool_args
+        self.max_turns = _infer_turn_limit_hint(self.stop_when)
+
+        if self.model is None:
+            raise ValueError("model is required")
+
+    def _resolve_state_and_metadata_types(self) -> tuple[Any, Any]:
+        original = getattr(self, "__orig_class__", None)
+        if original is None:
+            return EmptyState, EmptyMetadata
+
+        original_args = get_args(original)
+        if len(original_args) >= 2:
+            return original_args[0], original_args[1]
+
+        if len(original_args) == 1:
+            first_arg = original_args[0]
+            context_origin = get_origin(first_arg)
+            context_args = get_args(first_arg)
+            if context_origin is AgentContext:
+                if len(context_args) >= 2:
+                    return context_args[0], context_args[1]
+                if len(context_args) == 1:
+                    return context_args[0], EmptyMetadata
+                return EmptyState, EmptyMetadata
+            if isinstance(first_arg, type) and issubclass(first_arg, AgentContext):
+                return EmptyState, EmptyMetadata
+            return first_arg, EmptyMetadata
+
+        return EmptyState, EmptyMetadata
+
+    def _default_typed_payload(self, target_type: Any, *, label: str) -> Any:
+        if target_type in (Any, object, None, EmptyState, EmptyMetadata):
+            return EmptyState() if label == "state" else EmptyMetadata()
+        if isinstance(target_type, type):
+            try:
+                return target_type()
+            except Exception as exc:
+                raise ValueError(
+                    f"{label} must be provided because {target_type!r} "
+                    "does not have a default constructor"
+                ) from exc
+        raise ValueError(f"{label} must be provided")
+
+    def _coerce_typed_payload(self, value: Any, target_type: Any, *, label: str) -> Any:
+        if value is None:
+            return self._default_typed_payload(target_type, label=label)
+        if target_type in (Any, object, None):
+            return value
+        if isinstance(target_type, type) and isinstance(value, target_type):
+            return value
+        try:
+            return TypeAdapter(target_type).validate_python(value)
+        except Exception as exc:
+            raise TypeError(f"Invalid {label} for agent {self.name}: {exc}") from exc
+
+    def build_context(
+        self,
+        input: str | list[MessageLike],
+        *,
+        state: Any = None,
+        metadata: Any = None,
+    ) -> AgentContext[Any, Any]:
+        state_type, metadata_type = self._resolve_state_and_metadata_types()
+        messages = normalize_messages_input(input)
+        if self.instructions:
+            messages = [system(self.instructions), *messages]
+
+        return AgentContext(
+            messages=messages,
+            state=self._coerce_typed_payload(state, state_type, label="state"),
+            metadata=self._coerce_typed_payload(
+                metadata,
+                metadata_type,
+                label="metadata",
+            ),
         )
 
-        if self.verifier is not None and not callable(self.verifier):
-            raise TypeError("verifier must be callable")
-        if self.verifier_max_attempts <= 0:
-            raise ValueError("verifier_max_attempts must be greater than 0")
-        if self.verifier is not None and (
-            self.output_type is None
-            or not isinstance(self.output_type, type)
-            or not issubclass(self.output_type, BaseModel)
-        ):
-            raise ValueError(
-                "verifier requires output_type to be a Pydantic BaseModel subclass"
+    def context_from_dict(self, data: dict[str, Any]) -> AgentContext[Any, Any]:
+        state_type, metadata_type = self._resolve_state_and_metadata_types()
+        return AgentContext.from_dict(
+            data,
+            state_type=state_type,
+            metadata_type=metadata_type,
+        )
+
+    def context_from_json(self, json_str: str) -> AgentContext[Any, Any]:
+        state_type, metadata_type = self._resolve_state_and_metadata_types()
+        return AgentContext.from_json(
+            json_str,
+            state_type=state_type,
+            metadata_type=metadata_type,
+        )
+
+    def resolve_model(self, agent_ctx: ContextType) -> Model:
+        model_or_factory = self.model
+        if callable(model_or_factory):
+            model = cast(Callable[[ContextType], Model], model_or_factory)(agent_ctx)
+        else:
+            model = model_or_factory
+        if not isinstance(model, Model):
+            raise TypeError("Resolved model must be a factorial.ai.models.Model")
+        return model
+
+    def resolve_tools(self, agent_ctx: ContextType) -> list[ToolDefinition[ContextType]]:
+        return [
+            tool
+            for tool in self.tools
+            if (
+                tool.is_enabled(agent_ctx)
+                if callable(tool.is_enabled)
+                else bool(tool.is_enabled)
             )
+        ]
 
-        # Lifecycle callbacks
-        self.on_run_start = on_run_start
-        self.on_run_end = on_run_end
-        self.on_turn_start = on_turn_start
-        self.on_turn_end = on_turn_end
-        self.on_pending_tool_call = on_pending_tool_call
-        self.on_pending_tool_results = on_pending_tool_results
-        self.on_run_cancelled = on_run_cancelled
-
-        # --- Validate lifecycle callback signatures --- #
-        _vcs("on_run_start", self.on_run_start, (AgentContext, ExecutionContext))
-        _vcs("on_turn_start", self.on_turn_start, (AgentContext, ExecutionContext))
-        _vcs(
-            "on_turn_end",
-            self.on_turn_end,
-            (AgentContext, ExecutionContext, TurnCompletion),
+    def _build_turn(
+        self,
+        agent_ctx: ContextType,
+        execution_ctx: ExecutionContext,
+    ) -> Turn[ContextType]:
+        return Turn(
+            model=self.resolve_model(agent_ctx),
+            messages=list(agent_ctx.messages),
+            tools=self.resolve_tools(agent_ctx),
+            tool_choice=self.default_tool_choice,
+            parallel_tool_calls=self.default_parallel_tool_calls,
+            temperature=self.default_temperature,
+            max_output_tokens=self.default_max_output_tokens,
         )
-        _vcs(
-            "on_run_end",
-            self.on_run_end,
-            (AgentContext, ExecutionContext, RunCompletion),
-        )
-        _vcs(
-            "on_pending_tool_call",
-            self.on_pending_tool_call,
-            (AgentContext, ExecutionContext, ChatCompletionMessageToolCall),
-        )
-        _vcs(
-            "on_pending_tool_results",
-            self.on_pending_tool_results,
-            (AgentContext, ExecutionContext, list),
-        )
-        _vcs(
-            "on_run_cancelled",
-            self.on_run_cancelled,
-            (AgentContext, ExecutionContext),
-        )
-
-    # ===== Overridable Methods ===== #
 
     async def validate_completion(
         self,
         agent_ctx: ContextType,
         response: ChatCompletion,
     ) -> None:
-        """Validate the completion response.
+        del agent_ctx, response
 
-        Raise an InvalidLLMResponseError if the response is invalid.
-        """
-        pass
-
-    async def completion(
+    @retry
+    async def _completion_with_retry(
         self,
+        turn: Turn[ContextType],
         agent_ctx: ContextType,
-        messages: list[dict[str, Any]],
     ) -> ChatCompletion:
-        """Execute LLM completion. Override to customize."""
-        model_settings = self.resolve_model_settings(agent_ctx)
-        tools = self.resolve_tools(agent_ctx)
-        model = self.resolve_model(agent_ctx)
-
-        execution_ctx = ExecutionContext.current()
-
-        # If max_turns is set, force the agent to finish on the final turn.
-        is_last_turn = (
-            self.max_turns is not None and agent_ctx.turn >= self.max_turns - 1
+        response = cast(
+            ChatCompletion,
+            await self.client.completion(
+                model=turn.model,
+                messages=messages_to_chat_messages(turn.messages),
+                tools=[tool.to_openai_tool_schema() for tool in turn.tools] or None,
+                tool_choice=turn.tool_choice,
+                parallel_tool_calls=turn.parallel_tool_calls,
+                temperature=turn.temperature,
+                max_completion_tokens=turn.max_output_tokens,
+                stream=False,
+            ),
         )
-
-        if is_last_turn:
-            if self.final_output_tool is not None:
-                model_settings.tool_choice = {
-                    "type": "function",
-                    "function": {"name": "final_output"},
-                }
-            else:
-                model_settings.tool_choice = "none"
-
-        if not self.stream:
-            response = cast(
-                ChatCompletion,
-                await self.client.completion(
-                    model=model,
-                    messages=messages,
-                    tools=tools,
-                    temperature=model_settings.temperature,
-                    max_completion_tokens=model_settings.max_completion_tokens,
-                    tool_choice=model_settings.tool_choice,
-                    parallel_tool_calls=model_settings.parallel_tool_calls,
-                ),
-            )
-            await self.validate_completion(agent_ctx, response)
-        else:
-            # progressively reconstruct both the assistant text content
-            # *and* any tool calls (potentially multiple)
-
-            content: str = ""
-            # tool-call index -> partial data
-            tool_call_acc: dict[int, dict[str, Any]] = {}
-
-            res_id: str = ""
-            created_ts: int | None = None
-            finish_reason: Literal[
-                "stop", "length", "tool_calls", "content_filter", "function_call"
-            ] | None = None
-            usage: Any | None = None  # ``usage`` is populated in the last chunk
-
-            res = cast(
-                AsyncStream[ChatCompletionChunk],
-                await self.client.completion(
-                    model=model,
-                    messages=messages,
-                    tools=tools,
-                    temperature=model_settings.temperature,
-                    max_completion_tokens=model_settings.max_completion_tokens,
-                    tool_choice=model_settings.tool_choice,
-                    parallel_tool_calls=model_settings.parallel_tool_calls,
-                    stream=True,
-                ),
-            )
-
-            async for chunk in res:
-                res_id = chunk.id
-                created_ts = chunk.created
-                delta = chunk.choices[0].delta
-
-                if delta.content:
-                    content += delta.content
-
-                # Accumulate tool call deltas (could be multiple per chunk)
-                if delta.tool_calls:
-                    for delta_tool in delta.tool_calls:
-                        idx = delta_tool.index or 0
-
-                        acc = tool_call_acc.setdefault(
-                            idx,
-                            {
-                                "id": None,
-                                "type": None,
-                                "name": None,
-                                "arguments": "",
-                            },
-                        )
-
-                        # Static fields can arrive anytime – keep first non-None.
-                        if delta_tool.id is not None:
-                            acc["id"] = delta_tool.id
-                        if delta_tool.type is not None:
-                            acc["type"] = delta_tool.type
-
-                        # Function fragment (name/arguments)
-                        if delta_tool.function:
-                            if delta_tool.function.name is not None:
-                                acc["name"] = delta_tool.function.name
-                            if delta_tool.function.arguments:
-                                acc["arguments"] += delta_tool.function.arguments
-
-                # Capture finish reason (set in the last chunk)
-                if chunk.choices[0].finish_reason is not None:
-                    finish_reason = chunk.choices[0].finish_reason
-
-                # Capture usage if provided (usually only in last chunk)
-                if chunk.usage is not None:
-                    usage = chunk.usage
-
-                # Publish progress update for this chunk (streaming)
-                try:
-                    if execution_ctx and execution_ctx.events:
-                        await execution_ctx.events.publish_event(
-                            AgentEvent(
-                                event_type="progress_update_completion_chunk",
-                                task_id=execution_ctx.task_id,
-                                owner_id=execution_ctx.owner_id,
-                                agent_name=self.name,
-                                turn=agent_ctx.turn,
-                                data=serialize_data(chunk),
-                            )
-                        )
-                except Exception:
-                    logger.exception(
-                        "Failed to publish streaming progress update", exc_info=True
-                    )
-
-            # Convert accumulated tool call data into the structured OpenAI type
-            formatted_tool_calls: (
-                list[
-                    ChatCompletionMessageFunctionToolCall
-                    | ChatCompletionMessageCustomToolCall
-                ]
-                | None
-            ) = None
-            if tool_call_acc:
-                formatted_tool_calls = []
-                for idx in sorted(tool_call_acc.keys()):
-                    acc = tool_call_acc[idx]
-                    if acc["name"] is None:
-                        # Incomplete tool call – skip for safety (shouldn't happen)
-                        logger.debug(
-                            "Incomplete tool call: %s",
-                            acc,
-                        )
-                        continue
-                    formatted_tool_calls.append(
-                        ChatCompletionMessageToolCall(
-                            id=acc["id"] or f"call_{idx}",
-                            type=acc["type"] or "function",
-                            function=ToolCallFunction(
-                                name=acc["name"],
-                                arguments=acc["arguments"],
-                            ),
-                        )
-                    )
-
-            response = ChatCompletion(
-                id=res_id,
-                model=model.name,
-                created=created_ts or int(datetime.now().timestamp()),
-                object="chat.completion",
-                choices=[
-                    Choice(
-                        index=0,
-                        message=ChatCompletionMessage(
-                            role="assistant",
-                            content=content or None,
-                            tool_calls=formatted_tool_calls,
-                        ),
-                        finish_reason=finish_reason or "stop",
-                    )
-                ],
-                usage=usage,
-            )
-
+        await self.validate_completion(agent_ctx, response)
         return response
+
+    async def _invoke_callback(
+        self,
+        callback: EventCallback | None,
+        event: BaseEvent,
+        agent_ctx: ContextType,
+        execution_ctx: ExecutionContext,
+    ) -> None:
+        if callback is None:
+            return
+
+        kwargs: dict[str, Any] = {}
+        signature = inspect.signature(callback)
+        params = list(signature.parameters.values())
+        if params:
+            first = params[0]
+            if first.kind not in (
+                inspect.Parameter.POSITIONAL_ONLY,
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            ):
+                raise TypeError("Callback must accept the event as its first parameter")
+
+        for param in params[1:]:
+            if param.kind not in (
+                inspect.Parameter.KEYWORD_ONLY,
+                inspect.Parameter.VAR_KEYWORD,
+            ):
+                raise TypeError(
+                    "Additional callback parameters must be keyword-only "
+                    "for injected context values"
+                )
+            if param.kind is inspect.Parameter.VAR_KEYWORD:
+                continue
+            if param.name == "agent_ctx":
+                kwargs[param.name] = agent_ctx
+            elif param.name == "execution_ctx":
+                kwargs[param.name] = execution_ctx
+            elif param.default is inspect.Parameter.empty:
+                raise TypeError(
+                    f"Unsupported required callback parameter '{param.name}'. "
+                    "Only keyword-only agent_ctx and execution_ctx are injected."
+                )
+
+        try:
+            result = callback(event, **kwargs)
+            if inspect.isawaitable(result):
+                await cast(Awaitable[Any], result)
+        except FatalAgentError:
+            raise
+        except Exception:
+            logger.exception("Callback failed", exc_info=True)
+
+    async def _dispatch_callbacks(
+        self,
+        event: BaseEvent,
+        agent_ctx: ContextType,
+        execution_ctx: ExecutionContext,
+    ) -> None:
+        callback: EventCallback | None = None
+        if isinstance(event, StartEvent):
+            callback = self.callbacks.on_start
+        elif isinstance(event, TurnStartEvent):
+            callback = self.callbacks.on_turn_start
+        elif isinstance(event, ModelStartEvent):
+            callback = self.callbacks.on_model_start
+        elif isinstance(event, ModelFinishEvent):
+            callback = self.callbacks.on_model_finish
+        elif isinstance(event, ToolStartEvent):
+            callback = self.callbacks.on_tool_start
+        elif isinstance(event, ToolFinishEvent):
+            callback = self.callbacks.on_tool_finish
+        elif isinstance(event, WaitEvent):
+            callback = self.callbacks.on_wait
+        elif isinstance(event, TurnFinishEvent):
+            callback = self.callbacks.on_turn_finish
+        elif isinstance(event, FinishEvent):
+            callback = self.callbacks.on_finish
+        await self._invoke_callback(callback, event, agent_ctx, execution_ctx)
+
+    async def _emit_event(
+        self,
+        event: BaseEvent,
+        agent_ctx: ContextType,
+        execution_ctx: ExecutionContext,
+    ) -> None:
+        if execution_ctx.events is not None:
+            await execution_ctx.events.publish_event(event)
+        await self._dispatch_callbacks(event, agent_ctx, execution_ctx)
+
+    @staticmethod
+    def _stringify_for_model(value: Any) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, str):
+            return value
+        serialized = serialize_data(value)
+        if isinstance(serialized, str):
+            return serialized
+        try:
+            return json.dumps(serialized, ensure_ascii=False, sort_keys=True)
+        except (TypeError, ValueError):
+            return str(serialized)
+
+    @classmethod
+    def _wait_model_output(cls, wait_instr: WaitInstruction) -> str:
+        if wait_instr.data is not None:
+            if isinstance(wait_instr.data, BaseModel):
+                return cls._stringify_for_model(serialize_for_model(wait_instr.data))
+            return cls._stringify_for_model(wait_instr.data)
+        if wait_instr.kind == "sleep":
+            return f"Waiting for {wait_instr.sleep_s or 0}s"
+        if wait_instr.kind == "cron":
+            expr = wait_instr.cron or "<cron>"
+            tz = wait_instr.timezone or "UTC"
+            return f"Waiting for next cron tick '{expr}' ({tz})"
+        if wait_instr.kind == "jobs":
+            return "Waiting for spawned jobs"
+        if wait_instr.kind == "activity":
+            return "Waiting for activity"
+        if wait_instr.kind == "signal":
+            return "Waiting for signal"
+        return "Waiting"
+
+    def _normalize_tool_result(
+        self,
+        result: Any,
+        tool_call: ChatCompletionMessageToolCall,
+        pending_child_task_ids: list[str] | None = None,
+    ) -> _ToolResultInternal:
+        if isinstance(result, _ToolResultInternal):
+            result.tool_call = tool_call
+            if pending_child_task_ids:
+                existing = result.pending_child_task_ids or []
+                result.pending_child_task_ids = list(
+                    dict.fromkeys([*existing, *pending_child_task_ids])
+                )
+            return result
+
+        if isinstance(result, WaitInstruction):
+            return _ToolResultInternal(
+                tool_call=tool_call,
+                model_output=self._wait_model_output(result),
+                client_output=result,
+                pending_child_task_ids=pending_child_task_ids,
+            )
+
+        if isinstance(result, BaseModel):
+            return _ToolResultInternal(
+                tool_call=tool_call,
+                model_output=self._stringify_for_model(serialize_for_model(result)),
+                client_output=serialize_for_client(result),
+                pending_child_task_ids=pending_child_task_ids,
+            )
+
+        if result is None:
+            return _ToolResultInternal(
+                tool_call=tool_call,
+                model_output="",
+                client_output=None,
+                pending_child_task_ids=pending_child_task_ids,
+            )
+
+        return _ToolResultInternal(
+            tool_call=tool_call,
+            model_output=self._stringify_for_model(result),
+            client_output=result,
+            pending_child_task_ids=pending_child_task_ids,
+        )
 
     async def tool_action(
         self,
         tool_call: ChatCompletionMessageToolCall,
         agent_ctx: ContextType,
     ) -> _ToolResultInternal:
-        """Execute a tool action. Override to customize."""
         tool_name = tool_call.function.name
         tool_args = tool_call.function.arguments
         action = self.tool_actions.get(tool_name)
@@ -776,29 +943,23 @@ class BaseAgent(Generic[ContextType]):
 
         execution_ctx = ExecutionContext.current()
 
-        if not action:
+        if action is None:
             raise ValueError(f"Agent {self.name} has no tool action for {tool_name}")
 
         is_forking_tool = getattr(action, "forking_tool", False)
 
         if not self.parse_tool_args:
             result = await _invoke_callable_non_blocking(action, tool_args, agent_ctx)
-
         else:
             raw_tool_args = json.loads(tool_args)
             parsed_tool_args = dict(raw_tool_args)
 
             for param_name, param in inspect.signature(action).parameters.items():
-                # Skip if the argument is already provided by the LLM call
                 if param_name in parsed_tool_args:
                     continue
-
-                # Case 1: Parameter named 'agent_ctx'
                 if param_name == "agent_ctx":
                     parsed_tool_args[param_name] = agent_ctx
                     continue
-
-                # Case 2: Parameter type is a subclass of AgentContext
                 if (
                     param.annotation
                     and param.annotation is not inspect.Parameter.empty
@@ -807,13 +968,9 @@ class BaseAgent(Generic[ContextType]):
                 ):
                     parsed_tool_args[param_name] = agent_ctx
                     continue
-
-                # Case 3: Parameter named 'execution_ctx'
                 if param_name == "execution_ctx":
                     parsed_tool_args[param_name] = execution_ctx
                     continue
-
-                # Case 4: Parameter type is a subclass of ExecutionContext
                 if (
                     param.annotation
                     and param.annotation is not inspect.Parameter.empty
@@ -823,58 +980,47 @@ class BaseAgent(Generic[ContextType]):
                     parsed_tool_args[param_name] = execution_ctx
                     continue
 
-            # ────────────────────────────────────────────────────────────
-            # Second pass: coerce parsed JSON args into Pydantic models.
-            # Supports both single ``BaseModel`` parameters and
-            # ``list[BaseModel]`` collections.
-            # ────────────────────────────────────────────────────────────
-            for _pname, _param in inspect.signature(action).parameters.items():
-                if _pname not in parsed_tool_args:
+            for param_name, param in inspect.signature(action).parameters.items():
+                if param_name not in parsed_tool_args:
                     continue
-
-                _expected = _param.annotation
-                if _expected is inspect.Parameter.empty:
+                expected = param.annotation
+                if expected is inspect.Parameter.empty:
                     continue
 
                 try:
-                    if get_origin(_expected) is Annotated:
-                        _annotated_args = get_args(_expected)
-                        if _annotated_args:
-                            _expected = _annotated_args[0]
-
-                    _origin = get_origin(_expected)
-
-                    # Case 1 – standalone BaseModel
+                    if get_origin(expected) is Annotated:
+                        annotated_args = get_args(expected)
+                        if annotated_args:
+                            expected = annotated_args[0]
+                    origin = get_origin(expected)
                     if (
-                        isinstance(_expected, type)
-                        and issubclass(_expected, BaseModel)
-                        and isinstance(parsed_tool_args[_pname], dict)
+                        isinstance(expected, type)
+                        and issubclass(expected, BaseModel)
+                        and isinstance(parsed_tool_args[param_name], dict)
                     ):
-                        parsed_tool_args[_pname] = _expected(**parsed_tool_args[_pname])
-
-                    # Case 2 – list[BaseModel]
-                    elif _origin is list:
-                        _item_type = (
-                            get_args(_expected)[0] if get_args(_expected) else None
+                        parsed_tool_args[param_name] = expected(
+                            **parsed_tool_args[param_name]
                         )
+                    elif origin is list:
+                        item_type = get_args(expected)[0] if get_args(expected) else None
                         if (
-                            _item_type
-                            and isinstance(_item_type, type)
-                            and issubclass(_item_type, BaseModel)
-                            and isinstance(parsed_tool_args[_pname], list)
+                            item_type
+                            and isinstance(item_type, type)
+                            and issubclass(item_type, BaseModel)
+                            and isinstance(parsed_tool_args[param_name], list)
                         ):
-                            parsed_tool_args[_pname] = [
-                                _item_type(**_it)
-                                if not isinstance(_it, _item_type)
-                                else _it  # type: ignore[arg-type]
-                                for _it in parsed_tool_args[_pname]
+                            parsed_tool_args[param_name] = [
+                                item_type(**item)
+                                if not isinstance(item, item_type)
+                                else item
+                                for item in parsed_tool_args[param_name]
                             ]
-                except Exception as _e:
+                except Exception as exc:
                     logger.debug(
                         "Failed to coerce argument '%s' to %s: %s",
-                        _pname,
-                        _expected,
-                        _e,
+                        param_name,
+                        expected,
+                        exc,
                     )
 
             if hook_plan is not None:
@@ -884,7 +1030,6 @@ class BaseAgent(Generic[ContextType]):
                     for param_name in hook_param_names
                     if param_name in parsed_tool_args
                 ]
-
                 if present_hook_params and len(present_hook_params) != len(
                     hook_param_names
                 ):
@@ -904,9 +1049,7 @@ class BaseAgent(Generic[ContextType]):
                         dict[str, Any], serialize_data(request_tool_args)
                     )
                     now_ts = datetime.now(timezone.utc).timestamp()
-                    session_seed = (
-                        f"{execution_ctx.task_id}:{tool_call.id}:{tool_name}"
-                    )
+                    session_seed = f"{execution_ctx.task_id}:{tool_call.id}:{tool_name}"
                     session_id = hashlib.sha256(
                         session_seed.encode("utf-8")
                     ).hexdigest()
@@ -923,8 +1066,7 @@ class BaseAgent(Generic[ContextType]):
                     first_stage = hook_plan.stages[0] if hook_plan.stages else ()
                     if not first_stage:
                         raise ValueError(
-                            f"Hook plan for tool '{tool_name}' has no "
-                            "requestable stage."
+                            f"Hook plan for tool '{tool_name}' has no requestable stage."
                         )
 
                     request_ctx = HookRequestContext(
@@ -1012,7 +1154,6 @@ class BaseAgent(Generic[ContextType]):
         pending_child_task_ids: list[str] = []
         if is_forking_tool:
             candidate_ids: list[str] | tuple[str, ...] | None
-
             if isinstance(result, _ToolResultInternal):
                 if not result.pending_child_task_ids:
                     raise ValueError(
@@ -1041,183 +1182,68 @@ class BaseAgent(Generic[ContextType]):
             pending_child_task_ids = list(candidate_ids)
 
         return self._normalize_tool_result(
-            result, tool_call, pending_child_task_ids or None
+            result,
+            tool_call,
+            pending_child_task_ids or None,
         )
 
-    @staticmethod
-    def _stringify_for_model(value: Any) -> str:
-        """Convert arbitrary output into stable model-facing text."""
-        if value is None:
-            return ""
-        if isinstance(value, str):
-            return value
-
-        serialized = serialize_data(value)
-        if isinstance(serialized, str):
-            return serialized
-        try:
-            return json.dumps(serialized, ensure_ascii=False, sort_keys=True)
-        except (TypeError, ValueError):
-            return str(serialized)
-
-    @classmethod
-    def _wait_model_output(cls, wait_instr: WaitInstruction) -> str:
-        """Generate model-facing text for a WaitInstruction."""
-        if wait_instr.data is not None:
-            if isinstance(wait_instr.data, BaseModel):
-                return cls._stringify_for_model(serialize_for_model(wait_instr.data))
-            return cls._stringify_for_model(wait_instr.data)
-        if wait_instr.kind == "sleep":
-            return f"Waiting for {wait_instr.sleep_s or 0}s"
-        if wait_instr.kind == "cron":
-            expr = wait_instr.cron or "<cron>"
-            tz = wait_instr.timezone or "UTC"
-            return f"Waiting for next cron tick '{expr}' ({tz})"
-        if wait_instr.kind == "jobs":
-            return "Waiting for spawned jobs"
-        if wait_instr.kind == "activity":
-            if (
-                wait_instr.activity_timeout_kind == "sleep"
-                and wait_instr.activity_timeout_s is not None
-            ):
-                return (
-                    "Waiting for activity or timeout after "
-                    f"{wait_instr.activity_timeout_s}s"
-                )
-            if (
-                wait_instr.activity_timeout_kind == "cron"
-                and wait_instr.activity_timeout_cron
-            ):
-                tz = wait_instr.activity_timeout_timezone or "UTC"
-                return (
-                    "Waiting for activity or next cron tick "
-                    f"'{wait_instr.activity_timeout_cron}' ({tz})"
-                )
-            return "Waiting for activity"
-        return "Waiting"
-
-    def _normalize_tool_result(
+    @retry(max_attempts=3, delay=0.5)
+    async def _tool_action_with_retry(
         self,
-        result: Any,
         tool_call: ChatCompletionMessageToolCall,
-        pending_child_task_ids: list[str] | None = None,
+        agent_ctx: ContextType,
     ) -> _ToolResultInternal:
-        """Normalize any tool return value into _ToolResultInternal.
-
-        Handles the v2 return contract:
-        - BaseModel with Hidden fields -> model sees non-hidden, client sees all
-        - BaseModel without Hidden -> both see all
-        - WaitInstruction -> model sees description, client sees WaitInstruction
-        - None -> empty
-        - Plain types (str, dict, list, etc.) -> both see the same thing
-        """
-        if isinstance(result, _ToolResultInternal):
-            result.tool_call = tool_call
-            if pending_child_task_ids:
-                existing = result.pending_child_task_ids or []
-                result.pending_child_task_ids = list(
-                    dict.fromkeys([*existing, *pending_child_task_ids])
-                )
-            return result
-
-        if isinstance(result, WaitInstruction):
-            return _ToolResultInternal(
-                tool_call=tool_call,
-                model_output=self._wait_model_output(result),
-                client_output=result,
-                pending_child_task_ids=pending_child_task_ids,
-            )
-
-        if isinstance(result, BaseModel):
-            return _ToolResultInternal(
-                tool_call=tool_call,
-                model_output=self._stringify_for_model(serialize_for_model(result)),
-                client_output=serialize_for_client(result),
-                pending_child_task_ids=pending_child_task_ids,
-            )
-
-        if result is None:
-            return _ToolResultInternal(
-                tool_call=tool_call,
-                model_output="",
-                client_output=None,
-                pending_child_task_ids=pending_child_task_ids,
-            )
-
-        # Plain types: str, dict, list, int, float, etc.
-        return _ToolResultInternal(
-            tool_call=tool_call,
-            model_output=self._stringify_for_model(result),
-            client_output=result,
-            pending_child_task_ids=pending_child_task_ids,
-        )
-
-    def format_tool_result(
-        self, tool_call_id: str, result: Any | _ToolResultInternal | Exception
-    ) -> str:
-        if isinstance(result, Exception):
-            return (
-                f'<tool_call_error tool="{tool_call_id}">\n'
-                f"Error running tool:\n{result}\n</tool_call_error>"
-            )
-        elif isinstance(result, _ToolResultInternal):
-            return (
-                f'<tool_call_result tool="{tool_call_id}">\n'
-                f"{result.model_output}\n</tool_call_result>"
-            )
-        else:
-            return (
-                f'<tool_call_result tool="{tool_call_id}">\n'
-                f"{str(result)}\n</tool_call_result>"
-            )
-
-    def format_child_task_result(
-        self, child_task_id: str, result: Any | Exception
-    ) -> str:
-        if isinstance(result, Exception):
-            return (
-                f'<sub_task_error sub_task_id="{child_task_id}">\n'
-                f"Error running sub task:\n{result}\n</sub_task_error>"
-            )
-        else:
-            return (
-                f'<sub_task_result sub_task_id="{child_task_id}">\n'
-                f"{str(result)}\n</sub_task_result>"
-            )
+        return await self.tool_action(tool_call, agent_ctx)
 
     async def execute_tools(
         self,
         tool_calls: list[ChatCompletionMessageToolCall],
         agent_ctx: ContextType,
     ) -> ToolExecutionResults:
-        """Execute tool calls and add results to messages"""
-        new_messages: list[dict[str, Any]] = []
+        new_messages: list[Message] = []
         pending_tool_call_ids: list[str] = []
         all_pending_child_task_ids: list[str] = []
-        tool_call_results: list[
-            tuple[ChatCompletionMessageToolCall, Any | Exception]
+        tool_call_results: list[tuple[ChatCompletionMessageToolCall, Any | Exception]] = []
+        resolved_results: list[
+            tuple[ChatCompletionMessageToolCall, _ToolResultInternal | Exception]
         ] = []
+        execution_ctx = ExecutionContext.current()
 
-        # Run tools in parallel
-        tasks = [
-            self._tool_action_with_retry_and_progress(
-                tc,
+        for tool_call in tool_calls:
+            await self._emit_event(
+                ToolStartEvent(
+                    task_id=execution_ctx.task_id,
+                    owner_id=execution_ctx.owner_id,
+                    agent_name=self.name,
+                    turn=agent_ctx.turn_number,
+                    tool_name=tool_call.function.name,
+                    tool_call_id=tool_call.id,
+                ),
                 agent_ctx,
+                execution_ctx,
             )
-            for tc in tool_calls
-        ]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        # Add results to messages
-        for tc, result in zip(tool_calls, results, strict=True):
+        results = await asyncio.gather(
+            *[
+                self._tool_action_with_retry(tool_call, agent_ctx)
+                for tool_call in tool_calls
+            ],
+            return_exceptions=True,
+        )
+
+        for tool_call, result in zip(tool_calls, results, strict=True):
+            resolved_results.append(
+                (
+                    tool_call,
+                    cast(_ToolResultInternal | Exception, result),
+                )
+            )
             tool_call_results.append(
                 (
-                    tc,
+                    tool_call,
                     result
                     if isinstance(result, Exception)
-                    else result.client_output
-                    if isinstance(result, _ToolResultInternal)
-                    else result,
+                    else result.client_output,
                 )
             )
 
@@ -1229,453 +1255,224 @@ class BaseAgent(Generic[ContextType]):
 
             if isinstance(result, Exception):
                 logger.error(
-                    f"Tool {tc.function.name} failed: {result}", exc_info=result
+                    "Tool %s failed: %s",
+                    tool_call.function.name,
+                    result,
+                    exc_info=result,
                 )
-                # Still need to add tool response to maintain conversation format
-                content = self.format_tool_result(tc.id, result)
                 new_messages.append(
-                    {"role": "tool", "tool_call_id": tc.id, "content": content}
+                    tool_result(
+                        tool_call.id,
+                        str(result),
+                        tool_name=tool_call.function.name,
+                        is_error=True,
+                        model_output=str(result),
+                    )
                 )
-            elif isinstance(result, _ToolResultInternal) and result.pending_result:
-                pending_tool_call_ids.append(tc.id)
-                # Invoke lifecycle callback for pending tool calls
-                await self._safe_call(
-                    self.on_pending_tool_call,
+                await self._emit_event(
+                    ToolFinishEvent(
+                        task_id=execution_ctx.task_id,
+                        owner_id=execution_ctx.owner_id,
+                        agent_name=self.name,
+                        turn=agent_ctx.turn_number,
+                        tool_name=tool_call.function.name,
+                        tool_call_id=tool_call.id,
+                        output=str(result),
+                        is_error=True,
+                    ),
                     agent_ctx,
-                    ExecutionContext.current(),
-                    tc,
+                    execution_ctx,
+                )
+            elif result.pending_result:
+                pending_tool_call_ids.append(tool_call.id)
+                await self._emit_event(
+                    ToolFinishEvent(
+                        task_id=execution_ctx.task_id,
+                        owner_id=execution_ctx.owner_id,
+                        agent_name=self.name,
+                        turn=agent_ctx.turn_number,
+                        tool_name=tool_call.function.name,
+                        tool_call_id=tool_call.id,
+                        output=result.client_output,
+                        is_error=False,
+                    ),
+                    agent_ctx,
+                    execution_ctx,
                 )
             else:
-                content = self.format_tool_result(tc.id, result)
                 new_messages.append(
-                    {"role": "tool", "tool_call_id": tc.id, "content": content}
+                    tool_result(
+                        tool_call.id,
+                        result.client_output,
+                        tool_name=tool_call.function.name,
+                        is_error=False,
+                        model_output=result.model_output,
+                    )
+                )
+                await self._emit_event(
+                    ToolFinishEvent(
+                        task_id=execution_ctx.task_id,
+                        owner_id=execution_ctx.owner_id,
+                        agent_name=self.name,
+                        turn=agent_ctx.turn_number,
+                        tool_name=tool_call.function.name,
+                        tool_call_id=tool_call.id,
+                        output=result.client_output,
+                        is_error=False,
+                    ),
+                    agent_ctx,
+                    execution_ctx,
                 )
 
-            # Propagate unrecoverable errors so the worker can fail the task.
             if isinstance(result, FatalAgentError):
                 raise result
 
         return ToolExecutionResults(
             new_messages=new_messages,
             tool_call_results=tool_call_results,
+            resolved_results=resolved_results,
             pending_tool_call_ids=pending_tool_call_ids,
             pending_child_task_ids=all_pending_child_task_ids,
         )
-
-    async def run_turn(
-        self,
-        agent_ctx: ContextType,
-    ) -> TurnCompletion[ContextType]:
-        """Run a single turn. Override for custom logic."""
-
-        # Lifecycle callback – turn start
-        execution_ctx = ExecutionContext.current()
-        await self._safe_call(self.on_turn_start, agent_ctx, execution_ctx)
-
-        messages = self.prepare_messages(agent_ctx)
-
-        response = await self._completion_with_retry_and_progress(
-            agent_ctx,
-            messages,
-        )
-
-        assistant_msg: dict[str, Any] = {
-            "role": "assistant",
-            "content": response.choices[0].message.content,
-        }
-        if response.choices[0].message.tool_calls:
-            assistant_msg["tool_calls"] = [
-                tc.model_dump()  # type: ignore
-                for tc in response.choices[0].message.tool_calls
-            ]
-        messages.append(assistant_msg)
-
-        if self._is_done(response):
-            output = self._extract_output(response)
-            if self.verifier is not None:
-                validated_output = self._validate_output_for_verifier(output)
-                candidate_hash = self._compute_candidate_hash(validated_output)
-                verifier_kwargs = self._resolve_verifier_injected_kwargs(
-                    agent_ctx,
-                    execution_ctx,
-                )
-                try:
-                    verifier_result = await _invoke_callable_non_blocking(
-                        self.verifier,
-                        validated_output,
-                        **verifier_kwargs,
-                    )
-                except VerificationRejected as rejection:
-                    verification_state = agent_ctx.verification
-                    attempts_counted = False
-                    if verification_state.last_candidate_hash != candidate_hash:
-                        verification_state.attempts_used += 1
-                        attempts_counted = True
-                    verification_state.last_candidate_hash = candidate_hash
-                    verification_state.last_outcome = "rejected"
-
-                    await self._publish_verification_event(
-                        execution_ctx=execution_ctx,
-                        agent_ctx=agent_ctx,
-                        event_type="verification_rejected",
-                        data={
-                            "attempts_used": verification_state.attempts_used,
-                            "max_attempts": self.verifier_max_attempts,
-                            "attempt_counted": attempts_counted,
-                            "message": rejection.message,
-                            "code": rejection.code,
-                            "metadata": rejection.metadata,
-                        },
-                    )
-
-                    if verification_state.attempts_used >= self.verifier_max_attempts:
-                        await self._publish_verification_event(
-                            execution_ctx=execution_ctx,
-                            agent_ctx=agent_ctx,
-                            event_type="verification_exhausted",
-                            data={
-                                "attempts_used": verification_state.attempts_used,
-                                "max_attempts": self.verifier_max_attempts,
-                                "message": rejection.message,
-                                "code": rejection.code,
-                            },
-                        )
-                        raise FatalAgentError(
-                            "Verification attempt budget exhausted "
-                            f"({verification_state.attempts_used}/"
-                            f"{self.verifier_max_attempts}): {rejection.message}"
-                        ) from rejection
-
-                    messages.append(
-                        {
-                            "role": "user",
-                            "content": self._format_verification_feedback(rejection),
-                        }
-                    )
-                    agent_ctx.messages = messages
-                    agent_ctx.turn += 1
-                    completion = TurnCompletion(
-                        is_done=False,
-                        context=agent_ctx,
-                    )
-
-                    await self._safe_call(
-                        self.on_turn_end, agent_ctx, execution_ctx, completion
-                    )
-                    return completion
-                except FatalAgentError:
-                    agent_ctx.verification.last_outcome = "system_error"
-                    raise
-                except Exception:
-                    agent_ctx.verification.last_outcome = "system_error"
-                    raise
-
-                agent_ctx.verification.last_candidate_hash = candidate_hash
-                agent_ctx.verification.last_outcome = "passed"
-                output = serialize_data(verifier_result)
-                await self._publish_verification_event(
-                    execution_ctx=execution_ctx,
-                    agent_ctx=agent_ctx,
-                    event_type="verification_passed",
-                    data={
-                        "attempts_used": agent_ctx.verification.attempts_used,
-                        "max_attempts": self.verifier_max_attempts,
-                    },
-                )
-
-            agent_ctx.output = output  # Store the final output in the agent context
-            agent_ctx.messages = messages
-            completion = TurnCompletion(
-                is_done=True,
-                context=agent_ctx,
-                output=output,
-            )
-
-            # Lifecycle callback – turn end
-            await self._safe_call(
-                self.on_turn_end, agent_ctx, execution_ctx, completion
-            )
-            return completion
-
-        # Handle tool calls and append results to messages
-        tool_call_results: list[
-            tuple[ChatCompletionMessageToolCall, Any | Exception]
-        ] = []
-        pending_tool_call_ids: list[str] = []
-        pending_child_task_ids: list[str] = []
-        if response.choices[0].message.tool_calls:
-            # Filter to only function tool calls (the only type we support)
-            function_tool_calls = [
-                tc
-                for tc in response.choices[0].message.tool_calls
-                if isinstance(tc, ChatCompletionMessageFunctionToolCall)
-            ]
-            results = await self.execute_tools(
-                function_tool_calls,
-                agent_ctx,
-            )
-            messages += results.new_messages
-            pending_tool_call_ids += results.pending_tool_call_ids
-            pending_child_task_ids += results.pending_child_task_ids
-            tool_call_results += results.tool_call_results
-
-        agent_ctx.messages = messages
-        agent_ctx.turn += 1
-        completion = TurnCompletion(
-            is_done=False,
-            context=agent_ctx,
-            pending_tool_call_ids=pending_tool_call_ids,
-            pending_child_task_ids=pending_child_task_ids,
-            tool_call_results=tool_call_results,
-        )
-
-        # Lifecycle callback – turn end
-        await self._safe_call(self.on_turn_end, agent_ctx, execution_ctx, completion)
-        return completion
 
     def process_deferred_tool_results(
         self,
         agent_ctx: ContextType,
         tool_call_results: list[tuple[str, Any]],
     ) -> TurnCompletion[ContextType]:
-        updated_messages = agent_ctx.messages.copy()
+        updated_messages = list(agent_ctx.messages)
         for tool_call_id, result in tool_call_results:
             if isinstance(result, Exception):
-                logger.error(f"Tool {tool_call_id} failed: {result}", exc_info=result)
-
-            content = self.format_tool_result(tool_call_id, result)
-            updated_messages.append(
-                {"role": "tool", "tool_call_id": tool_call_id, "content": content}
-            )
+                updated_messages.append(
+                    tool_result(
+                        tool_call_id,
+                        str(result),
+                        is_error=True,
+                        model_output=str(result),
+                    )
+                )
+            else:
+                updated_messages.append(
+                    tool_result(
+                        tool_call_id,
+                        result,
+                        model_output=self._stringify_for_model(result),
+                    )
+                )
         agent_ctx.messages = updated_messages
-
         return TurnCompletion(is_done=False, context=agent_ctx)
+
+    def format_child_task_result(
+        self,
+        child_task_id: str,
+        result: Any | Exception,
+    ) -> str:
+        if isinstance(result, Exception):
+            return (
+                f'<sub_task_error sub_task_id="{child_task_id}">\n'
+                f"Error running sub task:\n{result}\n</sub_task_error>"
+            )
+        return (
+            f'<sub_task_result sub_task_id="{child_task_id}">\n'
+            f"{str(result)}\n</sub_task_result>"
+        )
 
     def process_child_task_results(
         self,
         agent_ctx: ContextType,
         child_task_results: list[tuple[str, Any]],
     ) -> TurnCompletion[ContextType]:
-        updated_messages = agent_ctx.messages.copy()
-        formatted_child_task_results = []
-
-        for child_task_id, result in child_task_results:
-            if isinstance(result, Exception):
-                logger.error(
-                    f"Child task {child_task_id} failed: {result}", exc_info=result
+        updated_messages = list(agent_ctx.messages)
+        formatted_results = [
+            self.format_child_task_result(child_task_id, result)
+            for child_task_id, result in child_task_results
+        ]
+        if formatted_results:
+            updated_messages.append(
+                assistant(
+                    "<sub_task_results>\n"
+                    + "\n\n".join(formatted_results)
+                    + "\n</sub_task_results>"
                 )
-            formatted_child_task_results.append(
-                self.format_child_task_result(child_task_id, result)
             )
-
-        if formatted_child_task_results:
-            joined_results = "\n\n".join(formatted_child_task_results)
-            content = f"<sub_task_results>\n{joined_results}\n</sub_task_results>"
-            updated_messages.append({"role": "assistant", "content": content})
-
         agent_ctx.messages = updated_messages
-
         return TurnCompletion(is_done=False, context=agent_ctx)
 
-    # ===== Helper Methods ===== #
-    def resolve_tools(self, agent_ctx: ContextType) -> list[dict[str, Any]]:
-        tools = [
-            tool.to_openai_tool_schema()
-            for tool in self.tools
-            if (
-                tool.is_enabled(agent_ctx)
-                if callable(tool.is_enabled)
-                else tool.is_enabled
-            )
-        ]
-        if self.final_output_tool:
-            tools.append(self.final_output_tool)
-
-        return tools
-
-    def resolve_model(self, agent_ctx: ContextType) -> Model:
-        model = self.model(agent_ctx) if callable(self.model) else self.model
-        if not model:
-            raise ValueError("No model is configured for agent")
-
-        return model
-
-    def resolve_model_settings(self, agent_ctx: ContextType) -> ResolvedModelSettings:
-        return self.model_settings.resolve(agent_ctx)
-
-    def resolve_instructions(self, agent_ctx: ContextType) -> str:
-        """Resolve instructions, handling both string and callable instructions."""
-        instructions = self.instructions
-
-        if callable(instructions):
-            sig = inspect.signature(instructions)
-            params = list(sig.parameters.values())
-
-            # Always pass agent_ctx as first argument
-            args = [agent_ctx]
-
-            # Check if any parameter has ExecutionContext type annotation
-            has_execution_ctx = any(
-                param.annotation
-                and param.annotation != inspect.Parameter.empty
-                and isinstance(param.annotation, type)
-                and issubclass(param.annotation, ExecutionContext)
-                for param in params
-            )
-
-            if has_execution_ctx:
-                execution_ctx = ExecutionContext.current()
-                args.append(cast(Any, execution_ctx))
-
-            instructions = instructions(*args)
-
-        return instructions or ""
-
-    def _is_done(self, response: ChatCompletion) -> bool:
-        """Check if agent should complete"""
-        tool_calls = response.choices[0].message.tool_calls
-
-        return (not tool_calls and self.output_type is None) or any(
-            isinstance(tc, ChatCompletionMessageFunctionToolCall)
-            and tc.function.name == "final_output"
-            for tc in tool_calls or []
-        )
-
-    def _prepare_instructions(self, agent_ctx: ContextType) -> str:
-        """Prepare instructions for LLM request. Override to customize."""
-
-        instructions = self.resolve_instructions(agent_ctx)
-
-        if self.max_turns:
-            instructions += (
-                f"\n\nYou must reach a final response "
-                f"in {self.max_turns} turns or less."
-            )
-        if (
-            self.output_type
-            and isinstance(self.output_type, type)
-            and issubclass(self.output_type, BaseModel)
-        ):
-            instructions += (
-                "\n\nYour final response must be made using the 'final_output' tool."
-            )
-
-        return instructions
-
-    @staticmethod
-    def _sanitize_message_for_completion(message: dict[str, Any]) -> dict[str, Any]:
-        """Remove nullable fields that OpenAI rejects in chat history."""
-        sanitized = dict(message)
-        if sanitized.get("tool_calls", "__missing__") is None:
-            sanitized.pop("tool_calls", None)
-        if sanitized.get("function_call", "__missing__") is None:
-            sanitized.pop("function_call", None)
-
-        # Assistant messages with no tool calls must have non-null content.
-        if (
-            sanitized.get("role") == "assistant"
-            and sanitized.get("content") is None
-            and "tool_calls" not in sanitized
-            and "function_call" not in sanitized
-        ):
-            sanitized["content"] = ""
-
-        return sanitized
-
-    def prepare_messages(self, agent_ctx: ContextType) -> list[dict[str, Any]]:
-        """Prepare messages for LLM request. Override to customize."""
-        if agent_ctx.turn == 0:
-            messages = (
-                [{"role": "system", "content": self._prepare_instructions(agent_ctx)}]
-                if self.instructions
-                else []
-            )
-            if agent_ctx.messages:
-                messages.extend(
-                    [
-                        self._sanitize_message_for_completion(message)
-                        for message in agent_ctx.messages
-                        if message.get("content")
-                    ]
-                )
-            messages.append({"role": "user", "content": agent_ctx.query})
-        else:
-            messages = [
-                self._sanitize_message_for_completion(message)
-                for message in agent_ctx.messages
-            ]
-
-        return messages
-
-    def _extract_output(
+    def _response_tool_calls(
         self,
         response: ChatCompletion,
-    ) -> str | dict[str, Any] | None:
-        """Extract the final output from response content or tool calls."""
-        content = response.choices[0].message.content
-        tool_calls = response.choices[0].message.tool_calls
+    ) -> list[ChatCompletionMessageFunctionToolCall]:
+        tool_calls = response.choices[0].message.tool_calls or []
+        return [
+            tool_call
+            for tool_call in tool_calls
+            if isinstance(tool_call, ChatCompletionMessageFunctionToolCall)
+        ]
+
+    def _canonical_response_messages(
+        self,
+        response: ChatCompletion,
+    ) -> tuple[list[Message], list[ChatCompletionMessageFunctionToolCall]]:
+        messages: list[Message] = []
+        content = response.choices[0].message.content or ""
+        function_tool_calls = self._response_tool_calls(response)
 
         if content:
-            return content
+            messages.append(assistant(content))
 
-        if tool_calls:
-            for tool_call in tool_calls:
-                if (
-                    isinstance(tool_call, ChatCompletionMessageFunctionToolCall)
-                    and tool_call.function.name == "final_output"
-                ):
-                    if self.parse_tool_args:
-                        parsed: dict[str, Any] = json.loads(
-                            tool_call.function.arguments
+        if function_tool_calls:
+            messages.append(
+                message_tool_calls(
+                    *[
+                        message_tool_call(
+                            tool_call.function.name,
+                            json.loads(tool_call.function.arguments)
+                            if self.parse_tool_args
+                            else tool_call.function.arguments,
+                            call_id=tool_call.id,
                         )
-                        return parsed
-                    else:
-                        return tool_call.function.arguments
-
-        return None
-
-    def _extract_output_payload_for_verifier(
-        self, output: str | dict[str, Any] | None
-    ) -> dict[str, Any]:
-        if isinstance(output, dict):
-            return output
-        if isinstance(output, str):
-            try:
-                parsed = json.loads(output)
-            except json.JSONDecodeError as e:
-                raise InvalidLLMResponseError(
-                    "final_output arguments must be valid JSON object"
-                ) from e
-            if not isinstance(parsed, dict):
-                raise InvalidLLMResponseError(
-                    "final_output arguments must decode to a JSON object"
+                        for tool_call in function_tool_calls
+                    ]
                 )
-            return parsed
-        raise InvalidLLMResponseError("Missing final_output payload for verification")
-
-    def _validate_output_for_verifier(
-        self, output: str | dict[str, Any] | None
-    ) -> BaseModel:
-        if (
-            self.output_type is None
-            or not isinstance(self.output_type, type)
-            or not issubclass(self.output_type, BaseModel)
-        ):
-            raise InvalidLLMResponseError(
-                "Verifier requires output_type to be a Pydantic BaseModel subclass"
             )
 
-        payload = self._extract_output_payload_for_verifier(output)
-        try:
-            return self.output_type.model_validate(payload)
-        except Exception as e:
-            raise InvalidLLMResponseError(
-                f"final_output payload failed output_type validation: {e}"
-            ) from e
+        return messages, function_tool_calls
 
-    def _compute_candidate_hash(self, output_model: BaseModel) -> str:
+    def _candidate_output_from_turn(
+        self,
+        *,
+        assistant_content: str,
+        resolved_tool_results: list[
+            tuple[ChatCompletionMessageToolCall, _ToolResultInternal | Exception]
+        ],
+    ) -> Any:
+        if assistant_content or not resolved_tool_results:
+            return assistant_content
+
+        for tool_call, result in resolved_tool_results:
+            del tool_call
+            if isinstance(result, Exception) or result.pending_result:
+                continue
+            return result.client_output
+        return None
+
+    def _turn_finish_reason(
+        self,
+        response: ChatCompletion,
+        function_tool_calls: list[ChatCompletionMessageFunctionToolCall],
+    ) -> str:
+        if function_tool_calls:
+            tool_names = ",".join(tool_call.function.name for tool_call in function_tool_calls)
+            return f"tool_called:{tool_names}"
+        return str(response.choices[0].finish_reason or "stop")
+
+    def _format_verifier_feedback(self, decision: VerifierRetry[Any]) -> str:
+        code_suffix = f" [{decision.code}]" if decision.code else ""
+        return f"Verifier feedback{code_suffix}: {decision.message}"
+
+    def _compute_candidate_hash(self, output: Any) -> str:
         canonical_payload = json.dumps(
-            output_model.model_dump(mode="json"),
+            serialize_data(output),
             sort_keys=True,
             separators=(",", ":"),
             default=str,
@@ -1698,127 +1495,276 @@ class BaseAgent(Generic[ContextType]):
 
         kwargs: dict[str, Any] = {}
         for param in params[1:]:
-            param_name = param.name
-
             if param.kind in (
                 inspect.Parameter.VAR_POSITIONAL,
                 inspect.Parameter.VAR_KEYWORD,
             ):
                 continue
-
             annotation = param.annotation
-            injected = False
-
-            if param_name == "agent_ctx":
-                kwargs[param_name] = agent_ctx
-                injected = True
-            elif (
+            if param.name == "agent_ctx":
+                kwargs[param.name] = agent_ctx
+                continue
+            if (
                 annotation is not inspect.Parameter.empty
                 and isinstance(annotation, type)
                 and issubclass(annotation, AgentContext)
             ):
-                kwargs[param_name] = agent_ctx
-                injected = True
-            elif param_name == "execution_ctx":
-                kwargs[param_name] = execution_ctx
-                injected = True
-            elif (
+                kwargs[param.name] = agent_ctx
+                continue
+            if param.name == "execution_ctx":
+                kwargs[param.name] = execution_ctx
+                continue
+            if (
                 annotation is not inspect.Parameter.empty
                 and isinstance(annotation, type)
                 and issubclass(annotation, ExecutionContext)
             ):
-                kwargs[param_name] = execution_ctx
-                injected = True
-
-            if injected:
+                kwargs[param.name] = execution_ctx
                 continue
-            if param.default is not inspect.Parameter.empty:
-                continue
-            raise TypeError(
-                f"Unsupported required verifier parameter '{param_name}'. "
-                "Only output (first arg), agent_ctx, and execution_ctx are supported."
-            )
-
+            if param.default is inspect.Parameter.empty:
+                raise TypeError(
+                    f"Unsupported required verifier parameter '{param.name}'. "
+                    "Only output (first arg), agent_ctx, and execution_ctx are supported."
+                )
         return kwargs
 
-    async def _publish_verification_event(
+    async def _apply_verifier(
         self,
-        *,
+        candidate_output: Any,
+        agent_ctx: ContextType,
         execution_ctx: ExecutionContext,
-        agent_ctx: ContextType,
-        event_type: str,
-        data: dict[str, Any] | None = None,
-        error: str | None = None,
-    ) -> None:
-        try:
-            await execution_ctx.events.publish_event(
-                AgentEvent(
-                    event_type=event_type,
-                    task_id=execution_ctx.task_id,
-                    owner_id=execution_ctx.owner_id,
-                    agent_name=self.name,
-                    turn=agent_ctx.turn,
-                    data=serialize_data(data) if data is not None else None,
-                    error=error,
-                )
-            )
-        except Exception:
-            logger.exception("Failed to publish verification event", exc_info=True)
+    ) -> tuple[Literal["accept", "retry"], VerificationSummary[Any] | None]:
+        if self.verifier is None:
+            return "accept", None
 
-    def _format_verification_feedback(self, rejection: VerificationRejected) -> str:
-        code_attr = (
-            f' code="{rejection.code}"'
-            if rejection.code is not None and rejection.code != ""
-            else ""
+        decision = await _invoke_callable_non_blocking(
+            self.verifier,
+            candidate_output,
+            **self._resolve_verifier_injected_kwargs(agent_ctx, execution_ctx),
         )
-        lines = [
-            f"<verification_rejected{code_attr}>",
-            f"Summary: {rejection.message}",
-        ]
-        if rejection.metadata:
-            metadata_json = json.dumps(
-                serialize_data(rejection.metadata),
-                sort_keys=True,
+        if not isinstance(decision, (VerifierAccept, VerifierRetry, VerifierFail)):
+            raise TypeError(
+                "verifier must return verify.accept(...), verify.retry(...), "
+                "or verify.fail(...)"
             )
-            lines.append(f"Metadata: {metadata_json}")
-        lines.append("</verification_rejected>")
-        return "\n".join(lines)
 
-    # ===== Core logic ===== #
+        candidate_hash = self._compute_candidate_hash(candidate_output)
+        verification_state = agent_ctx.verification
+        verification_state.last_candidate_hash = candidate_hash
 
-    def get_execution_context(self) -> ExecutionContext:
-        return ExecutionContext.current()
+        if isinstance(decision, VerifierAccept):
+            verification_state.last_outcome = "passed"
+            summary = VerificationSummary(
+                status="passed",
+                attempts_used=verification_state.attempts_used,
+                metadata=decision.metadata,
+            )
+            return "accept", summary
 
-    @retry(max_attempts=3, delay=0.5)
-    @publish_progress(func_name="completion")
-    async def _completion_with_retry_and_progress(
-        self,
-        agent_ctx: ContextType,
-        messages: list[dict[str, Any]],
-    ) -> ChatCompletion:
-        """Internal method that wraps completion with retry and progress publishing"""
-        return await self.completion(
-            agent_ctx,
-            messages,
+        if isinstance(decision, VerifierRetry):
+            verification_state.attempts_used += 1
+            verification_state.last_outcome = "retry_requested"
+            verification_state.last_code = decision.code
+            summary = VerificationSummary(
+                status="retry_requested",
+                attempts_used=verification_state.attempts_used,
+                code=decision.code,
+                message=decision.message,
+                metadata=decision.metadata,
+            )
+            agent_ctx.messages.append(system(self._format_verifier_feedback(decision)))
+            return "retry", summary
+
+        verification_state.last_outcome = "failed"
+        verification_state.last_code = decision.code
+        raise _RunFailureError(
+            decision.message,
+            verification_summary=VerificationSummary(
+                status="failed",
+                attempts_used=verification_state.attempts_used,
+                code=decision.code,
+                message=decision.message,
+                metadata=decision.metadata,
+            ),
         )
 
-    @retry(max_attempts=2, delay=0.25)
-    @publish_progress(func_name="tool_action")
-    async def _tool_action_with_retry_and_progress(
-        self,
-        tool_call: ChatCompletionMessageToolCall,
-        agent_ctx: ContextType,
-    ) -> _ToolResultInternal:
-        """Internal method that wraps tool_action with retry and progress publishing"""
-        return await self.tool_action(tool_call, agent_ctx)
-
-    @publish_progress(func_name="run_turn")
-    async def _run_turn_with_progress(
+    async def run_turn(
         self,
         agent_ctx: ContextType,
     ) -> TurnCompletion[ContextType]:
-        """Internal method that wraps run_turn with progress publishing"""
-        return await self.run_turn(agent_ctx)
+        execution_ctx = ExecutionContext.current()
+        turn = await _maybe_call_prepare_turn(
+            self.prepare_turn,
+            self._build_turn(agent_ctx, execution_ctx),
+            agent_ctx,
+            execution_ctx,
+        )
+
+        await self._emit_event(
+            TurnStartEvent(
+                task_id=execution_ctx.task_id,
+                owner_id=execution_ctx.owner_id,
+                agent_name=self.name,
+                turn=agent_ctx.turn_number,
+            ),
+            agent_ctx,
+            execution_ctx,
+        )
+        await self._emit_event(
+            ModelStartEvent(
+                task_id=execution_ctx.task_id,
+                owner_id=execution_ctx.owner_id,
+                agent_name=self.name,
+                turn=agent_ctx.turn_number,
+                model_name=turn.model.name,
+            ),
+            agent_ctx,
+            execution_ctx,
+        )
+
+        response = await self._completion_with_retry(turn, agent_ctx)
+        turn_usage = UsageSummary.from_provider_usage(getattr(response, "usage", None))
+        execution_ctx.usage = execution_ctx.usage.add(turn_usage)
+
+        canonical_response_messages, function_tool_calls = self._canonical_response_messages(
+            response
+        )
+        assistant_content = response.choices[0].message.content or ""
+        updated_messages = [*agent_ctx.messages, *canonical_response_messages]
+
+        finish_reason = self._turn_finish_reason(response, function_tool_calls)
+        await self._emit_event(
+            ModelFinishEvent(
+                task_id=execution_ctx.task_id,
+                owner_id=execution_ctx.owner_id,
+                agent_name=self.name,
+                turn=agent_ctx.turn_number,
+                model_name=turn.model.name,
+                finish_reason=finish_reason,
+                usage=turn_usage,
+            ),
+            agent_ctx,
+            execution_ctx,
+        )
+
+        tool_results = ToolExecutionResults(
+            new_messages=[],
+            tool_call_results=[],
+            resolved_results=[],
+            pending_tool_call_ids=[],
+            pending_child_task_ids=[],
+        )
+        if function_tool_calls:
+            tool_results = await self.execute_tools(function_tool_calls, agent_ctx)
+            updated_messages.extend(tool_results.new_messages)
+
+        agent_ctx.messages = updated_messages
+        candidate_output = self._candidate_output_from_turn(
+            assistant_content=assistant_content,
+            resolved_tool_results=tool_results.resolved_results,
+        )
+        turn_summary = TurnSummary(
+            turn_number=agent_ctx.turn_number,
+            finish_reason=finish_reason,
+            status="completed",
+            output=candidate_output,
+            usage=turn_usage,
+        )
+        execution_ctx.last_turn = turn_summary
+
+        if tool_results.pending_tool_call_ids:
+            wait_event = WaitEvent(
+                task_id=execution_ctx.task_id,
+                owner_id=execution_ctx.owner_id,
+                agent_name=self.name,
+                turn=agent_ctx.turn_number,
+                wait_kind="pending_tool_call_results",
+                source_tool_call_ids=tuple(tool_results.pending_tool_call_ids),
+            )
+            await self._emit_event(wait_event, agent_ctx, execution_ctx)
+
+        if tool_results.pending_child_task_ids:
+            wait_event = WaitEvent(
+                task_id=execution_ctx.task_id,
+                owner_id=execution_ctx.owner_id,
+                agent_name=self.name,
+                turn=agent_ctx.turn_number,
+                wait_kind="pending_child_task_results",
+                source_tool_call_ids=tuple(tool_results.pending_child_task_ids),
+            )
+            await self._emit_event(wait_event, agent_ctx, execution_ctx)
+
+        should_stop = bool(self.stop_when(agent_ctx, execution_ctx))
+        verification_summary: VerificationSummary[Any] | None = None
+        if should_stop:
+            if candidate_output is None:
+                raise _RunFailureError(
+                    "Agent stopped without producing a finalized output"
+                )
+            verifier_action, verification_summary = await self._apply_verifier(
+                candidate_output,
+                agent_ctx,
+                execution_ctx,
+            )
+            if verifier_action == "accept":
+                agent_ctx.output = candidate_output
+                completion = TurnCompletion(
+                    is_done=True,
+                    context=agent_ctx,
+                    output=candidate_output,
+                    tool_call_results=tool_results.tool_call_results,
+                    pending_tool_call_ids=tool_results.pending_tool_call_ids,
+                    pending_child_task_ids=tool_results.pending_child_task_ids,
+                    finish_reason=finish_reason,
+                    usage=turn_usage,
+                    turn_summary=turn_summary,
+                    verification_summary=verification_summary,
+                )
+                await self._emit_event(
+                    TurnFinishEvent(
+                        task_id=execution_ctx.task_id,
+                        owner_id=execution_ctx.owner_id,
+                        agent_name=self.name,
+                        turn=agent_ctx.turn_number,
+                        finish_reason=finish_reason,
+                        output=candidate_output,
+                        pending_tool_call_ids=tuple(tool_results.pending_tool_call_ids),
+                        pending_child_task_ids=tuple(tool_results.pending_child_task_ids),
+                        usage=turn_usage,
+                    ),
+                    agent_ctx,
+                    execution_ctx,
+                )
+                return completion
+
+        agent_ctx.turn_number += 1
+        completion = TurnCompletion(
+            is_done=False,
+            context=agent_ctx,
+            tool_call_results=tool_results.tool_call_results,
+            pending_tool_call_ids=tool_results.pending_tool_call_ids,
+            pending_child_task_ids=tool_results.pending_child_task_ids,
+            finish_reason=finish_reason,
+            usage=turn_usage,
+            turn_summary=turn_summary,
+            verification_summary=verification_summary,
+        )
+        await self._emit_event(
+            TurnFinishEvent(
+                task_id=execution_ctx.task_id,
+                owner_id=execution_ctx.owner_id,
+                agent_name=self.name,
+                turn=turn_summary.turn_number,
+                finish_reason=finish_reason,
+                output=None,
+                pending_tool_call_ids=tuple(tool_results.pending_tool_call_ids),
+                pending_child_task_ids=tuple(tool_results.pending_child_task_ids),
+                usage=turn_usage,
+            ),
+            agent_ctx,
+            execution_ctx,
+        )
+        return completion
 
     async def steer(
         self,
@@ -1826,181 +1772,326 @@ class BaseAgent(Generic[ContextType]):
         agent_ctx: ContextType,
         execution_ctx: ExecutionContext,
     ) -> ContextType:
-        agent_ctx.messages.extend(messages)
+        del execution_ctx
+        agent_ctx.messages.extend(normalize_message(cast(MessageLike, message)) for message in messages)
         return agent_ctx
 
     async def cancel(
-        self, agent_ctx: ContextType, execution_ctx: ExecutionContext
-    ) -> None:
-        pass
-
-    @final
-    async def run_inline(
         self,
         agent_ctx: ContextType,
-        event_handler: Callable[[AgentEvent], Awaitable[None]] | None = None,
-    ) -> RunCompletion[ContextType]:
-        """Run the agent in-line, without orchestration. For simple use-cases."""
+        execution_ctx: ExecutionContext,
+    ) -> None:
+        del agent_ctx, execution_ctx
 
-        # ------------------------------------------------------------------
-        # Lightweight, *local* execution helper.
-        #
-        # This mirrors the orchestrator/worker flow but **without** any Redis/
-        # queue dependencies so developers can run agents directly in an async
-        # context (e.g. notebooks, scripts, tests).
-        # ------------------------------------------------------------------
-
-        class InlineEventPublisher:  # pragma: no cover – simple stub
-            """Minimal stub that satisfies the EventPublisher interface"""
-
-            async def publish_event(self, event: Any) -> None:  # noqa: ANN401
-                if event_handler:
-                    await event_handler(event)
-
+    async def run(
+        self,
+        input: str | list[MessageLike],
+        *,
+        state: Any = None,
+        metadata: Any = None,
+    ) -> RunResult[Any, Any, Any]:
+        run_id = str(uuid.uuid4())
+        task_id = str(uuid.uuid4())
+        owner_id = str(uuid.uuid4())
         started_at = datetime.now(timezone.utc)
-
-        # Dummy execution context suitable for local runs.
+        agent_ctx = self.build_context(input, state=state, metadata=metadata)
         execution_ctx = ExecutionContext(
-            task_id=str(uuid.uuid4()),
-            owner_id=str(uuid.uuid4()),
-            retries=0,
-            iterations=agent_ctx.turn,
-            events=InlineEventPublisher(),  # type: ignore[arg-type]
+            task_id=task_id,
+            owner_id=owner_id,
+            retry_count=0,
+            events=cast(EventPublisher, _DirectEventPublisher()),
         )
-
-        # Make the execution context available via the contextvar so all helper
-        # utilities and decorators function as expected.
         token = execution_context.set(execution_ctx)
+        last_verification_summary: VerificationSummary[Any] | None = None
 
         try:
-            # Lifecycle callback – run start
-            await self._safe_call(self.on_run_start, agent_ctx, execution_ctx)
+            await self._emit_event(
+                StartEvent(
+                    task_id=task_id,
+                    owner_id=owner_id,
+                    agent_name=self.name,
+                ),
+                agent_ctx,
+                execution_ctx,
+            )
 
-            turn_completion: TurnCompletion[ContextType]
-
-            # Main turn-processing loop ------------------------------------------------
             while True:
-                turn_completion = await self._run_turn_with_progress(agent_ctx)
-
-                # Pending tool or child task results are not supported in local mode
-                if (
-                    turn_completion.pending_tool_call_ids
-                    or turn_completion.pending_child_task_ids
-                ):
+                completion = await self.run_turn(agent_ctx)
+                if completion.verification_summary is not None:
+                    last_verification_summary = completion.verification_summary
+                if completion.pending_tool_call_ids or completion.pending_child_task_ids:
                     raise RuntimeError(
-                        "Pending tool/child task results are not "
-                        "supported when running the agent locally."
+                        "Direct agent.run(...) does not support pending tool results "
+                        "or pending child-task continuations"
                     )
-
-                if turn_completion.is_done:
-                    break
-
-                # Defensive guard – respect max_turns in case the LLM never
-                # reaches a final output.  `run_turn` increments `agent_ctx.turn`.
-                if self.max_turns is not None and agent_ctx.turn >= self.max_turns:
-                    logger.warning(
-                        "Reached max_turns (%s) without final output, stopping.",
-                        self.max_turns,
+                if completion.is_done:
+                    finished_at = datetime.now(timezone.utc)
+                    result = RunResult(
+                        run_id=run_id,
+                        task_id=task_id,
+                        agent_name=self.name,
+                        owner_id=owner_id,
+                        status=RunStatus.COMPLETED,
+                        output=completion.output,
+                        state=agent_ctx.state,
+                        metadata=agent_ctx.metadata,
+                        messages=tuple(agent_ctx.messages),
+                        usage=execution_ctx.usage,
+                        turn_count=completion.turn_summary.turn_number if completion.turn_summary else agent_ctx.turn_number,
+                        last_turn=completion.turn_summary,
+                        verification=last_verification_summary,
+                        started_at=started_at,
+                        finished_at=finished_at,
                     )
-                    break
+                    await self._emit_event(
+                        FinishEvent(
+                            task_id=task_id,
+                            owner_id=owner_id,
+                            agent_name=self.name,
+                            status=RunStatus.COMPLETED,
+                            output=result.output,
+                            turn_count=result.turn_count,
+                            usage=result.usage,
+                        ),
+                        agent_ctx,
+                        execution_ctx,
+                    )
+                    return result
 
+        except _RunFailureError as exc:
             finished_at = datetime.now(timezone.utc)
-
-            run_completion: RunCompletion = RunCompletion(
-                output=turn_completion.output,
+            error = RunError.from_exception(exc)
+            result = RunResult(
+                run_id=run_id,
+                task_id=task_id,
+                agent_name=self.name,
+                owner_id=owner_id,
+                status=RunStatus.FAILED,
+                output=None,
+                state=agent_ctx.state,
+                metadata=agent_ctx.metadata,
+                messages=tuple(agent_ctx.messages),
+                usage=execution_ctx.usage,
+                turn_count=execution_ctx.last_turn.turn_number if execution_ctx.last_turn else max(agent_ctx.turn_number - 1, 0),
+                last_turn=execution_ctx.last_turn,
+                verification=exc.verification_summary or last_verification_summary,
                 started_at=started_at,
                 finished_at=finished_at,
+                error=error,
             )
-
-            # Lifecycle callback – run end (success)
-            await self._safe_call(
-                self.on_run_end,
-                agent_ctx,
-                execution_ctx,
-                run_completion,
-            )
-
-            return run_completion
-
-        except Exception as e:
-            # Lifecycle callback – run end (failure)
-            finished_at = datetime.now(timezone.utc)
-            await self._safe_call(
-                self.on_run_end,
-                agent_ctx,
-                execution_ctx,
-                RunCompletion(
-                    output=None,
-                    error=e,
-                    started_at=started_at,
-                    finished_at=finished_at,
+            await self._emit_event(
+                FinishEvent(
+                    task_id=task_id,
+                    owner_id=owner_id,
+                    agent_name=self.name,
+                    status=RunStatus.FAILED,
+                    run_error=error,
+                    turn_count=result.turn_count,
+                    usage=result.usage,
                 ),
+                agent_ctx,
+                execution_ctx,
             )
-            raise
-
+            return result
+        except Exception as exc:
+            finished_at = datetime.now(timezone.utc)
+            error = RunError.from_exception(exc)
+            result = RunResult(
+                run_id=run_id,
+                task_id=task_id,
+                agent_name=self.name,
+                owner_id=owner_id,
+                status=RunStatus.FAILED,
+                output=None,
+                state=agent_ctx.state,
+                metadata=agent_ctx.metadata,
+                messages=tuple(agent_ctx.messages),
+                usage=execution_ctx.usage,
+                turn_count=execution_ctx.last_turn.turn_number if execution_ctx.last_turn else max(agent_ctx.turn_number - 1, 0),
+                last_turn=execution_ctx.last_turn,
+                verification=last_verification_summary,
+                started_at=started_at,
+                finished_at=finished_at,
+                error=error,
+            )
+            await self._emit_event(
+                FinishEvent(
+                    task_id=task_id,
+                    owner_id=owner_id,
+                    agent_name=self.name,
+                    status=RunStatus.FAILED,
+                    run_error=error,
+                    turn_count=result.turn_count,
+                    usage=result.usage,
+                ),
+                agent_ctx,
+                execution_ctx,
+            )
+            return result
         finally:
-            # Always reset the execution context var to avoid leaking state.
             execution_context.reset(token)
 
-    @final
+    async def stream(
+        self,
+        input: str | list[MessageLike],
+        *,
+        state: Any = None,
+        metadata: Any = None,
+    ) -> AsyncIterator[BaseEvent]:
+        queue: asyncio.Queue[BaseEvent | None] = asyncio.Queue()
+
+        async def sink(event: BaseEvent) -> None:
+            await queue.put(event)
+
+        async def _runner() -> None:
+            run_id = str(uuid.uuid4())
+            task_id = str(uuid.uuid4())
+            owner_id = str(uuid.uuid4())
+            started_at = datetime.now(timezone.utc)
+            agent_ctx = self.build_context(input, state=state, metadata=metadata)
+            execution_ctx = ExecutionContext(
+                task_id=task_id,
+                owner_id=owner_id,
+                retry_count=0,
+                events=cast(EventPublisher, _DirectEventPublisher(sink)),
+            )
+            token = execution_context.set(execution_ctx)
+            last_verification_summary: VerificationSummary[Any] | None = None
+            try:
+                await self._emit_event(
+                    StartEvent(
+                        task_id=task_id,
+                        owner_id=owner_id,
+                        agent_name=self.name,
+                    ),
+                    agent_ctx,
+                    execution_ctx,
+                )
+                while True:
+                    completion = await self.run_turn(agent_ctx)
+                    if completion.verification_summary is not None:
+                        last_verification_summary = completion.verification_summary
+                    if completion.pending_tool_call_ids or completion.pending_child_task_ids:
+                        raise RuntimeError(
+                            "Direct agent.stream(...) does not support pending tool "
+                            "results or pending child-task continuations"
+                        )
+                    if completion.is_done:
+                        result = RunResult(
+                            run_id=run_id,
+                            task_id=task_id,
+                            agent_name=self.name,
+                            owner_id=owner_id,
+                            status=RunStatus.COMPLETED,
+                            output=completion.output,
+                            state=agent_ctx.state,
+                            metadata=agent_ctx.metadata,
+                            messages=tuple(agent_ctx.messages),
+                            usage=execution_ctx.usage,
+                            turn_count=completion.turn_summary.turn_number if completion.turn_summary else agent_ctx.turn_number,
+                            last_turn=completion.turn_summary,
+                            verification=last_verification_summary,
+                            started_at=started_at,
+                            finished_at=datetime.now(timezone.utc),
+                        )
+                        await self._emit_event(
+                            FinishEvent(
+                                task_id=task_id,
+                                owner_id=owner_id,
+                                agent_name=self.name,
+                                status=RunStatus.COMPLETED,
+                                output=result.output,
+                                turn_count=result.turn_count,
+                                usage=result.usage,
+                            ),
+                            agent_ctx,
+                            execution_ctx,
+                        )
+                        return
+            except _RunFailureError as exc:
+                error = RunError.from_exception(exc)
+                await self._emit_event(
+                    FinishEvent(
+                        task_id=task_id,
+                        owner_id=owner_id,
+                        agent_name=self.name,
+                        status=RunStatus.FAILED,
+                        run_error=error,
+                        turn_count=execution_ctx.last_turn.turn_number if execution_ctx.last_turn else max(agent_ctx.turn_number - 1, 0),
+                        usage=execution_ctx.usage,
+                    ),
+                    agent_ctx,
+                    execution_ctx,
+                )
+            except Exception as exc:
+                error = RunError.from_exception(exc)
+                await self._emit_event(
+                    FinishEvent(
+                        task_id=task_id,
+                        owner_id=owner_id,
+                        agent_name=self.name,
+                        status=RunStatus.FAILED,
+                        run_error=error,
+                        turn_count=execution_ctx.last_turn.turn_number if execution_ctx.last_turn else max(agent_ctx.turn_number - 1, 0),
+                        usage=execution_ctx.usage,
+                    ),
+                    agent_ctx,
+                    execution_ctx,
+                )
+            finally:
+                execution_context.reset(token)
+                await queue.put(None)
+
+        runner = asyncio.create_task(_runner())
+        try:
+            while True:
+                item = await queue.get()
+                if item is None:
+                    break
+                yield item
+            await runner
+        finally:
+            if not runner.done():
+                runner.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await runner
+
     async def execute(
         self,
         agent_ctx: ContextType,
         execution_ctx: ExecutionContext,
     ) -> TurnCompletion[ContextType]:
         token = execution_context.set(execution_ctx)
-
         try:
-            response = await self._run_turn_with_progress(agent_ctx)
-
-            if response.is_done:
-                await execution_ctx.events.publish_event(
-                    AgentEvent(
-                        event_type="agent_output",
-                        task_id=execution_ctx.task_id,
-                        owner_id=execution_ctx.owner_id,
-                        agent_name=self.name,
-                        turn=agent_ctx.turn,
-                        data=response.output,
-                    )
-                )
-
-            return response
-
-        except Exception as e:
-            logger.error(
-                f"Agent {self.name} failed to execute turn {agent_ctx.turn}", exc_info=e
-            )
-
-            raise e
-
+            return await self.run_turn(agent_ctx)
         finally:
             execution_context.reset(token)
 
-    async def _safe_call(self, func: Callable[..., Any] | None, *args: Any) -> None:
-        """Safely call a (possibly async) callback without letting it crash the agent.
-
-        *All* exceptions are logged, but only non-fatal ones are swallowed. If the
-        callback raises ``FatalAgentError`` we re-raise so the orchestrator can
-        treat the task as a hard failure.
-        """
-        if func is None:
-            return
-
-        try:
-            result = func(*args)
-            if inspect.isawaitable(result):
-                await result  # type: ignore[func-returns-value]
-        except FatalAgentError as e:
-            # Log and propagate so the caller can handle a fatal error.
-            logger.error("FatalAgentError in lifecycle callback", exc_info=e)
-            raise
-        except Exception:
-            # Non-fatal errors are logged but swallowed to avoid taking down the task.
-            logger.exception("Error in lifecycle callback", exc_info=True)
+    def get_execution_context(self) -> ExecutionContext:
+        return ExecutionContext.current()
 
 
-class Agent(BaseAgent[AgentContext]):
-    """Base agent class using AgentContext by default. For simple agents."""
-
+class Agent(
+    BaseAgent[AgentContext[StateT, MetadataT]],
+    Generic[StateT, MetadataT],
+):
     pass
+
+
+__all__ = [
+    "Agent",
+    "BaseAgent",
+    "Callbacks",
+    "Turn",
+    "TurnCompletion",
+    "all_of",
+    "any_of",
+    "chain_prepare_turn",
+    "no_tool_calls",
+    "retry",
+    "stop",
+    "tool_called",
+    "total_tokens_exceed",
+    "turn_count_is",
+    "verify",
+]

@@ -3,7 +3,7 @@ import json
 from collections.abc import Callable
 from typing import Any
 
-from agent import DemoContext, parent_agent
+from agent import DemoState, parent_agent
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
@@ -81,16 +81,16 @@ class SteerRequest(BaseModel):
 @app.post("/enqueue")
 @app.post("/api/enqueue")
 async def enqueue(request: EnqueueRequest):
-    payload = DemoContext(
-        messages=request.message_history,
-        query=request.query,
+    state = DemoState(
         role_name="parent",
         phase="init",
+        topic=request.query,
     )
-    task = await orchestrator.create_agent_task(
-        agent=parent_agent,
+    task = await orchestrator.enqueue(
+        parent_agent,
+        input=request.message_history if request.message_history else request.query,
         owner_id=request.user_id,
-        payload=payload,
+        state=state,
     )
     return {"task_id": task.id}
 

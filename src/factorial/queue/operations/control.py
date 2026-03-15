@@ -9,9 +9,10 @@ from typing import Any, cast
 import redis.asyncio as redis
 
 from factorial.agent import BaseAgent
-from factorial.core.events import AgentEvent, BatchEvent, EventPublisher
+from factorial.core.events import AgentEvent, BatchEvent, EventPublisher, FinishEvent
 from factorial.core.exceptions import InactiveTaskError, TaskNotFoundError
 from factorial.core.logging import colored, get_logger
+from factorial.core.run_types import RunStatus
 from factorial.core.utils import decode, serialize_data
 from factorial.execution.context import ExecutionContext
 from factorial.queue.keys import PENDING_SENTINEL, RedisKeys
@@ -335,7 +336,10 @@ async def resume_if_no_remaining_child_tasks(
     keys = RedisKeys.format(namespace=namespace, task_id=task_id, agent=agent_name)
 
     try:
-        task: Task = Task.from_dict(task_data, context_class=agent.context_class)
+        task: Task = Task.from_dict(
+            task_data,
+            payload_parser=agent.context_from_dict,
+        )
     except Exception as e:
         logger.error(
             f"Failed to process task {task_id}: Task data is invalid", exc_info=e
@@ -448,7 +452,10 @@ async def run_agent_cancellation(
         return
 
     try:
-        task: Task[Any] = Task.from_dict(task_data, context_class=agent.context_class)
+        task: Task[Any] = Task.from_dict(
+            task_data,
+            payload_parser=agent.context_from_dict,
+        )
     except Exception as e:
         logger.error(
             f"Failed to process task {task_id}: Task data is invalid", exc_info=e
@@ -465,25 +472,20 @@ async def run_agent_cancellation(
         execution_ctx = ExecutionContext(
             task_id=task.id,
             owner_id=task.metadata.owner_id,
-            retries=task.retries,
-            iterations=task.payload.turn,
+            retry_count=task.retries,
             events=event_publisher,
-        )
-        # Lifecycle callback – run cancelled
-        await agent._safe_call(
-            agent.on_run_cancelled,
-            task.payload,
-            execution_ctx,
         )
         logger.info(f"🚫 Task cancelled {colored(f'[{task.id}]', 'dim')}")
 
-        await event_publisher.publish_event(
-            AgentEvent(
-                event_type="run_cancelled",
+        await agent._emit_event(
+            FinishEvent(
                 task_id=task.id,
                 owner_id=task.metadata.owner_id,
                 agent_name=agent.name,
-            )
+                status=RunStatus.CANCELLED,
+            ),
+            task.payload,
+            execution_ctx,
         )
     except Exception as e:
         logger.error(f"Error sending cancellation event for {task.id}", exc_info=e)

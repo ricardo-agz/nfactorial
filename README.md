@@ -1,17 +1,17 @@
 # nFactorial
 
-**Build distributed agents that spawn more distributed sub-agents.**
+**Build agents that run directly or on a distributed runtime.**
 
-nFactorial is a distributed task queue for building reliable multi-agent systems. It makes the following trivial to implement:
+nFactorial is an agent framework with a Redis-backed orchestrator for reliable multi-agent systems. It makes the following straightforward to implement:
 
-* **Agent Reliability**: Automatic retries, backoff strategies, and recovery of dropped tasks from crashed workers.
-* **In-flight Task Management**: Cancel, steer, and monitor running tasks. 
-* **Spawning Sub Agents**: Having an agent spawn multiple sub agents and wait for their completion before continuing.
-* **Deferred Tools**: Pause the agent while it waits for long running tools to complete externally or wait for user approval before continuing.
-* **Observability**: Built-in metrics dashboard and comprehensive logging
+* **Direct and queued execution**: Run agents locally with `agent.run(...)` or on a distributed Redis-backed runtime.
+* **Agent reliability**: Automatic retries, backoff strategies, and recovery of dropped tasks from crashed workers.
+* **In-flight task management**: Cancel, steer, wake, branch, and monitor running tasks.
+* **Subagents and waits**: Spawn child tasks and pause on sleeps, activity, signals, jobs, or approval hooks.
+* **Runtime coordination**: Exchange direct or group messages, read inboxes, and process receipts.
+* **Observability**: Built-in metrics dashboard and comprehensive logging.
 
 ![Dashboard](https://raw.githubusercontent.com/ricardo-agz/nfactorial/main/docs/static/img/dashboard.png)
-
 
 ## Installation
 
@@ -22,7 +22,9 @@ pip install nfactorial
 ## Quick Start
 
 ```python
-from factorial import Agent, Orchestrator, AgentWorkerConfig, gpt_41
+import asyncio
+
+from factorial import Agent, gpt_41
 
 
 def get_weather(location: str) -> str:
@@ -35,39 +37,42 @@ agent = Agent(
     tools=[get_weather],
 )
 
-# Create orchestrator
-orchestrator = Orchestrator(
-    redis_host="localhost",
-    redis_port=6379,
-    redis_db=0,
-    redis_max_connections=50,
-)
-orchestrator.register(
-    agent=agent, agent_worker_config=AgentWorkerConfig(workers=1)
-)
 
-# Run the system
-if __name__ == "__main__":
-    orchestrator.run()
+async def main() -> None:
+    result = await agent.run("What's the weather in San Francisco?")
+    print(result.output)
+
+
+asyncio.run(main())
 
 ```
 
+When you need waits, hooks, subagents, messaging, retries, or distributed workers, register the agent with an `Orchestrator` and enqueue tasks instead.
 
-## Usage Examples:
+## Usage Examples
 
 ### IDE Coding Agent
 
-`/docs/examples/code_agent`
+`docs/docs/examples/code_agent.md`
 
 ![Dashboard](https://raw.githubusercontent.com/ricardo-agz/nfactorial/main/docs/static/img/code-agent.png)
 
 ### Multi-Agent
 
-`/docs/examples/multi_agent`
+`docs/docs/examples/multi_agent.md`
 
 ![Dashboard](https://raw.githubusercontent.com/ricardo-agz/nfactorial/main/docs/static/img/multi-agent-progress.png)
 
+### Group Chat Agent
+
+`docs/docs/examples/group_chat_agent.md`
+
+### Mafia Game Agent
+
+`examples/mafia_game_agent`
+
 ### Deliberations.ai
+
 [Check it out](https://www.deliberations.ai/)
 
 ![Dashboard](https://raw.githubusercontent.com/ricardo-agz/nfactorial/main/docs/static/img/deliberations-demo-small.gif)

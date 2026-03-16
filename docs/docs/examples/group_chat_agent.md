@@ -84,8 +84,8 @@ docker-compose up
 
 Open:
 
-- UI: <http://localhost:5173>
-- Dashboard: <http://localhost:8081>
+- UI: [http://localhost:5173](http://localhost:5173)
+- Dashboard: [http://localhost:8081](http://localhost:8081)
 
 ## What to Observe in the UI
 

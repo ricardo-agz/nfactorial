@@ -77,7 +77,7 @@ Service wiring in `vercel.json`:
 
 # 2. Install Python Dependencies
 pip install -r requirements.txt
-pip install -e .
+pip install -e ../../
 
 # 3. Install UI Dependencies
 cd ui

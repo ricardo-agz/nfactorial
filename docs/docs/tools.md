@@ -189,6 +189,61 @@ resolution = await orchestrator.resolve_hook(
 )
 ```
 
+For staged hook graphs, you can mix `hook.requires(...)` and `hook.awaits(...)`:
+
+```python
+from typing import Annotated
+
+from factorial import Hook, HookRequestContext, PendingHook, hook, tool
+
+
+class ManagerApproval(Hook):
+    approved: bool
+
+
+class LegalReview(Hook):
+    approved: bool
+
+
+class FinanceApproval(Hook):
+    approved: bool
+
+
+def request_manager(
+    ctx: HookRequestContext,
+    amount: int,
+) -> PendingHook[ManagerApproval]:
+    return ManagerApproval.pending(ctx=ctx, amount=amount)
+
+
+def request_legal(
+    ctx: HookRequestContext,
+    amount: int,
+) -> PendingHook[LegalReview]:
+    return LegalReview.pending(ctx=ctx, amount=amount)
+
+
+def request_finance(
+    ctx: HookRequestContext,
+    amount: int,
+    manager: ManagerApproval,
+    legal: LegalReview,
+) -> PendingHook[FinanceApproval]:
+    return FinanceApproval.pending(ctx=ctx, amount=amount)
+
+
+@tool
+def approve_procurement(
+    amount: int,
+    manager: Annotated[ManagerApproval, hook.requires(request_manager)],
+    legal: Annotated[LegalReview, hook.awaits(request_legal)],
+    finance: Annotated[FinanceApproval, hook.requires(request_finance)],
+) -> bool:
+    return manager.approved and legal.approved and finance.approved
+```
+
+Use `hook.awaits(...)` when the tool should wait on an additional staged hook dependency before the tool body runs. Request builders can depend on earlier hook outputs by parameter name, which lets you build multi-step approval or review flows.
+
 ## Error Handling
 
 Raise exceptions to signal tool failures. The framework catches them and surfaces the error to the model and in run events.

@@ -4,15 +4,15 @@ slug: /
 
 # Factorial
 
-**Build distributed agents that spawn other agents**
+**Build agents that run directly or on a distributed runtime**
 
-nFactorial is a distributed task queue for building reliable, high-concurrency multi-agent systems. It makes the following trivial to implement:
+Factorial is an agent framework with a Redis-backed orchestrator for reliable, high-concurrency workflows. It supports:
 
-* **Agent Reliability**: Automatic retries, backoff strategies, and recovery of dropped tasks from crashed workers.
-* **In-flight Task Management**: Cancel, steer, and monitor running tasks. 
-* **Spawning Sub Agents**: Having an agent spawn multiple sub agents and wait for their completion before continuing.
-* **Deferred Tools**: Pause the agent while it waits for long running tools to complete externally or wait for user approval before continuing.
-* **Observability**: Built-in dashboard to visualize agent states, completions, and failures.
+- direct `agent.run(...)` and `agent.stream(...)` for local synchronous flows
+- queued execution with retries, backoff, recovery, and observability
+- waits, hooks, subagents, messaging, inboxes, and signals
+- in-flight task management such as steer, cancel, wake, and branch
+- built-in dashboards and streaming runtime events
 
 ## Installation
 
@@ -26,67 +26,60 @@ pip install nfactorial
 
 ## Why use nFactorial
 
-nFactorial has a 2 core components:
+nFactorial has two core components:
 
-* **Agent (and Tools)**, which is simply a system prompt + python functions that interact with external systems in an LLM -> tool execution loop
-* **Orchestrator**, which spins up workers for each agent and orchestrates the task execution and agent states.
+- **Agent (and tools)**: the model loop, state, prompts, tools, verifiers, and direct execution APIs
+- **Orchestrator**: the queued runtime for distributed execution, waits, subagents, hooks, messaging, and control-plane operations
 
-In practice, this lets you easily build agents much like you would with another frameworks such as the OpenAI agents SDK, but with the reliability of using something like Celery or Temporal.
+In practice, this gives you a small local agent API when you want one, and a more powerful distributed runtime when the workflow needs to park, resume, coordinate, or scale.
 
 **Here are the main features:**
 
-* **Distributed execution**: Run agents across multiple workers with Redis powering the underlying queue.
-* **Fault tolerance**: Automatic retries, backoff strategies, and recovery of dropped tasks from crashed workers.
-* **Real-time events**: Stream progress updates and results via WebSocket or Redis pub/sub 
-* **Agent-lifecycle hooks**: Easily inject logic to run before/after each turn or run, on completion, failure, or cancellation. 
-* **In-flight agent task management**: Cancel or steer (inject in-flight messages) ongoing agent runs.
-* **Observability**: Built-in metrics dashboard to visualize active agents and workers and track succesful completions, errors, and other agent states.
-* **Hooks and wait orchestration**: Pause execution for external approvals via hooks, schedule time-based waits, and block on spawned subagent jobs.
+- **Direct runs**: execute an agent locally with `await agent.run(...)` or stream typed events with `agent.stream(...)`.
+- **Distributed execution**: run agents across workers with Redis as the source of truth.
+- **Fault tolerance**: automatic retries, backoff, and dropped-task recovery.
+- **Real-time events**: stream progress and lifecycle updates for direct and queued runs.
+- **Task control**: steer, cancel, wake, branch, and resume tasks in flight or after completion.
+- **Runtime coordination**: use hooks, waits, signals, subagents, messaging, and inboxes.
+- **Observability**: inspect dashboards, metrics, traces, and runtime state.
 
 ## Quick Example
 
 ```python
-from factorial import Agent, AgentContext, Orchestrator, AgentWorkerConfig
+import asyncio
+
+from factorial import Agent, gpt_41
 
 
 def get_weather(city: str) -> str:
     """Get weather for a city"""
     return f"The weather in {city} is sunny and 72°F"
 
-# Create an agent
 weather_agent = Agent(
     description="Weather Assistant",
     instructions="You help users get weather information.",
+    model=gpt_41,
     tools=[get_weather],
 )
 
-# Set up orchestrator
-orchestrator = Orchestrator()
-orchestrator.register(
-    agent=weather_agent,
-    agent_worker_config=AgentWorkerConfig(workers=2, batch_size=10),
-)
 
-# Enqueue a task
-task = await orchestrator.enqueue(
-    weather_agent,
-    input="What's the weather in San Francisco?",
-    owner_id="user123",
-)
+async def main() -> None:
+    result = await weather_agent.run("What's the weather in San Francisco?")
+    print(result.output)
 
-# Subscribe to results
-async for update in orchestrator.subscribe_to_updates(owner_id="user123"):
-    if update['event_type'] == 'agent_output':
-        print(f"Result: {update['data']}")
-        break
+
+asyncio.run(main())
 ```
 
+When the workflow needs waits, hooks, subagents, or human control-plane actions, register the agent with an `Orchestrator` and enqueue tasks instead.
 
 ## Next Steps
 
 - [**Quickstart**](./quickstart): Get up and running in 5 minutes
 - [**Agents**](./agents): Learn how to create and configure agents
 - [**Orchestrator**](./orchestrator): Set up distributed processing
+- [**Messaging**](./messaging): Coordinate tasks with groups, inboxes, and receipts
+- [**Signals**](./signals): Park tasks until named events arrive
 - [**Tools**](./tools): Build custom tools for your agents
 - [**Events**](./events): Real-time monitoring and progress tracking
 - [**Examples**](./examples/multi_agent.md): Check out example agents

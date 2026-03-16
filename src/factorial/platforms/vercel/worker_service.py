@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 from factorial.core.logging import get_logger
+from factorial.core.utils import resolve_awaitable
 from factorial.queue.keys import RedisKeys
 from factorial.queue.worker.tick import WorkerTickContext, worker_tick
 
@@ -17,7 +19,8 @@ from .settings import VercelRuntimeSettings
 from .wake_dispatcher import parse_wake_envelope
 
 if TYPE_CHECKING:
-    from factorial.orchestrator import Orchestrator, Runner
+    from factorial.orchestrator import Orchestrator
+    from factorial.orchestrator.core import Runner
 
 logger = get_logger(__name__)
 
@@ -28,7 +31,7 @@ def create_worker(
     orchestrator: Orchestrator,
     *,
     settings: VercelRuntimeSettings | None = None,
-):
+) -> Any:
     settings = settings or VercelRuntimeSettings.from_env()
     configure_orchestrator_for_vercel(orchestrator, settings=settings)
     registration_key = (
@@ -48,7 +51,7 @@ def create_worker(
             topic=settings.dispatch_topic,
             consumer=settings.dispatch_consumer,
         )
-        async def _queue_worker(message: Any, metadata: Any) -> None:
+        async def _queue_worker_native(message: Any, metadata: Any) -> None:
             await _handle_queue_payload(
                 orchestrator=orchestrator,
                 settings=settings,
@@ -70,7 +73,7 @@ def create_worker(
     subscribe, get_asgi_app = workers_runtime
 
     @subscribe(topic=settings.dispatch_topic, consumer=settings.dispatch_consumer)
-    async def _queue_worker(message: Any, metadata: Any) -> None:
+    async def _queue_worker_runtime(message: Any, metadata: Any) -> None:
         await _handle_queue_payload(
             orchestrator=orchestrator,
             settings=settings,
@@ -261,7 +264,9 @@ async def _agents_with_queue_main_backlog(
                 namespace=orchestrator.namespace,
                 agent=runner.agent.name,
             )
-            queue_main_len = await redis_client.llen(keys.queue_main)  # type: ignore[misc]
+            queue_main_len: int = await resolve_awaitable(
+                redis_client.llen(keys.queue_main)
+            )
             if int(queue_main_len) > 0:
                 backlogged.append(runner.agent.name)
         return sorted(set(backlogged))
@@ -290,7 +295,7 @@ def _normalize_worker_metadata(metadata: Any) -> dict[str, Any]:
     return normalized
 
 
-def _resolve_vercel_worker_class():
+def _resolve_vercel_worker_class() -> Any | None:
     try:
         from vercel.workers import Worker  # type: ignore
 
@@ -304,7 +309,8 @@ def _resolve_vercel_worker_class():
             return None
 
 
-def _resolve_vercel_workers_runtime():
+def _resolve_vercel_workers_runtime(
+) -> tuple[Callable[..., Any], Callable[[], Any]] | None:
     try:
         from vercel.workers import get_asgi_app, subscribe  # type: ignore
 

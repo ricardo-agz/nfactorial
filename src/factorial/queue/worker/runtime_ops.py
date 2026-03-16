@@ -9,7 +9,7 @@ from factorial.agent import BaseAgent
 from factorial.agent.tools.runtime import process_child_task_results
 from factorial.core.events import AgentEvent, BatchEvent, EventPublisher
 from factorial.core.exceptions import CorruptedTaskDataError
-from factorial.core.utils import serialize_data
+from factorial.core.utils import resolve_awaitable, serialize_data
 from factorial.queue.keys import PENDING_SENTINEL, RedisKeys
 from factorial.queue.lua import (
     ActivityWaitScript,
@@ -308,13 +308,17 @@ class TaskRuntimeOps:
         return wait_result.woken_immediately
 
     async def pop_signal_wake_context(self) -> dict[str, Any] | None:
-        raw_value = await self.redis_client.hget(
-            self.keys.signal_wake_meta,
-            self.task.id,
+        raw_value = await resolve_awaitable(
+            self.redis_client.hget(
+                self.keys.signal_wake_meta,
+                self.task.id,
+            )
         )
         if raw_value is None:
             return None
-        await self.redis_client.hdel(self.keys.signal_wake_meta, self.task.id)
+        await resolve_awaitable(
+            self.redis_client.hdel(self.keys.signal_wake_meta, self.task.id)
+        )
         try:
             decoded_value = (
                 raw_value.decode("utf-8")

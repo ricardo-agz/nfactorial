@@ -4,13 +4,14 @@ import hashlib
 import json
 import time
 import uuid
+from collections.abc import Sequence
 from typing import Any
 
 import redis.asyncio as redis
 
 from factorial.agent import BaseAgent
 from factorial.agent.context import VerificationState
-from factorial.ai.messages import normalize_message
+from factorial.ai.messages import Message, MessageLike, normalize_message
 from factorial.core.events import AgentEvent, EventPublisher
 from factorial.core.exceptions import CorruptedTaskDataError, InvalidTaskIdError
 from factorial.core.logging import get_logger
@@ -55,7 +56,7 @@ _RESUME_NAMESPACE_ROOT = uuid.uuid5(_NAMESPACE_ROOT, "resume.task")
 
 _RESUME_TASK_NAMESPACE = uuid.uuid5(_RESUME_NAMESPACE_ROOT, "task-id.v1")
 
-def _resume_request_hash(*, messages: list[dict[str, Any]]) -> str:
+def _resume_request_hash(*, messages: list[Message]) -> str:
     messages_json = json.dumps(
         serialize_data(messages),
         sort_keys=True,
@@ -237,7 +238,7 @@ async def resume_task(
     namespace: str,
     task_id: str,
     agent: BaseAgent[Any],
-    messages: list[dict[str, Any]],
+    messages: Sequence[MessageLike],
     idempotency_key: str | None = None,
 ) -> Task[Any]:
     """Resume a terminal task as a new queued task.
@@ -257,11 +258,11 @@ async def resume_task(
             )
         normalized_idempotency_key = idempotency_key.strip()
 
-    normalized_messages: list[dict[str, Any]] = []
+    normalized_messages: list[Message] = []
     for message in messages:
         if not isinstance(message, dict):
             raise TypeError("resume_task messages must be a list of dict objects")
-        normalized_messages.append(normalize_message(dict(message)))
+        normalized_messages.append(normalize_message(message))
 
     source_task_data = await get_task_data(redis_client, namespace, task_id)
     source_status = TaskStatus(source_task_data["status"])

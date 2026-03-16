@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator, AsyncIterator
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
@@ -220,7 +220,7 @@ class TaskHandle(Generic[OutputT, StateT, MetadataT]):
         self,
         *,
         types: tuple[type[BaseEvent], ...] | None = None,
-    ) -> AsyncIterator[BaseEvent]:
+    ) -> AsyncGenerator[BaseEvent, None]:
         async for update in self._orchestrator.subscribe_to_updates(
             owner_id=self.owner_id,
             task_ids=[self.id],
@@ -305,7 +305,7 @@ class BatchHandle(Generic[OutputT, StateT, MetadataT]):
         self,
         *,
         types: tuple[type[BaseEvent], ...] | None = None,
-    ) -> AsyncIterator[BaseEvent]:
+    ) -> AsyncGenerator[BaseEvent, None]:
         async for update in self._orchestrator.subscribe_to_updates(
             owner_id=self.owner_id,
             task_ids=list(self.task_ids),

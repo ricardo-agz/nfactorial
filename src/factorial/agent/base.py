@@ -154,7 +154,6 @@ class BaseAgent(Generic[ContextType]):
         self.http_client = http_client or httpx.AsyncClient(timeout=request_timeout)
         self.client = client or MultiClient(http_client=self.http_client)
         self.request_timeout = request_timeout
-        self.model = model
         self.default_tool_choice = tool_choice
         self.default_parallel_tool_calls = parallel_tool_calls
         self.default_temperature = temperature
@@ -168,8 +167,9 @@ class BaseAgent(Generic[ContextType]):
         self.callbacks = callbacks or Callbacks()
         self.max_turns = _infer_turn_limit_hint(self.stop_when)
 
-        if self.model is None:
+        if model is None:
             raise ValueError("model is required")
+        self.model: Model | Callable[[ContextType], Model] = model
 
     def _resolve_state_and_metadata_types(self) -> tuple[Any, Any]:
         original = getattr(self, "__orig_class__", None)
@@ -223,32 +223,38 @@ class BaseAgent(Generic[ContextType]):
 
     def build_context(
         self,
-        input: str | list[MessageLike],
+        input: str | Sequence[MessageLike],
         *,
         state: Any = None,
         metadata: Any = None,
-    ) -> AgentContext[Any, Any]:
+    ) -> ContextType:
         state_type, metadata_type = self._resolve_state_and_metadata_types()
         messages = normalize_messages_input(input)
         if self.instructions:
             messages = [system(self.instructions), *messages]
 
-        return AgentContext(
-            messages=messages,
-            state=self._coerce_typed_payload(state, state_type, label="state"),
-            metadata=self._coerce_typed_payload(
-                metadata,
-                metadata_type,
-                label="metadata",
+        return cast(
+            ContextType,
+            AgentContext(
+                messages=messages,
+                state=self._coerce_typed_payload(state, state_type, label="state"),
+                metadata=self._coerce_typed_payload(
+                    metadata,
+                    metadata_type,
+                    label="metadata",
+                ),
             ),
         )
 
-    def context_from_dict(self, data: dict[str, Any]) -> AgentContext[Any, Any]:
+    def context_from_dict(self, data: dict[str, Any]) -> ContextType:
         state_type, metadata_type = self._resolve_state_and_metadata_types()
-        return AgentContext.from_dict(
-            data,
-            state_type=state_type,
-            metadata_type=metadata_type,
+        return cast(
+            ContextType,
+            AgentContext.from_dict(
+                data,
+                state_type=state_type,
+                metadata_type=metadata_type,
+            ),
         )
 
     def resolve_model(self, agent_ctx: ContextType) -> Model:
@@ -449,7 +455,7 @@ class BaseAgent(Generic[ContextType]):
         *,
         assistant_content: str,
         resolved_tool_results: list[
-            tuple[ChatCompletionMessageToolCall, _ToolResultInternal | Exception]
+            tuple[ChatCompletionMessageToolCall, _ToolResultInternal | BaseException]
         ],
     ) -> Any:
         if assistant_content or not resolved_tool_results:
@@ -457,7 +463,9 @@ class BaseAgent(Generic[ContextType]):
 
         for tool_call, result in resolved_tool_results:
             del tool_call
-            if isinstance(result, Exception) or result.pending_result:
+            if isinstance(result, BaseException):
+                continue
+            if result.pending_result:
                 continue
             return result.client_output
         return None
@@ -477,14 +485,14 @@ class BaseAgent(Generic[ContextType]):
     def _event_pending_child_details(
         self,
         resolved_tool_results: list[
-            tuple[ChatCompletionMessageToolCall, _ToolResultInternal | Exception]
+            tuple[ChatCompletionMessageToolCall, _ToolResultInternal | BaseException]
         ],
     ) -> tuple[tuple[str, ...], tuple[str, ...]]:
         child_task_ids: list[str] = []
         source_tool_call_ids: list[str] = []
 
         for tool_call, result in resolved_tool_results:
-            if isinstance(result, Exception):
+            if isinstance(result, BaseException):
                 continue
 
             result_child_task_ids = list(result.pending_child_task_ids or ())
@@ -824,7 +832,7 @@ class BaseAgent(Generic[ContextType]):
 
     async def run(
         self,
-        input: str | list[MessageLike],
+        input: str | Sequence[MessageLike],
         *,
         state: Any = None,
         metadata: Any = None,
@@ -981,7 +989,7 @@ class BaseAgent(Generic[ContextType]):
 
     async def stream(
         self,
-        input: str | list[MessageLike],
+        input: str | Sequence[MessageLike],
         *,
         state: Any = None,
         metadata: Any = None,

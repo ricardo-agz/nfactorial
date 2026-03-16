@@ -33,7 +33,9 @@ class TurnCompletion(Generic[ContextType]):
     is_done: bool
     context: ContextType
     output: Any = None
-    tool_call_results: list[tuple[ChatCompletionMessageToolCall, Any | Exception]] = (
+    tool_call_results: list[
+        tuple[ChatCompletionMessageToolCall, Any | BaseException]
+    ] = (
         field(default_factory=list)
     )
     pending_tool_call_ids: list[str] = field(default_factory=list)
@@ -47,9 +49,9 @@ class TurnCompletion(Generic[ContextType]):
 @dataclass
 class ToolExecutionResults:
     new_messages: list[Message]
-    tool_call_results: list[tuple[ChatCompletionMessageToolCall, Any | Exception]]
+    tool_call_results: list[tuple[ChatCompletionMessageToolCall, Any | BaseException]]
     resolved_results: list[
-        tuple[ChatCompletionMessageToolCall, _ToolResultInternal | Exception]
+        tuple[ChatCompletionMessageToolCall, _ToolResultInternal | BaseException]
     ]
     pending_tool_call_ids: list[str]
     pending_child_task_ids: list[str]

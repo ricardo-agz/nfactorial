@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, TypeAlias, cast
+from typing import Any, TypeAlias, TypedDict, cast
 
 from redis.asyncio import Redis
 
@@ -142,6 +142,15 @@ TypedAgentEvent: TypeAlias = (
 )
 
 
+class _AgentEventCommonKwargs(TypedDict):
+    task_id: str | None
+    owner_id: str | None
+    agent_name: str | None
+    turn: int | None
+    metadata: dict[str, Any] | None
+    timestamp: datetime
+
+
 def _parse_usage(value: Any) -> UsageSummary:
     if isinstance(value, UsageSummary):
         return value
@@ -181,20 +190,53 @@ def _parse_timestamp(value: Any) -> datetime:
     return _utcnow()
 
 
-def parse_event(payload: dict[str, Any]) -> BaseEvent:
-    event_type = str(payload.get("event_type", "update"))
-    common_kwargs = {
-        "task_id": payload.get("task_id"),
-        "owner_id": payload.get("owner_id"),
-        "agent_name": payload.get("agent_name"),
-        "turn": (
+def _maybe_str(value: Any) -> str | None:
+    return value if isinstance(value, str) else None
+
+
+def _maybe_int(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    if isinstance(value, str):
+        try:
+            return int(value)
+        except ValueError:
+            return None
+    return None
+
+
+def _maybe_dict(value: Any) -> dict[str, Any] | None:
+    return cast(dict[str, Any], value) if isinstance(value, dict) else None
+
+
+def _tuple_of_strings(value: Any) -> tuple[str, ...]:
+    if not isinstance(value, (list, tuple, set)):
+        return ()
+    return tuple(item for item in value if isinstance(item, str))
+
+
+def _common_agent_event_kwargs(payload: dict[str, Any]) -> _AgentEventCommonKwargs:
+    return {
+        "task_id": _maybe_str(payload.get("task_id")),
+        "owner_id": _maybe_str(payload.get("owner_id")),
+        "agent_name": _maybe_str(payload.get("agent_name")),
+        "turn": _maybe_int(
             payload.get("turn")
             if payload.get("turn") is not None
             else payload.get("turn_number")
         ),
-        "metadata": cast(dict[str, Any] | None, payload.get("metadata")),
+        "metadata": _maybe_dict(payload.get("metadata")),
         "timestamp": _parse_timestamp(payload.get("timestamp")),
     }
+
+
+def parse_event(payload: dict[str, Any]) -> BaseEvent:
+    event_type = str(payload.get("event_type", "update"))
+    common_kwargs = _common_agent_event_kwargs(payload)
 
     if event_type in {"start", "run_started"}:
         return StartEvent(**common_kwargs)
@@ -244,38 +286,28 @@ def parse_event(payload: dict[str, Any]) -> BaseEvent:
         "task_signal_waiting",
         "task_signal_wait_satisfied",
     }:
-        data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
-        wait_kind = cast(
-            str | None,
-            payload.get("wait_kind")
-            if payload.get("wait_kind") is not None
-            else data.get("wait_kind"),
-        )
+        data = _maybe_dict(payload.get("data"))
+        wait_kind = _maybe_str(payload.get("wait_kind"))
+        if wait_kind is None and data is not None:
+            wait_kind = _maybe_str(data.get("wait_kind"))
         wake_at = payload.get("wake_at")
-        if wake_at is None and isinstance(data, dict):
+        if wake_at is None and data is not None:
             wake_at = data.get("wake_timestamp")
         if wake_at is not None:
             wake_at = str(wake_at)
-        signal_id = cast(
-            str | None,
-            payload.get("signal_id")
-            if payload.get("signal_id") is not None
-            else data.get("signal_id"),
+        signal_id = _maybe_str(payload.get("signal_id"))
+        if signal_id is None and data is not None:
+            signal_id = _maybe_str(data.get("signal_id"))
+        source_tool_call_ids = _tuple_of_strings(payload.get("source_tool_call_ids"))
+        if not source_tool_call_ids and data is not None:
+            source_tool_call_ids = _tuple_of_strings(data.get("source_tool_call_ids"))
+        pending_child_task_ids = _tuple_of_strings(
+            payload.get("pending_child_task_ids")
         )
-        source_tool_call_ids = tuple(
-            payload.get("source_tool_call_ids", ())
-            or (data.get("source_tool_call_ids", ()) if isinstance(data, dict) else ())
-            or ()
-        )
-        pending_child_task_ids = tuple(
-            payload.get("pending_child_task_ids", ())
-            or (
-                data.get("pending_child_task_ids", ())
-                if isinstance(data, dict)
-                else ()
+        if not pending_child_task_ids and data is not None:
+            pending_child_task_ids = _tuple_of_strings(
+                data.get("pending_child_task_ids")
             )
-            or ()
-        )
         return WaitEvent(
             **common_kwargs,
             wait_kind=wait_kind,
@@ -306,40 +338,40 @@ def parse_event(payload: dict[str, Any]) -> BaseEvent:
     if "batch_id" in payload:
         return BatchEvent(
             event_type=event_type,
-            task_id=payload.get("task_id"),
-            owner_id=payload.get("owner_id"),
+            task_id=_maybe_str(payload.get("task_id")),
+            owner_id=_maybe_str(payload.get("owner_id")),
             timestamp=_parse_timestamp(payload.get("timestamp")),
-            metadata=cast(dict[str, Any] | None, payload.get("metadata")),
-            batch_id=cast(str | None, payload.get("batch_id")),
+            metadata=_maybe_dict(payload.get("metadata")),
+            batch_id=_maybe_str(payload.get("batch_id")),
             progress=cast(float | None, payload.get("progress")),
-            completed_tasks=cast(int | None, payload.get("completed_tasks")),
-            total_tasks=cast(int | None, payload.get("total_tasks")),
-            status=cast(str | None, payload.get("status")),
+            completed_tasks=_maybe_int(payload.get("completed_tasks")),
+            total_tasks=_maybe_int(payload.get("total_tasks")),
+            status=_maybe_str(payload.get("status")),
         )
 
     if payload.get("agent_name") is not None:
         return AgentEvent(
             event_type=event_type,
-            task_id=payload.get("task_id"),
-            owner_id=payload.get("owner_id"),
+            task_id=_maybe_str(payload.get("task_id")),
+            owner_id=_maybe_str(payload.get("owner_id")),
             timestamp=_parse_timestamp(payload.get("timestamp")),
-            metadata=cast(dict[str, Any] | None, payload.get("metadata")),
-            agent_name=cast(str | None, payload.get("agent_name")),
-            turn=cast(int | None, payload.get("turn")),
+            metadata=_maybe_dict(payload.get("metadata")),
+            agent_name=_maybe_str(payload.get("agent_name")),
+            turn=_maybe_int(payload.get("turn")),
             data=payload.get("data"),
-            error=cast(str | None, payload.get("error")),
+            error=_maybe_str(payload.get("error")),
         )
 
     return QueueEvent(
         event_type=event_type,
-        task_id=payload.get("task_id"),
-        owner_id=payload.get("owner_id"),
+        task_id=_maybe_str(payload.get("task_id")),
+        owner_id=_maybe_str(payload.get("owner_id")),
         timestamp=_parse_timestamp(payload.get("timestamp")),
-        metadata=cast(dict[str, Any] | None, payload.get("metadata")),
-        agent_name=cast(str | None, payload.get("agent_name")),
-        worker_id=cast(str | None, payload.get("worker_id")),
-        batch_id=cast(str | None, payload.get("batch_id")),
-        error=cast(str | None, payload.get("error")),
+        metadata=_maybe_dict(payload.get("metadata")),
+        agent_name=_maybe_str(payload.get("agent_name")),
+        worker_id=_maybe_str(payload.get("worker_id")),
+        batch_id=_maybe_str(payload.get("batch_id")),
+        error=_maybe_str(payload.get("error")),
     )
 
 

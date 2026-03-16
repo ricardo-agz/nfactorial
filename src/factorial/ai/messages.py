@@ -3,10 +3,13 @@ from __future__ import annotations
 import base64
 import json
 import mimetypes
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from os import PathLike
 from pathlib import Path
-from typing import Any, Literal, TypeAlias, TypedDict, cast
+from typing import Any, Literal, TypeAlias, TypedDict, TypeGuard, cast
+
+from typing_extensions import NotRequired
 
 from factorial.core.utils import serialize_data
 
@@ -16,19 +19,19 @@ class InputTextDict(TypedDict):
     text: str
 
 
-class InputImageDict(TypedDict, total=False):
+class InputImageDict(TypedDict):
     type: Literal["input_image"]
-    image_url: str
-    file_id: str
-    detail: Literal["auto", "low", "high"]
+    image_url: NotRequired[str]
+    file_id: NotRequired[str]
+    detail: NotRequired[Literal["auto", "low", "high"]]
 
 
-class InputFileDict(TypedDict, total=False):
+class InputFileDict(TypedDict):
     type: Literal["input_file"]
-    file_id: str
-    file_url: str
-    file_data: str
-    filename: str
+    file_id: NotRequired[str]
+    file_url: NotRequired[str]
+    file_data: NotRequired[str]
+    filename: NotRequired[str]
 
 
 class SystemMessageDict(TypedDict):
@@ -57,13 +60,13 @@ class ToolCallMessageDict(TypedDict):
     calls: list[ToolCallDict]
 
 
-class ToolResultMessageDict(TypedDict, total=False):
+class ToolResultMessageDict(TypedDict):
     role: Literal["tool"]
     tool_call_id: str
-    tool_name: str | None
     output: object
     is_error: bool
-    model_output: str
+    tool_name: NotRequired[str]
+    model_output: NotRequired[str]
 
 
 Message: TypeAlias = (
@@ -74,7 +77,10 @@ Message: TypeAlias = (
     | ToolResultMessageDict
 )
 
-MessageLike: TypeAlias = Message
+MessageLike: TypeAlias = Message | Mapping[str, Any]
+
+
+NormalizedContentPart: TypeAlias = InputTextDict | InputImageDict | InputFileDict
 
 
 @dataclass(frozen=True)
@@ -104,6 +110,38 @@ ContentPartLike: TypeAlias = (
 )
 
 
+def _is_text_part(part: NormalizedContentPart) -> TypeGuard[InputTextDict]:
+    return part["type"] == "input_text"
+
+
+def _is_image_part(part: NormalizedContentPart) -> TypeGuard[InputImageDict]:
+    return part["type"] == "input_image"
+
+
+def _is_file_part(part: NormalizedContentPart) -> TypeGuard[InputFileDict]:
+    return part["type"] == "input_file"
+
+
+def _is_system_message(message: Message) -> TypeGuard[SystemMessageDict]:
+    return message["role"] == "system"
+
+
+def _is_user_message(message: Message) -> TypeGuard[UserMessageDict]:
+    return message["role"] == "user"
+
+
+def _is_assistant_message(message: Message) -> TypeGuard[AssistantMessageDict]:
+    return message["role"] == "assistant"
+
+
+def _is_tool_call_message(message: Message) -> TypeGuard[ToolCallMessageDict]:
+    return message["role"] == "assistant_tool_calls"
+
+
+def _is_tool_result_message(message: Message) -> TypeGuard[ToolResultMessageDict]:
+    return message["role"] == "tool"
+
+
 def _read_bytes(path: str | PathLike[str]) -> bytes:
     return Path(path).read_bytes()
 
@@ -125,98 +163,115 @@ def _normalize_content_part(
 
     if isinstance(part, ImageInput):
         if part.path is not None:
-            return {
+            image_path_part: InputImageDict = {
                 "type": "input_image",
                 "image_url": _data_url_for_image(part.path),
                 "detail": part.detail,
             }
+            return image_path_part
         if part.image_url is not None:
-            return {
+            image_url_part: InputImageDict = {
                 "type": "input_image",
                 "image_url": part.image_url,
                 "detail": part.detail,
             }
+            return image_url_part
         if part.file_id is not None:
-            return {
+            image_file_part: InputImageDict = {
                 "type": "input_image",
                 "file_id": part.file_id,
                 "detail": part.detail,
             }
+            return image_file_part
         raise ValueError("image(...) requires path, image_url, or file_id")
 
     if isinstance(part, FileInput):
         if part.path is not None:
             resolved_path = Path(part.path)
             encoded = base64.b64encode(_read_bytes(resolved_path)).decode("ascii")
-            return {
+            file_part: InputFileDict = {
                 "type": "input_file",
                 "file_data": encoded,
                 "filename": part.filename or resolved_path.name,
             }
+            return file_part
         if part.file_id is not None:
-            return {
+            file_id_part: InputFileDict = {
                 "type": "input_file",
                 "file_id": part.file_id,
-                "filename": part.filename,
             }
+            if part.filename is not None:
+                file_id_part["filename"] = part.filename
+            return file_id_part
         if part.file_url is not None:
-            return {
+            file_url_part: InputFileDict = {
                 "type": "input_file",
                 "file_url": part.file_url,
-                "filename": part.filename,
             }
+            if part.filename is not None:
+                file_url_part["filename"] = part.filename
+            return file_url_part
         if part.file_data is not None:
             file_data = part.file_data
             if isinstance(file_data, bytes):
                 file_data = base64.b64encode(file_data).decode("ascii")
-            return {
+            file_data_part: InputFileDict = {
                 "type": "input_file",
                 "file_data": file_data,
-                "filename": part.filename,
             }
+            if part.filename is not None:
+                file_data_part["filename"] = part.filename
+            return file_data_part
         raise ValueError("file(...) requires path, file_id, file_url, or file_data")
 
-    if isinstance(part, dict):
+    if isinstance(part, Mapping):
         part_type = part.get("type")
         if part_type == "input_text":
             text = part.get("text")
             if not isinstance(text, str):
                 raise TypeError("input_text parts require a string 'text' field")
-            return {"type": "input_text", "text": text}
+            text_part: InputTextDict = {"type": "input_text", "text": text}
+            return text_part
         if part_type == "input_image":
             normalized: InputImageDict = {"type": "input_image"}
-            if part.get("image_url") is not None:
-                normalized["image_url"] = str(part["image_url"])
-            if part.get("file_id") is not None:
-                normalized["file_id"] = str(part["file_id"])
-            if part.get("detail") is not None:
+            image_url = part.get("image_url")
+            file_id = part.get("file_id")
+            detail = part.get("detail")
+            if image_url is not None:
+                normalized["image_url"] = str(image_url)
+            if file_id is not None:
+                normalized["file_id"] = str(file_id)
+            if detail is not None:
                 normalized["detail"] = cast(
                     Literal["auto", "low", "high"],
-                    str(part["detail"]),
+                    str(detail),
                 )
             if "image_url" not in normalized and "file_id" not in normalized:
                 raise ValueError("input_image parts require image_url or file_id")
             return normalized
         if part_type == "input_file":
-            normalized_file: InputFileDict = {"type": "input_file"}
-            if part.get("file_id") is not None:
-                normalized_file["file_id"] = str(part["file_id"])
-            if part.get("file_url") is not None:
-                normalized_file["file_url"] = str(part["file_url"])
-            if part.get("file_data") is not None:
-                file_data = part["file_data"]
-                if not isinstance(file_data, str):
+            mapping_file_part: InputFileDict = {"type": "input_file"}
+            file_id = part.get("file_id")
+            file_url = part.get("file_url")
+            mapping_file_data = part.get("file_data")
+            filename = part.get("filename")
+            if file_id is not None:
+                mapping_file_part["file_id"] = str(file_id)
+            if file_url is not None:
+                mapping_file_part["file_url"] = str(file_url)
+            if mapping_file_data is not None:
+                if not isinstance(mapping_file_data, str):
                     raise TypeError("input_file.file_data must be a string")
-                normalized_file["file_data"] = file_data
-            if part.get("filename") is not None:
-                normalized_file["filename"] = str(part["filename"])
+                mapping_file_part["file_data"] = mapping_file_data
+            if filename is not None:
+                mapping_file_part["filename"] = str(filename)
             if not any(
-                key in normalized_file for key in ("file_id", "file_url", "file_data")
+                key in mapping_file_part for key in ("file_id", "file_url", "file_data")
             ):
                 raise ValueError(
                     "input_file parts require file_id, file_url, or file_data"
                 )
-            return normalized_file
+            return mapping_file_part
 
     raise TypeError(f"Unsupported content part: {type(part).__name__}")
 
@@ -273,7 +328,7 @@ def tool_call(
 def tool_calls(*calls: ToolCallDict) -> ToolCallMessageDict:
     return {
         "role": "assistant_tool_calls",
-        "calls": [dict(call) for call in calls],
+        "calls": list(calls),
     }
 
 
@@ -331,7 +386,7 @@ def file(
 
 
 def normalize_message(message: MessageLike) -> Message:
-    if not isinstance(message, dict):
+    if not isinstance(message, Mapping):
         raise TypeError("Messages must be mapping objects")
 
     role = message.get("role")
@@ -393,17 +448,19 @@ def normalize_message(message: MessageLike) -> Message:
             "output": message.get("output"),
             "is_error": bool(message.get("is_error", False)),
         }
-        if message.get("tool_name") is not None:
-            normalized_tool_result["tool_name"] = str(message["tool_name"])
-        if message.get("model_output") is not None:
-            normalized_tool_result["model_output"] = str(message["model_output"])
+        tool_name = message.get("tool_name")
+        if tool_name is not None:
+            normalized_tool_result["tool_name"] = str(tool_name)
+        model_output = message.get("model_output")
+        if model_output is not None:
+            normalized_tool_result["model_output"] = str(model_output)
         return normalized_tool_result
 
     raise ValueError(f"Unsupported message role: {role!r}")
 
 
 def normalize_messages_input(
-    input_value: str | list[MessageLike],
+    input_value: str | Sequence[MessageLike],
 ) -> list[Message]:
     if isinstance(input_value, str):
         return [user(input_value)]
@@ -411,20 +468,19 @@ def normalize_messages_input(
 
 
 def message_to_chat_message(message: Message) -> dict[str, Any]:
-    role = message["role"]
-    if role == "system":
+    if _is_system_message(message):
         return {"role": "system", "content": message["content"]}
 
-    if role == "user":
+    if _is_user_message(message):
         content = message["content"]
         if isinstance(content, str):
             return {"role": "user", "content": content}
 
         chat_parts: list[dict[str, Any]] = []
         for part in content:
-            if part["type"] == "input_text":
+            if _is_text_part(part):
                 chat_parts.append({"type": "text", "text": part["text"]})
-            elif part["type"] == "input_image":
+            elif _is_image_part(part):
                 if "image_url" not in part:
                     raise ValueError(
                         "Current chat-completions transport requires "
@@ -439,7 +495,7 @@ def message_to_chat_message(message: Message) -> dict[str, Any]:
                         "image_url": image_url_payload,
                     }
                 )
-            elif part["type"] == "input_file":
+            elif _is_file_part(part):
                 file_descriptor = part.get("filename") or part.get("file_url") or "file"
                 chat_parts.append(
                     {
@@ -449,10 +505,10 @@ def message_to_chat_message(message: Message) -> dict[str, Any]:
                 )
         return {"role": "user", "content": chat_parts}
 
-    if role == "assistant":
+    if _is_assistant_message(message):
         return {"role": "assistant", "content": message["content"]}
 
-    if role == "assistant_tool_calls":
+    if _is_tool_call_message(message):
         tool_call_payloads = []
         for call in message["calls"]:
             tool_call_payloads.append(
@@ -475,7 +531,7 @@ def message_to_chat_message(message: Message) -> dict[str, Any]:
             "tool_calls": tool_call_payloads,
         }
 
-    if role == "tool":
+    if _is_tool_result_message(message):
         model_output = message.get("model_output")
         if model_output is None:
             serialized = serialize_data(message.get("output"))
@@ -493,7 +549,7 @@ def message_to_chat_message(message: Message) -> dict[str, Any]:
             "content": model_output,
         }
 
-    raise ValueError(f"Unsupported message role: {role!r}")
+    raise ValueError(f"Unsupported message role: {message['role']!r}")
 
 
 def messages_to_chat_messages(messages: list[Message]) -> list[dict[str, Any]]:

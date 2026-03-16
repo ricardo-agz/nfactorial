@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any
 import redis.asyncio as redis
 
 from factorial.core.logging import get_logger
+from factorial.core.utils import resolve_awaitable
 from factorial.queue.maintenance.tick import (
     MaintenanceTickContext,
     MaintenanceTickResult,
@@ -18,7 +19,8 @@ from factorial.queue.maintenance.tick import (
 from .settings import VercelRuntimeSettings
 
 if TYPE_CHECKING:
-    from factorial.orchestrator import Orchestrator, Runner
+    from factorial.orchestrator import Orchestrator
+    from factorial.orchestrator.core import Runner
 
 logger = get_logger(__name__)
 
@@ -99,7 +101,9 @@ async def run_maintenance_invocation(
     token = str(uuid.uuid4())
     lock_ttl_s = max(int(settings.maintenance_budget_s) + 30, 60)
 
-    lock_acquired = await redis_client.set(lock_key, token, nx=True, ex=lock_ttl_s)  # type: ignore[misc]
+    lock_acquired = await resolve_awaitable(
+        redis_client.set(lock_key, token, nx=True, ex=lock_ttl_s)
+    )
     if not lock_acquired:
         await redis_client.close()
         return MaintenanceInvocationSummary(
@@ -216,7 +220,9 @@ async def run_maintenance_invocation(
         )
     finally:
         try:
-            await redis_client.eval(_LOCK_RELEASE_SCRIPT, 1, lock_key, token)  # type: ignore[misc]
+            await resolve_awaitable(
+                redis_client.eval(_LOCK_RELEASE_SCRIPT, 1, lock_key, token)
+            )
         finally:
             await redis_client.close()
 
@@ -229,7 +235,7 @@ async def _ordered_runners(
 ) -> list[Runner]:
     if not runners:
         return []
-    cursor_raw = await redis_client.get(cursor_key)  # type: ignore[misc]
+    cursor_raw = await resolve_awaitable(redis_client.get(cursor_key))
     try:
         cursor = int(cursor_raw) if cursor_raw is not None else 0
     except (TypeError, ValueError):
@@ -247,13 +253,13 @@ async def _advance_cursor(
 ) -> None:
     if not runners:
         return
-    current_raw = await redis_client.get(cursor_key)  # type: ignore[misc]
+    current_raw = await resolve_awaitable(redis_client.get(cursor_key))
     try:
         current = int(current_raw) if current_raw is not None else 0
     except (TypeError, ValueError):
         current = 0
     next_cursor = (current + max(processed, 1)) % len(runners)
-    await redis_client.set(cursor_key, str(next_cursor))  # type: ignore[misc]
+    await resolve_awaitable(redis_client.set(cursor_key, str(next_cursor)))
 
 
 def _maintenance_lock_key(namespace: str) -> str:

@@ -25,7 +25,7 @@ from factorial.core.exceptions import (
 )
 from factorial.core.logging import get_logger
 from factorial.core.run_types import RunResult, RunStatus, UsageSummary
-from factorial.core.utils import to_snake_case
+from factorial.core.utils import resolve_awaitable, to_snake_case
 from factorial.execution.hooks import HookRecord, HookResolutionResult, PendingHook
 from factorial.orchestrator.handles import (
     BatchHandle,
@@ -1469,11 +1469,15 @@ class Orchestrator:
         task_id: str,
     ) -> tuple[PendingHookSnapshot, ...]:
         task_keys = RedisKeys.format(namespace=self.namespace, task_id=task_id)
-        hook_ids = sorted(await redis_client.smembers(task_keys.hooks_by_task))  # type: ignore[arg-type]
+        hook_ids: list[Any] = sorted(
+            await resolve_awaitable(redis_client.smembers(task_keys.hooks_by_task))
+        )
         if not hook_ids:
             return ()
 
-        records_raw = await redis_client.hmget(task_keys.hooks_index, hook_ids)  # type: ignore[arg-type]
+        records_raw: list[Any] = await resolve_awaitable(
+            redis_client.hmget(task_keys.hooks_index, hook_ids)
+        )
         snapshots: list[PendingHookSnapshot] = []
         for record_raw in records_raw:
             if not record_raw:
@@ -1522,8 +1526,11 @@ class Orchestrator:
                 task_id=task_id,
                 agent=agent_name,
             )
+            pending_child_members: set[Any] = await resolve_awaitable(
+                redis_client.smembers(task_keys.pending_child_wait_ids)
+            )
             pending_child_task_ids = tuple(
-                sorted(await redis_client.smembers(task_keys.pending_child_wait_ids))  # type: ignore[arg-type]
+                sorted(pending_child_members)
             )
             backoff_score = await redis_client.zscore(task_keys.queue_backoff, task_id)
 

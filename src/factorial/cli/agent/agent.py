@@ -1,11 +1,14 @@
 import os
 from collections.abc import Callable
+from typing import Any
 
 import httpx
 from dotenv import load_dotenv
 from pydantic import BaseModel
 
 from factorial import Agent, Model, MultiClient, any_of, no_tool_calls, turn_count_is
+from factorial.agent.context import AgentContext
+from factorial.agent.types import Turn
 
 from .tools.file import file_tools
 from .tools.project import project_tools
@@ -38,7 +41,7 @@ class FinalOutput(BaseModel):
     run_commands: list[str]
 
 
-def _cli_prepare_turn(turn, agent_ctx):
+def _cli_prepare_turn(turn: Turn[Any], agent_ctx: AgentContext[Any, Any]) -> None:
     if agent_ctx.turn_number == 1:
         turn.tool_choice = {"type": "function", "function": {"name": "think"}}
     elif agent_ctx.turn_number == 2:
@@ -53,20 +56,20 @@ class NFactorialAgent:
     def __init__(
         self,
         mode: str,
-        model: Model | Callable,
+        model: Model | Callable[[Any], Model],
         client: MultiClient,
     ):
         self._agent = create_nfactorial_agent(mode=mode, model=model, client=client)
 
-    def __getattr__(self, name):
+    def __getattr__(self, name: str) -> Any:
         return getattr(self._agent, name)
 
 
 def create_nfactorial_agent(
     mode: str,
-    model: Model | Callable,
+    model: Model | Callable[[Any], Model],
     client: MultiClient,
-) -> Agent:
+) -> Agent[Any, Any]:
     """Create an NFactorial CLI agent for the given mode and model."""
     model_name = model.name if isinstance(model, Model) else "default"
     if mode == "create":

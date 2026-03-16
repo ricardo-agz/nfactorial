@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from typing import Literal
 
 from factorial.core.logging import get_logger
 from factorial.orchestrator import Orchestrator
@@ -27,8 +28,11 @@ def configure_orchestrator_for_vercel(
     settings = settings or VercelRuntimeSettings.from_env()
     orchestrator.runtime_mode = "vercel"
 
-    wake_transport = (os.getenv("NFACTORIAL_WAKE_TRANSPORT") or "").strip().lower()
-    if wake_transport not in {"none", "vercel_queue"}:
+    raw_wake_transport = (os.getenv("NFACTORIAL_WAKE_TRANSPORT") or "").strip().lower()
+    wake_transport: Literal["none", "vercel_queue"]
+    if raw_wake_transport == "none":
+        wake_transport = "none"
+    else:
         wake_transport = "vercel_queue"
     orchestrator.wake_transport = wake_transport
 

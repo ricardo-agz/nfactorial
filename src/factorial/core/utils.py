@@ -2,13 +2,16 @@ import base64
 import inspect
 import re
 import uuid
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import is_dataclass
 from datetime import date, datetime, time, timedelta
 from enum import Enum
-from typing import Any, get_origin
+from typing import Any, cast, get_origin, overload
 
 from pydantic import BaseModel
+from typing_extensions import TypeVar
+
+T = TypeVar("T")
 
 
 def to_snake_case(camel: str) -> str:
@@ -64,6 +67,20 @@ def serialize_data(data: Any) -> Any:
 
 def decode(data: bytes | str) -> str:
     return data.decode("utf-8") if isinstance(data, bytes) else data
+
+
+@overload
+async def resolve_awaitable(value: Awaitable[T]) -> T: ...
+
+
+@overload
+async def resolve_awaitable(value: T) -> T: ...
+
+
+async def resolve_awaitable(value: T | Awaitable[T]) -> T:
+    if inspect.isawaitable(value):
+        return await cast(Awaitable[T], value)
+    return cast(T, value)
 
 
 def is_valid_task_id(task_id: str) -> bool:

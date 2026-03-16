@@ -386,9 +386,11 @@ async def execute_tools(
     new_messages: list[Message] = []
     pending_tool_call_ids: list[str] = []
     all_pending_child_task_ids: list[str] = []
-    tool_call_results: list[tuple[ChatCompletionMessageToolCall, Any | Exception]] = []
+    tool_call_results: list[
+        tuple[ChatCompletionMessageToolCall, Any | BaseException]
+    ] = []
     resolved_results: list[
-        tuple[ChatCompletionMessageToolCall, _ToolResultInternal | Exception]
+        tuple[ChatCompletionMessageToolCall, _ToolResultInternal | BaseException]
     ] = []
     execution_ctx = ExecutionContext.current()
 
@@ -416,19 +418,19 @@ async def execute_tools(
 
     for tool_call, result in zip(tool_calls, results, strict=True):
         resolved_results.append(
-            (tool_call, cast(_ToolResultInternal | Exception, result))
+            (tool_call, cast(_ToolResultInternal | BaseException, result))
         )
         tool_call_results.append(
             (
                 tool_call,
-                result if isinstance(result, Exception) else result.client_output,
+                result if isinstance(result, BaseException) else result.client_output,
             )
         )
 
         if isinstance(result, _ToolResultInternal) and result.pending_child_task_ids:
             all_pending_child_task_ids.extend(result.pending_child_task_ids)
 
-        if isinstance(result, Exception):
+        if isinstance(result, BaseException):
             logger.error(
                 "Tool %s failed: %s",
                 tool_call.function.name,
@@ -513,11 +515,11 @@ async def execute_tools(
 
 def process_deferred_tool_results(
     agent_ctx: ContextT,
-    tool_call_results: list[tuple[str, Any]],
+    tool_call_results: list[tuple[str, Any | BaseException]],
 ) -> TurnCompletion[ContextT]:
     updated_messages = list(agent_ctx.messages)
     for tool_call_id, result in tool_call_results:
-        if isinstance(result, Exception):
+        if isinstance(result, BaseException):
             updated_messages.append(
                 tool_result(
                     tool_call_id,
@@ -540,9 +542,9 @@ def process_deferred_tool_results(
 
 def format_child_task_result(
     child_task_id: str,
-    result: Any | Exception,
+    result: Any | BaseException,
 ) -> str:
-    if isinstance(result, Exception):
+    if isinstance(result, BaseException):
         return (
             f'<sub_task_error sub_task_id="{child_task_id}">\n'
             f"Error running sub task:\n{result}\n</sub_task_error>"
@@ -555,7 +557,7 @@ def format_child_task_result(
 
 def process_child_task_results(
     agent_ctx: ContextT,
-    child_task_results: list[tuple[str, Any]],
+    child_task_results: list[tuple[str, Any | BaseException]],
 ) -> TurnCompletion[ContextT]:
     updated_messages = list(agent_ctx.messages)
     formatted_results = [

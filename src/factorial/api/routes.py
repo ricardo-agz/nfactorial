@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import AsyncGenerator
 from typing import TYPE_CHECKING, Any
 
 from fastapi import FastAPI, HTTPException, Request
@@ -164,7 +165,7 @@ def register_control_plane_routes(
 
     @app.get("/events/{owner_id}")
     async def stream_events(owner_id: str, request: Request) -> StreamingResponse:
-        async def event_stream():
+        async def event_stream() -> AsyncGenerator[str, None]:
             async for update in orchestrator.subscribe_to_updates(owner_id=owner_id):
                 if await request.is_disconnected():
                     break
@@ -185,7 +186,7 @@ def register_control_plane_routes(
     if enable_ws:
 
         @app.websocket("/ws/{owner_id}")
-        async def websocket_updates(websocket: WebSocket, owner_id: str):
+        async def websocket_updates(websocket: WebSocket, owner_id: str) -> None:
             await websocket.accept()
             try:
                 async for update in orchestrator.subscribe_to_updates(

@@ -12,8 +12,8 @@ import pytest_asyncio
 import redis.asyncio as redis
 
 from factorial.agent import BaseAgent, TurnCompletion
-from factorial.ai.models import Model, Provider
 from factorial.agent.context import AgentContext
+from factorial.ai.models import Model, Provider
 from factorial.queue.keys import PENDING_SENTINEL, RedisKeys
 from factorial.queue.lua import (
     BackoffRecoveryScript,

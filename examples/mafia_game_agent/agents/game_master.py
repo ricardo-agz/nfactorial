@@ -246,15 +246,21 @@ def _phase_deadline_ts(agent_ctx: MafiaGameContext) -> float | None:
 
 def _state_snapshot(agent_ctx: MafiaGameContext) -> GameStateSnapshot:
     alive_werewolves = sum(
-        1 for player in agent_ctx.state.players if player.alive and player.role == "werewolf"
+        1
+        for player in agent_ctx.state.players
+        if player.alive and player.role == "werewolf"
     )
     alive_villagers = sum(
-        1 for player in agent_ctx.state.players if player.alive and player.role == "villager"
+        1
+        for player in agent_ctx.state.players
+        if player.alive and player.role == "villager"
     )
     players_public: list[dict[str, Any]] = []
     players_omniscient: list[dict[str, Any]] = []
     for player in agent_ctx.state.players:
-        reveal_role = player.role if (agent_ctx.state.winner or not player.alive) else None
+        reveal_role = (
+            player.role if (agent_ctx.state.winner or not player.alive) else None
+        )
         players_public.append(
             {
                 "player_id": player.player_id,
@@ -399,7 +405,10 @@ def _resolve_voter_id(
     payload: dict[str, Any],
 ) -> str | None:
     from_task_id = getattr(message, "from_task_id", None)
-    if isinstance(from_task_id, str) and from_task_id in agent_ctx.state.task_id_to_player_id:
+    if (
+        isinstance(from_task_id, str)
+        and from_task_id in agent_ctx.state.task_id_to_player_id
+    ):
         return agent_ctx.state.task_id_to_player_id[from_task_id]
 
     from_owner_id = getattr(message, "from_owner_id", None)
@@ -474,7 +483,10 @@ async def _drain_night_actions(agent_ctx: MafiaGameContext) -> dict[str, str]:
             voter = _player_by_id(agent_ctx, voter_id)
             if voter is None or not voter.alive or voter.role != "werewolf":
                 continue
-            if voter_id in agent_ctx.state.pending_night_actions or voter_id in accepted:
+            if (
+                voter_id in agent_ctx.state.pending_night_actions
+                or voter_id in accepted
+            ):
                 continue
             target_id = payload.get("target_player_id")
             if not isinstance(target_id, str):
@@ -547,7 +559,9 @@ async def setup_game(agent_ctx: MafiaGameContext) -> GameActionResult:
             "Call set_player_agent_for_game_master(...) during startup."
         )
 
-    agent_ctx.state.ai_player_count = _normalize_ai_player_count(agent_ctx.state.ai_player_count)
+    agent_ctx.state.ai_player_count = _normalize_ai_player_count(
+        agent_ctx.state.ai_player_count
+    )
     agent_ctx.state.day_discussion_seconds = _normalize_timeout_seconds(
         agent_ctx.state.day_discussion_seconds,
         default=90,
@@ -565,7 +579,9 @@ async def setup_game(agent_ctx: MafiaGameContext) -> GameActionResult:
     players: list[PlayerRecord] = []
     player_jobs_for_group: list[dict[str, Any]] = []
     task_id_to_player_id: dict[str, str] = {}
-    random_seed = f"{parent_task_id}:{agent_ctx.state.query}:{agent_ctx.state.game_name}"
+    random_seed = (
+        f"{parent_task_id}:{agent_ctx.state.query}:{agent_ctx.state.game_name}"
+    )
     randomizer = random.Random(random_seed)
 
     shuffled_names = list(_NAME_POOL)
@@ -668,7 +684,10 @@ async def setup_game(agent_ctx: MafiaGameContext) -> GameActionResult:
         if player.task_id and player.role == "werewolf"
     ]
     if werewolf_task_ids:
-        await messaging.groups.add_members(agent_ctx.state.wolf_group_name, werewolf_task_ids)
+        await messaging.groups.add_members(
+            agent_ctx.state.wolf_group_name,
+            werewolf_task_ids,
+        )
 
     kickoff_message = (
         f"{agent_ctx.state.game_name}: setup complete. "
@@ -851,7 +870,9 @@ async def open_day_vote(agent_ctx: MafiaGameContext) -> GameActionResult:
     alive_ai_task_ids = _alive_ai_task_ids(agent_ctx)
     agent_ctx.state.pending_day_votes = {}
     agent_ctx.state.day_discussion_deadline_ts = None
-    agent_ctx.state.day_vote_deadline_ts = time.time() + float(agent_ctx.state.day_vote_seconds)
+    agent_ctx.state.day_vote_deadline_ts = time.time() + float(
+        agent_ctx.state.day_vote_seconds
+    )
 
     await subagents.signal(
         alive_ai_task_ids,
@@ -866,7 +887,8 @@ async def open_day_vote(agent_ctx: MafiaGameContext) -> GameActionResult:
     )
     alive_names = [p.display_name for p in _alive_players(agent_ctx)]
     message_text = (
-        f"Round {agent_ctx.state.round_no}: Voting is open for {agent_ctx.state.day_vote_seconds} "
+        f"Round {agent_ctx.state.round_no}: Voting is open for "
+        f"{agent_ctx.state.day_vote_seconds} "
         f"seconds. Submit exactly one vote. "
         f"Alive players: {', '.join(alive_names)}."
     )
@@ -1035,7 +1057,9 @@ async def open_night_action(agent_ctx: MafiaGameContext) -> GameActionResult:
 
     agent_ctx.state.pending_night_actions = {}
     agent_ctx.state.day_vote_deadline_ts = None
-    agent_ctx.state.night_deadline_ts = time.time() + float(agent_ctx.state.night_seconds)
+    agent_ctx.state.night_deadline_ts = time.time() + float(
+        agent_ctx.state.night_seconds
+    )
 
     await subagents.signal(
         alive_ai_task_ids,
@@ -1049,7 +1073,8 @@ async def open_night_action(agent_ctx: MafiaGameContext) -> GameActionResult:
         },
     )
     message_text = (
-        f"Round {agent_ctx.state.round_no}: Night falls for {agent_ctx.state.night_seconds} "
+        f"Round {agent_ctx.state.round_no}: Night falls for "
+        f"{agent_ctx.state.night_seconds} "
         "seconds. Werewolves choose a target."
     )
     await messaging.group.send(
@@ -1173,12 +1198,14 @@ async def resolve_night_action(agent_ctx: MafiaGameContext) -> GameActionResult:
         )
         eliminated_role = eliminated.role if eliminated else "unknown"
         dawn_message = (
-            f"Dawn of round {agent_ctx.state.round_no}: {eliminated_label} did not survive "
+            f"Dawn of round {agent_ctx.state.round_no}: "
+            f"{eliminated_label} did not survive "
             f"the night. They were a {eliminated_role}."
         )
     else:
         dawn_message = (
-            f"Dawn of round {agent_ctx.state.round_no}: no valid night target was available."
+            f"Dawn of round {agent_ctx.state.round_no}: "
+            "no valid night target was available."
         )
 
     await messaging.group.send(

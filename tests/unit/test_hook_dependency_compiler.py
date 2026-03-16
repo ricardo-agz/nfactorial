@@ -1,13 +1,10 @@
 """Contracts for hook dependency inference and validation."""
 
-from collections.abc import Awaitable, Coroutine
 from typing import Annotated, Any, cast
 
 import pytest
 
 from factorial import (
-    AgentContext,
-    ExecutionContext,
     Hook,
     HookRequestContext,
     PendingHook,

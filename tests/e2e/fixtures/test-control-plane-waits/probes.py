@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from factorial import HookCompletionStatus, RunStatus
-
 from tests.e2e import (
     ProbeContext,
     output_contains,

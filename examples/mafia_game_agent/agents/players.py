@@ -137,7 +137,10 @@ def _day_vote_seconds_remaining(agent_ctx: MafiaPlayerContext) -> float | None:
 
 
 def _night_coordination_allowed(agent_ctx: MafiaPlayerContext) -> bool:
-    return agent_ctx.state.role == "werewolf" and agent_ctx.state.night_alive_werewolf_count > 1
+    return (
+        agent_ctx.state.role == "werewolf"
+        and agent_ctx.state.night_alive_werewolf_count > 1
+    )
 
 
 def _chat_enabled(agent_ctx: MafiaPlayerContext) -> bool:

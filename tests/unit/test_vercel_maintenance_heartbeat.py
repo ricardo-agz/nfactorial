@@ -42,7 +42,9 @@ class _FakeRedis:
 
 
 @pytest.mark.asyncio
-async def test_ensure_maintenance_heartbeat_dispatches_delayed_wake(monkeypatch) -> None:
+async def test_ensure_maintenance_heartbeat_dispatches_delayed_wake(
+    monkeypatch,
+) -> None:
     orchestrator = Orchestrator()
     orchestrator.wake_transport = "vercel_queue"
     fake_redis = _FakeRedis(lock_acquired=True)

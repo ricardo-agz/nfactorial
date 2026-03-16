@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import uuid
-from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
@@ -364,7 +363,11 @@ async def test_subagents_cancel_rejects_invalid_target() -> None:
 async def test_subagents_signal_routes_single_target_callback() -> None:
     seen: list[tuple[str, str, Any]] = []
 
-    async def _signal_child(task_id: str, signal_id: str, payload: Any) -> dict[str, Any]:
+    async def _signal_child(
+        task_id: str,
+        signal_id: str,
+        payload: Any,
+    ) -> dict[str, Any]:
         seen.append((task_id, signal_id, payload))
         return {
             "signal_id": signal_id,

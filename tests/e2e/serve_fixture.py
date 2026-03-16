@@ -10,7 +10,9 @@ from .loader import load_fixture_bundle
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Serve a fixture app with probe routes.")
+    parser = argparse.ArgumentParser(
+        description="Serve a fixture app with probe routes."
+    )
     parser.add_argument("fixture", help="Path to the fixture directory")
     parser.add_argument("--host", default="0.0.0.0", help="Host to bind")
     parser.add_argument("--port", type=int, default=8000, help="Port to bind")

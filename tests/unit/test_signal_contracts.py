@@ -4,14 +4,12 @@ from __future__ import annotations
 
 from typing import Any, cast
 
-import pytest
 from pydantic import BaseModel
 
 from factorial.core.events import EventPublisher
 from factorial.execution.context import (
     ExecutionContext,
     SignalsExecutionNamespace,
-    SubagentsExecutionNamespace,
     execution_context,
 )
 from factorial.execution.signals import SignalEnvelope, signals

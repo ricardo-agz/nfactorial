@@ -13,15 +13,8 @@ from openai.types.chat.chat_completion_message_function_tool_call import (
 )
 
 from factorial.agent import BaseAgent, TurnCompletion
-from factorial.ai.models import Model, Provider
 from factorial.agent.context import AgentContext
-
-MOCK_MODEL = Model(
-    name="mock-model",
-    provider=Provider.OPENAI,
-    provider_model_id="mock-v1",
-    context_window=128000,
-)
+from factorial.ai.models import Model, Provider
 from factorial.execution.signals import signals
 from factorial.execution.waits import wait
 from factorial.queue.keys import RedisKeys
@@ -34,6 +27,13 @@ from factorial.queue.lua import (
 from factorial.queue.operations import enqueue_task, signal_task
 from factorial.queue.task import Task, TaskStatus, get_task_status
 from factorial.queue.worker import process_task
+
+MOCK_MODEL = Model(
+    name="mock-model",
+    provider=Provider.OPENAI,
+    provider_model_id="mock-v1",
+    context_window=128000,
+)
 
 
 def _make_tool_call(
@@ -172,7 +172,10 @@ async def test_process_task_parks_wait_until_signal(
         metrics_retention_duration=3600,
     )
 
-    assert await get_task_status(redis_client, test_namespace, task_id) == TaskStatus.PAUSED
+    assert (
+        await get_task_status(redis_client, test_namespace, task_id)
+        == TaskStatus.PAUSED
+    )
     wait_meta_raw = await redis_client.hget(keys.signal_wait_meta, task_id)
     assert wait_meta_raw is not None
     wait_meta = json.loads(wait_meta_raw)
@@ -265,8 +268,14 @@ async def test_signal_task_wakes_waiting_signal_task(
         await get_task_status(redis_client, test_namespace, receiver_task_id)
         == TaskStatus.ACTIVE
     )
-    assert await redis_client.hget(receiver_keys.signal_wait_meta, receiver_task_id) is None
-    assert await redis_client.zscore(receiver_keys.queue_pending, receiver_task_id) is None
+    assert (
+        await redis_client.hget(receiver_keys.signal_wait_meta, receiver_task_id)
+        is None
+    )
+    assert (
+        await redis_client.zscore(receiver_keys.queue_pending, receiver_task_id)
+        is None
+    )
     queued_ids = await redis_client.lrange(receiver_keys.queue_main, 0, -1)
     assert receiver_task_id in queued_ids
 
@@ -294,8 +303,14 @@ async def test_signal_task_wakes_waiting_signal_task(
         await get_task_status(redis_client, test_namespace, receiver_task_id)
         == TaskStatus.COMPLETED
     )
-    assert await redis_client.hget(receiver_keys.signal_wake_meta, receiver_task_id) is None
-    assert await redis_client.hget(receiver_keys.signal_wait_meta, receiver_task_id) is None
+    assert (
+        await redis_client.hget(receiver_keys.signal_wake_meta, receiver_task_id)
+        is None
+    )
+    assert (
+        await redis_client.hget(receiver_keys.signal_wait_meta, receiver_task_id)
+        is None
+    )
 
 
 @pytest.mark.asyncio
@@ -347,7 +362,10 @@ async def test_wait_until_signal_timeout_exposes_timeout_wake_reason(
         task_timeout=60,
         metrics_retention_duration=3600,
     )
-    assert await get_task_status(redis_client, test_namespace, task_id) == TaskStatus.PAUSED
+    assert (
+        await get_task_status(redis_client, test_namespace, task_id)
+        == TaskStatus.PAUSED
+    )
 
     scheduled_recovery_script = await create_scheduled_recovery_script(redis_client)
     recovered_ids = await scheduled_recovery_script.execute(
@@ -393,6 +411,9 @@ async def test_wait_until_signal_timeout_exposes_timeout_wake_reason(
         task_timeout=60,
         metrics_retention_duration=3600,
     )
-    assert await get_task_status(redis_client, test_namespace, task_id) == TaskStatus.COMPLETED
+    assert (
+        await get_task_status(redis_client, test_namespace, task_id)
+        == TaskStatus.COMPLETED
+    )
     assert await redis_client.hget(keys.signal_wake_meta, task_id) is None
     assert await redis_client.hget(keys.signal_wait_meta, task_id) is None

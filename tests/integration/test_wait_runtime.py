@@ -16,13 +16,6 @@ from factorial.agent import BaseAgent, TurnCompletion
 from factorial.agent.context import AgentContext
 from factorial.ai.models import Model, Provider
 from factorial.execution.context import ExecutionContext
-
-MOCK_MODEL = Model(
-    name="mock-model",
-    provider=Provider.OPENAI,
-    provider_model_id="mock-v1",
-    context_window=128000,
-)
 from factorial.execution.subagents import subagents
 from factorial.execution.waits import wait
 from factorial.queue.keys import PENDING_SENTINEL, RedisKeys
@@ -36,6 +29,13 @@ from factorial.queue.task import Task, TaskStatus, get_task_data, get_task_statu
 from factorial.queue.worker import CompletionAction, process_task
 
 from .conftest import ScriptRunner, SimpleTestAgent
+
+MOCK_MODEL = Model(
+    name="mock-model",
+    provider=Provider.OPENAI,
+    provider_model_id="mock-v1",
+    context_window=128000,
+)
 
 
 def _make_tool_call(
@@ -566,7 +566,9 @@ async def test_wait_jobs_deduplicates_child_ids_before_parent_parking(
     parent_task = Task.create(
         owner_id=test_owner_id,
         agent=parent_agent.name,
-        payload=AgentContext(messages=[{"role": "user", "content": "wait on duplicate refs"}]),
+        payload=AgentContext(
+            messages=[{"role": "user", "content": "wait on duplicate refs"}]
+        ),
     )
     parent_task_id = await enqueue_task(
         redis_client=redis_client,
@@ -722,7 +724,10 @@ async def test_process_task_spawn_without_wait_is_non_blocking(
     agent_b = SimpleTestAgent(name="child_b")
     parent_agent = _SpawnNoWaitAgent(
         agent_a=agent_a,
-        agent_a_inputs=[AgentContext(messages=[{"role": "user", "content": "a1"}]), AgentContext(messages=[{"role": "user", "content": "a2"}])],
+        agent_a_inputs=[
+            AgentContext(messages=[{"role": "user", "content": "a1"}]),
+            AgentContext(messages=[{"role": "user", "content": "a2"}]),
+        ],
         agent_b=agent_b,
         agent_b_inputs=[AgentContext(messages=[{"role": "user", "content": "b1"}])],
     )
@@ -797,7 +802,9 @@ async def test_subagents_spawn_is_idempotent_across_parent_retry(
     parent_task = Task.create(
         owner_id=test_owner_id,
         agent=parent_agent.name,
-        payload=AgentContext(messages=[{"role": "user", "content": "retry spawn parent"}]),
+        payload=AgentContext(
+            messages=[{"role": "user", "content": "retry spawn parent"}]
+        ),
     )
     parent_task_id = await enqueue_task(
         redis_client=redis_client,
@@ -886,7 +893,9 @@ async def test_subagents_cancel_allows_direct_child_task(
     parent_task = Task.create(
         owner_id=test_owner_id,
         agent=parent_agent.name,
-        payload=AgentContext(messages=[{"role": "user", "content": "cancel direct child"}]),
+        payload=AgentContext(
+            messages=[{"role": "user", "content": "cancel direct child"}]
+        ),
     )
     parent_task_id = await enqueue_task(
         redis_client=redis_client,
@@ -961,7 +970,9 @@ async def test_subagents_cancel_rejects_non_child_task(
     parent_task = Task.create(
         owner_id=test_owner_id,
         agent=parent_agent.name,
-        payload=AgentContext(messages=[{"role": "user", "content": "attempt invalid cancel"}]),
+        payload=AgentContext(
+            messages=[{"role": "user", "content": "attempt invalid cancel"}]
+        ),
     )
     parent_task_id = await enqueue_task(
         redis_client=redis_client,
@@ -973,7 +984,9 @@ async def test_subagents_cancel_rejects_non_child_task(
     non_child_task = Task.create(
         owner_id=test_owner_id,
         agent=child_agent.name,
-        payload=AgentContext(messages=[{"role": "user", "content": "not a direct child"}]),
+        payload=AgentContext(
+            messages=[{"role": "user", "content": "not a direct child"}]
+        ),
     )
     non_child_task.metadata.team_id = parent_task_id
     non_child_task_id = await enqueue_task(
@@ -1035,7 +1048,9 @@ async def test_subagents_cancel_list_allows_direct_child_tasks(
     parent_task = Task.create(
         owner_id=test_owner_id,
         agent=parent_agent.name,
-        payload=AgentContext(messages=[{"role": "user", "content": "cancel direct children list"}]),
+        payload=AgentContext(
+            messages=[{"role": "user", "content": "cancel direct children list"}]
+        ),
     )
     parent_task_id = await enqueue_task(
         redis_client=redis_client,
@@ -1128,7 +1143,11 @@ async def test_subagents_cancel_list_rejects_mixed_scope_without_partial_cancell
     parent_task = Task.create(
         owner_id=test_owner_id,
         agent=parent_agent.name,
-        payload=AgentContext(messages=[{"role": "user", "content": "attempt mixed-scope list cancel"}]),
+        payload=AgentContext(
+            messages=[
+                {"role": "user", "content": "attempt mixed-scope list cancel"}
+            ]
+        ),
     )
     parent_task_id = await enqueue_task(
         redis_client=redis_client,
@@ -1154,7 +1173,9 @@ async def test_subagents_cancel_list_rejects_mixed_scope_without_partial_cancell
     invalid_non_child = Task.create(
         owner_id=test_owner_id,
         agent=child_agent.name,
-        payload=AgentContext(messages=[{"role": "user", "content": "invalid-non-child"}]),
+        payload=AgentContext(
+            messages=[{"role": "user", "content": "invalid-non-child"}]
+        ),
     )
     invalid_non_child.metadata.team_id = parent_task_id
     invalid_non_child_id = await enqueue_task(
@@ -1218,7 +1239,9 @@ async def test_wait_jobs_fast_path_preserves_results_when_continue_rejected(
     parent_task = Task.create(
         owner_id=test_owner_id,
         agent=parent_agent.name,
-        payload=AgentContext(messages=[{"role": "user", "content": "wait on ready jobs"}]),
+        payload=AgentContext(
+            messages=[{"role": "user", "content": "wait on ready jobs"}]
+        ),
     )
     parent_task_id = await enqueue_task(
         redis_client=redis_client,
@@ -1300,7 +1323,9 @@ async def test_wait_jobs_quiescent_children_auto_resume_parent(
     parent_task = Task.create(
         owner_id=test_owner_id,
         agent=parent_agent.name,
-        payload=AgentContext(messages=[{"role": "user", "content": "wait on quiescent jobs"}]),
+        payload=AgentContext(
+            messages=[{"role": "user", "content": "wait on quiescent jobs"}]
+        ),
     )
     parent_task_id = await enqueue_task(
         redis_client=redis_client,

@@ -44,7 +44,10 @@ def create_worker(
     if worker_class is not None:
         worker = worker_class()
 
-        @worker.receive(topic=settings.dispatch_topic, consumer=settings.dispatch_consumer)
+        @worker.receive(
+            topic=settings.dispatch_topic,
+            consumer=settings.dispatch_consumer,
+        )
         async def _queue_worker(message: Any, metadata: Any) -> None:
             await _handle_queue_payload(
                 orchestrator=orchestrator,

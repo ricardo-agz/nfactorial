@@ -249,9 +249,20 @@ def tool_call(
     *,
     call_id: str | None = None,
 ) -> ToolCallDict:
-    normalized_call_id = call_id or (
-        f"call_{abs(hash((name, json.dumps(serialize_data(arguments), sort_keys=True, default=str))))}"
+    serialized_arguments = serialize_data(arguments)
+    call_hash = abs(
+        hash(
+            (
+                name,
+                json.dumps(
+                    serialized_arguments,
+                    sort_keys=True,
+                    default=str,
+                ),
+            )
+        )
     )
+    normalized_call_id = call_id or f"call_{call_hash}"
     return {
         "id": normalized_call_id,
         "name": name,

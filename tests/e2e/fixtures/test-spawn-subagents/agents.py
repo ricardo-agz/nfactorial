@@ -3,7 +3,6 @@ from __future__ import annotations
 from factorial import WaitInstruction, subagents, tool, wait
 from factorial.testing import MockAgent, tool_call
 
-
 child_agent = MockAgent(
     name="spawn_child",
     instructions="Return a deterministic child completion string.",

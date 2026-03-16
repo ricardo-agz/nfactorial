@@ -15,15 +15,8 @@ from openai.types.chat.chat_completion_message_function_tool_call import (
 )
 
 from factorial.agent import BaseAgent, TurnCompletion
-from factorial.ai.models import Model, Provider
 from factorial.agent.context import AgentContext
-
-MOCK_MODEL = Model(
-    name="mock-model",
-    provider=Provider.OPENAI,
-    provider_model_id="mock-v1",
-    context_window=128000,
-)
+from factorial.ai.models import Model, Provider
 from factorial.execution.waits import wait
 from factorial.queue.keys import PENDING_SENTINEL, RedisKeys
 from factorial.queue.lua import (
@@ -46,6 +39,13 @@ from factorial.queue.task import Task, TaskStatus, get_task_status
 from factorial.queue.worker import CompletionAction, process_task
 
 from .conftest import SimpleTestAgent
+
+MOCK_MODEL = Model(
+    name="mock-model",
+    provider=Provider.OPENAI,
+    provider_model_id="mock-v1",
+    context_window=128000,
+)
 
 
 def _make_tool_call(
@@ -210,7 +210,9 @@ async def test_process_task_parks_wait_activity(
     task = Task.create(
         owner_id=test_owner_id,
         agent=agent.name,
-        payload=AgentContext(messages=[{"role": "user", "content": "wait on activity"}]),
+        payload=AgentContext(
+            messages=[{"role": "user", "content": "wait on activity"}]
+        ),
         max_turns=10,
     )
     task_id = await enqueue_task(

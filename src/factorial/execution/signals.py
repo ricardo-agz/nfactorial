@@ -14,7 +14,9 @@ def _current_execution_context() -> ExecutionContext:
     try:
         return ExecutionContext.current()
     except LookupError as exc:  # pragma: no cover - defensive runtime guard
-        raise RuntimeError("signals can only be used during active task execution") from exc
+        raise RuntimeError(
+            "signals can only be used during active task execution"
+        ) from exc
 
 
 @dataclass(frozen=True)

@@ -125,6 +125,9 @@ async def test_mock_agent_responses_are_tracked_per_task() -> None:
         task_keys = [entry["task_key"] for entry in agent.mock_client.call_history]
         assert len(task_keys) == 2
         assert task_keys[0] != task_keys[1]
-        assert all(entry["response_index"] == 0 for entry in agent.mock_client.call_history)
+        assert all(
+            entry["response_index"] == 0
+            for entry in agent.mock_client.call_history
+        )
     finally:
         await _close_agents([agent])

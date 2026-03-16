@@ -15,7 +15,6 @@ from factorial import (
     tool,
     tool_called,
     turn_count_is,
-    verify,
     wait,
 )
 from factorial.ai.models import ai_gateway, gpt_41_mini

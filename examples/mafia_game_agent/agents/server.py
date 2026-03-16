@@ -139,7 +139,11 @@ async def enqueue(request: EnqueueRequest) -> EnqueueResponse:
         owner_id=request.user_id,
         state=state,
     )
-    human_name = (request.human_name.strip() or "You") if request.include_human else "You"
+    human_name = (
+        request.human_name.strip() or "You"
+        if request.include_human
+        else "You"
+    )
     GAME_SESSIONS[task.id] = GameSessionMeta(
         owner_id=request.user_id,
         include_human=request.include_human,
@@ -231,7 +235,10 @@ async def human_night_action(
 
 
 @app.post("/api/games/{task_id}/call_vote")
-async def human_call_vote(task_id: str, request: HumanCallVoteRequest) -> dict[str, Any]:
+async def human_call_vote(
+    task_id: str,
+    request: HumanCallVoteRequest,
+) -> dict[str, Any]:
     session = _get_session_or_404(task_id)
     _ensure_owner_or_403(session, request.user_id)
     if not session.include_human:

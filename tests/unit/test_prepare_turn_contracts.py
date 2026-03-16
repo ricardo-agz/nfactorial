@@ -62,7 +62,8 @@ async def test_prepare_turn_mutates_next_request_without_rewriting_transcript() 
     assert first_call["temperature"] == 0.1
     assert first_call["max_completion_tokens"] == 32
 
-    # prepare_turn shapes only the next request. It should not rewrite the live transcript.
+    # prepare_turn shapes only the next request.
+    # It should not rewrite the live transcript.
     assert result.status is RunStatus.COMPLETED
     assert result.messages == (
         {"role": "system", "content": "Base instructions."},

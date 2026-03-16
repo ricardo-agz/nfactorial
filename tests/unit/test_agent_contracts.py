@@ -214,6 +214,8 @@ async def test_verifier_retry_loops_without_transforming_final_output() -> None:
         "turn_number": 2,
     }
     assert agent.mock_client.call_count == 2
-    feedback_message = _first_system_message(agent.mock_client.call_history[1]["messages"])
+    feedback_message = _first_system_message(
+        agent.mock_client.call_history[1]["messages"]
+    )
     assert feedback_message is not None
     assert "Verifier feedback [needs_evidence]" in feedback_message

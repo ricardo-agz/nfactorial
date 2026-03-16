@@ -4,12 +4,12 @@ from typing import Any
 import pytest
 import redis.asyncio as redis
 
+from factorial.agent.context import AgentContext
 from factorial.core.exceptions import (
     MessagingGroupAlreadyExistsError,
     MessagingPermissionError,
     MessagingScopeError,
 )
-from factorial.agent.context import AgentContext
 from factorial.queue.keys import RedisKeys
 from factorial.queue.operations import (
     enqueue_task,
@@ -192,7 +192,9 @@ async def test_group_send_fanout_and_history_persistence(
         teammate = Task.create(
             owner_id=test_owner_id,
             agent=test_agent.name,
-            payload=AgentContext(messages=[{"role": "user", "content": f"teammate-{idx}"}]),
+            payload=AgentContext(
+                messages=[{"role": "user", "content": f"teammate-{idx}"}]
+            ),
         )
         teammate.metadata.team_id = team_id
         await enqueue_task(

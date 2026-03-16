@@ -5,7 +5,6 @@ import asyncio
 import traceback
 from dataclasses import dataclass
 from time import perf_counter
-from typing import Any
 
 import httpx
 
@@ -69,7 +68,10 @@ async def run_fixture_probes(
 async def _main_async(args: argparse.Namespace) -> int:
     bundle = load_fixture_bundle(args.fixture)
 
-    async with httpx.AsyncClient(base_url=args.base_url, timeout=args.http_timeout) as client:
+    async with httpx.AsyncClient(
+        base_url=args.base_url,
+        timeout=args.http_timeout,
+    ) as client:
         outcomes = await run_fixture_probes(
             bundle,
             client=client,
@@ -91,7 +93,9 @@ async def _main_async(args: argparse.Namespace) -> int:
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Run all probes for one fixture folder.")
+    parser = argparse.ArgumentParser(
+        description="Run all probes for one fixture folder."
+    )
     parser.add_argument("fixture", help="Path to the fixture directory")
     parser.add_argument(
         "--base-url",

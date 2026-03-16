@@ -65,7 +65,8 @@ def _coerce_inputs_for_agent(agent: Any, inputs: list[Any]) -> list[AgentContext
     build_context = getattr(agent, "build_context", None)
     if not callable(context_from_dict) or not callable(build_context):
         raise TypeError(
-            f"Subagent '{getattr(agent, 'name', '<unknown>')}' cannot coerce agent inputs."
+            f"Subagent '{getattr(agent, 'name', '<unknown>')}' "
+            "cannot coerce agent inputs."
         )
 
     coerced_inputs: list[AgentContext] = []

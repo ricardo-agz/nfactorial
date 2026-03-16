@@ -25,8 +25,8 @@ from openai.types.chat.chat_completion_message_function_tool_call import (
 )
 from openai.types.completion_usage import CompletionUsage
 
-from factorial.ai.models import Model
 from factorial.agent.context import AgentContext
+from factorial.ai.models import Model
 
 
 @dataclass
@@ -178,7 +178,11 @@ class MockLLMClient:
         if self.response_generator:
             # Build minimal context for dynamic responses (turn_number defaults to 1)
             ctx = AgentContext(
-                messages=[{"role": "user", "content": "mock"}] if not messages else messages,
+                messages=(
+                    [{"role": "user", "content": "mock"}]
+                    if not messages
+                    else messages
+                ),
                 turn_number=1,
             )
             response = self.response_generator(messages, ctx)

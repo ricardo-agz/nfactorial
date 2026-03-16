@@ -187,7 +187,11 @@ def parse_event(payload: dict[str, Any]) -> BaseEvent:
         "task_id": payload.get("task_id"),
         "owner_id": payload.get("owner_id"),
         "agent_name": payload.get("agent_name"),
-        "turn": payload.get("turn") if payload.get("turn") is not None else payload.get("turn_number"),
+        "turn": (
+            payload.get("turn")
+            if payload.get("turn") is not None
+            else payload.get("turn_number")
+        ),
         "metadata": cast(dict[str, Any] | None, payload.get("metadata")),
         "timestamp": _parse_timestamp(payload.get("timestamp")),
     }
@@ -228,7 +232,9 @@ def parse_event(payload: dict[str, Any]) -> BaseEvent:
             finish_reason=cast(str | None, payload.get("finish_reason")),
             output=payload.get("output"),
             pending_tool_call_ids=tuple(payload.get("pending_tool_call_ids", ()) or ()),
-            pending_child_task_ids=tuple(payload.get("pending_child_task_ids", ()) or ()),
+            pending_child_task_ids=tuple(
+                payload.get("pending_child_task_ids", ()) or ()
+            ),
             usage=_parse_usage(payload.get("usage")),
         )
     if event_type in {
@@ -290,7 +296,9 @@ def parse_event(payload: dict[str, Any]) -> BaseEvent:
             **common_kwargs,
             status=status,
             output=payload.get("output") or payload.get("data"),
-            run_error=_parse_run_error(payload.get("run_error") or payload.get("error")),
+            run_error=_parse_run_error(
+                payload.get("run_error") or payload.get("error")
+            ),
             turn_count=cast(int | None, payload.get("turn_count")),
             usage=_parse_usage(payload.get("usage")),
         )

@@ -1,12 +1,14 @@
-FROM node:18-alpine
+FROM node:20-bookworm-slim
 
 WORKDIR /app
 
-# Copy package files
-COPY package*.json ./
+ENV NODE_ENV=development
 
-# Install dependencies
-RUN npm install
+# Copy package files
+COPY package.json ./
+
+# Use linux-native optional deps (tailwind oxide) instead of reusing host lock metadata.
+RUN npm install --include=optional
 
 # Copy source code
 COPY . .

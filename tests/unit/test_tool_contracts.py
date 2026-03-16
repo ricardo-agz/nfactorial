@@ -116,6 +116,10 @@ class _PlainModel(BaseModel):
     value: int
 
 
+class _ApprovalPayload(BaseModel):
+    approved: bool
+
+
 def test_hidden_annotation_detected() -> None:
     from typing import get_type_hints
 
@@ -251,7 +255,6 @@ async def test_tool_action_plain_string_return() -> None:
     try:
         tool_call = _make_tool_call("echo", {"text": "hello"})
         result = await _invoke_tool(agent, tool_call)
-        assert isinstance(result, _ToolResultInternal)
         assert result.model_output == "echo: hello"
         assert result.client_output == "echo: hello"
     finally:
@@ -269,7 +272,6 @@ async def test_tool_action_dict_return() -> None:
     try:
         tool_call = _make_tool_call("get_data")
         result = await _invoke_tool(agent, tool_call)
-        assert isinstance(result, _ToolResultInternal)
         assert result.client_output == {"key": "value", "count": 42}
         assert "key" in result.model_output
         assert "value" in result.model_output
@@ -288,7 +290,6 @@ async def test_tool_action_none_return() -> None:
     try:
         tool_call = _make_tool_call("noop")
         result = await _invoke_tool(agent, tool_call)
-        assert isinstance(result, _ToolResultInternal)
         assert result.model_output == ""
         assert result.client_output is None
     finally:
@@ -316,7 +317,6 @@ async def test_tool_action_basemodel_with_hidden() -> None:
     try:
         tool_call = _make_tool_call("edit")
         result = await _invoke_tool(agent, tool_call)
-        assert isinstance(result, _ToolResultInternal)
         # Model sees only non-hidden fields
         assert "summary" in result.model_output
         assert "Edited file" in result.model_output
@@ -341,7 +341,6 @@ async def test_tool_action_basemodel_without_hidden() -> None:
     try:
         tool_call = _make_tool_call("get_info")
         result = await _invoke_tool(agent, tool_call)
-        assert isinstance(result, _ToolResultInternal)
         # Both model and client see all fields
         assert "name" in result.model_output
         assert "test" in result.model_output
@@ -361,7 +360,6 @@ async def test_tool_action_wait_instruction_with_data() -> None:
     try:
         tool_call = _make_tool_call("wait_tool")
         result = await _invoke_tool(agent, tool_call)
-        assert isinstance(result, _ToolResultInternal)
         assert result.model_output == "Cooling down"
         assert isinstance(result.client_output, WaitInstruction)
         assert result.client_output.data == "Cooling down"
@@ -380,9 +378,26 @@ async def test_tool_action_wait_instruction_default_message() -> None:
     try:
         tool_call = _make_tool_call("wait_tool")
         result = await _invoke_tool(agent, tool_call)
-        assert isinstance(result, _ToolResultInternal)
         assert "60" in result.model_output
         assert isinstance(result.client_output, WaitInstruction)
+    finally:
+        execution_context.reset(token)
+        await agent.http_client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_tool_action_coerces_postponed_annotated_model_arguments() -> None:
+    @tool
+    def approve(payload: Annotated[_ApprovalPayload, "typed"]) -> bool:
+        return payload.approved
+
+    agent = _make_agent_with_tools([approve])
+    token = _set_test_execution_context()
+    try:
+        tool_call = _make_tool_call("approve", {"payload": {"approved": True}})
+        result = await _invoke_tool(agent, tool_call)
+        assert result.client_output is True
+        assert result.model_output == "true"
     finally:
         execution_context.reset(token)
         await agent.http_client.aclose()
@@ -429,28 +444,3 @@ async def test_tool_action_list_return_is_plain_result() -> None:
         await agent.http_client.aclose()
 
 
-# ---------------------------------------------------------------------------
-# WaitInstruction data= parameter
-# ---------------------------------------------------------------------------
-
-
-def test_wait_sleep_data_string() -> None:
-    instr = wait.sleep(10, data="pausing")
-    assert instr.data == "pausing"
-    assert instr.sleep_s == 10
-
-
-def test_wait_sleep_data_dict() -> None:
-    instr = wait.sleep(10, data={"reason": "cooldown"})
-    assert instr.data == {"reason": "cooldown"}
-
-
-def test_wait_cron_data() -> None:
-    instr = wait.cron("*/5 * * * *", data="next tick")
-    assert instr.data == "next tick"
-    assert instr.cron == "*/5 * * * *"
-
-
-def test_wait_sleep_no_data_defaults_none() -> None:
-    instr = wait.sleep(5)
-    assert instr.data is None

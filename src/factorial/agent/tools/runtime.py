@@ -5,7 +5,7 @@ import hashlib
 import inspect
 import json
 from datetime import datetime, timezone
-from typing import Annotated, Any, TypeVar, cast, get_args, get_origin
+from typing import Annotated, Any, TypeVar, cast, get_args, get_origin, get_type_hints
 
 from openai.types.chat import ChatCompletionMessageToolCall
 from pydantic import BaseModel
@@ -151,10 +151,15 @@ def _coerce_tool_argument_models(
     action: Any,
     parsed_tool_args: dict[str, Any],
 ) -> None:
+    try:
+        resolved_hints = get_type_hints(action, include_extras=True)
+    except Exception:
+        resolved_hints = {}
+
     for param_name, param in inspect.signature(action).parameters.items():
         if param_name not in parsed_tool_args:
             continue
-        expected = param.annotation
+        expected = resolved_hints.get(param_name, param.annotation)
         if expected is inspect.Parameter.empty:
             continue
 

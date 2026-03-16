@@ -123,7 +123,7 @@ const App: React.FC = () => {
           )}
         </div>
       )),
-    [messages]
+    [messages, subAgentProgress, researchProgress]
   );
 
   return (

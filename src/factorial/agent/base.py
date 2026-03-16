@@ -115,6 +115,7 @@ from factorial.execution.context import (
     ExecutionContext,
     execution_context,
 )
+from factorial.execution.waits import WaitInstruction
 
 logger = get_logger(__name__)
 
@@ -473,6 +474,37 @@ class BaseAgent(Generic[ContextType]):
             return f"tool_called:{tool_names}"
         return str(response.choices[0].finish_reason or "stop")
 
+    def _event_pending_child_details(
+        self,
+        resolved_tool_results: list[
+            tuple[ChatCompletionMessageToolCall, _ToolResultInternal | Exception]
+        ],
+    ) -> tuple[tuple[str, ...], tuple[str, ...]]:
+        child_task_ids: list[str] = []
+        source_tool_call_ids: list[str] = []
+
+        for tool_call, result in resolved_tool_results:
+            if isinstance(result, Exception):
+                continue
+
+            result_child_task_ids = list(result.pending_child_task_ids or ())
+            if result_child_task_ids:
+                child_task_ids.extend(result_child_task_ids)
+                source_tool_call_ids.append(tool_call.id)
+
+            if (
+                isinstance(result.client_output, WaitInstruction)
+                and result.client_output.kind == "jobs"
+                and result.client_output.child_task_ids
+            ):
+                child_task_ids.extend(result.client_output.child_task_ids)
+                source_tool_call_ids.append(tool_call.id)
+
+        return (
+            tuple(dict.fromkeys(child_task_ids)),
+            tuple(dict.fromkeys(source_tool_call_ids)),
+        )
+
     def _format_verifier_feedback(self, decision: VerifierRetry[Any]) -> str:
         code_suffix = f" [{decision.code}]" if decision.code else ""
         return f"Verifier feedback{code_suffix}: {decision.message}"
@@ -679,6 +711,9 @@ class BaseAgent(Generic[ContextType]):
             usage=turn_usage,
         )
         execution_ctx.last_turn = turn_summary
+        event_pending_child_task_ids, event_source_tool_call_ids = (
+            self._event_pending_child_details(tool_results.resolved_results)
+        )
 
         if tool_results.pending_tool_call_ids:
             wait_event = WaitEvent(
@@ -691,14 +726,15 @@ class BaseAgent(Generic[ContextType]):
             )
             await self._emit_event(wait_event, agent_ctx, execution_ctx)
 
-        if tool_results.pending_child_task_ids:
+        if event_pending_child_task_ids:
             wait_event = WaitEvent(
                 task_id=execution_ctx.task_id,
                 owner_id=execution_ctx.owner_id,
                 agent_name=self.name,
                 turn=agent_ctx.turn_number,
                 wait_kind="pending_child_task_results",
-                source_tool_call_ids=tuple(tool_results.pending_child_task_ids),
+                source_tool_call_ids=event_source_tool_call_ids,
+                pending_child_task_ids=event_pending_child_task_ids,
             )
             await self._emit_event(wait_event, agent_ctx, execution_ctx)
 
@@ -737,9 +773,7 @@ class BaseAgent(Generic[ContextType]):
                         finish_reason=finish_reason,
                         output=candidate_output,
                         pending_tool_call_ids=tuple(tool_results.pending_tool_call_ids),
-                        pending_child_task_ids=tuple(
-                            tool_results.pending_child_task_ids
-                        ),
+                        pending_child_task_ids=event_pending_child_task_ids,
                         usage=turn_usage,
                     ),
                     agent_ctx,
@@ -768,7 +802,7 @@ class BaseAgent(Generic[ContextType]):
                 finish_reason=finish_reason,
                 output=None,
                 pending_tool_call_ids=tuple(tool_results.pending_tool_call_ids),
-                pending_child_task_ids=tuple(tool_results.pending_child_task_ids),
+                pending_child_task_ids=event_pending_child_task_ids,
                 usage=turn_usage,
             ),
             agent_ctx,

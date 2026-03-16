@@ -1,21 +1,16 @@
-FROM node:18-alpine
+FROM node:20-bookworm-slim
 
 WORKDIR /app
 
-# Ensure dev dependencies are installed (needed for Vite dev server)
 ENV NODE_ENV=development
 
-# Copy package files
-COPY package*.json ./
+COPY package.json ./
 
-# Install dependencies
-RUN npm install
+# Use linux-native optional deps (tailwind oxide) instead of reusing host lock metadata.
+RUN npm install --include=optional
 
-# Copy source code
 COPY . .
 
-# Expose port
 EXPOSE 5173
 
-# Start development server
 CMD ["npm", "run", "dev", "--", "--host", "0.0.0.0"]

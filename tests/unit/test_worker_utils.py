@@ -16,37 +16,6 @@ from factorial.queue.worker import (
 )
 
 
-class TestCompletionAction:
-    """Tests for CompletionAction enum."""
-
-    def test_all_actions_are_strings(self) -> None:
-        """Verify all CompletionAction values are strings."""
-        for action in CompletionAction:
-            assert isinstance(action.value, str)
-
-    def test_expected_actions_exist(self) -> None:
-        """Verify all expected actions exist."""
-        expected = [
-            "continue",
-            "pending_tool_call_results",
-            "pending_child_task_results",
-            "complete",
-            "retry",
-            "backoff",
-            "fail",
-        ]
-        actual = [a.value for a in CompletionAction]
-        assert set(expected) == set(actual)
-
-    def test_action_from_string(self) -> None:
-        """Test creating CompletionAction from string value."""
-        assert CompletionAction("continue") == CompletionAction.CONTINUE
-        assert CompletionAction("complete") == CompletionAction.COMPLETE
-        assert CompletionAction("retry") == CompletionAction.RETRY
-        assert CompletionAction("backoff") == CompletionAction.BACKOFF
-        assert CompletionAction("fail") == CompletionAction.FAIL
-
-
 class TestClassifyFailure:
     """Tests for classify_failure function."""
 

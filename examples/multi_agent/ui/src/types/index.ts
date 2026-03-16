@@ -4,7 +4,14 @@ export interface AgentEvent {
   agent_name?: string;
   turn?      : number;
   data?      : any;
+  output?    : any;
+  status?    : string;
   error?     : string;
+  run_error? : { message?: string } | null;
+  tool_name? : string;
+  tool_call_id?: string;
+  is_error?  : boolean;
+  progress?  : number;
   timestamp  : string;
 }
 

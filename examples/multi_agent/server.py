@@ -16,6 +16,15 @@ WS_REDIS_SUB_TIMEOUT = 5.0  # seconds
 redis_client: RedisType
 
 
+def _build_input(
+    message_history: list[dict[str, str]],
+    query: str,
+) -> str | list[dict[str, str]]:
+    if not message_history:
+        return query
+    return [*message_history, {"role": "user", "content": query}]
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global redis_client
@@ -106,7 +115,7 @@ class SteerRequest(BaseModel):
 async def enqueue(request: EnqueueRequest):
     task = await orchestrator.enqueue(
         basic_agent,
-        input=request.message_history if request.message_history else request.query,
+        input=_build_input(request.message_history, request.query),
         owner_id=request.user_id,
     )
 

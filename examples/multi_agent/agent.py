@@ -11,9 +11,9 @@ from factorial import (
     Hidden,
     WaitInstruction,
     any_of,
-    no_tool_calls,
     subagents,
     tool,
+    tool_called,
     turn_count_is,
     verify,
     wait,
@@ -32,9 +32,7 @@ class PlanResult(BaseModel):
     steps: Annotated[list[str], Hidden]
 
 
-def plan(
-    overview: str, steps: list[str], agent_ctx
-) -> PlanResult:
+def plan(overview: str, steps: list[str], agent_ctx) -> PlanResult:
     """Structure your plan to accomplish the task.
 
     This should be user-readable and not mention any specific tool names.
@@ -75,40 +73,16 @@ def search(query: str) -> SearchResult:
     return SearchResult(summary=str(result), results=data)
 
 
-class FinalOutput(BaseModel):
-    final_output: str
-
-
 @dataclass
 class MainAgentState:
     has_used_research: bool = False
+    done_turn: int | None = None
 
 
-def verify_final_output(
-    output: FinalOutput | str,
-    *,
-    agent_ctx,
-):
-    if isinstance(output, str):
-        output = FinalOutput(final_output=output)
-    text = output.final_output.strip()
-    if not text:
-        return verify.fail(
-            message="Final output cannot be empty.",
-            code="empty_output",
-        )
-    if len(text) < 40:
-        return verify.fail(
-            message="Final output is too short; provide a more complete response.",
-            code="output_too_short",
-            metadata={"min_chars": 40, "actual_chars": len(text)},
-        )
-    if not agent_ctx.state.has_used_research:
-        return verify.fail(
-            message="Use the research tool at least once before finalizing.",
-            code="research_required",
-        )
-    return verify.accept()
+@tool
+def done(final_output: str, agent_ctx) -> str:
+    """Finish the task with the final user-facing response."""
+    return final_output.strip()
 
 
 def _research_enabled(agent_ctx) -> bool:
@@ -141,10 +115,10 @@ search_agent = Agent[Any](
     description="Research Sub-Agent",
     model=ai_gateway(gpt_41_mini),
     instructions="You are an intelligent research assistant.",
-    tools=[reflect, search],
+    tools=[reflect, search, done],
     temperature=1.0,
     tool_choice="required",
-    stop_when=any_of(no_tool_calls(), turn_count_is(10)),
+    stop_when=any_of(tool_called("done"), turn_count_is(10)),
 )
 
 basic_agent = Agent[MainAgentState](
@@ -152,8 +126,7 @@ basic_agent = Agent[MainAgentState](
     description="Main Agent",
     model=ai_gateway(gpt_41_mini),
     instructions="You are a helpful assistant. Always start by making a plan.",
-    tools=[plan, reflect, research, search],
+    tools=[plan, reflect, research, search, done],
     prepare_turn=_main_prepare_turn,
-    verifier=verify_final_output,
-    stop_when=any_of(no_tool_calls(), turn_count_is(15)),
+    stop_when=any_of(tool_called("done"), turn_count_is(15)),
 )

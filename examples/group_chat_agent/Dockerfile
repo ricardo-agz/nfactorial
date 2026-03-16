@@ -1,6 +1,8 @@
 FROM python:3.11-slim AS base
 
 WORKDIR /app
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONPYCACHEPREFIX=/tmp/pycache
 
 RUN apt-get update && apt-get install -y \
     gcc \
@@ -19,10 +21,10 @@ FROM base AS agent
 
 EXPOSE 8081
 
-CMD ["python", "orchestrator.py"]
+CMD ["sh", "-c", "rm -rf /tmp/pycache && exec python orchestrator.py"]
 
 FROM base AS server
 
 EXPOSE 8000
 
-CMD ["python", "server.py"]
+CMD ["sh", "-c", "rm -rf /tmp/pycache && exec python server.py"]

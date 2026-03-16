@@ -165,7 +165,10 @@ class MockLLMClient:
                 "messages": messages,
                 "tools": tools,
                 "temperature": temperature,
+                "max_completion_tokens": max_completion_tokens,
                 "tool_choice": tool_choice,
+                "parallel_tool_calls": parallel_tool_calls,
+                "stream": stream,
             }
         )
 
@@ -258,20 +261,6 @@ def create_multi_turn_mock(
     ]
     responses.append(MockResponse(content=final_content, is_final=True))
     return MockLLMClient(responses=responses)
-
-
-def create_final_output_tool_mock(output: dict[str, Any]) -> MockLLMClient:
-    """Create a mock that simulates structured completion-style payloads."""
-    return MockLLMClient(
-        responses=[
-            MockResponse(
-                tool_calls=[MockToolCall(name="final_output", arguments=output)],
-                is_final=True,
-            )
-        ]
-    )
-
-
 def create_failing_mock(
     exception: Exception,
     fail_on_call: int = 1,

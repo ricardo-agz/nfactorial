@@ -86,10 +86,39 @@ class FinalOutput(BaseModel):
     final_output: str
 
 
-def verify_parent_output(output: FinalOutput | str, *, agent_ctx):
+def _coerce_final_text(output: Any) -> str:
     if isinstance(output, str):
-        output = FinalOutput(final_output=output)
-    text = output.final_output.strip()
+        return output
+    if isinstance(output, FinalOutput):
+        return output.final_output
+    if isinstance(output, BaseModel):
+        data = output.model_dump()
+    elif isinstance(output, dict):
+        data = output
+    else:
+        return str(output)
+
+    final_output = data.get("final_output")
+    if isinstance(final_output, str):
+        return final_output
+    summary = data.get("summary")
+    if isinstance(summary, str):
+        return summary
+    return str(data)
+
+
+def _latest_user_message(agent_ctx) -> str:
+    for message in reversed(agent_ctx.messages):
+        if message.get("role") != "user":
+            continue
+        content = message.get("content")
+        if isinstance(content, str) and content.strip():
+            return content.strip()
+    return ""
+
+
+def verify_parent_output(output: Any, *, agent_ctx):
+    text = _coerce_final_text(output).strip()
     if not text:
         return verify.fail(
             message="Final output cannot be empty.",
@@ -107,7 +136,9 @@ def verify_parent_output(output: FinalOutput | str, *, agent_ctx):
             code="children_wait_required",
         )
 
-    expected_roles = sorted(role for role in agent_ctx.state.roster.keys() if role != "parent")
+    expected_roles = sorted(
+        role for role in agent_ctx.state.roster.keys() if role != "parent"
+    )
 
     lowered = text.lower()
     if "credit" not in lowered:
@@ -171,9 +202,7 @@ async def _sync_group_membership(agent_ctx) -> dict[str, str]:
         if candidate_child_ids:
             candidate_child_ids.sort()
             ordered_child_ids = sorted(
-                task_id
-                for task_id in member_task_ids
-                if task_id != roster["parent"]
+                task_id for task_id in member_task_ids if task_id != roster["parent"]
             )
             if current_task_id in ordered_child_ids and len(ordered_child_ids) > 1:
                 current_index = ordered_child_ids.index(current_task_id)
@@ -213,7 +242,8 @@ def _resolve_dm_target(raw_target: str, roster: dict[str, str]) -> str:
 @tool
 async def spawn_team(topic: str, agent_ctx) -> SpawnTeamResult:
     """
-    Parent-only: spawn researcher/skeptic/synthesizer subagents and create a team chat group.
+    Parent-only: spawn researcher/skeptic/synthesizer subagents and create
+    a team chat group.
     """
     if agent_ctx.state.role_name != "parent":
         raise ValueError("Only the parent coordinator can spawn the team.")
@@ -223,13 +253,19 @@ async def spawn_team(topic: str, agent_ctx) -> SpawnTeamResult:
             group_name=agent_ctx.state.group_name,
             roster=agent_ctx.state.roster,
             child_task_ids=[
-                task_id for role, task_id in agent_ctx.state.roster.items() if role != "parent"
+                task_id
+                for role, task_id in agent_ctx.state.roster.items()
+                if role != "parent"
             ],
         )
 
     normalized_topic = topic.strip() if isinstance(topic, str) else ""
     if not normalized_topic:
-        normalized_topic = agent_ctx.query.strip() or "multi-agent coordination demo"
+        normalized_topic = agent_ctx.state.topic.strip() or _latest_user_message(
+            agent_ctx
+        )
+    if not normalized_topic:
+        normalized_topic = "multi-agent coordination demo"
 
     researcher_state = DemoState(
         role_name="researcher",

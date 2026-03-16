@@ -116,6 +116,7 @@ class WaitEvent(AgentEvent):
     wake_at: str | None = None
     signal_id: str | None = None
     source_tool_call_ids: tuple[str, ...] = ()
+    pending_child_task_ids: tuple[str, ...] = ()
 
 
 @dataclass(kw_only=True)
@@ -238,18 +239,44 @@ def parse_event(payload: dict[str, Any]) -> BaseEvent:
         "task_signal_wait_satisfied",
     }:
         data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
-        wait_kind = cast(str | None, data.get("wait_kind")) if isinstance(data, dict) else None
-        wake_at = data.get("wake_timestamp") if isinstance(data, dict) else None
+        wait_kind = cast(
+            str | None,
+            payload.get("wait_kind")
+            if payload.get("wait_kind") is not None
+            else data.get("wait_kind"),
+        )
+        wake_at = payload.get("wake_at")
+        if wake_at is None and isinstance(data, dict):
+            wake_at = data.get("wake_timestamp")
         if wake_at is not None:
             wake_at = str(wake_at)
-        signal_id = cast(str | None, data.get("signal_id")) if isinstance(data, dict) else None
-        source_tool_call_ids = tuple(data.get("source_tool_call_ids", ()) or ()) if isinstance(data, dict) else ()
+        signal_id = cast(
+            str | None,
+            payload.get("signal_id")
+            if payload.get("signal_id") is not None
+            else data.get("signal_id"),
+        )
+        source_tool_call_ids = tuple(
+            payload.get("source_tool_call_ids", ())
+            or (data.get("source_tool_call_ids", ()) if isinstance(data, dict) else ())
+            or ()
+        )
+        pending_child_task_ids = tuple(
+            payload.get("pending_child_task_ids", ())
+            or (
+                data.get("pending_child_task_ids", ())
+                if isinstance(data, dict)
+                else ()
+            )
+            or ()
+        )
         return WaitEvent(
             **common_kwargs,
             wait_kind=wait_kind,
             wake_at=cast(str | None, wake_at),
             signal_id=signal_id,
             source_tool_call_ids=source_tool_call_ids,
+            pending_child_task_ids=pending_child_task_ids,
         )
     if event_type in {"finish", "run_completed", "run_failed", "run_cancelled"}:
         status = RunStatus.COMPLETED

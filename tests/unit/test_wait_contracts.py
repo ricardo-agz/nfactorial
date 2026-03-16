@@ -53,12 +53,6 @@ def test_next_cron_wake_timestamp_rejects_invalid_expression() -> None:
         next_cron_wake_timestamp("* * *", "UTC", now_ts=0)
 
 
-def test_wait_namespace_exposes_jobs_not_children() -> None:
-    assert hasattr(wait, "jobs")
-    assert not hasattr(wait, "children")
-    assert hasattr(wait, "activity")
-
-
 def test_wait_namespace_builders_return_serializable_instructions() -> None:
     sleep_wait = wait.sleep(12.5, data="retry shortly")
     cron_wait = wait.cron("0 * * * *", timezone="UTC", data="hourly sync")
@@ -120,6 +114,45 @@ def test_wait_activity_timeout_cron_builder() -> None:
 def test_wait_activity_timeout_rejects_non_scheduled_waits() -> None:
     with pytest.raises(ValueError, match="only supports wait.sleep"):
         wait.activity(timeout=wait.activity())
+
+
+def test_wait_until_signal_builder_without_timeout() -> None:
+    instruction = wait.until_signal("day_vote_open:2", data={"phase": "day_vote"})
+    assert instruction.kind == "signal"
+    assert instruction.signal_id == "day_vote_open:2"
+    assert instruction.data == {"phase": "day_vote"}
+    assert instruction.signal_timeout_kind is None
+
+
+def test_wait_until_signal_builder_with_sleep_timeout() -> None:
+    instruction = wait.until_signal(
+        "night_action_open:3",
+        timeout=wait.sleep(15.0),
+        data={"phase": "night_action"},
+    )
+    assert instruction.kind == "signal"
+    assert instruction.signal_id == "night_action_open:3"
+    assert instruction.signal_timeout_kind == "sleep"
+    assert instruction.signal_timeout_s == 15.0
+
+
+def test_wait_until_signal_builder_with_cron_timeout() -> None:
+    instruction = wait.until_signal(
+        "night_action_open:3",
+        timeout=wait.cron("*/2 * * * *", timezone="UTC"),
+    )
+    assert instruction.kind == "signal"
+    assert instruction.signal_id == "night_action_open:3"
+    assert instruction.signal_timeout_kind == "cron"
+    assert instruction.signal_timeout_cron == "*/2 * * * *"
+    assert instruction.signal_timeout_timezone == "UTC"
+
+
+def test_wait_until_signal_rejects_invalid_inputs() -> None:
+    with pytest.raises(ValueError, match="non-empty signal_id"):
+        wait.until_signal("   ")
+    with pytest.raises(ValueError, match="only supports wait.sleep"):
+        wait.until_signal("x", timeout=wait.activity())
 
 
 def test_wait_jobs_rejects_empty_job_list() -> None:
@@ -241,7 +274,4 @@ def test_wait_jobs_rejects_missing_parent_ref_in_execution_context() -> None:
         execution_context.reset(token)
 
 
-def test_wait_cron_rejects_removed_tz_alias() -> None:
-    with pytest.raises(TypeError, match="unexpected keyword argument 'tz'"):
-        wait.cron("0 * * * *", tz="America/New_York")
 

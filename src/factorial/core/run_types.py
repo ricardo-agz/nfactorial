@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Generic, TypeAlias, TypeVar
+from typing import TYPE_CHECKING, Any, Generic, TypeAlias, TypeVar
 
-if False:  # pragma: no cover
+if TYPE_CHECKING:
     from factorial.ai.messages import Message
 
 
@@ -161,7 +161,7 @@ class RunResult(Generic[OutputT, StateT, MetadataT]):
     turn_count: int
     last_turn: TurnSummary | None = None
     verification: VerificationSummary[Any] | None = None
-    started_at: datetime = field(default_factory=datetime.utcnow)
+    started_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     finished_at: datetime | None = None
     error: RunError | None = None
 

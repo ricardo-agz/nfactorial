@@ -22,6 +22,15 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+def _build_input(
+    message_history: list[dict[str, str]],
+    query: str,
+) -> str | list[dict[str, str]]:
+    if not message_history:
+        return query
+    return [*message_history, {"role": "user", "content": query}]
+
 @app.middleware("http")
 async def vercel_context_middleware(request: Request, call_next: Callable):
     set_headers(request.headers)
@@ -70,7 +79,7 @@ async def enqueue(request: EnqueueRequest):
 
     task = await orchestrator.enqueue(
         ide_agent,
-        input=request.message_history if request.message_history else request.query,
+        input=_build_input(request.message_history, request.query),
         owner_id=request.user_id,
         state=state,
     )

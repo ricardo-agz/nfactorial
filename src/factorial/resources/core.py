@@ -4,13 +4,21 @@ import json
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any, Generic, Protocol, TypeVar
+from typing import Any, Generic, Protocol, TypeGuard, TypeVar
 
 R = TypeVar("R")
+R_co = TypeVar("R_co", covariant=True)
 
 _RESOURCE_LIFECYCLE_ATTR = "__factorial_resource_lifecycle__"
-_RESOURCE_LIFECYCLES_BY_TYPE: dict[type[Any], type[Any]] = {}
+_RESOURCE_LIFECYCLES_BY_TYPE: dict[ResourceType[Any], type[Any]] = {}
 _RESOURCE_LIFECYCLES_BY_KEY: dict[str, type[Any]] = {}
+
+
+class ResourceType(Protocol[R_co]):
+    __module__: str
+    __qualname__: str
+
+    def __hash__(self) -> int: ...
 
 
 @dataclass(frozen=True)
@@ -40,7 +48,7 @@ class ResourceContext:
 
 @dataclass(frozen=True)
 class ResourceRequest(Generic[R]):
-    resource_type: type[R]
+    resource_type: ResourceType[R]
     logical_name: str = "default"
 
     @property
@@ -173,12 +181,12 @@ class ResourceBindingRecord:
         return cls.from_dict(json.loads(raw))
 
 
-def resource_type_key(resource_type: type[Any]) -> str:
+def resource_type_key(resource_type: ResourceType[Any]) -> str:
     return f"{resource_type.__module__}:{resource_type.__qualname__}"
 
 
 def register_resource_lifecycle(
-    resource_type: type[Any],
+    resource_type: ResourceType[R],
     lifecycle_type: type[ResourceLifecycle[R]],
 ) -> type[ResourceLifecycle[R]]:
     key = resource_type_key(resource_type)
@@ -192,7 +200,7 @@ def register_resource_lifecycle(
 
 
 def resource(
-    resource_type: type[Any],
+    resource_type: ResourceType[R],
 ) -> Callable[[type[ResourceLifecycle[R]]], type[ResourceLifecycle[R]]]:
     def decorator(
         lifecycle_type: type[ResourceLifecycle[R]],
@@ -203,23 +211,28 @@ def resource(
 
 
 def get_resource_lifecycle(
-    resource_type: type[Any],
-) -> type[ResourceLifecycle[Any]] | None:
+    resource_type: ResourceType[R],
+) -> type[ResourceLifecycle[R]] | None:
     lifecycle = _RESOURCE_LIFECYCLES_BY_TYPE.get(resource_type)
     if lifecycle is not None:
-        return lifecycle
+        return _coerce_resource_lifecycle(lifecycle)
 
-    lifecycle = getattr(resource_type, _RESOURCE_LIFECYCLE_ATTR, None)
-    if lifecycle is not None:
-        _RESOURCE_LIFECYCLES_BY_TYPE[resource_type] = lifecycle
-        _RESOURCE_LIFECYCLES_BY_KEY[resource_type_key(resource_type)] = lifecycle
-    return lifecycle
+    lifecycle_value = getattr(resource_type, _RESOURCE_LIFECYCLE_ATTR, None)
+    if not _is_resource_lifecycle_type(lifecycle_value):
+        return None
+
+    _RESOURCE_LIFECYCLES_BY_TYPE[resource_type] = lifecycle_value
+    _RESOURCE_LIFECYCLES_BY_KEY[resource_type_key(resource_type)] = lifecycle_value
+    return _coerce_resource_lifecycle(lifecycle_value)
 
 
 def get_resource_lifecycle_by_key(
     resource_type_key_value: str,
 ) -> type[ResourceLifecycle[Any]] | None:
-    return _RESOURCE_LIFECYCLES_BY_KEY.get(resource_type_key_value)
+    lifecycle = _RESOURCE_LIFECYCLES_BY_KEY.get(resource_type_key_value)
+    if not _is_resource_lifecycle_type(lifecycle):
+        return None
+    return lifecycle
 
 
 def has_resource_lifecycle(resource_type: Any) -> bool:
@@ -229,7 +242,24 @@ def has_resource_lifecycle(resource_type: Any) -> bool:
     )
 
 
-def lifecycle_supports_live_refs(lifecycle_type: type[Any]) -> bool:
+def _is_resource_lifecycle_type(
+    value: object,
+) -> TypeGuard[type[ResourceLifecycle[Any]]]:
+    return all(
+        hasattr(value, attr)
+        for attr in ("create", "restore", "checkpoint", "destroy")
+    )
+
+
+def _coerce_resource_lifecycle(
+    lifecycle_type: type[Any],
+) -> type[ResourceLifecycle[R]]:
+    return lifecycle_type
+
+
+def lifecycle_supports_live_refs(
+    lifecycle_type: type[ResourceLifecycle[R]],
+) -> TypeGuard[type[LiveResourceLifecycle[R]]]:
     return hasattr(lifecycle_type, "attach_live") and hasattr(
         lifecycle_type,
         "capture_live_ref",
@@ -249,6 +279,7 @@ def checkpoint_is_expired(checkpoint: ResourceCheckpoint) -> bool:
 __all__ = [
     "LiveResourceLifecycle",
     "LiveResourceRef",
+    "ResourceType",
     "ResourceBindingRecord",
     "ResourceCheckpoint",
     "ResourceContext",

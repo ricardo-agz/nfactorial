@@ -22,7 +22,19 @@ class SandboxExecResult:
 
 @dataclass(frozen=True)
 class SandboxCheckpoint(ResourceCheckpoint):
-    pass
+    @classmethod
+    def from_resource_checkpoint(
+        cls,
+        checkpoint: ResourceCheckpoint,
+    ) -> SandboxCheckpoint:
+        if isinstance(checkpoint, cls):
+            return checkpoint
+        return cls(
+            provider=checkpoint.provider,
+            kind=checkpoint.kind,
+            ref=checkpoint.ref,
+            metadata=dict(checkpoint.metadata),
+        )
 
 
 class SandboxProcess(ABC):

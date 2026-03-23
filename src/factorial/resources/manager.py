@@ -4,7 +4,7 @@ import asyncio
 import json
 import time
 from dataclasses import dataclass, field
-from typing import Any, Generic, Protocol, TypeVar, cast
+from typing import Any, Generic, Protocol, TypeVar
 
 import redis.asyncio as redis
 
@@ -12,12 +12,13 @@ from factorial.core.logging import get_logger
 from factorial.core.utils import resolve_awaitable
 
 from .core import (
-    LiveResourceLifecycle,
+    LiveResourceRef,
     ResourceBindingRecord,
     ResourceCheckpoint,
     ResourceContext,
     ResourceLifecycle,
     ResourceRequest,
+    ResourceType,
     checkpoint_is_expired,
     get_resource_lifecycle,
     lifecycle_supports_live_refs,
@@ -120,7 +121,7 @@ class RedisResourceBindingStore:
 
 @dataclass
 class _LiveBinding(Generic[R]):
-    resource_type: type[R]
+    resource_type: ResourceType[R]
     lifecycle: type[ResourceLifecycle[R]]
     request: ResourceRequest[R]
     resource: R
@@ -147,7 +148,11 @@ class ResourceManager:
             metadata=dict(self.metadata),
         )
 
-    def _lock(self, resource_type_value: type[Any], logical_name: str) -> asyncio.Lock:
+    def _lock(
+        self,
+        resource_type_value: ResourceType[Any],
+        logical_name: str,
+    ) -> asyncio.Lock:
         key = (resource_type_key(resource_type_value), logical_name)
         lock = self._locks.get(key)
         if lock is None:
@@ -155,16 +160,32 @@ class ResourceManager:
             self._locks[key] = lock
         return lock
 
+    def _binding_key(
+        self,
+        resource_type_value: ResourceType[Any],
+        logical_name: str,
+    ) -> tuple[str, str]:
+        return (resource_type_key(resource_type_value), logical_name)
+
+    def _get_live_binding(
+        self,
+        resource_type_value: ResourceType[R],
+        logical_name: str,
+    ) -> _LiveBinding[R] | None:
+        return self._live_bindings.get(
+            self._binding_key(resource_type_value, logical_name)
+        )
+
     async def get(
         self,
-        resource_type_value: type[R],
+        resource_type_value: ResourceType[R],
         logical_name: str = "default",
     ) -> R:
-        binding_key = (resource_type_key(resource_type_value), logical_name)
+        binding_key = self._binding_key(resource_type_value, logical_name)
         async with self._lock(resource_type_value, logical_name):
-            live_binding = self._live_bindings.get(binding_key)
+            live_binding = self._get_live_binding(resource_type_value, logical_name)
             if live_binding is not None:
-                return cast(R, live_binding.resource)
+                return live_binding.resource
 
             lifecycle = get_resource_lifecycle(resource_type_value)
             if lifecycle is None:
@@ -191,7 +212,7 @@ class ResourceManager:
                 if attached is not None:
                     return await self._remember_live_resource(
                         resource_type=resource_type_value,
-                        lifecycle=cast(type[ResourceLifecycle[R]], lifecycle),
+                        lifecycle=lifecycle,
                         request=request,
                         resource=attached,
                         checkpoint=persisted.checkpoint,
@@ -205,29 +226,23 @@ class ResourceManager:
                 if checkpoint_is_expired(persisted.checkpoint):
                     await self.store.delete(binding_key[0], logical_name)
                 else:
-                    restored = await cast(
-                        type[ResourceLifecycle[R]],
-                        lifecycle,
-                    ).restore(
+                    restored = await lifecycle.restore(
                         persisted.checkpoint,
                         ctx,
                         request,
                     )
                     return await self._remember_live_resource(
                         resource_type=resource_type_value,
-                        lifecycle=cast(type[ResourceLifecycle[R]], lifecycle),
+                        lifecycle=lifecycle,
                         request=request,
                         resource=restored,
                         checkpoint=persisted.checkpoint,
                     )
 
-            created = await cast(type[ResourceLifecycle[R]], lifecycle).create(
-                ctx,
-                request,
-            )
+            created = await lifecycle.create(ctx, request)
             return await self._remember_live_resource(
                 resource_type=resource_type_value,
-                lifecycle=cast(type[ResourceLifecycle[R]], lifecycle),
+                lifecycle=lifecycle,
                 request=request,
                 resource=created,
                 checkpoint=None,
@@ -235,12 +250,12 @@ class ResourceManager:
 
     async def checkpoint(
         self,
-        resource_type_value: type[R],
+        resource_type_value: ResourceType[R],
         logical_name: str = "default",
     ) -> ResourceCheckpoint | None:
-        binding_key = (resource_type_key(resource_type_value), logical_name)
+        binding_key = self._binding_key(resource_type_value, logical_name)
         async with self._lock(resource_type_value, logical_name):
-            live_binding = self._live_bindings.get(binding_key)
+            live_binding = self._get_live_binding(resource_type_value, logical_name)
             if live_binding is None:
                 persisted = await self.store.load(binding_key[0], logical_name)
                 return None if persisted is None else persisted.checkpoint
@@ -276,12 +291,13 @@ class ResourceManager:
 
     async def destroy(
         self,
-        resource_type_value: type[R],
+        resource_type_value: ResourceType[R],
         logical_name: str = "default",
     ) -> None:
-        binding_key = (resource_type_key(resource_type_value), logical_name)
+        binding_key = self._binding_key(resource_type_value, logical_name)
         async with self._lock(resource_type_value, logical_name):
-            live_binding = self._live_bindings.pop(binding_key, None)
+            live_binding = self._get_live_binding(resource_type_value, logical_name)
+            self._live_bindings.pop(binding_key, None)
             if live_binding is not None:
                 ctx = self._resource_context(logical_name)
                 await live_binding.lifecycle.destroy(
@@ -312,25 +328,23 @@ class ResourceManager:
         await self.store.delete_all()
         self._live_bindings.clear()
 
-    def _iter_live_resource_keys(self) -> list[tuple[type[Any], str]]:
-        keys: list[tuple[type[Any], str]] = []
+    def _iter_live_resource_keys(self) -> list[tuple[ResourceType[Any], str]]:
+        keys: list[tuple[ResourceType[Any], str]] = []
         for (_, logical_name), live_binding in self._live_bindings.items():
             keys.append((live_binding.resource_type, logical_name))
         return keys
 
     async def _try_attach_live(
         self,
-        lifecycle: type[ResourceLifecycle[Any]],
-        live_ref: Any,
+        lifecycle: type[ResourceLifecycle[R]],
+        live_ref: LiveResourceRef,
         ctx: ResourceContext,
-        request: ResourceRequest[Any],
-    ) -> Any | None:
+        request: ResourceRequest[R],
+    ) -> R | None:
         if not lifecycle_supports_live_refs(lifecycle):
             return None
         try:
-            live_lifecycle = cast(type[LiveResourceLifecycle[Any]], lifecycle)
-            attach_live = live_lifecycle.attach_live
-            return await attach_live(live_ref, ctx, request)
+            return await lifecycle.attach_live(live_ref, ctx, request)
         except Exception:
             logger.warning(
                 "Failed to attach live resource %s for %s",
@@ -343,7 +357,7 @@ class ResourceManager:
     async def _remember_live_resource(
         self,
         *,
-        resource_type: type[R],
+        resource_type: ResourceType[R],
         lifecycle: type[ResourceLifecycle[R]],
         request: ResourceRequest[R],
         resource: R,
@@ -358,9 +372,7 @@ class ResourceManager:
         )
 
         if lifecycle_supports_live_refs(lifecycle):
-            live_lifecycle = cast(type[LiveResourceLifecycle[R]], lifecycle)
-            capture_live_ref = live_lifecycle.capture_live_ref
-            live_ref = capture_live_ref(
+            live_ref = lifecycle.capture_live_ref(
                 resource,
                 self._resource_context(request.logical_name),
                 request,
@@ -396,14 +408,14 @@ class ResourcesExecutionNamespace:
 
     async def get_resource(
         self,
-        resource_type_value: type[R],
+        resource_type_value: ResourceType[R],
         logical_name: str = "default",
     ) -> R:
         return await self._require_manager().get(resource_type_value, logical_name)
 
     async def checkpoint_resource(
         self,
-        resource_type_value: type[R],
+        resource_type_value: ResourceType[R],
         logical_name: str = "default",
     ) -> ResourceCheckpoint | None:
         return await self._require_manager().checkpoint(
@@ -413,7 +425,7 @@ class ResourcesExecutionNamespace:
 
     async def destroy_resource(
         self,
-        resource_type_value: type[R],
+        resource_type_value: ResourceType[R],
         logical_name: str = "default",
     ) -> None:
         await self._require_manager().destroy(resource_type_value, logical_name)

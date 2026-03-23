@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import importlib
 import os
 from contextlib import suppress
 from dataclasses import dataclass
-from typing import Any, cast
+from typing import Literal, Protocol, TypedDict, TypeGuard
 
 from ..core import (
     LiveResourceRef,
@@ -34,6 +35,122 @@ _DEFAULT_EXPOSED_PORTS = [
     8888,
     9000,
 ]
+
+
+class _VercelSnapshotSource(TypedDict):
+    type: Literal["snapshot"]
+    snapshot_id: str
+
+
+class _VercelWriteFile(TypedDict):
+    path: str
+    content: bytes
+
+
+class _VercelSnapshotLike(Protocol):
+    @property
+    def snapshot_id(self) -> str: ...
+
+    @property
+    def source_sandbox_id(self) -> str: ...
+
+    @property
+    def expires_at(self) -> int: ...
+
+
+class _VercelCommandResultLike(Protocol):
+    @property
+    def cmd_id(self) -> str: ...
+
+    @property
+    def exit_code(self) -> int: ...
+
+    async def stdout(self) -> str: ...
+
+    async def stderr(self) -> str: ...
+
+
+class _VercelCommandLike(_VercelCommandResultLike, Protocol):
+    async def wait(self) -> _VercelCommandResultLike: ...
+
+    async def output(self, stream: str = "both") -> str: ...
+
+    async def kill(self, signal: int = 15) -> None: ...
+
+
+class _VercelAsyncSandboxLike(Protocol):
+    @property
+    def sandbox_id(self) -> str: ...
+
+    @property
+    def status(self) -> str: ...
+
+    async def wait_for_status(
+        self,
+        status: str,
+        *,
+        timeout: float = 30.0,
+        poll_interval: float = 0.5,
+    ) -> None: ...
+
+    async def run_command(
+        self,
+        cmd: str,
+        args: list[str] | None = None,
+        *,
+        cwd: str | None = None,
+        env: dict[str, str] | None = None,
+        sudo: bool = False,
+    ) -> _VercelCommandResultLike: ...
+
+    async def run_command_detached(
+        self,
+        cmd: str,
+        args: list[str] | None = None,
+        *,
+        cwd: str | None = None,
+        env: dict[str, str] | None = None,
+        sudo: bool = False,
+    ) -> _VercelCommandLike: ...
+
+    async def mk_dir(self, path: str, *, cwd: str | None = None) -> None: ...
+
+    async def read_file(self, path: str, *, cwd: str | None = None) -> bytes | None: ...
+
+    async def write_files(self, files: list[_VercelWriteFile]) -> None: ...
+
+    def domain(self, port: int) -> str: ...
+
+    async def snapshot(self) -> _VercelSnapshotLike: ...
+
+    async def stop(self) -> None: ...
+
+
+class _VercelAsyncSandboxFactory(Protocol):
+    @staticmethod
+    async def create(
+        *,
+        source: _VercelSnapshotSource | None = None,
+        ports: list[int] | None = None,
+        timeout: int | None = None,
+        resources: dict[str, object] | None = None,
+        runtime: str | None = None,
+        token: str | None = None,
+        project_id: str | None = None,
+        team_id: str | None = None,
+        interactive: bool = False,
+        env: dict[str, str] | None = None,
+        network_policy: object | None = None,
+    ) -> _VercelAsyncSandboxLike: ...
+
+    @staticmethod
+    async def get(
+        *,
+        sandbox_id: str,
+        token: str | None = None,
+        project_id: str | None = None,
+        team_id: str | None = None,
+    ) -> _VercelAsyncSandboxLike: ...
 
 
 def _configured_ports() -> list[int]:
@@ -75,29 +192,43 @@ def _configured_runtime() -> str | None:
     return raw.strip()
 
 
-def _load_vercel_async_sandbox() -> Any:
+def _is_vercel_async_sandbox_factory(
+    value: object,
+) -> TypeGuard[_VercelAsyncSandboxFactory]:
+    create = getattr(value, "create", None)
+    get = getattr(value, "get", None)
+    return callable(create) and callable(get)
+
+
+def _load_vercel_async_sandbox() -> _VercelAsyncSandboxFactory:
     try:
-        from vercel.sandbox import AsyncSandbox  # type: ignore[import-not-found]
+        module = importlib.import_module("vercel.sandbox")
     except ImportError as exc:  # pragma: no cover
         raise RuntimeError(
             "Sandbox support requires the `vercel` package. "
             'Install it with `pip install "nfactorial[vercel]"`.'
         ) from exc
-    return AsyncSandbox
+    async_sandbox: object = getattr(module, "AsyncSandbox", None)
+    if not _is_vercel_async_sandbox_factory(async_sandbox):
+        raise RuntimeError(
+            "Installed `vercel` package does not expose `vercel.sandbox.AsyncSandbox`."
+        )
+    return async_sandbox
 
 
-async def _ensure_running(native_sandbox: Any) -> None:
-    if getattr(native_sandbox, "status", None) == "running":
+async def _ensure_running(native_sandbox: _VercelAsyncSandboxLike) -> None:
+    if native_sandbox.status == "running":
         return
-    wait_for_status = getattr(native_sandbox, "wait_for_status", None)
-    if callable(wait_for_status):
-        await wait_for_status("running", timeout=_configured_ready_timeout_s())
+    await native_sandbox.wait_for_status(
+        "running",
+        timeout=_configured_ready_timeout_s(),
+    )
 
 
-async def _command_to_result(command: Any) -> SandboxExecResult:
+async def _command_to_result(command: _VercelCommandResultLike) -> SandboxExecResult:
     return SandboxExecResult(
-        command_id=getattr(command, "cmd_id", None),
-        exit_code=int(getattr(command, "exit_code", 0)),
+        command_id=command.cmd_id,
+        exit_code=command.exit_code,
         stdout_text=await command.stdout(),
         stderr_text=await command.stderr(),
     )
@@ -105,7 +236,7 @@ async def _command_to_result(command: Any) -> SandboxExecResult:
 
 @dataclass
 class VercelSandboxProcess(SandboxProcess):
-    command: Any
+    command: _VercelCommandLike
 
     @property
     def id(self) -> str:
@@ -116,13 +247,13 @@ class VercelSandboxProcess(SandboxProcess):
         return await _command_to_result(finished)
 
     async def output(self, stream: str = "both") -> str:
-        return cast(str, await self.command.output(stream))
+        return await self.command.output(stream)
 
     async def stdout(self) -> str:
-        return cast(str, await self.command.stdout())
+        return await self.command.stdout()
 
     async def stderr(self) -> str:
-        return cast(str, await self.command.stderr())
+        return await self.command.stderr()
 
     async def kill(self, signal: int = 15) -> None:
         await self.command.kill(signal=signal)
@@ -130,7 +261,7 @@ class VercelSandboxProcess(SandboxProcess):
 
 @dataclass
 class VercelSandboxHandle(Sandbox):
-    sandbox: Any
+    sandbox: _VercelAsyncSandboxLike
 
     @property
     def id(self) -> str:
@@ -141,7 +272,7 @@ class VercelSandboxHandle(Sandbox):
         return "vercel"
 
     @property
-    def native(self) -> object:
+    def native(self) -> _VercelAsyncSandboxLike:
         return self.sandbox
 
     async def exec(
@@ -193,25 +324,24 @@ class VercelSandboxHandle(Sandbox):
         return VercelSandboxProcess(command=command)
 
     async def read_file(self, path: str) -> bytes | None:
-        return cast(bytes | None, await self.sandbox.read_file(path))
+        return await self.sandbox.read_file(path)
 
     async def write_files(self, files: list[SandboxWriteFile]) -> None:
-        await self.sandbox.write_files(
-            [
-                {
-                    "path": file.path,
-                    "content": encode_sandbox_file_content(file.content),
-                }
-                for file in files
-            ]
-        )
+        payload: list[_VercelWriteFile] = [
+            {
+                "path": file.path,
+                "content": encode_sandbox_file_content(file.content),
+            }
+            for file in files
+        ]
+        await self.sandbox.write_files(payload)
 
     async def mkdir(self, path: str, *, parents: bool = True) -> None:
         del parents
         await self.sandbox.mk_dir(path)
 
     async def url(self, port: int) -> str:
-        return cast(str, self.sandbox.domain(port))
+        return self.sandbox.domain(port)
 
     async def checkpoint(self) -> SandboxCheckpoint:
         snapshot = await self.sandbox.snapshot()
@@ -252,8 +382,12 @@ class VercelSandboxLifecycle:
     ) -> Sandbox:
         del ctx, request
         async_sandbox = _load_vercel_async_sandbox()
+        source: _VercelSnapshotSource = {
+            "type": "snapshot",
+            "snapshot_id": checkpoint.ref,
+        }
         sandbox = await async_sandbox.create(
-            source={"type": "snapshot", "snapshot_id": checkpoint.ref},
+            source=source,
             ports=_configured_ports(),
             timeout=_configured_timeout_ms(),
             runtime=_configured_runtime(),
@@ -279,11 +413,9 @@ class VercelSandboxLifecycle:
         request: ResourceRequest[Sandbox],
     ) -> None:
         del ctx, request
-        native = getattr(resource, "native", None)
-        stop = getattr(native, "stop", None)
-        if callable(stop):
+        if isinstance(resource, VercelSandboxHandle):
             with suppress(Exception):
-                await stop()
+                await resource.sandbox.stop()
 
     @classmethod
     async def attach_live(
@@ -296,7 +428,7 @@ class VercelSandboxLifecycle:
         async_sandbox = _load_vercel_async_sandbox()
         with suppress(Exception):
             sandbox = await async_sandbox.get(sandbox_id=live_ref.ref)
-            if getattr(sandbox, "status", None) not in {"running", "pending"}:
+            if sandbox.status not in {"running", "pending"}:
                 return None
             await _ensure_running(sandbox)
             return VercelSandboxHandle(sandbox=sandbox)

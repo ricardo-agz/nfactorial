@@ -5,6 +5,7 @@ from .core import (
     ResourceContext,
     ResourceLifecycle,
     ResourceRequest,
+    ResourceType,
     register_resource_lifecycle,
     resource,
 )
@@ -35,6 +36,7 @@ __all__ = [
     "ResourceLifecycle",
     "ResourceManager",
     "ResourceRequest",
+    "ResourceType",
     "ResourcesExecutionNamespace",
     "Sandbox",
     "SandboxCheckpoint",

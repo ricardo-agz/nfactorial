@@ -474,9 +474,13 @@ async def run_agent_cancellation(
     )
 
     try:
+        await redis_client.delete(
+            RedisKeys.format(namespace=namespace, task_id=task.id).resource_bindings
+        )
         execution_ctx = ExecutionContext(
             task_id=task.id,
             owner_id=task.metadata.owner_id,
+            agent_name=agent.name,
             retry_count=task.retries,
             events=event_publisher,
         )

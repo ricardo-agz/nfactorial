@@ -26,6 +26,7 @@ from pydantic import BaseModel, ConfigDict
 from factorial.agent.context import AgentContext
 from factorial.core.utils import decode
 from factorial.execution.context import ExecutionContext
+from factorial.execution.dependencies import is_runtime_injected_annotation
 
 HookT = TypeVar("HookT", bound="Hook")
 HookRequestBuilder = Callable[..., "PendingHook[Any] | Awaitable[PendingHook[Any]]"]
@@ -496,13 +497,7 @@ def is_hook_dependency_annotation(annotation: Any) -> bool:
 
 
 def _is_execution_injected_tool_param(name: str, annotation: Any) -> bool:
-    if name in {"agent_ctx", "execution_ctx"}:
-        return True
-    if isinstance(annotation, type) and (
-        issubclass(annotation, AgentContext) or issubclass(annotation, ExecutionContext)
-    ):
-        return True
-    return False
+    return is_runtime_injected_annotation(name, annotation)
 
 
 def _is_request_context_param(name: str, annotation: Any) -> bool:

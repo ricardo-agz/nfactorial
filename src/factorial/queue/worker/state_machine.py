@@ -99,6 +99,7 @@ async def handle_hook_state(
             raise RuntimeError(
                 "Hook runtime requested re-park with no pending tool calls."
             )
+        await execution_ctx.resources.checkpoint_all()
         await complete(
             action=CompletionAction.PENDING_TOOL,
             pending_tool_call_ids=hook_tick.pending_tool_call_ids,
@@ -117,6 +118,7 @@ async def handle_hook_state(
         return True
 
     if hook_pending_child_task_ids:
+        await execution_ctx.resources.checkpoint_all()
         await park_or_resume_child_wait(
             child_task_ids=hook_pending_child_task_ids,
             event_data=None,
@@ -130,6 +132,7 @@ async def handle_wait_state(
     *,
     task: Task[ContextType],
     agent: BaseAgent[ContextType],
+    execution_ctx: ExecutionContext,
     turn_completion: Any,
     wait_instructions: list[tuple[str, WaitInstruction]],
     event_publisher: EventPublisher,
@@ -177,6 +180,7 @@ async def handle_wait_state(
         if not child_task_ids:
             raise ValueError("wait.jobs requires at least one job/task reference.")
 
+        await execution_ctx.resources.checkpoint_all()
         await park_or_resume_child_wait(
             child_task_ids=child_task_ids,
             event_data=serialize_data(turn_completion),
@@ -243,6 +247,7 @@ async def handle_wait_state(
                 activity_timeout_cron_timezone,
             ) = min(activity_timeout_candidates, key=lambda item: item[0])
 
+        await execution_ctx.resources.checkpoint_all()
         await park_activity_wait(
             source_tool_call_ids=source_tool_call_ids,
             data=activity_wait_data,
@@ -347,6 +352,7 @@ async def handle_wait_state(
                 signal_timeout_cron_timezone,
             ) = min(signal_timeout_candidates, key=lambda item: item[0])
 
+        await execution_ctx.resources.checkpoint_all()
         woken_immediately = await park_signal_wait(
             signal_id=signal_id,
             source_tool_call_ids=source_tool_call_ids,
@@ -425,6 +431,7 @@ async def handle_wait_state(
                 "use the same expression and timezone."
             )
 
+    await execution_ctx.resources.checkpoint_all()
     await park_scheduled_wait(
         wait_kind=wait_kind,
         wake_timestamp=wake_timestamp,
@@ -473,6 +480,7 @@ async def handle_completion_state(
         )
 
     if turn_completion.pending_tool_call_ids:
+        await execution_ctx.resources.checkpoint_all()
         await complete(
             action=CompletionAction.PENDING_TOOL,
             pending_tool_call_ids=turn_completion.pending_tool_call_ids,
@@ -497,6 +505,7 @@ async def handle_completion_state(
         logger.info(
             f"⏳ Task awaiting child task results {colored(f'[{task.id}]', 'dim')}"
         )
+        await execution_ctx.resources.checkpoint_all()
         await park_or_resume_child_wait(
             child_task_ids=turn_completion.pending_child_task_ids,
             event_data=serialize_data(turn_completion),
@@ -504,6 +513,7 @@ async def handle_completion_state(
         return
 
     if turn_completion.is_done:
+        await execution_ctx.resources.destroy_all()
         await complete(
             action=CompletionAction.COMPLETE,
             pending_tool_call_ids=None,
@@ -541,6 +551,7 @@ async def handle_completion_state(
             await publish_batch_progress(task.metadata.batch_id)
         return
 
+    await execution_ctx.resources.checkpoint_all()
     await complete(
         action=CompletionAction.CONTINUE,
         pending_tool_call_ids=None,
@@ -608,6 +619,7 @@ async def run_task_state_machine(
                 should_stop = await handle_wait_state(
                     task=task,
                     agent=agent,
+                    execution_ctx=execution_ctx,
                     turn_completion=turn_completion,
                     wait_instructions=wait_instructions,
                     event_publisher=event_publisher,
@@ -680,6 +692,11 @@ async def handle_failure_state(
         )
     except Exception as publish_err:
         logger.error(f"Failed to send task failed event: {publish_err}")
+
+    if failure_action is CompletionAction.FAIL:
+        await execution_ctx.resources.destroy_all()
+    else:
+        await execution_ctx.resources.checkpoint_all()
 
     await complete(
         action=failure_action,

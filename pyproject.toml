@@ -46,6 +46,7 @@ cli = [
     "inquirer>=3.2.4",
 ]
 vercel = [
+    "vercel>=0.5.2",
     "vercel-workers",
 ]
 

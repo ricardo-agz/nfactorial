@@ -39,6 +39,7 @@ It also exposes the distributed runtime namespaces used by higher-level APIs:
 ```python
 execution_ctx.subagents
 execution_ctx.hooks
+execution_ctx.resources
 execution_ctx.messaging
 execution_ctx.inbox
 execution_ctx.signals
@@ -69,6 +70,78 @@ The same injection pattern works in:
 - `prepare_turn`
 - verifiers
 - custom `run_turn(...)` implementations
+
+Factorial also injects runtime-managed resources when your callable declares them:
+
+```python
+from factorial import Sandbox, Sandboxes, tool
+
+
+@tool
+async def run_tests(path: str, sandbox: Sandbox) -> str:
+    result = await sandbox.exec("pytest", path)
+    return result.stdout_text
+
+
+@tool
+async def compare(branches: list[str], sandboxes: Sandboxes) -> str:
+    outputs: list[str] = []
+    for branch in branches:
+        sb = await sandboxes.get(f"branch:{branch}")
+        outputs.append((await sb.exec("git", "status")).stdout_text)
+    return "\n\n".join(outputs)
+```
+
+For custom injectable resources, attach lifecycle behavior with `@resource(Type)` and then use the plain handle type in your function signature:
+
+```python
+from dataclasses import dataclass
+
+from factorial import ResourceCheckpoint, ResourceContext, ResourceRequest, resource
+
+
+@dataclass
+class BrowserSession:
+    session_id: str
+
+
+@resource(BrowserSession)
+class BrowserLifecycle:
+    @classmethod
+    async def create(
+        cls,
+        ctx: ResourceContext,
+        request: ResourceRequest[BrowserSession],
+    ) -> BrowserSession:
+        ...
+
+    @classmethod
+    async def restore(
+        cls,
+        checkpoint: ResourceCheckpoint,
+        ctx: ResourceContext,
+        request: ResourceRequest[BrowserSession],
+    ) -> BrowserSession:
+        ...
+
+    @classmethod
+    async def checkpoint(
+        cls,
+        resource_value: BrowserSession,
+        ctx: ResourceContext,
+        request: ResourceRequest[BrowserSession],
+    ) -> ResourceCheckpoint | None:
+        ...
+
+    @classmethod
+    async def destroy(
+        cls,
+        resource_value: BrowserSession,
+        ctx: ResourceContext,
+        request: ResourceRequest[BrowserSession],
+    ) -> None:
+        ...
+```
 
 ## `ExecutionContext.current()`
 

@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any
 from factorial.agent.context import ContextType
 from factorial.core.events import EventPublisher
 from factorial.core.run_types import TurnSummary, UsageSummary
+from factorial.resources import ResourcesExecutionNamespace
 
 if TYPE_CHECKING:
     from factorial.agent import BaseAgent  # pragma: no cover
@@ -521,6 +522,7 @@ class ExecutionContext:
 
     task_id: str
     owner_id: str
+    agent_name: str | None = None
     retry_count: int = 0
     wake_reason: str | None = None
     usage: UsageSummary = field(default_factory=UsageSummary.zero)
@@ -536,6 +538,9 @@ class ExecutionContext:
     inbox: InboxExecutionNamespace = field(default_factory=InboxExecutionNamespace)
     signals: SignalsExecutionNamespace = field(
         default_factory=SignalsExecutionNamespace
+    )
+    resources: ResourcesExecutionNamespace = field(
+        default_factory=ResourcesExecutionNamespace
     )
 
     @classmethod
@@ -607,6 +612,7 @@ __all__ = [
     "InboxReceiptsExecutionNamespace",
     "MessagingExecutionNamespace",
     "MessagingGroupsExecutionNamespace",
+    "ResourcesExecutionNamespace",
     "SignalsExecutionNamespace",
     "SubagentsExecutionNamespace",
     "execution_context",

@@ -22,6 +22,11 @@ from factorial.execution.context import (
     SignalsExecutionNamespace,
     SubagentsExecutionNamespace,
 )
+from factorial.resources import (
+    RedisResourceBindingStore,
+    ResourceManager,
+    ResourcesExecutionNamespace,
+)
 from factorial.queue.keys import RedisKeys
 from factorial.queue.lua import (
     ActivityWaitScript,
@@ -195,6 +200,7 @@ async def process_task(
             execution_ctx = ExecutionContext(
                 task_id=task.id,
                 owner_id=task.metadata.owner_id,
+                agent_name=agent.name,
                 retry_count=task.retries,
                 events=event_publisher,
                 subagents=SubagentsExecutionNamespace(
@@ -236,6 +242,18 @@ async def process_task(
                     ),
                 ),
                 signals=SignalsExecutionNamespace(),
+                resources=ResourcesExecutionNamespace(
+                    manager=ResourceManager(
+                        store=RedisResourceBindingStore(
+                            redis_client=redis_client,
+                            namespace=namespace,
+                            task_id=task.id,
+                        ),
+                        task_id=task.id,
+                        owner_id=task.metadata.owner_id,
+                        agent_name=agent.name,
+                    )
+                ),
             )
 
             if task.payload.turn_number == 1 and task.retries == 0:

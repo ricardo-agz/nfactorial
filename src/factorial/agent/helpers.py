@@ -5,7 +5,7 @@ import inspect
 import random
 from collections.abc import Awaitable, Callable
 from functools import wraps
-from typing import Any, cast, get_origin, overload
+from typing import Any, cast, overload
 
 from typing_extensions import TypeVar
 
@@ -14,6 +14,10 @@ from factorial.core.events import BaseEvent
 from factorial.core.exceptions import RETRYABLE_EXCEPTIONS, FatalAgentError
 from factorial.core.run_types import VerificationSummary
 from factorial.execution.context import ExecutionContext
+from factorial.execution.dependencies import (
+    inject_runtime_kwargs,
+    is_runtime_injected_annotation,
+)
 
 from .types import PrepareTurnHook, Turn
 
@@ -145,6 +149,13 @@ async def _maybe_call_prepare_turn(
     ):
         raise TypeError("prepare_turn must accept the turn as its first parameter")
 
+    injected_kwargs = await inject_runtime_kwargs(
+        func=func,
+        existing_kwargs={},
+        agent_ctx=agent_ctx,
+        execution_ctx=execution_ctx,
+        start_at=1,
+    )
     args: list[Any] = [turn]
     kwargs: dict[str, Any] = {}
     for param in params[1:]:
@@ -154,48 +165,31 @@ async def _maybe_call_prepare_turn(
         ):
             continue
 
-        annotation = param.annotation
-        annotation_origin = get_origin(annotation)
-        injected_value: Any | None = None
-        if (
-            param.name == "agent_ctx"
-            or annotation is AgentContext
-            or annotation_origin is AgentContext
-        ):
-            injected_value = agent_ctx
-        elif (
-            param.name == "execution_ctx"
-            or annotation is ExecutionContext
-            or annotation_origin is ExecutionContext
-        ):
-            injected_value = execution_ctx
-        elif (
-            annotation is not inspect.Parameter.empty
-            and isinstance(annotation, type)
-            and issubclass(annotation, AgentContext)
-        ):
-            injected_value = agent_ctx
-        elif (
-            annotation is not inspect.Parameter.empty
-            and isinstance(annotation, type)
-            and issubclass(annotation, ExecutionContext)
-        ):
-            injected_value = execution_ctx
-        elif param.default is not inspect.Parameter.empty:
+        if param.name in injected_kwargs:
+            injected_value = injected_kwargs[param.name]
+            if param.kind in (
+                inspect.Parameter.POSITIONAL_ONLY,
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            ):
+                args.append(injected_value)
+            else:
+                kwargs[param.name] = injected_value
             continue
-        else:
-            raise TypeError(
-                f"Unsupported required prepare_turn parameter '{param.name}'. "
-                "Only turn (first arg), agent_ctx, and execution_ctx are supported."
+
+        if param.default is not inspect.Parameter.empty:
+            continue
+
+        annotation = param.annotation
+        if is_runtime_injected_annotation(param.name, annotation):
+            raise RuntimeError(
+                f"Failed to resolve prepare_turn parameter '{param.name}'."
             )
 
-        if param.kind in (
-            inspect.Parameter.POSITIONAL_ONLY,
-            inspect.Parameter.POSITIONAL_OR_KEYWORD,
-        ):
-            args.append(injected_value)
-        else:
-            kwargs[param.name] = injected_value
+        raise TypeError(
+            f"Unsupported required prepare_turn parameter '{param.name}'. "
+            "Only turn (first arg), agent_ctx, execution_ctx, and other "
+            "runtime-injected dependencies are supported."
+        )
 
     result = func(*args, **kwargs)
     if inspect.isawaitable(result):

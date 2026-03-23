@@ -17,7 +17,7 @@ from openai.types.chat import ChatCompletionMessageToolCall
 from pydantic import BaseModel
 
 from factorial.agent.context import AgentContext
-from factorial.execution.context import ExecutionContext
+from factorial.execution.dependencies import is_runtime_injected_annotation
 from factorial.execution.hooks import (
     HookExecutionPlan,
     compile_hook_plan,
@@ -213,17 +213,7 @@ def _function_to_json_schema(func: F) -> tuple[dict[str, Any], bool]:
         if is_hook_dependency_annotation(full_annotation):
             continue
 
-        if param_name == "agent_ctx" or (
-            param.annotation != inspect.Parameter.empty
-            and isinstance(param.annotation, type)
-            and issubclass(param.annotation, AgentContext)
-        ):
-            continue
-        if param_name == "execution_ctx" or (
-            param.annotation != inspect.Parameter.empty
-            and isinstance(param.annotation, type)
-            and issubclass(param.annotation, ExecutionContext)
-        ):
+        if is_runtime_injected_annotation(param_name, full_annotation):
             continue
 
         param_type = type_hints.get(param_name, str)

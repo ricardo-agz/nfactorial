@@ -17,6 +17,7 @@ from factorial.core.exceptions import FatalAgentError
 from factorial.core.logging import get_logger
 from factorial.core.utils import serialize_data
 from factorial.execution.context import ExecutionContext
+from factorial.execution.dependencies import inject_runtime_kwargs
 from factorial.execution.hooks import (
     HookRequestContext,
     HookSessionNode,
@@ -113,38 +114,6 @@ def normalize_tool_result(
         client_output=result,
         pending_child_task_ids=pending_child_task_ids,
     )
-
-
-def _inject_tool_context_params(
-    action: Any,
-    parsed_tool_args: dict[str, Any],
-    agent_ctx: ContextT,
-    execution_ctx: ExecutionContext,
-) -> None:
-    for param_name, param in inspect.signature(action).parameters.items():
-        if param_name in parsed_tool_args:
-            continue
-        if param_name == "agent_ctx":
-            parsed_tool_args[param_name] = agent_ctx
-            continue
-        if (
-            param.annotation
-            and param.annotation is not inspect.Parameter.empty
-            and isinstance(param.annotation, type)
-            and issubclass(param.annotation, AgentContext)
-        ):
-            parsed_tool_args[param_name] = agent_ctx
-            continue
-        if param_name == "execution_ctx":
-            parsed_tool_args[param_name] = execution_ctx
-            continue
-        if (
-            param.annotation
-            and param.annotation is not inspect.Parameter.empty
-            and isinstance(param.annotation, type)
-            and issubclass(param.annotation, ExecutionContext)
-        ):
-            parsed_tool_args[param_name] = execution_ctx
 
 
 def _coerce_tool_argument_models(
@@ -348,8 +317,12 @@ async def tool_action(
         raise ValueError(f"Agent {agent.name} has no tool action for {tool_name}")
 
     raw_tool_args = _parse_tool_arguments(tool_name, tool_call.function.arguments)
-    parsed_tool_args = dict(raw_tool_args)
-    _inject_tool_context_params(action, parsed_tool_args, agent_ctx, execution_ctx)
+    parsed_tool_args = await inject_runtime_kwargs(
+        func=action,
+        existing_kwargs=raw_tool_args,
+        agent_ctx=agent_ctx,
+        execution_ctx=execution_ctx,
+    )
     _coerce_tool_argument_models(action, parsed_tool_args)
 
     if hook_plan is not None:

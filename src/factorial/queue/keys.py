@@ -59,6 +59,8 @@ TASK_STEERING = "{namespace}:steer:{task_id}:messages"
 PENDING_TOOL_RESULTS = "{namespace}:pending:{task_id}:tools"
 # HASH: child_task_id -> result_json or <|PENDING|>
 PENDING_CHILD_TASK_RESULTS = "{namespace}:pending:{task_id}:children"
+# HASH: resource_type_key:logical_name -> resource_binding_json
+RESOURCE_BINDINGS = "{namespace}:resources:bindings:{task_id}"
 # SET: child_task_id values currently being awaited by the parent task
 PENDING_CHILD_WAIT_IDS = "{namespace}:pending:{task_id}:children_wait_ids"
 # HASH: task_id -> scheduled wait metadata JSON
@@ -223,6 +225,7 @@ class RedisKeys:
     _task_signals: str | None = None
     _pending_tool_results: str | None = None
     _pending_child_task_results: str | None = None
+    _resource_bindings: str | None = None
     _pending_child_wait_ids: str | None = None
     _hooks_by_task: str | None = None
     _hook_session_by_tool_call: str | None = None
@@ -575,6 +578,16 @@ class RedisKeys:
         return self._pending_child_task_results
 
     @property
+    def resource_bindings(self) -> str:
+        """{namespace}:resources:bindings:{task_id}"""
+        if self._resource_bindings is None:
+            raise ValueError(
+                "resource_bindings is not available - "
+                "task_id was not provided during RedisKeys.format()"
+            )
+        return self._resource_bindings
+
+    @property
     def pending_child_wait_ids(self) -> str:
         """{namespace}:pending:{task_id}:children_wait_ids"""
         if self._pending_child_wait_ids is None:
@@ -795,6 +808,12 @@ class RedisKeys:
             else None,
             _pending_child_task_results=PENDING_CHILD_TASK_RESULTS.format(
                 namespace=namespace, task_id=task_id
+            )
+            if task_id
+            else None,
+            _resource_bindings=RESOURCE_BINDINGS.format(
+                namespace=namespace,
+                task_id=task_id,
             )
             if task_id
             else None,

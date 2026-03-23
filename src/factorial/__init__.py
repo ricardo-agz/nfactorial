@@ -141,6 +141,7 @@ from factorial.execution.messaging import (
     MessagingNamespace,
     messaging,
 )
+from factorial.execution.resources import Resources, Sandboxes, sandboxes
 from factorial.execution.signals import SignalEnvelope, SignalsNamespace, signals
 from factorial.execution.subagents import (
     JobRef,
@@ -172,6 +173,18 @@ from factorial.orchestrator import (
     with_context,
 )
 from factorial.queue.task import Task, TaskStatus
+from factorial.resources import (
+    ResourceCheckpoint,
+    ResourceContext,
+    ResourceLifecycle,
+    ResourceRequest,
+    Sandbox,
+    SandboxCheckpoint,
+    SandboxExecResult,
+    SandboxProcess,
+    SandboxWriteFile,
+    resource,
+)
 
 __all__ = [
     "BaseAgent",
@@ -234,6 +247,19 @@ __all__ = [
     "SignalDeliveryReport",
     "SubagentsNamespace",
     "subagents",
+    "Resources",
+    "Sandboxes",
+    "sandboxes",
+    "ResourceCheckpoint",
+    "ResourceContext",
+    "ResourceLifecycle",
+    "ResourceRequest",
+    "resource",
+    "Sandbox",
+    "SandboxCheckpoint",
+    "SandboxExecResult",
+    "SandboxProcess",
+    "SandboxWriteFile",
     "InboxMessage",
     "InboxMessagePage",
     "InboxReceipt",

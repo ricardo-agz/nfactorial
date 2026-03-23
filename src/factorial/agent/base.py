@@ -115,7 +115,16 @@ from factorial.execution.context import (
     ExecutionContext,
     execution_context,
 )
+from factorial.execution.dependencies import (
+    inject_runtime_kwargs,
+    is_runtime_injected_annotation,
+)
 from factorial.execution.waits import WaitInstruction
+from factorial.resources import (
+    InMemoryResourceBindingStore,
+    ResourceManager,
+    ResourcesExecutionNamespace,
+)
 
 logger = get_logger(__name__)
 
@@ -526,7 +535,7 @@ class BaseAgent(Generic[ContextType]):
         )
         return hashlib.sha256(canonical_payload.encode("utf-8")).hexdigest()
 
-    def _resolve_verifier_injected_kwargs(
+    async def _resolve_verifier_injected_kwargs(
         self,
         agent_ctx: ContextType,
         execution_ctx: ExecutionContext,
@@ -540,40 +549,30 @@ class BaseAgent(Generic[ContextType]):
         if not params:
             raise TypeError("verifier must accept at least one argument for output")
 
-        kwargs: dict[str, Any] = {}
+        kwargs = await inject_runtime_kwargs(
+            func=verifier,
+            existing_kwargs={},
+            agent_ctx=agent_ctx,
+            execution_ctx=execution_ctx,
+            start_at=1,
+        )
         for param in params[1:]:
             if param.kind in (
                 inspect.Parameter.VAR_POSITIONAL,
                 inspect.Parameter.VAR_KEYWORD,
             ):
                 continue
-            annotation = param.annotation
-            if param.name == "agent_ctx":
-                kwargs[param.name] = agent_ctx
+            if param.name in kwargs or param.default is not inspect.Parameter.empty:
                 continue
-            if (
-                annotation is not inspect.Parameter.empty
-                and isinstance(annotation, type)
-                and issubclass(annotation, AgentContext)
-            ):
-                kwargs[param.name] = agent_ctx
-                continue
-            if param.name == "execution_ctx":
-                kwargs[param.name] = execution_ctx
-                continue
-            if (
-                annotation is not inspect.Parameter.empty
-                and isinstance(annotation, type)
-                and issubclass(annotation, ExecutionContext)
-            ):
-                kwargs[param.name] = execution_ctx
-                continue
-            if param.default is inspect.Parameter.empty:
-                raise TypeError(
-                    f"Unsupported required verifier parameter '{param.name}'. "
-                    "Only output (first arg), agent_ctx, and execution_ctx "
-                    "are supported."
+            if is_runtime_injected_annotation(param.name, param.annotation):
+                raise RuntimeError(
+                    f"Failed to resolve verifier parameter '{param.name}'."
                 )
+            raise TypeError(
+                f"Unsupported required verifier parameter '{param.name}'. "
+                "Only output (first arg) and runtime-injected dependencies "
+                "are supported."
+            )
         return kwargs
 
     async def _apply_verifier(
@@ -588,7 +587,7 @@ class BaseAgent(Generic[ContextType]):
         decision = await invoke_callable_non_blocking(
             self.verifier,
             candidate_output,
-            **self._resolve_verifier_injected_kwargs(agent_ctx, execution_ctx),
+            **(await self._resolve_verifier_injected_kwargs(agent_ctx, execution_ctx)),
         )
         if not isinstance(decision, (VerifierAccept, VerifierRetry, VerifierFail)):
             raise TypeError(
@@ -845,8 +844,17 @@ class BaseAgent(Generic[ContextType]):
         execution_ctx = ExecutionContext(
             task_id=task_id,
             owner_id=owner_id,
+            agent_name=self.name,
             retry_count=0,
             events=cast(EventPublisher, _DirectEventPublisher()),
+            resources=ResourcesExecutionNamespace(
+                manager=ResourceManager(
+                    store=InMemoryResourceBindingStore(),
+                    task_id=task_id,
+                    owner_id=owner_id,
+                    agent_name=self.name,
+                )
+            ),
         )
         token = execution_context.set(execution_ctx)
         last_verification_summary: VerificationSummary[Any] | None = None
@@ -985,6 +993,10 @@ class BaseAgent(Generic[ContextType]):
             )
             return result
         finally:
+            try:
+                await execution_ctx.resources.destroy_all()
+            except Exception:
+                logger.exception("Failed to destroy runtime resources for run()")
             execution_context.reset(token)
 
     async def stream(
@@ -1008,8 +1020,17 @@ class BaseAgent(Generic[ContextType]):
             execution_ctx = ExecutionContext(
                 task_id=task_id,
                 owner_id=owner_id,
+                agent_name=self.name,
                 retry_count=0,
                 events=cast(EventPublisher, _DirectEventPublisher(sink)),
+                resources=ResourcesExecutionNamespace(
+                    manager=ResourceManager(
+                        store=InMemoryResourceBindingStore(),
+                        task_id=task_id,
+                        owner_id=owner_id,
+                        agent_name=self.name,
+                    )
+                ),
             )
             token = execution_context.set(execution_ctx)
             last_verification_summary: VerificationSummary[Any] | None = None
@@ -1104,6 +1125,10 @@ class BaseAgent(Generic[ContextType]):
                     execution_ctx,
                 )
             finally:
+                try:
+                    await execution_ctx.resources.destroy_all()
+                except Exception:
+                    logger.exception("Failed to destroy runtime resources for stream()")
                 execution_context.reset(token)
                 await queue.put(None)
 

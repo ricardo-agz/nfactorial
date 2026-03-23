@@ -4,7 +4,7 @@ import asyncio
 import os
 from contextlib import suppress
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, cast
 
 from ..core import (
     LiveResourceRef,
@@ -77,7 +77,7 @@ def _configured_runtime() -> str | None:
 
 def _load_vercel_async_sandbox() -> Any:
     try:
-        from vercel.sandbox import AsyncSandbox
+        from vercel.sandbox import AsyncSandbox  # type: ignore[import-not-found]
     except ImportError as exc:  # pragma: no cover
         raise RuntimeError(
             "Sandbox support requires the `vercel` package. "
@@ -116,13 +116,13 @@ class VercelSandboxProcess(SandboxProcess):
         return await _command_to_result(finished)
 
     async def output(self, stream: str = "both") -> str:
-        return await self.command.output(stream)
+        return cast(str, await self.command.output(stream))
 
     async def stdout(self) -> str:
-        return await self.command.stdout()
+        return cast(str, await self.command.stdout())
 
     async def stderr(self) -> str:
-        return await self.command.stderr()
+        return cast(str, await self.command.stderr())
 
     async def kill(self, signal: int = 15) -> None:
         await self.command.kill(signal=signal)
@@ -193,7 +193,7 @@ class VercelSandboxHandle(Sandbox):
         return VercelSandboxProcess(command=command)
 
     async def read_file(self, path: str) -> bytes | None:
-        return await self.sandbox.read_file(path)
+        return cast(bytes | None, await self.sandbox.read_file(path))
 
     async def write_files(self, files: list[SandboxWriteFile]) -> None:
         await self.sandbox.write_files(
@@ -211,7 +211,7 @@ class VercelSandboxHandle(Sandbox):
         await self.sandbox.mk_dir(path)
 
     async def url(self, port: int) -> str:
-        return self.sandbox.domain(port)
+        return cast(str, self.sandbox.domain(port))
 
     async def checkpoint(self) -> SandboxCheckpoint:
         snapshot = await self.sandbox.snapshot()

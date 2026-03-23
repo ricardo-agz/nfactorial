@@ -178,7 +178,7 @@ def resource_type_key(resource_type: type[Any]) -> str:
 
 
 def register_resource_lifecycle(
-    resource_type: type[R],
+    resource_type: type[Any],
     lifecycle_type: type[ResourceLifecycle[R]],
 ) -> type[ResourceLifecycle[R]]:
     key = resource_type_key(resource_type)
@@ -192,7 +192,7 @@ def register_resource_lifecycle(
 
 
 def resource(
-    resource_type: type[R],
+    resource_type: type[Any],
 ) -> Callable[[type[ResourceLifecycle[R]]], type[ResourceLifecycle[R]]]:
     def decorator(
         lifecycle_type: type[ResourceLifecycle[R]],

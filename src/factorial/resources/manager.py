@@ -9,8 +9,10 @@ from typing import Any, Generic, Protocol, TypeVar, cast
 import redis.asyncio as redis
 
 from factorial.core.logging import get_logger
+from factorial.core.utils import resolve_awaitable
 
 from .core import (
+    LiveResourceLifecycle,
     ResourceBindingRecord,
     ResourceCheckpoint,
     ResourceContext,
@@ -83,9 +85,11 @@ class RedisResourceBindingStore:
         resource_type_key_value: str,
         logical_name: str,
     ) -> ResourceBindingRecord | None:
-        raw = await self.redis_client.hget(
-            self.keys.resource_bindings,
-            self._field_name(resource_type_key_value, logical_name),
+        raw = await resolve_awaitable(
+            self.redis_client.hget(
+                self.keys.resource_bindings,
+                self._field_name(resource_type_key_value, logical_name),
+            )
         )
         if raw is None:
             return None
@@ -94,20 +98,24 @@ class RedisResourceBindingStore:
         return ResourceBindingRecord.from_dict(json.loads(str(raw)))
 
     async def save(self, binding: ResourceBindingRecord) -> None:
-        await self.redis_client.hset(
-            self.keys.resource_bindings,
-            self._field_name(binding.resource_type_key, binding.logical_name),
-            binding.to_json(),
+        await resolve_awaitable(
+            self.redis_client.hset(
+                self.keys.resource_bindings,
+                self._field_name(binding.resource_type_key, binding.logical_name),
+                binding.to_json(),
+            )
         )
 
     async def delete(self, resource_type_key_value: str, logical_name: str) -> None:
-        await self.redis_client.hdel(
-            self.keys.resource_bindings,
-            self._field_name(resource_type_key_value, logical_name),
+        await resolve_awaitable(
+            self.redis_client.hdel(
+                self.keys.resource_bindings,
+                self._field_name(resource_type_key_value, logical_name),
+            )
         )
 
     async def delete_all(self) -> None:
-        await self.redis_client.delete(self.keys.resource_bindings)
+        await resolve_awaitable(self.redis_client.delete(self.keys.resource_bindings))
 
 
 @dataclass
@@ -320,7 +328,8 @@ class ResourceManager:
         if not lifecycle_supports_live_refs(lifecycle):
             return None
         try:
-            attach_live = lifecycle.attach_live
+            live_lifecycle = cast(type[LiveResourceLifecycle[Any]], lifecycle)
+            attach_live = live_lifecycle.attach_live
             return await attach_live(live_ref, ctx, request)
         except Exception:
             logger.warning(
@@ -349,7 +358,8 @@ class ResourceManager:
         )
 
         if lifecycle_supports_live_refs(lifecycle):
-            capture_live_ref = lifecycle.capture_live_ref
+            live_lifecycle = cast(type[LiveResourceLifecycle[R]], lifecycle)
+            capture_live_ref = live_lifecycle.capture_live_ref
             live_ref = capture_live_ref(
                 resource,
                 self._resource_context(request.logical_name),

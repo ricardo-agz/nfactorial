@@ -9,7 +9,6 @@ import type {
   Channel,
   GameStateSnapshot,
   HumanRolePreference,
-  PlayerStateView,
   ThoughtEntry,
   UiMessage,
 } from "../types";
@@ -19,10 +18,14 @@ import {
   extractFinalOutput,
   formatCountdown,
   normalizeChannel,
-  parseToolArgs,
   shortTaskId,
-  summarizeToolAction,
 } from "../utils";
+
+const TERMINAL_AGENT_STATUSES = new Set<AgentStatus>([
+  "completed",
+  "failed",
+  "cancelled",
+]);
 
 export function useGameEngine() {
   const [userId] = useState(createUserId);
@@ -234,7 +237,18 @@ export function useGameEngine() {
   const setTaskStatus = useCallback(
     (eventTaskId: string | null, status: AgentStatus) => {
       if (!eventTaskId) return;
-      setAgentStatus((prev) => ({ ...prev, [eventTaskId]: status }));
+      setAgentStatus((prev) => {
+        const current = prev[eventTaskId];
+        if (
+          current &&
+          TERMINAL_AGENT_STATUSES.has(current) &&
+          !TERMINAL_AGENT_STATUSES.has(status)
+        ) {
+          return prev;
+        }
+        if (current === status) return prev;
+        return { ...prev, [eventTaskId]: status };
+      });
     },
     [],
   );
@@ -246,15 +260,26 @@ export function useGameEngine() {
       const eventTaskId =
         typeof event.task_id === "string" ? event.task_id : null;
       const actorLabel = resolveActorLabel(event);
+      const isRunStarted = event.event_type === "start";
+      const isRunCompleted =
+        event.event_type === "finish" && event.status === "completed";
+      const isRunFailed =
+        event.event_type === "finish" && event.status === "failed";
+      const isRunCancelled =
+        event.event_type === "finish" && event.status === "cancelled";
+      const isToolStarted = event.event_type === "tool_start";
+      const isToolCompleted =
+        event.event_type === "tool_finish" && !event.is_error;
+      const isToolFailed = event.event_type === "tool_finish" && !!event.is_error;
 
       /* Status transitions */
-      if (event.event_type === "run_started")
+      if (isRunStarted)
         setTaskStatus(eventTaskId, "active");
-      else if (event.event_type === "run_completed")
+      else if (isRunCompleted)
         setTaskStatus(eventTaskId, "completed");
-      else if (event.event_type === "run_failed")
+      else if (isRunFailed)
         setTaskStatus(eventTaskId, "failed");
-      else if (event.event_type === "run_cancelled")
+      else if (isRunCancelled)
         setTaskStatus(eventTaskId, "cancelled");
       else if (
         event.event_type === "task_activity_waiting" ||
@@ -265,11 +290,9 @@ export function useGameEngine() {
         setTaskStatus(eventTaskId, "active");
 
       /* Tool started */
-      if (event.event_type === "progress_update_tool_action_started") {
-        const toolCall = event.data?.args?.[0];
-        const toolName = toolCall?.function?.name as string | undefined;
+      if (isToolStarted) {
+        const toolName = event.tool_name;
         if (toolName) {
-          const toolArgs = parseToolArgs(toolCall?.function?.arguments);
           pushActivity(
             `${actorLabel} started \`${toolName}\`.`,
             event.timestamp,
@@ -277,23 +300,16 @@ export function useGameEngine() {
               kind: "tool_started",
               actorLabel,
               toolName,
-              detail: summarizeToolAction(toolName, toolArgs),
             },
           );
         }
       }
 
       /* Tool completed */
-      if (event.event_type === "progress_update_tool_action_completed") {
-        const completion = event.data?.result;
-        const toolCall = completion?.tool_call;
-        const toolName = toolCall?.function?.name as string | undefined;
-        const output = (completion?.client_output ?? {}) as Record<
-          string,
-          any
-        >;
+      if (isToolCompleted) {
+        const toolName = event.tool_name;
+        const output = (event.output ?? {}) as Record<string, any>;
         if (toolName) {
-          const toolArgs = parseToolArgs(toolCall?.function?.arguments);
           pushActivity(
             `${actorLabel} completed \`${toolName}\`.`,
             event.timestamp,
@@ -301,7 +317,6 @@ export function useGameEngine() {
               kind: "tool_completed",
               actorLabel,
               toolName,
-              detail: summarizeToolAction(toolName, toolArgs),
             },
           );
         }
@@ -309,6 +324,13 @@ export function useGameEngine() {
         const maybeState = output?.game_state;
         if (maybeState && typeof maybeState === "object") {
           setGameState(maybeState as GameStateSnapshot);
+        }
+        if (
+          event.agent_name === "mafia_game_master" &&
+          eventTaskId &&
+          taskIdRef.current === eventTaskId
+        ) {
+          setStarting(false);
         }
         const stateForLookup =
           maybeState && typeof maybeState === "object"
@@ -381,9 +403,8 @@ export function useGameEngine() {
       }
 
       /* Tool failed */
-      if (event.event_type === "progress_update_tool_action_failed") {
-        const toolCall = event.data?.args?.[0];
-        const toolName = toolCall?.function?.name as string | undefined;
+      if (isToolFailed) {
+        const toolName = event.tool_name;
         pushActivity(
           toolName
             ? `${actorLabel} failed tool \`${toolName}\`: ${event.error ?? "unknown error"}`
@@ -422,11 +443,8 @@ export function useGameEngine() {
       }
 
       /* Game master final output */
-      if (
-        event.event_type === "agent_output" &&
-        event.agent_name === "mafia_game_master"
-      ) {
-        const text = extractFinalOutput(event.data);
+      if (isRunCompleted && event.agent_name === "mafia_game_master") {
+        const text = extractFinalOutput(event.output);
         if (text) {
           setFinalReport(text);
           setShowFinalReport(true);
@@ -442,7 +460,7 @@ export function useGameEngine() {
 
       /* Game master run completed */
       if (
-        event.event_type === "run_completed" &&
+        isRunCompleted &&
         event.agent_name === "mafia_game_master" &&
         eventTaskId &&
         taskIdRef.current === eventTaskId
@@ -453,14 +471,20 @@ export function useGameEngine() {
 
       /* Game master run failed / cancelled */
       if (
-        ["run_failed", "run_cancelled"].includes(event.event_type) &&
+        (isRunFailed || isRunCancelled) &&
         event.agent_name === "mafia_game_master" &&
         eventTaskId &&
         taskIdRef.current === eventTaskId
       ) {
+        const failureMessage = isRunCancelled
+          ? "Game cancelled."
+          : `Game failed: ${event.error ?? "unknown error"}`;
+        appendThreadMessage("system", "System", failureMessage, "system");
+        setErrorText(failureMessage);
         setStarting(false);
         setCancelling(false);
         setTaskId(null);
+        taskIdRef.current = null;
       }
     },
     [
@@ -514,6 +538,7 @@ export function useGameEngine() {
         task_id: string;
         human_player_id?: string | null;
       };
+      taskIdRef.current = payload.task_id;
       setTaskId(payload.task_id);
       setHumanPlayerId(payload.human_player_id ?? null);
       setSetupModalOpen(false);
@@ -918,6 +943,10 @@ export function useGameEngine() {
     () => Object.values(agentStatus).filter((s) => s === "waiting").length,
     [agentStatus],
   );
+  const failedAgentCount = useMemo(
+    () => Object.values(agentStatus).filter((s) => s === "failed").length,
+    [agentStatus],
+  );
 
   const sortedVisiblePlayers = useMemo(
     () =>
@@ -1072,6 +1101,7 @@ export function useGameEngine() {
     canUseHumanActions,
     activeAgentCount,
     waitingAgentCount,
+    failedAgentCount,
     selectedAgent,
     selectedAgentThoughts,
     guidanceText,

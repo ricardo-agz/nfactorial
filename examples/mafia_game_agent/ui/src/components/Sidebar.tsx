@@ -1,11 +1,44 @@
 import { Trophy } from "lucide-react";
 
 import type {
+  AgentStatus,
+  DayVoteHistoryEntry,
   GameStateSnapshot,
   PlayerStateView,
   ThoughtEntry,
+  VoteRecord,
 } from "../types";
 import { formatRoleLabel, formatTimestamp } from "../utils";
+
+const TASK_STATUS_META: Record<
+  AgentStatus,
+  { label: string; className: string }
+> = {
+  queued: {
+    label: "Queued",
+    className: "bg-neutral-800 text-neutral-400",
+  },
+  active: {
+    label: "Active",
+    className: "bg-emerald-500/10 text-emerald-300",
+  },
+  waiting: {
+    label: "Waiting",
+    className: "bg-amber-500/10 text-amber-300",
+  },
+  completed: {
+    label: "Done",
+    className: "bg-neutral-800 text-neutral-300",
+  },
+  failed: {
+    label: "Failed",
+    className: "bg-rose-500/10 text-rose-300",
+  },
+  cancelled: {
+    label: "Cancelled",
+    className: "bg-neutral-800 text-neutral-400",
+  },
+};
 
 interface SidebarProps {
   includeHuman: boolean;
@@ -15,6 +48,7 @@ interface SidebarProps {
   showOmniscient: boolean;
   isNightPhase: boolean;
   sortedVisiblePlayers: PlayerStateView[];
+  agentStatus: Record<string, AgentStatus>;
   selectedAgentPlayerId: string | null;
   votedRoundByPlayerId: Record<string, number>;
   selectedAgent: PlayerStateView | null;
@@ -24,12 +58,54 @@ interface SidebarProps {
   onShowFinalReport: () => void;
 }
 
+function VoteList({ votes }: { votes: VoteRecord[] }) {
+  return (
+    <div className="space-y-1.5">
+      {votes.map((vote) => (
+        <div
+          key={`${vote.voter_id}:${vote.target_player_id}`}
+          className="flex items-center justify-between gap-3 rounded-lg border border-neutral-800 bg-neutral-900 px-2.5 py-2 text-xs"
+        >
+          <span className="truncate text-neutral-200">
+            {vote.voter_display_name}
+          </span>
+          <span className="shrink-0 text-neutral-600">-&gt;</span>
+          <span className="truncate text-right text-amber-300">
+            {vote.target_display_name}
+          </span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function VoteHistoryCard({ entry }: { entry: DayVoteHistoryEntry }) {
+  return (
+    <div className="rounded-lg border border-neutral-800 bg-neutral-900/70 p-2.5">
+      <div className="mb-2 flex items-center justify-between gap-2 text-[10px] uppercase tracking-widest text-neutral-500">
+        <span>Round {entry.round_no}</span>
+        {entry.eliminated_display_name ? (
+          <span className="text-neutral-400">
+            Eliminated: {entry.eliminated_display_name}
+          </span>
+        ) : null}
+      </div>
+      {entry.votes.length === 0 ? (
+        <p className="text-[11px] text-neutral-600">No votes recorded.</p>
+      ) : (
+        <VoteList votes={entry.votes} />
+      )}
+    </div>
+  );
+}
+
 function PlayerCard({
   player,
   showOmniscient,
   isNightPhase,
   isSelected,
   canInspect,
+  taskStatus,
   votedThisRound,
   onClick,
 }: {
@@ -38,6 +114,7 @@ function PlayerCard({
   isNightPhase: boolean;
   isSelected: boolean;
   canInspect: boolean;
+  taskStatus?: AgentStatus;
   votedThisRound: boolean;
   onClick: () => void;
 }) {
@@ -91,6 +168,16 @@ function PlayerCard({
           ) : (
             "AI Agent"
           )}
+          {!player.is_human && taskStatus && (
+            <>
+              <span className="text-neutral-700">&middot;</span>
+              <span
+                className={`rounded px-1.5 py-0.5 text-[9px] font-bold uppercase ${TASK_STATUS_META[taskStatus].className}`}
+              >
+                {TASK_STATUS_META[taskStatus].label}
+              </span>
+            </>
+          )}
           <span className="text-neutral-700">&middot;</span>
           {!player.alive ? (
             <span className="text-neutral-600">Dead</span>
@@ -121,6 +208,7 @@ export function Sidebar({
   showOmniscient,
   isNightPhase,
   sortedVisiblePlayers,
+  agentStatus,
   selectedAgentPlayerId,
   votedRoundByPlayerId,
   selectedAgent,
@@ -129,6 +217,9 @@ export function Sidebar({
   onSelectAgent,
   onShowFinalReport,
 }: SidebarProps) {
+  const currentDayVotes = gameState?.current_day_votes ?? [];
+  const dayVoteHistory = [...(gameState?.day_vote_history ?? [])].reverse();
+
   return (
     <aside className="flex w-[320px] shrink-0 flex-col border-r border-neutral-800 bg-neutral-950 lg:w-[340px]">
       <div className="flex-1 overflow-y-auto p-4">
@@ -256,6 +347,9 @@ export function Sidebar({
                     isNightPhase={isNightPhase}
                     isSelected={isSelected}
                     canInspect={canInspect}
+                    taskStatus={
+                      player.task_id ? agentStatus[player.task_id] : undefined
+                    }
                     votedThisRound={votedThisRound}
                     onClick={() =>
                       onSelectAgent(
@@ -270,6 +364,37 @@ export function Sidebar({
             </div>
           )}
         </div>
+
+        {/* Omniscient vote ledger */}
+        {showOmniscient && (
+          <div className="mt-4">
+            <h3 className="mb-2 text-[10px] font-semibold uppercase tracking-widest text-neutral-500">
+              Vote Ledger
+            </h3>
+            {currentDayVotes.length === 0 && dayVoteHistory.length === 0 ? (
+              <p className="text-[11px] text-neutral-600">
+                No day votes recorded yet.
+              </p>
+            ) : (
+              <div className="space-y-2">
+                {currentDayVotes.length > 0 && gameState ? (
+                  <div className="rounded-lg border border-amber-500/15 bg-amber-500/5 p-2.5">
+                    <div className="mb-2 text-[10px] uppercase tracking-widest text-amber-300/70">
+                      Round {gameState.round_no} In Progress
+                    </div>
+                    <VoteList votes={currentDayVotes} />
+                  </div>
+                ) : null}
+                {dayVoteHistory.map((entry) => (
+                  <VoteHistoryCard
+                    key={`${entry.round_no}:${entry.eliminated_player_id ?? "unknown"}`}
+                    entry={entry}
+                  />
+                ))}
+              </div>
+            )}
+          </div>
+        )}
 
         {/* Agent thoughts */}
         {showOmniscient && (

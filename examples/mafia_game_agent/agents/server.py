@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from typing import Any, Literal
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from models import MafiaGameState
@@ -42,6 +42,16 @@ async def stream_updates(user_id: str):
             "X-Accel-Buffering": "no",
         },
     )
+
+
+@app.websocket("/ws/{user_id}")
+async def websocket_updates(websocket: WebSocket, user_id: str) -> None:
+    await websocket.accept()
+    try:
+        async for update in orchestrator.subscribe_to_updates(owner_id=user_id):
+            await websocket.send_text(json.dumps(update))
+    except WebSocketDisconnect:
+        return
 
 
 @app.get("/")

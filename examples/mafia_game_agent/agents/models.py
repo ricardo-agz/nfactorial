@@ -18,6 +18,20 @@ class PlayerRecord(BaseModel):
     alive: bool = True
 
 
+class VoteRecord(BaseModel):
+    voter_id: str
+    voter_display_name: str
+    target_player_id: str
+    target_display_name: str
+
+
+class DayVoteHistoryEntry(BaseModel):
+    round_no: int
+    eliminated_player_id: str | None = None
+    eliminated_display_name: str | None = None
+    votes: list[VoteRecord] = Field(default_factory=list)
+
+
 class GameStateSnapshot(BaseModel):
     phase: str
     round_no: int
@@ -33,6 +47,8 @@ class GameStateSnapshot(BaseModel):
     players_omniscient: list[dict[str, Any]]
     human_player_id: str | None = None
     human_private_role: str | None = None
+    current_day_votes: list[VoteRecord] = Field(default_factory=list)
+    day_vote_history: list[DayVoteHistoryEntry] = Field(default_factory=list)
     elimination_log: list[dict[str, Any]] = Field(default_factory=list)
 
 
@@ -115,6 +131,8 @@ MafiaPlayerContext: TypeAlias = AgentContext[MafiaPlayerState]
 
 __all__ = [
     "PlayerRecord",
+    "VoteRecord",
+    "DayVoteHistoryEntry",
     "GameStateSnapshot",
     "GameActionResult",
     "PlayerActionResult",

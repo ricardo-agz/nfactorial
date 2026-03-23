@@ -9,8 +9,8 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 RUN pip install --no-cache-dir uv
 
-# Install app deps from the example lockfile (including local nfactorial wheel)
-# into system site-packages so `python ...` works directly at runtime.
+# Install app deps from the example lockfile into system site-packages so
+# `python ...` works directly at runtime.
 COPY examples/mafia_game_agent/pyproject.toml examples/mafia_game_agent/uv.lock ./
 COPY examples/mafia_game_agent/wheels ./wheels
 RUN uv export \
@@ -20,6 +20,14 @@ RUN uv export \
     --format requirements.txt \
     --output-file requirements.lock \
     && pip install --no-cache-dir -r requirements.lock
+
+# The example lockfile installs a bundled nfactorial wheel, which can drift from
+# the repo source. Reinstall the local checkout so the example runs against the
+# code in this workspace.
+COPY pyproject.toml README.md /tmp/nfactorial/
+COPY src /tmp/nfactorial/src
+RUN pip install --no-cache-dir --no-deps --force-reinstall /tmp/nfactorial \
+    && rm -rf /tmp/nfactorial
 
 COPY examples/mafia_game_agent/ ./
 

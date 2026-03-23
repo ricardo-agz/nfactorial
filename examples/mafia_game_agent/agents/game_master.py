@@ -1,34 +1,44 @@
 from __future__ import annotations
 
 import math
+import os
 import random
 import time
 from collections import Counter
+from functools import lru_cache
 from typing import Any
 
+import redis.asyncio as redis
 from constants import HUMAN_PLAYER_ID
 from models import (
+    DayVoteHistoryEntry,
     GameActionResult,
     GameStateSnapshot,
     MafiaGameContext,
     MafiaPlayerState,
     PlayerRecord,
+    VoteRecord,
 )
 
 from factorial import (
     ExecutionContext,
+    FatalAgentError,
     WaitInstruction,
-    inbox,
     messaging,
     subagents,
     tool,
     wait,
+)
+from factorial.queue.operations.messaging import (
+    messaging_inbox_direct_mark_read,
+    messaging_inbox_direct_peek,
 )
 
 _player_agent_ref: Any | None = None
 PLAYER_ACTIVE_POLL_SECONDS = 5
 PLAYER_AWAIT_SIGNAL_SECONDS = 180
 NIGHT_COLLECTION_POLL_SECONDS = 1.0
+DAY_VOTE_COLLECTION_POLL_SECONDS = 1.0
 VOTE_CALL_POLL_SECONDS = 2.0
 
 _NAME_POOL = [
@@ -212,6 +222,43 @@ def _player_roster(agent_ctx: MafiaGameContext) -> list[dict[str, Any]]:
     ]
 
 
+def _player_display_name(agent_ctx: MafiaGameContext, player_id: str) -> str:
+    player = _player_by_id(agent_ctx, player_id)
+    return player.display_name if player is not None else player_id
+
+
+def _vote_records(
+    agent_ctx: MafiaGameContext,
+    votes: dict[str, str],
+) -> list[VoteRecord]:
+    return [
+        VoteRecord(
+            voter_id=voter_id,
+            voter_display_name=_player_display_name(agent_ctx, voter_id),
+            target_player_id=target_id,
+            target_display_name=_player_display_name(agent_ctx, target_id),
+        )
+        for voter_id, target_id in sorted(votes.items())
+    ]
+
+
+def _day_vote_history(agent_ctx: MafiaGameContext) -> list[DayVoteHistoryEntry]:
+    history: list[DayVoteHistoryEntry] = []
+    for entry in agent_ctx.state.elimination_log:
+        if not isinstance(entry, dict) or entry.get("reason") != "day_vote":
+            continue
+        raw_votes = entry.get("votes")
+        history.append(
+            DayVoteHistoryEntry(
+                round_no=_coerce_round_no(entry.get("round_no")) or 0,
+                eliminated_player_id=entry.get("player_id"),
+                eliminated_display_name=entry.get("display_name"),
+                votes=raw_votes if isinstance(raw_votes, list) else [],
+            )
+        )
+    return history
+
+
 def _alive_werewolf_ids(agent_ctx: MafiaGameContext) -> list[str]:
     return [
         player.player_id
@@ -231,6 +278,62 @@ def _alive_villager_ids(agent_ctx: MafiaGameContext) -> list[str]:
 def _deterministic_choice(options: list[str], seed: str) -> str:
     rng = random.Random(seed)
     return rng.choice(options)
+
+
+@lru_cache(maxsize=1)
+def _direct_inbox_redis_client() -> redis.Redis:
+    redis_url = os.getenv("REDIS_URL") or os.getenv("UPSTASH_REDIS_URL")
+    max_connections = int(os.getenv("REDIS_MAX_CONNECTIONS", "50"))
+    if redis_url:
+        return redis.Redis.from_url(
+            redis_url,
+            decode_responses=True,
+            max_connections=max_connections,
+        )
+    return redis.Redis(
+        host=os.getenv("REDIS_HOST", "localhost"),
+        port=int(os.getenv("REDIS_PORT", "6379")),
+        db=int(os.getenv("REDIS_DB", "0")),
+        decode_responses=True,
+        max_connections=max_connections,
+    )
+
+
+def _message_field(message: Any, field_name: str) -> Any:
+    if isinstance(message, dict):
+        return message.get(field_name)
+    return getattr(message, field_name, None)
+
+
+async def _peek_direct_inbox_page(
+    *,
+    unread_only: bool = True,
+    limit: int = 100,
+    cursor: str | None = None,
+) -> dict[str, Any]:
+    execution_ctx = ExecutionContext.current()
+    return await messaging_inbox_direct_peek(
+        redis_client=_direct_inbox_redis_client(),
+        namespace=os.getenv("FACTORIAL_NAMESPACE", "factorial"),
+        task_id=execution_ctx.task_id,
+        unread_only=unread_only,
+        limit=limit,
+        cursor=cursor,
+    )
+
+
+async def _mark_direct_inbox_read(message_ids: list[str]) -> None:
+    if not message_ids:
+        return
+    execution_ctx = ExecutionContext.current()
+    await messaging_inbox_direct_mark_read(
+        redis_client=_direct_inbox_redis_client(),
+        namespace=os.getenv("FACTORIAL_NAMESPACE", "factorial"),
+        task_id=execution_ctx.task_id,
+        message_ids=message_ids,
+        notify_sender=False,
+        data=None,
+    )
 
 
 def _phase_deadline_ts(agent_ctx: MafiaGameContext) -> float | None:
@@ -299,6 +402,8 @@ def _state_snapshot(agent_ctx: MafiaGameContext) -> GameStateSnapshot:
         players_omniscient=players_omniscient,
         human_player_id=(HUMAN_PLAYER_ID if human else None),
         human_private_role=human_role,
+        current_day_votes=_vote_records(agent_ctx, agent_ctx.state.pending_day_votes),
+        day_vote_history=_day_vote_history(agent_ctx),
         elimination_log=list(agent_ctx.state.elimination_log),
     )
 
@@ -316,6 +421,18 @@ def _make_result(
         channel=channel,
         message=message,
     )
+
+
+def _vote_call_announcement(
+    agent_ctx: MafiaGameContext,
+    *,
+    caller_id: str,
+    current_count: int,
+    threshold: int,
+) -> str:
+    caller = _player_by_id(agent_ctx, caller_id)
+    caller_name = caller.display_name if caller else caller_id
+    return f"{caller_name} has called for a vote ({current_count}/{threshold} needed)."
 
 
 async def _cancel_all_ai_children(agent_ctx: MafiaGameContext) -> None:
@@ -404,14 +521,14 @@ def _resolve_voter_id(
     message: Any,
     payload: dict[str, Any],
 ) -> str | None:
-    from_task_id = getattr(message, "from_task_id", None)
+    from_task_id = _message_field(message, "from_task_id")
     if (
         isinstance(from_task_id, str)
         and from_task_id in agent_ctx.state.task_id_to_player_id
     ):
         return agent_ctx.state.task_id_to_player_id[from_task_id]
 
-    from_owner_id = getattr(message, "from_owner_id", None)
+    from_owner_id = _message_field(message, "from_owner_id")
     if isinstance(from_owner_id, str) and _human_player(agent_ctx):
         return HUMAN_PLAYER_ID
 
@@ -425,13 +542,24 @@ async def _drain_day_votes(agent_ctx: MafiaGameContext) -> dict[str, str]:
     accepted: dict[str, str] = {}
     cursor: str | None = None
     while True:
-        page = await inbox.direct.peek(unread_only=True, limit=100, cursor=cursor)
+        page = await _peek_direct_inbox_page(
+            unread_only=True,
+            limit=100,
+            cursor=cursor,
+        )
         consumed_message_ids: list[str] = []
-        for message in page.messages:
-            payload = message.data if isinstance(message.data, dict) else {}
+        messages = page.get("messages", [])
+        if not isinstance(messages, list):
+            break
+        for message in messages:
+            payload = message.get("data") if isinstance(message, dict) else None
+            payload = payload if isinstance(payload, dict) else {}
             if payload.get("kind") != "day_vote":
                 continue
-            consumed_message_ids.append(message.message_id)
+            message_id = _message_field(message, "message_id")
+            if not isinstance(message_id, str):
+                continue
+            consumed_message_ids.append(message_id)
             round_no = _coerce_round_no(payload.get("round_no"))
             if round_no is not None and round_no != agent_ctx.state.round_no:
                 continue
@@ -453,13 +581,11 @@ async def _drain_day_votes(agent_ctx: MafiaGameContext) -> dict[str, str]:
                 continue
             accepted[voter_id] = target_id
         if consumed_message_ids:
-            await inbox.direct.mark_read(
-                message_ids=consumed_message_ids,
-                notify_sender=False,
-            )
-        if not page.has_more or not page.next_cursor:
+            await _mark_direct_inbox_read(consumed_message_ids)
+        next_cursor = page.get("next_cursor")
+        if not page.get("has_more") or not isinstance(next_cursor, str):
             break
-        cursor = page.next_cursor
+        cursor = next_cursor
     return accepted
 
 
@@ -467,13 +593,24 @@ async def _drain_night_actions(agent_ctx: MafiaGameContext) -> dict[str, str]:
     accepted: dict[str, str] = {}
     cursor: str | None = None
     while True:
-        page = await inbox.direct.peek(unread_only=True, limit=100, cursor=cursor)
+        page = await _peek_direct_inbox_page(
+            unread_only=True,
+            limit=100,
+            cursor=cursor,
+        )
         consumed_message_ids: list[str] = []
-        for message in page.messages:
-            payload = message.data if isinstance(message.data, dict) else {}
+        messages = page.get("messages", [])
+        if not isinstance(messages, list):
+            break
+        for message in messages:
+            payload = message.get("data") if isinstance(message, dict) else None
+            payload = payload if isinstance(payload, dict) else {}
             if payload.get("kind") != "night_action":
                 continue
-            consumed_message_ids.append(message.message_id)
+            message_id = _message_field(message, "message_id")
+            if not isinstance(message_id, str):
+                continue
+            consumed_message_ids.append(message_id)
             round_no = _coerce_round_no(payload.get("round_no"))
             if round_no is not None and round_no != agent_ctx.state.round_no:
                 continue
@@ -496,13 +633,11 @@ async def _drain_night_actions(agent_ctx: MafiaGameContext) -> dict[str, str]:
                 continue
             accepted[voter_id] = target_id
         if consumed_message_ids:
-            await inbox.direct.mark_read(
-                message_ids=consumed_message_ids,
-                notify_sender=False,
-            )
-        if not page.has_more or not page.next_cursor:
+            await _mark_direct_inbox_read(consumed_message_ids)
+        next_cursor = page.get("next_cursor")
+        if not page.get("has_more") or not isinstance(next_cursor, str):
             break
-        cursor = page.next_cursor
+        cursor = next_cursor
     return accepted
 
 
@@ -510,13 +645,24 @@ async def _drain_vote_calls(agent_ctx: MafiaGameContext) -> set[str]:
     accepted: set[str] = set()
     cursor: str | None = None
     while True:
-        page = await inbox.direct.peek(unread_only=True, limit=100, cursor=cursor)
+        page = await _peek_direct_inbox_page(
+            unread_only=True,
+            limit=100,
+            cursor=cursor,
+        )
         consumed_message_ids: list[str] = []
-        for message in page.messages:
-            payload = message.data if isinstance(message.data, dict) else {}
+        messages = page.get("messages", [])
+        if not isinstance(messages, list):
+            break
+        for message in messages:
+            payload = message.get("data") if isinstance(message, dict) else None
+            payload = payload if isinstance(payload, dict) else {}
             if payload.get("kind") != "call_vote":
                 continue
-            consumed_message_ids.append(message.message_id)
+            message_id = _message_field(message, "message_id")
+            if not isinstance(message_id, str):
+                continue
+            consumed_message_ids.append(message_id)
             round_no = _coerce_round_no(payload.get("round_no"))
             if round_no is not None and round_no != agent_ctx.state.round_no:
                 continue
@@ -530,13 +676,11 @@ async def _drain_vote_calls(agent_ctx: MafiaGameContext) -> set[str]:
                 continue
             accepted.add(voter_id)
         if consumed_message_ids:
-            await inbox.direct.mark_read(
-                message_ids=consumed_message_ids,
-                notify_sender=False,
-            )
-        if not page.has_more or not page.next_cursor:
+            await _mark_direct_inbox_read(consumed_message_ids)
+        next_cursor = page.get("next_cursor")
+        if not page.get("has_more") or not isinstance(next_cursor, str):
             break
-        cursor = page.next_cursor
+        cursor = next_cursor
     return accepted
 
 
@@ -815,12 +959,14 @@ async def collect_vote_calls(
     current_count = len(agent_ctx.state.pending_vote_calls)
 
     for caller_id in newly_announced:
-        caller = _player_by_id(agent_ctx, caller_id)
-        caller_name = caller.display_name if caller else caller_id
         await messaging.group.send(
             agent_ctx.state.town_group_name,
-            f"{caller_name} has called for a vote "
-            f"({current_count}/{threshold} needed).",
+            _vote_call_announcement(
+                agent_ctx,
+                caller_id=caller_id,
+                current_count=current_count,
+                threshold=threshold,
+            ),
             data={
                 "kind": "system_announcement",
                 "phase": "vote_call",
@@ -848,6 +994,26 @@ async def collect_vote_calls(
             f"({current_count}/{threshold} vote calls received)."
         )
         return _make_result(agent_ctx, summary=summary)
+
+    if newly_announced:
+        announcement_text = " ".join(
+            _vote_call_announcement(
+                agent_ctx,
+                caller_id=caller_id,
+                current_count=current_count,
+                threshold=threshold,
+            )
+            for caller_id in newly_announced
+        )
+        return _make_result(
+            agent_ctx,
+            summary=(
+                f"Registered {len(newly_announced)} new vote call(s) "
+                f"({current_count}/{threshold})."
+            ),
+            channel="town",
+            message=announcement_text,
+        )
 
     poll_sleep = min(remaining, VOTE_CALL_POLL_SECONDS)
     return wait.activity(
@@ -939,8 +1105,9 @@ async def collect_day_votes(
         )
         return _make_result(agent_ctx, summary=summary)
 
+    poll_sleep_seconds = min(remaining, DAY_VOTE_COLLECTION_POLL_SECONDS)
     return wait.activity(
-        timeout=wait.sleep(remaining),
+        timeout=wait.sleep(poll_sleep_seconds),
         data={
             "phase": "collect_day_votes",
             "round_no": agent_ctx.state.round_no,
@@ -964,34 +1131,42 @@ async def resolve_day_vote(agent_ctx: MafiaGameContext) -> GameActionResult:
         return _make_result(agent_ctx, summary="No alive players remained.")
 
     if not agent_ctx.state.pending_day_votes:
-        chosen_player_id = _deterministic_choice(
-            alive_ids,
-            seed=f"day_vote_fallback:{agent_ctx.state.round_no}:{','.join(sorted(alive_ids))}",
+        raise FatalAgentError(
+            "No day votes were collected for the current round. "
+            "Refusing to eliminate a random player."
         )
-    else:
-        tally = Counter(agent_ctx.state.pending_day_votes.values())
-        top_votes = max(tally.values())
-        tied_player_ids = sorted(
-            player_id for player_id, count in tally.items() if count == top_votes
-        )
-        chosen_player_id = _deterministic_choice(
-            tied_player_ids,
-            seed=(
-                f"day_vote_tiebreak:{agent_ctx.state.round_no}:"
-                + ",".join(
-                    f"{voter_id}->{target_id}"
-                    for voter_id, target_id in sorted(
-                        agent_ctx.state.pending_day_votes.items()
-                    )
+    vote_records = _vote_records(agent_ctx, agent_ctx.state.pending_day_votes)
+    tally = Counter(agent_ctx.state.pending_day_votes.values())
+    top_votes = max(tally.values())
+    tied_player_ids = sorted(
+        player_id for player_id, count in tally.items() if count == top_votes
+    )
+    chosen_player_id = _deterministic_choice(
+        tied_player_ids,
+        seed=(
+            f"day_vote_tiebreak:{agent_ctx.state.round_no}:"
+            + ",".join(
+                f"{voter_id}->{target_id}"
+                for voter_id, target_id in sorted(
+                    agent_ctx.state.pending_day_votes.items()
                 )
-            ),
+            )
         )
+    )
 
     eliminated = await _mark_player_eliminated(
         agent_ctx,
         player_id=chosen_player_id,
         reason="day_vote",
     )
+    if agent_ctx.state.elimination_log:
+        latest_entry = agent_ctx.state.elimination_log[-1]
+        if (
+            isinstance(latest_entry, dict)
+            and latest_entry.get("reason") == "day_vote"
+            and latest_entry.get("round_no") == agent_ctx.state.round_no
+        ):
+            latest_entry["votes"] = vote_records
     eliminated_label = (
         eliminated.display_name if eliminated else f"Unknown ({chosen_player_id})"
     )
@@ -1178,12 +1353,9 @@ async def resolve_night_action(agent_ctx: MafiaGameContext) -> GameActionResult:
                 ),
             )
         else:
-            chosen_target = _deterministic_choice(
-                alive_villagers,
-                seed=(
-                    f"night_action_fallback:{agent_ctx.state.round_no}:"
-                    f"{','.join(sorted(alive_villagers))}"
-                ),
+            raise FatalAgentError(
+                "No night actions were collected for the current round. "
+                "Refusing to eliminate a random villager."
             )
 
     eliminated_role: str | None = None
@@ -1274,7 +1446,7 @@ def _gm_tool_choice(agent_ctx: MafiaGameContext) -> str | dict[str, Any]:
     tool_name = _GM_PHASE_TOOL.get(phase)
     if tool_name:
         return {"type": "function", "function": {"name": tool_name}}
-    return "auto"
+    raise RuntimeError(f"Unexpected game master phase {phase!r}.")
 
 
 GAME_MASTER_TOOLS = [

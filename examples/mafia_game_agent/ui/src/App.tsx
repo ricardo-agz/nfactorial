@@ -49,6 +49,7 @@ export default function App() {
             showOmniscient={g.showOmniscient}
             isNightPhase={g.isNightPhase}
             sortedVisiblePlayers={g.sortedVisiblePlayers}
+            agentStatus={g.agentStatus}
             selectedAgentPlayerId={g.selectedAgentPlayerId}
             votedRoundByPlayerId={g.votedRoundByPlayerId}
             selectedAgent={g.selectedAgent}
@@ -64,6 +65,7 @@ export default function App() {
             canViewWolfThread={g.canViewWolfThread}
             activeAgentCount={g.activeAgentCount}
             waitingAgentCount={g.waitingAgentCount}
+            failedAgentCount={g.failedAgentCount}
             isNightPhase={g.isNightPhase}
             canUseHumanActions={g.canUseHumanActions}
             chatInput={g.chatInput}

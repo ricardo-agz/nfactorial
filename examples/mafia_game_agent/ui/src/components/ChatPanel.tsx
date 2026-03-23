@@ -21,6 +21,7 @@ interface ChatPanelProps {
   canViewWolfThread: boolean;
   activeAgentCount: number;
   waitingAgentCount: number;
+  failedAgentCount: number;
   isNightPhase: boolean;
   canUseHumanActions: boolean;
   chatInput: string;
@@ -121,6 +122,7 @@ export function ChatPanel({
   canViewWolfThread,
   activeAgentCount,
   waitingAgentCount,
+  failedAgentCount,
   isNightPhase,
   canUseHumanActions,
   chatInput,
@@ -197,7 +199,9 @@ export function ChatPanel({
           );
         })}
         <div className="flex-1" />
-        {(activeAgentCount > 0 || waitingAgentCount > 0) && (
+        {(activeAgentCount > 0 ||
+          waitingAgentCount > 0 ||
+          failedAgentCount > 0) && (
           <div className="flex items-center gap-2 text-[10px] text-neutral-600">
             {activeAgentCount > 0 && (
               <span className="flex items-center gap-1">
@@ -209,6 +213,12 @@ export function ChatPanel({
               <span className="flex items-center gap-1">
                 <Clock3 className="h-3 w-3 text-amber-500/50" />
                 {waitingAgentCount} waiting
+              </span>
+            )}
+            {failedAgentCount > 0 && (
+              <span className="flex items-center gap-1 text-rose-300">
+                <span className="h-1.5 w-1.5 rounded-full bg-rose-400" />
+                {failedAgentCount} failed
               </span>
             )}
           </div>

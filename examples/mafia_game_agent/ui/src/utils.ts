@@ -92,12 +92,14 @@ export function summarizeToolAction(
     return "drafting a town statement";
   }
   if (toolName === "vote") {
-    const target = toolArgs.target_player_id;
+    const target =
+      toolArgs.target_player_id ?? toolArgs.player_id ?? toolArgs.target_id;
     if (typeof target === "string" && target.trim()) return `targeting ${target.trim()}`;
     return "choosing day vote target";
   }
   if (toolName === "kill") {
-    const target = toolArgs.target_player_id;
+    const target =
+      toolArgs.target_player_id ?? toolArgs.player_id ?? toolArgs.target_id;
     if (typeof target === "string" && target.trim()) return `targeting ${target.trim()}`;
     return "choosing night kill target";
   }

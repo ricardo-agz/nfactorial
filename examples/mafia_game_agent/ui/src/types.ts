@@ -23,6 +23,11 @@ export interface AgentEvent {
   timestamp: string;
   data?: any;
   error?: string;
+  tool_name?: string;
+  tool_call_id?: string;
+  output?: any;
+  is_error?: boolean;
+  status?: string;
 }
 
 export interface UiMessage {
@@ -43,6 +48,20 @@ export interface PlayerStateView {
   role?: string | null;
 }
 
+export interface VoteRecord {
+  voter_id: string;
+  voter_display_name: string;
+  target_player_id: string;
+  target_display_name: string;
+}
+
+export interface DayVoteHistoryEntry {
+  round_no: number;
+  eliminated_player_id?: string | null;
+  eliminated_display_name?: string | null;
+  votes: VoteRecord[];
+}
+
 export interface GameStateSnapshot {
   phase: string;
   round_no: number;
@@ -58,6 +77,8 @@ export interface GameStateSnapshot {
   players_omniscient: PlayerStateView[];
   human_player_id?: string | null;
   human_private_role?: string | null;
+  current_day_votes?: VoteRecord[];
+  day_vote_history?: DayVoteHistoryEntry[];
   elimination_log: Array<Record<string, any>>;
 }
 

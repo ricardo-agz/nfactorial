@@ -147,7 +147,11 @@ class ResourceManager:
             self._locks[key] = lock
         return lock
 
-    async def get(self, resource_type_value: type[R], logical_name: str = "default") -> R:
+    async def get(
+        self,
+        resource_type_value: type[R],
+        logical_name: str = "default",
+    ) -> R:
         binding_key = (resource_type_key(resource_type_value), logical_name)
         async with self._lock(resource_type_value, logical_name):
             live_binding = self._live_bindings.get(binding_key)
@@ -316,7 +320,7 @@ class ResourceManager:
         if not lifecycle_supports_live_refs(lifecycle):
             return None
         try:
-            attach_live = getattr(lifecycle, "attach_live")
+            attach_live = lifecycle.attach_live
             return await attach_live(live_ref, ctx, request)
         except Exception:
             logger.warning(
@@ -345,7 +349,7 @@ class ResourceManager:
         )
 
         if lifecycle_supports_live_refs(lifecycle):
-            capture_live_ref = getattr(lifecycle, "capture_live_ref")
+            capture_live_ref = lifecycle.capture_live_ref
             live_ref = capture_live_ref(
                 resource,
                 self._resource_context(request.logical_name),
@@ -375,7 +379,9 @@ class ResourcesExecutionNamespace:
     def _require_manager(self) -> ResourceManager:
         manager = self.manager
         if manager is None:
-            raise RuntimeError("resources are not configured for this execution context")
+            raise RuntimeError(
+                "resources are not configured for this execution context"
+            )
         return manager
 
     async def get_resource(

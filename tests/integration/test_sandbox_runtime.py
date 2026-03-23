@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import pytest
 import redis.asyncio as redis
@@ -17,7 +17,11 @@ from factorial.agent.context import AgentContext
 from factorial.ai.models import Model, Provider
 from factorial.execution.waits import wait
 from factorial.queue.keys import RedisKeys
-from factorial.queue.lua import BatchPickupScript, TaskCompletionScript, TaskSteeringScript
+from factorial.queue.lua import (
+    BatchPickupScript,
+    TaskCompletionScript,
+    TaskSteeringScript,
+)
 from factorial.queue.operations import enqueue_task
 from factorial.queue.task import Task, TaskStatus, get_task_status
 from factorial.queue.worker import process_task
@@ -38,7 +42,7 @@ class _FakeSnapshot:
 
 
 class _FakeAsyncSandbox:
-    instances: dict[str, "_FakeAsyncSandbox"] = {}
+    instances: dict[str, _FakeAsyncSandbox] = {}
     created_kwargs: list[dict] = []
     counter: int = 0
 
@@ -73,7 +77,9 @@ class _FakeAsyncSandbox:
         self.status = status
 
     async def run_command(self, *args, **kwargs):
-        raise AssertionError("run_command should not be called in this integration test")
+        raise AssertionError(
+            "run_command should not be called in this integration test"
+        )
 
     async def run_command_detached(self, *args, **kwargs):
         raise AssertionError(
@@ -208,7 +214,6 @@ async def test_process_task_checkpoints_sandbox_on_pause(
     )
 
     agent = _SandboxWaitAgent()
-    keys = RedisKeys.format(namespace=test_namespace, agent=agent.name, task_id="unused")
     task = Task.create(
         owner_id=test_owner_id,
         agent=agent.name,
@@ -247,7 +252,10 @@ async def test_process_task_checkpoints_sandbox_on_pause(
         metrics_retention_duration=3600,
     )
 
-    assert await get_task_status(redis_client, test_namespace, task_id) == TaskStatus.PAUSED
+    assert (
+        await get_task_status(redis_client, test_namespace, task_id)
+        == TaskStatus.PAUSED
+    )
     bindings = await redis_client.hgetall(task_keys.resource_bindings)
     assert len(bindings) == 1
     binding = json.loads(next(iter(bindings.values())))

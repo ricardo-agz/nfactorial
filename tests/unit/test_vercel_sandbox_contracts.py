@@ -48,7 +48,7 @@ class _FakeSnapshot:
 class _FakeAsyncSandbox:
     created_kwargs: list[dict] = []
     get_ids: list[str] = []
-    instances: dict[str, "_FakeAsyncSandbox"] = {}
+    instances: dict[str, _FakeAsyncSandbox] = {}
     snapshot_sources: dict[str, str] = {}
     counter: int = 0
 

@@ -23,9 +23,7 @@ from typing import (
 
 from pydantic import BaseModel, ConfigDict
 
-from factorial.agent.context import AgentContext
 from factorial.core.utils import decode
-from factorial.execution.context import ExecutionContext
 from factorial.execution.dependencies import is_runtime_injected_annotation
 
 HookT = TypeVar("HookT", bound="Hook")

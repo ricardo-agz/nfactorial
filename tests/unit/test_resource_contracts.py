@@ -21,19 +21,19 @@ from factorial import (
     ResourceRequest,
     Resources,
     Sandboxes,
-    verify,
     resource,
     tool,
+    verify,
 )
 from factorial.agent.tools.runtime import tool_action as run_tool_action
 from factorial.ai.models import Model, Provider
 from factorial.core.events import EventPublisher
+from factorial.execution.context import execution_context
 from factorial.resources import (
     InMemoryResourceBindingStore,
     ResourceManager,
     ResourcesExecutionNamespace,
 )
-from factorial.execution.context import execution_context
 from factorial.testing import MockAgent
 from tests.mocks.llm import MockLLMClient
 
@@ -352,7 +352,12 @@ async def test_verifier_supports_runtime_resource_injection() -> None:
             del resource_value, ctx, request
 
     def verifier(output: Any, browser: BrowserSession):
-        return verify.accept(metadata={"browser_session": browser.session_id, "output": output})
+        return verify.accept(
+            metadata={
+                "browser_session": browser.session_id,
+                "output": output,
+            }
+        )
 
     agent = MockAgent(
         name="resource_verifier_agent",

@@ -22,11 +22,6 @@ from factorial.execution.context import (
     SignalsExecutionNamespace,
     SubagentsExecutionNamespace,
 )
-from factorial.resources import (
-    RedisResourceBindingStore,
-    ResourceManager,
-    ResourcesExecutionNamespace,
-)
 from factorial.queue.keys import RedisKeys
 from factorial.queue.lua import (
     ActivityWaitScript,
@@ -40,6 +35,11 @@ from factorial.queue.lua import (
     create_wait_schedule_script,
 )
 from factorial.queue.task import Task, get_task_data
+from factorial.resources import (
+    RedisResourceBindingStore,
+    ResourceManager,
+    ResourcesExecutionNamespace,
+)
 
 from .common import apply_steering_if_available, classify_failure, logger
 from .runtime_ops import TaskRuntimeOps

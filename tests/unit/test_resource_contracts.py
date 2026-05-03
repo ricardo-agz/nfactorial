@@ -20,7 +20,13 @@ from factorial import (
     ResourceContext,
     ResourceRequest,
     Resources,
+    Sandbox,
+    SandboxCheckpoint,
     Sandboxes,
+    SandboxExecResult,
+    SandboxProcess,
+    SandboxWriteFile,
+    register_sandbox_provider,
     resource,
     tool,
     verify,
@@ -31,9 +37,11 @@ from factorial.core.events import EventPublisher
 from factorial.execution.context import execution_context
 from factorial.resources import (
     InMemoryResourceBindingStore,
+    LiveResourceRef,
     ResourceManager,
     ResourcesExecutionNamespace,
 )
+from factorial.resources.sandbox.guarded import GuardedSandbox
 from factorial.testing import MockAgent
 from tests.mocks.llm import MockLLMClient
 
@@ -41,6 +49,196 @@ from tests.mocks.llm import MockLLMClient
 @dataclass
 class BrowserSession:
     session_id: str
+
+
+class _TestSandboxProcess(SandboxProcess):
+    @property
+    def id(self) -> str:
+        return "test-process"
+
+    async def wait(self) -> SandboxExecResult:
+        return SandboxExecResult(
+            command_id=self.id,
+            exit_code=0,
+            stdout_text="",
+            stderr_text="",
+        )
+
+    async def output(self, stream: str = "both") -> str:
+        del stream
+        return ""
+
+    async def stdout(self) -> str:
+        return ""
+
+    async def stderr(self) -> str:
+        return ""
+
+    async def kill(self, signal: int = 15) -> None:
+        del signal
+
+
+@dataclass
+class _TestSandbox(Sandbox):
+    sandbox_id: str
+    provider_alias: str
+
+    @property
+    def id(self) -> str:
+        return self.sandbox_id
+
+    @property
+    def provider(self) -> str:
+        return self.provider_alias
+
+    @property
+    def native(self) -> object:
+        return self
+
+    async def exec(
+        self,
+        *args: str,
+        cwd: str | None = None,
+        env: dict[str, str] | None = None,
+        timeout_s: float | None = None,
+        sudo: bool = False,
+    ) -> SandboxExecResult:
+        del args, cwd, env, timeout_s, sudo
+        return SandboxExecResult(
+            command_id="exec",
+            exit_code=0,
+            stdout_text="",
+            stderr_text="",
+        )
+
+    async def spawn(
+        self,
+        *args: str,
+        cwd: str | None = None,
+        env: dict[str, str] | None = None,
+        timeout_s: float | None = None,
+        sudo: bool = False,
+    ) -> SandboxProcess:
+        del args, cwd, env, timeout_s, sudo
+        return _TestSandboxProcess()
+
+    async def read_file(self, path: str) -> bytes | None:
+        del path
+        return None
+
+    async def write_files(self, files: list[SandboxWriteFile]) -> None:
+        del files
+
+    async def mkdir(self, path: str, *, parents: bool = True) -> None:
+        del path, parents
+
+    async def url(self, port: int) -> str:
+        return f"https://{self.sandbox_id}-{port}.example.test"
+
+    async def checkpoint(self) -> SandboxCheckpoint:
+        return SandboxCheckpoint(
+            provider=self.provider_alias,
+            kind="sandbox",
+            ref=f"checkpoint-{self.sandbox_id}",
+        )
+
+
+@pytest.mark.asyncio
+async def test_guarded_sandbox_native_methods_are_lease_validated() -> None:
+    async def _validator() -> None:
+        raise RuntimeError("lease lost")
+
+    sandbox = GuardedSandbox(
+        sandbox=_TestSandbox(sandbox_id="sb-1", provider_alias="test"),
+        validator=_validator,
+    )
+
+    with pytest.raises(RuntimeError, match="lease lost"):
+        await sandbox.native.exec("echo", "unsafe")  # type: ignore[attr-defined]
+
+
+@dataclass
+class _RecordingSandboxProvider:
+    alias: str
+    created_names: list[str]
+
+    async def create(
+        self,
+        ctx: ResourceContext,
+        request: ResourceRequest[Sandbox],
+    ) -> Sandbox:
+        del ctx
+        self.created_names.append(request.logical_name)
+        return _TestSandbox(
+            sandbox_id=f"{self.alias}-{request.logical_name}",
+            provider_alias=self.alias,
+        )
+
+    async def restore(
+        self,
+        checkpoint: ResourceCheckpoint,
+        ctx: ResourceContext,
+        request: ResourceRequest[Sandbox],
+    ) -> Sandbox:
+        del ctx, request
+        return _TestSandbox(
+            sandbox_id=checkpoint.ref,
+            provider_alias=self.alias,
+        )
+
+    async def checkpoint(
+        self,
+        resource: Sandbox,
+        ctx: ResourceContext,
+        request: ResourceRequest[Sandbox],
+    ) -> ResourceCheckpoint | None:
+        del ctx, request
+        return ResourceCheckpoint(
+            provider=self.alias,
+            kind="sandbox",
+            ref=f"checkpoint-{resource.id}",
+        )
+
+    async def destroy(
+        self,
+        resource: Sandbox,
+        ctx: ResourceContext,
+        request: ResourceRequest[Sandbox],
+    ) -> None:
+        del resource, ctx, request
+
+    async def attach_live(
+        self,
+        live_ref: LiveResourceRef,
+        ctx: ResourceContext,
+        request: ResourceRequest[Sandbox],
+    ) -> Sandbox | None:
+        del ctx, request
+        return _TestSandbox(
+            sandbox_id=live_ref.ref,
+            provider_alias=self.alias,
+        )
+
+    def capture_live_ref(
+        self,
+        resource: Sandbox,
+        ctx: ResourceContext,
+        request: ResourceRequest[Sandbox],
+    ) -> LiveResourceRef | None:
+        del ctx, request
+        return LiveResourceRef(
+            provider=self.alias,
+            kind="sandbox",
+            ref=resource.id,
+        )
+
+    async def delete_checkpoint(
+        self,
+        checkpoint: ResourceCheckpoint,
+        ctx: ResourceContext,
+        request: ResourceRequest[Sandbox],
+    ) -> None:
+        del checkpoint, ctx, request
 
 
 class _NoopEvents:
@@ -83,6 +281,7 @@ def _make_agent_with_tools(tools: list[Any]) -> Agent:
 def _set_test_execution_context(
     *,
     manager: ResourceManager | None = None,
+    default_sandbox_provider: str | None = None,
 ) -> Any:
     ctx = ExecutionContext(
         task_id=str(uuid.uuid4()),
@@ -90,7 +289,10 @@ def _set_test_execution_context(
         agent_name="test-agent",
         retry_count=0,
         events=EventPublisher.__new__(EventPublisher),
-        resources=ResourcesExecutionNamespace(manager=manager),
+        resources=ResourcesExecutionNamespace(
+            manager=manager,
+            default_sandbox_provider=default_sandbox_provider,
+        ),
     )
     ctx.events = _NoopEvents()  # type: ignore[assignment]
     return execution_context.set(ctx)
@@ -228,6 +430,59 @@ async def test_tool_action_injects_custom_resource_dependency() -> None:
         assert calls["destroy"] == 1
     finally:
         execution_context.reset(token)
+        await agent.http_client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_sandbox_runtime_uses_default_and_explicit_provider_aliases() -> None:
+    default_alias = f"test-default-{uuid.uuid4().hex}"
+    explicit_alias = f"test-explicit-{uuid.uuid4().hex}"
+    default_provider = _RecordingSandboxProvider(default_alias, [])
+    explicit_provider = _RecordingSandboxProvider(explicit_alias, [])
+    register_sandbox_provider(default_provider, alias=default_alias)
+    register_sandbox_provider(explicit_provider, alias=explicit_alias)
+
+    @tool
+    async def inspect_default_provider(sandbox: Sandbox) -> str:
+        return sandbox.provider
+
+    @tool
+    async def inspect_explicit_provider(sandboxes: Sandboxes) -> str:
+        sandbox = await sandboxes.get("browser", provider=explicit_alias)
+        return sandbox.provider
+
+    manager = ResourceManager(
+        store=InMemoryResourceBindingStore(),
+        task_id="task-sandbox",
+        owner_id="owner-sandbox",
+        agent_name="sandbox-agent",
+    )
+    agent = _make_agent_with_tools(
+        [inspect_default_provider, inspect_explicit_provider]
+    )
+    token = _set_test_execution_context(
+        manager=manager,
+        default_sandbox_provider=default_alias,
+    )
+    try:
+        default_result = await run_tool_action(
+            agent,
+            _make_tool_call("inspect_default_provider"),
+            AgentContext(messages=[{"role": "user", "content": "q"}]),
+        )
+        explicit_result = await run_tool_action(
+            agent,
+            _make_tool_call("inspect_explicit_provider"),
+            AgentContext(messages=[{"role": "user", "content": "q"}]),
+        )
+
+        assert default_result.client_output == default_alias
+        assert explicit_result.client_output == explicit_alias
+        assert default_provider.created_names == ["default"]
+        assert explicit_provider.created_names == ["browser"]
+    finally:
+        execution_context.reset(token)
+        await manager.destroy_all()
         await agent.http_client.aclose()
 
 

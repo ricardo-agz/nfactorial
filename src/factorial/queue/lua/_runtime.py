@@ -5,8 +5,11 @@ import redis.asyncio as redis
 from redis.commands.core import AsyncScript
 
 from factorial.core.utils import decode
-
-from ._core import LuaScriptContract, _execute_contract, get_cached_script
+from factorial.queue.lua_core import (
+    LuaScriptContract,
+    _execute_contract,
+    get_cached_script,
+)
 
 
 @dataclass
@@ -405,9 +408,27 @@ class ChildTaskCompletionScript(AsyncScript):
             "task_pickups_key",
             "task_retries_key",
             "task_metas_key",
+            "activity_wait_meta_key",
         ),
-        arg_fields=("task_id", "updated_task_context_json"),
-        optional_key_fields=frozenset({"pending_child_wait_ids_key"}),
+        arg_fields=(
+            "task_id",
+            "updated_task_context_json",
+            "expected_wait_child_ids_json",
+            "expected_result_values_json",
+            "expected_child_statuses_json",
+            "expected_child_activity_waiting_json",
+        ),
+        optional_key_fields=frozenset(
+            {"pending_child_wait_ids_key", "activity_wait_meta_key"}
+        ),
+        optional_arg_fields=frozenset(
+            {
+                "expected_wait_child_ids_json",
+                "expected_result_values_json",
+                "expected_child_statuses_json",
+                "expected_child_activity_waiting_json",
+            }
+        ),
     )
 
     async def execute(
@@ -426,9 +447,42 @@ class ChildTaskCompletionScript(AsyncScript):
         task_id: str,
         updated_task_context_json: str,
         pending_child_wait_ids_key: str | None = None,
+        activity_wait_meta_key: str | None = None,
+        expected_wait_child_ids: list[str] | None = None,
+        expected_result_values: list[str | None] | None = None,
+        expected_child_statuses: list[str | None] | None = None,
+        expected_child_activity_waiting: list[bool] | None = None,
     ) -> tuple[bool, str]:
+        expected_wait_child_ids_json = (
+            json.dumps(expected_wait_child_ids)
+            if expected_wait_child_ids is not None
+            else None
+        )
+        expected_result_values_json = (
+            json.dumps(expected_result_values)
+            if expected_result_values is not None
+            else None
+        )
+        expected_child_statuses_json = (
+            json.dumps(expected_child_statuses)
+            if expected_child_statuses is not None
+            else None
+        )
+        expected_child_activity_waiting_json = (
+            json.dumps(expected_child_activity_waiting)
+            if expected_child_activity_waiting is not None
+            else None
+        )
+        execution_values = dict(locals())
+        for field_name in (
+            "expected_wait_child_ids",
+            "expected_result_values",
+            "expected_child_statuses",
+            "expected_child_activity_waiting",
+        ):
+            execution_values.pop(field_name, None)
         result: tuple[int, str | bytes] = await _execute_contract(
-            self, self._CONTRACT, locals()
+            self, self._CONTRACT, execution_values
         )
         return bool(result[0]), decode(result[1])
 

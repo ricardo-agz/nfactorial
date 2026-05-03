@@ -5,7 +5,8 @@ from .base import (
     SandboxProcess,
     SandboxWriteFile,
 )
-from .vercel import VercelSandboxHandle, VercelSandboxLifecycle, VercelSandboxProcess
+from .lifecycle import SandboxLifecycle
+from .providers import SandboxProvider, register_sandbox_provider
 
 __all__ = [
     "Sandbox",
@@ -13,7 +14,7 @@ __all__ = [
     "SandboxExecResult",
     "SandboxProcess",
     "SandboxWriteFile",
-    "VercelSandboxHandle",
-    "VercelSandboxLifecycle",
-    "VercelSandboxProcess",
+    "SandboxLifecycle",
+    "SandboxProvider",
+    "register_sandbox_provider",
 ]

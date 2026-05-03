@@ -41,6 +41,26 @@ class _FakeSnapshot:
     expires_at: int = 9999999999
 
 
+@dataclass
+class _FakeRemoteSnapshot:
+    snapshot_id: str
+
+    async def delete(self) -> None:
+        _FakeAsyncSnapshotApi.deleted_ids.append(self.snapshot_id)
+
+
+class _FakeAsyncSnapshotApi:
+    deleted_ids: list[str] = []
+
+    @classmethod
+    def reset(cls) -> None:
+        cls.deleted_ids = []
+
+    @classmethod
+    async def get(cls, *, snapshot_id: str):
+        return _FakeRemoteSnapshot(snapshot_id=snapshot_id)
+
+
 class _FakeAsyncSandbox:
     instances: dict[str, _FakeAsyncSandbox] = {}
     created_kwargs: list[dict] = []
@@ -154,6 +174,7 @@ class _SandboxWaitAgent(BaseAgent[AgentContext]):
             name="sandbox_wait_agent",
             instructions="Pause with a sandbox",
             model=MOCK_MODEL,
+            sandbox="vercel",
         )
 
     async def run_turn(
@@ -181,6 +202,7 @@ class _SandboxCompleteAgent(BaseAgent[AgentContext]):
             name="sandbox_complete_agent",
             instructions="Complete with a sandbox",
             model=MOCK_MODEL,
+            sandbox="vercel",
         )
 
     async def run_turn(
@@ -208,9 +230,14 @@ async def test_process_task_checkpoints_sandbox_on_pause(
     steering_script: TaskSteeringScript,
 ) -> None:
     _FakeAsyncSandbox.reset()
+    _FakeAsyncSnapshotApi.reset()
     monkeypatch.setattr(
         "factorial.resources.sandbox.vercel._load_vercel_async_sandbox",
         lambda: _FakeAsyncSandbox,
+    )
+    monkeypatch.setattr(
+        "factorial.resources.sandbox.vercel._load_vercel_async_snapshot",
+        lambda: _FakeAsyncSnapshotApi,
     )
 
     agent = _SandboxWaitAgent()
@@ -274,9 +301,14 @@ async def test_process_task_destroys_sandbox_on_completion(
     steering_script: TaskSteeringScript,
 ) -> None:
     _FakeAsyncSandbox.reset()
+    _FakeAsyncSnapshotApi.reset()
     monkeypatch.setattr(
         "factorial.resources.sandbox.vercel._load_vercel_async_sandbox",
         lambda: _FakeAsyncSandbox,
+    )
+    monkeypatch.setattr(
+        "factorial.resources.sandbox.vercel._load_vercel_async_snapshot",
+        lambda: _FakeAsyncSnapshotApi,
     )
 
     agent = _SandboxCompleteAgent()
@@ -324,3 +356,88 @@ async def test_process_task_destroys_sandbox_on_completion(
     )
     assert await redis_client.exists(task_keys.resource_bindings) == 0
     assert _FakeAsyncSandbox.instances["sb-1"].stop_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_cancel_paused_task_cleans_persisted_sandbox_checkpoint(
+    monkeypatch,
+    redis_client: redis.Redis,
+    test_namespace: str,
+    test_owner_id: str,
+    pickup_script: BatchPickupScript,
+    completion_script: TaskCompletionScript,
+    steering_script: TaskSteeringScript,
+) -> None:
+    _FakeAsyncSandbox.reset()
+    _FakeAsyncSnapshotApi.reset()
+    monkeypatch.setattr(
+        "factorial.resources.sandbox.vercel._load_vercel_async_sandbox",
+        lambda: _FakeAsyncSandbox,
+    )
+    monkeypatch.setattr(
+        "factorial.resources.sandbox.vercel._load_vercel_async_snapshot",
+        lambda: _FakeAsyncSnapshotApi,
+    )
+
+    agent = _SandboxWaitAgent()
+    task = Task.create(
+        owner_id=test_owner_id,
+        agent=agent.name,
+        payload=AgentContext(
+            messages=[{"role": "user", "content": "pause then cancel"}]
+        ),
+    )
+    task_id = await enqueue_task(
+        redis_client=redis_client,
+        namespace=test_namespace,
+        agent=agent,
+        task=task,
+    )
+    task_keys = RedisKeys.format(
+        namespace=test_namespace,
+        agent=agent.name,
+        task_id=task_id,
+    )
+
+    picked = await _pickup_single_task(
+        redis_client=redis_client,
+        keys=RedisKeys.format(namespace=test_namespace, agent=agent.name),
+        pickup_script=pickup_script,
+    )
+    assert picked == [task_id]
+
+    await process_task(
+        redis_client=redis_client,
+        namespace=test_namespace,
+        task_id=task_id,
+        completion_script=completion_script,
+        steering_script=steering_script,
+        agent=agent,
+        agents_by_name={agent.name: agent},
+        max_retries=3,
+        heartbeat_interval=30,
+        task_timeout=30,
+        metrics_retention_duration=3600,
+    )
+
+    assert (
+        await get_task_status(redis_client, test_namespace, task_id)
+        == TaskStatus.PAUSED
+    )
+
+    from factorial.queue.operations import cancel_task
+
+    await cancel_task(
+        redis_client=redis_client,
+        namespace=test_namespace,
+        task_id=task_id,
+        agents_by_name={agent.name: agent},
+        metrics_retention_duration=3600,
+    )
+
+    assert (
+        await get_task_status(redis_client, test_namespace, task_id)
+        == TaskStatus.CANCELLED
+    )
+    assert await redis_client.exists(task_keys.resource_bindings) == 0
+    assert _FakeAsyncSnapshotApi.deleted_ids == ["snap-sb-1"]

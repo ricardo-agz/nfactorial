@@ -5,8 +5,7 @@ import redis.asyncio as redis
 from redis.commands.core import AsyncScript
 
 from factorial.core.utils import decode
-
-from ._core import (
+from factorial.queue.lua_core import (
     LuaScriptContract,
     _decode_json_string_list,
     _execute_contract,

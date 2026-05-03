@@ -1,3 +1,5 @@
+from factorial.queue.lua_core import LuaScriptContract
+
 from ._communication import (
     HookResolveScript,
     HookResolveScriptResult,
@@ -21,7 +23,6 @@ from ._communication import (
     create_messaging_human_direct_send_script,
     create_messaging_human_group_send_script,
 )
-from ._core import LuaScriptContract
 from ._enqueue import (
     EnqueueBatchScript,
     EnqueueBatchScriptResult,

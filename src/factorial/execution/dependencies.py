@@ -70,7 +70,7 @@ async def resolve_runtime_injected_value(
     if normalized is Sandboxes:
         return True, sandboxes
     if normalized is Sandbox:
-        return True, await execution_ctx.resources.get_resource(Sandbox, "default")
+        return True, await execution_ctx.resources.get_sandbox("default")
     if isinstance(normalized, type) and has_resource_lifecycle(normalized):
         return True, await execution_ctx.resources.get_resource(normalized, "default")
 

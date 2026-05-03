@@ -1,4 +1,5 @@
 from .core import (
+    CheckpointCleanupResourceLifecycle,
     LiveResourceRef,
     ResourceBindingRecord,
     ResourceCheckpoint,
@@ -10,8 +11,6 @@ from .core import (
     resource,
 )
 from .manager import (
-    InMemoryResourceBindingStore,
-    RedisResourceBindingStore,
     ResourceManager,
     ResourcesExecutionNamespace,
 )
@@ -19,17 +18,26 @@ from .sandbox import (
     Sandbox,
     SandboxCheckpoint,
     SandboxExecResult,
+    SandboxLifecycle,
     SandboxProcess,
+    SandboxProvider,
     SandboxWriteFile,
-    VercelSandboxHandle,
-    VercelSandboxLifecycle,
-    VercelSandboxProcess,
+    register_sandbox_provider,
+)
+from .store import (
+    InMemoryResourceBindingStore,
+    RedisResourceBindingStore,
+    ResourceLease,
+    ResourceLeaseLostError,
 )
 
 __all__ = [
     "InMemoryResourceBindingStore",
+    "CheckpointCleanupResourceLifecycle",
     "LiveResourceRef",
     "RedisResourceBindingStore",
+    "ResourceLease",
+    "ResourceLeaseLostError",
     "ResourceBindingRecord",
     "ResourceCheckpoint",
     "ResourceContext",
@@ -41,11 +49,11 @@ __all__ = [
     "Sandbox",
     "SandboxCheckpoint",
     "SandboxExecResult",
+    "SandboxLifecycle",
+    "SandboxProvider",
     "SandboxProcess",
     "SandboxWriteFile",
-    "VercelSandboxHandle",
-    "VercelSandboxLifecycle",
-    "VercelSandboxProcess",
     "register_resource_lifecycle",
+    "register_sandbox_provider",
     "resource",
 ]

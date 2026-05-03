@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import json
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -12,7 +14,8 @@ from factorial.core.utils import decode
 
 T = TypeVar("T", bound=AsyncScript)
 
-_SCRIPTS_DIR = Path(__file__).parent / "scripts"
+_SCRIPTS_DIR = Path(__file__).resolve().parent.parent / "queue" / "scripts"
+_SCRIPT_PATH_CACHE: dict[str, Path] | None = None
 _SCRIPT_CONTENT: dict[str, str] = {}
 _SHARED_SCRIPT_CONTENT: str | None = None
 _SCRIPT_INSTANCES: WeakKeyDictionary[redis.Redis, dict[str, Any]] = (
@@ -22,8 +25,47 @@ _SCRIPT_INSTANCES_BY_ID: dict[tuple[int, str], Any] = {}
 _ALLOWED_EXECUTE_LOCALS = frozenset({"self"})
 
 
+def _discover_script_paths() -> dict[str, Path]:
+    if not _SCRIPTS_DIR.exists():
+        raise FileNotFoundError(f"Lua scripts directory not found: {_SCRIPTS_DIR}")
+
+    scripts_by_name: dict[str, Path] = {}
+    duplicate_paths: dict[str, list[Path]] = {}
+    for script_path in sorted(_SCRIPTS_DIR.rglob("*.lua")):
+        if script_path.name == "shared.lua":
+            continue
+
+        script_name = script_path.stem
+        existing = scripts_by_name.get(script_name)
+        if existing is not None:
+            duplicate_paths.setdefault(script_name, [existing]).append(script_path)
+            continue
+        scripts_by_name[script_name] = script_path
+
+    if duplicate_paths:
+        details = "; ".join(
+            f"{name}: "
+            + ", ".join(str(path.relative_to(_SCRIPTS_DIR)) for path in paths)
+            for name, paths in sorted(duplicate_paths.items())
+        )
+        raise RuntimeError(
+            f"Duplicate Lua script names found under {_SCRIPTS_DIR}: {details}"
+        )
+
+    return scripts_by_name
+
+
 def _get_script_path(script_name: str) -> Path:
-    return _SCRIPTS_DIR / f"{script_name}.lua"
+    global _SCRIPT_PATH_CACHE
+    if _SCRIPT_PATH_CACHE is None:
+        _SCRIPT_PATH_CACHE = _discover_script_paths()
+
+    script_path = _SCRIPT_PATH_CACHE.get(script_name)
+    if script_path is None:
+        raise FileNotFoundError(
+            f"Lua script '{script_name}' not found under {_SCRIPTS_DIR}"
+        )
+    return script_path
 
 
 def _load_shared_script_content() -> str:
@@ -205,3 +247,11 @@ def _decode_json_string_list(raw: str | bytes | None) -> list[str]:
     if not isinstance(parsed, list):
         return []
     return [str(item) for item in parsed]
+
+
+__all__ = [
+    "LuaScriptContract",
+    "_decode_json_string_list",
+    "_execute_contract",
+    "get_cached_script",
+]

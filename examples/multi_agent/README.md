@@ -34,6 +34,34 @@ docker-compose up
 - UI: <http://localhost:5173>
 - Dashboard: <http://localhost:8081>
 
+## Deploy on Vercel
+
+This example supports both runtime modes:
+
+- **Process mode (local):** `docker-compose up`
+- **Serverless mode (Vercel):** `vercel.json` + queue worker
+
+### Required environment variables (Vercel Project)
+
+- `AI_GATEWAY_API_KEY`
+- `EXA_API_KEY`
+- `REDIS_HOST`
+- `REDIS_PORT`
+- `REDIS_DB`
+- `REDIS_MAX_CONNECTIONS` (optional; defaults to `1000`)
+
+### Deploy
+
+```bash
+cd examples/multi_agent
+vercel
+```
+
+Service wiring in `vercel.json`:
+
+- `web` -> `server.py`
+- `worker` -> `orchestrator.py` (Vercel Queue consumer + self-renewing maintenance heartbeat)
+
 ## Manual Setup
 
 ### Prerequisites
@@ -49,7 +77,7 @@ docker-compose up
 
 # 2. Install Python Dependencies
 pip install -r requirements.txt
-pip install -e .
+pip install -e ../../
 
 # 3. Install UI Dependencies
 cd ui
@@ -59,7 +87,7 @@ npm install
 redis-server
 
 # 5. Run components (separate terminals):
-python agent.py    # Agent workers
+python orchestrator.py    # Agent workers
 python server.py   # API server
 cd ui && npm run dev  # UI
 ```

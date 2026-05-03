@@ -1,3 +1,3 @@
-from .agent import CLIAgentContext, NFactorialAgent
+from .agent import NFactorialAgent
 
-__all__ = ["NFactorialAgent", "CLIAgentContext"]
+__all__ = ["NFactorialAgent"]

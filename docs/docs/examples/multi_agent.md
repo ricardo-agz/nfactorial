@@ -13,7 +13,7 @@ import os
 from typing import Annotated, Any
 from dotenv import load_dotenv
 from pydantic import BaseModel
-from factorial import Agent, AgentContext, Hidden, ai_gateway, gpt_41
+from factorial import Agent, Hidden, ai_gateway, gpt_41
 from exa_py import Exa
 
 
@@ -59,7 +59,7 @@ from agent import basic_agent
 
 orchestrator = Orchestrator()
 
-orchestrator.register_runner(
+orchestrator.register(
     agent=basic_agent,
     agent_worker_config=AgentWorkerConfig(workers=50, turn_timeout=120),
 )
@@ -68,19 +68,16 @@ if __name__ == "__main__":
     orchestrator.run()
 ```
 
-`register_runner` spins up a pool of workers that pull tasks from Redis and drive the agent.
+`register` registers the agent with the orchestrator; workers pull tasks from Redis and drive the agent.
 
 ## 3. Subagents: spawn independent child tasks
 
-Let's say we want to give our agent the ability to spin up multiple independent research subagents and wait for their results. In v2, use `subagents.spawn(...)` and `wait.jobs(...)`.
+Use `subagents.spawn(...)` and `wait.jobs(...)` to fan out to child tasks and block until they complete.
 
 First, create the research subagent:
 
 ```python
-from factorial import BaseModel, ai_gateway, gpt_41_mini
-
-class SubAgentOutput(BaseModel):
-    findings: list[str]
+from factorial import Agent, ai_gateway, any_of, gpt_41_mini, no_tool_calls, turn_count_is
 
 search_agent = Agent(
     name="research_subagent",
@@ -88,36 +85,14 @@ search_agent = Agent(
     model=ai_gateway(gpt_41_mini),
     instructions="You are an intelligent research assistant.",
     tools=[plan, reflect, search],
-    output_type=SubAgentOutput,
+    stop_when=any_of(no_tool_calls(), turn_count_is(10)),
 )
 ```
 
-You can optionally add output verification to force revisions until results meet your bar:
+Register the subagent in your orchestrator:
 
 ```python
-from factorial import VerificationRejected
-
-def verify_subagent_output(output: SubAgentOutput) -> SubAgentOutput:
-    if len(output.findings) < 3:
-        raise VerificationRejected(
-            message="Provide at least 3 findings from different sources.",
-            code="not_enough_findings",
-            metadata={"minimum": 3, "actual": len(output.findings)},
-        )
-    return output
-
-search_agent = Agent(
-    ...,
-    output_type=SubAgentOutput,
-    verifier=verify_subagent_output,
-    verifier_max_attempts=3,
-)
-```
-
-Register the subagent's runner in your orchestrator:
-
-```python
-orchestrator.register_runner(
+orchestrator.register(
     agent=search_agent,
     agent_worker_config=AgentWorkerConfig(workers=25, turn_timeout=120),
 )
@@ -131,14 +106,13 @@ from factorial import WaitInstruction, subagents, tool, wait
 @tool
 async def research(
     queries: list[str],
-    agent_ctx: AgentContext,
+    agent_ctx,
 ) -> WaitInstruction:
     """Spawn child search tasks for each query and wait for completion."""
-
-    payloads = [AgentContext(query=q) for q in queries]
+    inputs = [search_agent.build_context(input=q) for q in queries]
     jobs = await subagents.spawn(
         agent=search_agent,
-        inputs=payloads,
+        inputs=inputs,
         key="research",
     )
     return wait.jobs(jobs, data="Waiting for research subagents")
@@ -192,14 +166,11 @@ class EnqueueRequest(BaseModel):
 
 @app.post("/api/enqueue")
 async def enqueue(request: EnqueueRequest):
-    payload = AgentContext(
-        messages=request.message_history,
-        query=request.query,
-    )
-    task = await orchestrator.create_agent_task(
-        agent=basic_agent,
+    input_data = request.message_history if request.message_history else request.query
+    task = await orchestrator.enqueue(
+        basic_agent,
+        input=input_data,
         owner_id=request.user_id,
-        payload=payload,
     )
     return {"task_id": task.id}
 

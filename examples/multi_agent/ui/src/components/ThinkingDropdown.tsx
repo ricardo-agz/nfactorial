@@ -42,7 +42,9 @@ export const ThinkingDropdown: React.FC<ThinkingDropdownProps> = ({
   researchProgress,
 }) => {
   const [open, setOpen] = useState(true);
-  const calls = Object.values(thinking.tool_calls);
+  const calls = Object.values(thinking.tool_calls).filter(
+    (call) => call.tool_name !== 'done',
+  );
   const hasActive = calls.some(c => c.status === 'started');
 
   // Helper to render bullet-point representation for reflect / plan

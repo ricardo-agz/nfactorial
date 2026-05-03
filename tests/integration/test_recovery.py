@@ -3,7 +3,7 @@ import time
 import pytest
 import redis.asyncio as redis
 
-from factorial.context import AgentContext
+from factorial.agent.context import AgentContext
 from factorial.queue.operations import enqueue_task
 from factorial.queue.task import Task, TaskStatus, get_task_status
 from factorial.queue.worker import CompletionAction
@@ -108,7 +108,7 @@ class TestBackoffRecovery:
 
         # Create and backoff multiple tasks
         for i in range(5):
-            ctx = AgentContext(query=f"Query {i}")
+            ctx = AgentContext(messages=[{"role": "user", "content": f"Query {i}"}])
             task = Task.create(
                 owner_id=test_owner_id,
                 agent=test_agent.name,
@@ -151,7 +151,7 @@ class TestBackoffRecovery:
 
         # Create more tasks than batch size
         for i in range(5):
-            ctx = AgentContext(query=f"Query {i}")
+            ctx = AgentContext(messages=[{"role": "user", "content": f"Query {i}"}])
             task = Task.create(
                 owner_id=test_owner_id,
                 agent=test_agent.name,
@@ -366,7 +366,7 @@ class TestStaleTaskRecovery:
 
         # Create multiple stale tasks
         for i in range(5):
-            ctx = AgentContext(query=f"Query {i}")
+            ctx = AgentContext(messages=[{"role": "user", "content": f"Query {i}"}])
             task = Task.create(
                 owner_id=test_owner_id,
                 agent=test_agent.name,
@@ -546,7 +546,7 @@ class TestTaskExpiration:
         keys = script_runner.keys
 
         # Create completed task
-        ctx1 = AgentContext(query="Completed task")
+        ctx1 = AgentContext(messages=[{"role": "user", "content": "Completed task"}])
         task1 = Task.create(owner_id=test_owner_id, agent=test_agent.name, payload=ctx1)
         task_id_1 = await script_runner.enqueue_and_pickup(test_agent, task1)
         await script_runner.complete(
@@ -557,7 +557,7 @@ class TestTaskExpiration:
         )
         await redis_client.zadd(keys.queue_completions, {task_id_1: time.time() - 7200})
         # Create failed task
-        ctx2 = AgentContext(query="Failed task")
+        ctx2 = AgentContext(messages=[{"role": "user", "content": "Failed task"}])
         task2 = Task.create(owner_id=test_owner_id, agent=test_agent.name, payload=ctx2)
         task_id_2 = await script_runner.enqueue_and_pickup(test_agent, task2)
         await script_runner.complete(
@@ -592,7 +592,7 @@ class TestTaskExpiration:
 
         # Create multiple completed tasks
         for i in range(5):
-            ctx = AgentContext(query=f"Query {i}")
+            ctx = AgentContext(messages=[{"role": "user", "content": f"Query {i}"}])
             task = Task.create(
                 owner_id=test_owner_id, agent=test_agent.name, payload=ctx
             )

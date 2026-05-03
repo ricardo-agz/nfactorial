@@ -1,4 +1,4 @@
-"""Contracts for tool decorators, schemas, and forking behavior."""
+"""Contracts for tool decorators, schemas, and runtime normalization."""
 
 from __future__ import annotations
 
@@ -25,17 +25,18 @@ from factorial import (
     ToolDefinition,
     tool,
 )
-from factorial.context import execution_context
-from factorial.events import EventPublisher
-from factorial.tools import (
+from factorial.agent.tools.core import (
     _ToolResultInternal,
     convert_tools_list,
-    forking_tool,
     has_hidden_annotation,
     serialize_for_client,
     serialize_for_model,
 )
-from factorial.waits import WaitInstruction, wait
+from factorial.agent.tools.runtime import tool_action as run_tool_action
+from factorial.ai.models import Model, Provider
+from factorial.core.events import EventPublisher
+from factorial.execution.context import execution_context
+from factorial.execution.waits import WaitInstruction, wait
 
 
 def _make_tool_call(
@@ -60,18 +61,43 @@ def _set_test_execution_context() -> Token[ExecutionContext]:
     ctx = ExecutionContext(
         task_id=str(uuid.uuid4()),
         owner_id="test-owner",
-        retries=0,
-        iterations=0,
+        retry_count=0,
         events=cast(EventPublisher, _NoopEvents()),
     )
     return execution_context.set(ctx)
 
 
+MOCK_MODEL = Model(
+    name="mock-model",
+    provider=Provider.OPENAI,
+    provider_model_id="mock-v1",
+    context_window=128000,
+)
+
+
 def _make_agent_with_tools(
     tools: list[ToolDefinition[AgentContext] | Callable[..., Any]],
 ) -> Agent:
+    from tests.mocks.llm import MockLLMClient
+
     http_client = httpx.AsyncClient(verify=False, trust_env=False)
-    return Agent(tools=tools, http_client=http_client)
+    return Agent(
+        model=MOCK_MODEL,
+        client=MockLLMClient(),
+        tools=tools,
+        http_client=http_client,
+    )
+
+
+async def _invoke_tool(
+    agent: Agent,
+    tool_call: ChatCompletionMessageFunctionToolCall,
+) -> _ToolResultInternal:
+    return await run_tool_action(
+        agent,
+        tool_call,
+        AgentContext(messages=[{"role": "user", "content": "q"}]),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -88,6 +114,10 @@ class _SampleModel(BaseModel):
 class _PlainModel(BaseModel):
     name: str
     value: int
+
+
+class _ApprovalPayload(BaseModel):
+    approved: bool
 
 
 def test_hidden_annotation_detected() -> None:
@@ -179,7 +209,15 @@ def test_tool_schema_excludes_injected_context_params() -> None:
         agent_ctx: AgentContext,
         execution_ctx: ExecutionContext,
     ) -> str:
-        return f"{query}:{agent_ctx.query}:{execution_ctx.task_id}"
+        first_user = next(
+            (m for m in agent_ctx.messages if m.get("role") == "user"), None
+        )
+        user_content = (
+            first_user["content"]
+            if first_user and isinstance(first_user.get("content"), str)
+            else ""
+        )
+        return f"{query}:{user_content}:{execution_ctx.task_id}"
 
     assert set(contextual.params_json_schema["properties"]) == {"query"}
 
@@ -216,8 +254,7 @@ async def test_tool_action_plain_string_return() -> None:
     token = _set_test_execution_context()
     try:
         tool_call = _make_tool_call("echo", {"text": "hello"})
-        result = await agent.tool_action(tool_call, AgentContext(query="q"))
-        assert isinstance(result, _ToolResultInternal)
+        result = await _invoke_tool(agent, tool_call)
         assert result.model_output == "echo: hello"
         assert result.client_output == "echo: hello"
     finally:
@@ -234,8 +271,7 @@ async def test_tool_action_dict_return() -> None:
     token = _set_test_execution_context()
     try:
         tool_call = _make_tool_call("get_data")
-        result = await agent.tool_action(tool_call, AgentContext(query="q"))
-        assert isinstance(result, _ToolResultInternal)
+        result = await _invoke_tool(agent, tool_call)
         assert result.client_output == {"key": "value", "count": 42}
         assert "key" in result.model_output
         assert "value" in result.model_output
@@ -253,8 +289,7 @@ async def test_tool_action_none_return() -> None:
     token = _set_test_execution_context()
     try:
         tool_call = _make_tool_call("noop")
-        result = await agent.tool_action(tool_call, AgentContext(query="q"))
-        assert isinstance(result, _ToolResultInternal)
+        result = await _invoke_tool(agent, tool_call)
         assert result.model_output == ""
         assert result.client_output is None
     finally:
@@ -281,8 +316,7 @@ async def test_tool_action_basemodel_with_hidden() -> None:
     token = _set_test_execution_context()
     try:
         tool_call = _make_tool_call("edit")
-        result = await agent.tool_action(tool_call, AgentContext(query="q"))
-        assert isinstance(result, _ToolResultInternal)
+        result = await _invoke_tool(agent, tool_call)
         # Model sees only non-hidden fields
         assert "summary" in result.model_output
         assert "Edited file" in result.model_output
@@ -306,8 +340,7 @@ async def test_tool_action_basemodel_without_hidden() -> None:
     token = _set_test_execution_context()
     try:
         tool_call = _make_tool_call("get_info")
-        result = await agent.tool_action(tool_call, AgentContext(query="q"))
-        assert isinstance(result, _ToolResultInternal)
+        result = await _invoke_tool(agent, tool_call)
         # Both model and client see all fields
         assert "name" in result.model_output
         assert "test" in result.model_output
@@ -326,8 +359,7 @@ async def test_tool_action_wait_instruction_with_data() -> None:
     token = _set_test_execution_context()
     try:
         tool_call = _make_tool_call("wait_tool")
-        result = await agent.tool_action(tool_call, AgentContext(query="q"))
-        assert isinstance(result, _ToolResultInternal)
+        result = await _invoke_tool(agent, tool_call)
         assert result.model_output == "Cooling down"
         assert isinstance(result.client_output, WaitInstruction)
         assert result.client_output.data == "Cooling down"
@@ -345,8 +377,7 @@ async def test_tool_action_wait_instruction_default_message() -> None:
     token = _set_test_execution_context()
     try:
         tool_call = _make_tool_call("wait_tool")
-        result = await agent.tool_action(tool_call, AgentContext(query="q"))
-        assert isinstance(result, _ToolResultInternal)
+        result = await _invoke_tool(agent, tool_call)
         assert "60" in result.model_output
         assert isinstance(result.client_output, WaitInstruction)
     finally:
@@ -354,39 +385,19 @@ async def test_tool_action_wait_instruction_default_message() -> None:
         await agent.http_client.aclose()
 
 
-# ---------------------------------------------------------------------------
-# Forking tools
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.asyncio
-async def test_forking_tool_wraps_sync_callable_with_timeout_metadata() -> None:
-    @forking_tool(timeout=20.0)
-    def spawn() -> list[str]:
-        return [str(uuid.uuid4())]
+async def test_tool_action_coerces_postponed_annotated_model_arguments() -> None:
+    @tool
+    def approve(payload: Annotated[_ApprovalPayload, "typed"]) -> bool:
+        return payload.approved
 
-    result = await spawn()
-    assert len(result) == 1
-    assert hasattr(spawn, "forking_tool")
-    assert hasattr(spawn, "timeout")
-    assert spawn.forking_tool is True
-    assert spawn.timeout == 20.0
-
-
-@pytest.mark.asyncio
-async def test_tool_action_extracts_child_ids_from_forking_list_return() -> None:
-    child_ids = [str(uuid.uuid4()), str(uuid.uuid4())]
-
-    @forking_tool(timeout=600.0)
-    def spawn_children() -> list[str]:
-        return child_ids
-
-    agent = _make_agent_with_tools([spawn_children])
+    agent = _make_agent_with_tools([approve])
     token = _set_test_execution_context()
     try:
-        tool_call = _make_tool_call("spawn_children")
-        result = await agent.tool_action(tool_call, AgentContext(query="q"))
-        assert result.pending_child_task_ids == child_ids
+        tool_call = _make_tool_call("approve", {"payload": {"approved": True}})
+        result = await _invoke_tool(agent, tool_call)
+        assert result.client_output is True
+        assert result.model_output == "true"
     finally:
         execution_context.reset(token)
         await agent.http_client.aclose()
@@ -405,7 +416,7 @@ async def test_tool_action_offloads_sync_callbacks_to_worker_thread() -> None:
     token = _set_test_execution_context()
     try:
         tool_call = _make_tool_call("sync_search", {"query": "weather"})
-        result = await agent.tool_action(tool_call, AgentContext(query="q"))
+        result = await _invoke_tool(agent, tool_call)
         assert result.model_output == "result:weather"
         assert callback_thread_ids
         assert callback_thread_ids[0] != loop_thread_id
@@ -415,63 +426,21 @@ async def test_tool_action_offloads_sync_callbacks_to_worker_thread() -> None:
 
 
 @pytest.mark.asyncio
-async def test_tool_action_rejects_legacy_forking_tuple_return() -> None:
-    child_ids = [str(uuid.uuid4())]
+async def test_tool_action_list_return_is_plain_result() -> None:
+    values = [str(uuid.uuid4()), str(uuid.uuid4())]
 
-    @forking_tool(timeout=600.0)
-    def spawn_children_with_message() -> tuple[str, list[str]]:
-        return "spawned", child_ids
+    def spawn_children() -> list[str]:
+        return values
 
-    agent = _make_agent_with_tools([spawn_children_with_message])
+    agent = _make_agent_with_tools([spawn_children])
     token = _set_test_execution_context()
     try:
-        tool_call = _make_tool_call("spawn_children_with_message")
-        with pytest.raises(ValueError, match="must return list\\[str\\]"):
-            await agent.tool_action(tool_call, AgentContext(query="q"))
+        tool_call = _make_tool_call("spawn_children")
+        result = await _invoke_tool(agent, tool_call)
+        assert result.client_output == values
+        assert result.pending_child_task_ids is None
     finally:
         execution_context.reset(token)
         await agent.http_client.aclose()
 
 
-@pytest.mark.asyncio
-async def test_tool_action_rejects_invalid_forking_child_ids() -> None:
-    @forking_tool(timeout=600.0)
-    def spawn_children_invalid() -> list[str]:
-        return ["not-a-task-id"]
-
-    agent = _make_agent_with_tools([spawn_children_invalid])
-    token = _set_test_execution_context()
-    try:
-        tool_call = _make_tool_call("spawn_children_invalid")
-        with pytest.raises(ValueError, match="invalid task IDs"):
-            await agent.tool_action(tool_call, AgentContext(query="q"))
-    finally:
-        execution_context.reset(token)
-        await agent.http_client.aclose()
-
-
-# ---------------------------------------------------------------------------
-# WaitInstruction data= parameter
-# ---------------------------------------------------------------------------
-
-
-def test_wait_sleep_data_string() -> None:
-    instr = wait.sleep(10, data="pausing")
-    assert instr.data == "pausing"
-    assert instr.sleep_s == 10
-
-
-def test_wait_sleep_data_dict() -> None:
-    instr = wait.sleep(10, data={"reason": "cooldown"})
-    assert instr.data == {"reason": "cooldown"}
-
-
-def test_wait_cron_data() -> None:
-    instr = wait.cron("*/5 * * * *", data="next tick")
-    assert instr.data == "next tick"
-    assert instr.cron == "*/5 * * * *"
-
-
-def test_wait_sleep_no_data_defaults_none() -> None:
-    instr = wait.sleep(5)
-    assert instr.data is None

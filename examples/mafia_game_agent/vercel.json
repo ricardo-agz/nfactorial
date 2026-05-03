@@ -1,0 +1,21 @@
+{
+  "projectSettings": {
+    "framework": "services"
+  },
+  "experimentalServices": {
+    "ui": {
+      "entrypoint": "ui",
+      "routePrefix": "/"
+    },
+    "api": {
+      "entrypoint": "agents/server.py",
+      "routePrefix": "/api"
+    },
+    "worker": {
+      "type": "worker",
+      "entrypoint": "agents/orchestrator.py",
+      "topic": "nfactorial-dispatch",
+      "consumer": "default"
+    }
+  }
+}

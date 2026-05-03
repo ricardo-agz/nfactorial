@@ -6,8 +6,8 @@ from typing import cast
 
 from openai.types.chat import ChatCompletion
 
-from factorial.llms import MultiClient, gpt_41_nano
-from factorial.logging import get_logger
+from factorial.ai.models import MultiClient, gpt_41_nano
+from factorial.core.logging import get_logger
 
 from ..utils import line_count
 

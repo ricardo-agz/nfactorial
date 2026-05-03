@@ -1,6 +1,6 @@
 import { useCallback, useRef, useEffect } from 'react';
 import type { AgentEvent } from '../types';
-import { WS_BASE } from '../constants';
+import { SSE_BASE } from '../constants';
 import { useRuns } from '../context/RunContext';
 import type { Action } from '../types/run';
 
@@ -19,7 +19,7 @@ export const useWebSocket = ({
   setCancelling,
   setProposedCode,
 }: UseWebSocketProps) => {
-  const wsRef = useRef<WebSocket | null>(null);
+  const streamRef = useRef<EventSource | null>(null);
   const { addAction, updateAction } = useRuns();
 
   const parseToolArguments = (raw: unknown): Record<string, unknown> => {
@@ -51,9 +51,9 @@ export const useWebSocket = ({
     return fallback;
   };
 
-  const handleWSMessage = useCallback((evt: MessageEvent) => {
+  const handleSSEMessage = useCallback((evt: MessageEvent) => {
     const event: AgentEvent = JSON.parse(evt.data);
-    console.log('WS event:', event);
+    console.log('SSE event:', event);
 
     switch (event.event_type) {
       case 'progress_update_tool_action_started': {
@@ -246,11 +246,14 @@ export const useWebSocket = ({
   }, [setLoading, setCurrentTaskId, setCancelling, setProposedCode, addAction, updateAction]);
 
   useEffect(() => {
-    const ws = new WebSocket(`${WS_BASE}/${userId}`);
-    ws.onmessage = handleWSMessage;
-    wsRef.current = ws;
-    return () => ws.close();
-  }, [userId, handleWSMessage]);
+    const stream = new EventSource(`${SSE_BASE}/${userId}`);
+    stream.onmessage = handleSSEMessage;
+    stream.onerror = (err) => {
+      console.error('SSE stream error:', err);
+    };
+    streamRef.current = stream;
+    return () => stream.close();
+  }, [userId, handleSSEMessage]);
 
-  return wsRef;
+  return streamRef;
 }; 

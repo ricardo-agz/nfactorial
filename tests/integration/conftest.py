@@ -12,7 +12,8 @@ import pytest_asyncio
 import redis.asyncio as redis
 
 from factorial.agent import BaseAgent, TurnCompletion
-from factorial.context import AgentContext
+from factorial.agent.context import AgentContext
+from factorial.ai.models import Model, Provider
 from factorial.queue.keys import PENDING_SENTINEL, RedisKeys
 from factorial.queue.lua import (
     BackoffRecoveryScript,
@@ -25,9 +26,11 @@ from factorial.queue.lua import (
     StaleRecoveryScript,
     StaleRecoveryScriptResult,
     TaskCompletionScript,
+    TaskCompletionScriptResult,
     TaskExpirationScript,
     TaskExpirationScriptResult,
     TaskSteeringScript,
+    TaskSteeringScriptResult,
     ToolCompletionScript,
     WaitScheduleScript,
     create_backoff_recovery_script,
@@ -44,13 +47,23 @@ from factorial.queue.lua import (
     create_tool_completion_script,
     create_wait_schedule_script,
 )
-from factorial.queue.lua._loader import (
-    TaskCompletionScriptResult,
-    TaskSteeringScriptResult,
-)
 from factorial.queue.operations import enqueue_task
 from factorial.queue.task import Task, TaskStatus
 from factorial.queue.worker import CompletionAction
+
+MOCK_MODEL = Model(
+    name="mock-model",
+    provider=Provider.OPENAI,
+    provider_model_id="mock-v1",
+    context_window=128000,
+)
+
+
+def _first_user_content(ctx: AgentContext) -> str:
+    for m in ctx.messages:
+        if m.get("role") == "user" and isinstance(m.get("content"), str):
+            return m["content"]
+    return ""
 
 
 class SimpleTestAgent(BaseAgent[AgentContext]):
@@ -60,8 +73,7 @@ class SimpleTestAgent(BaseAgent[AgentContext]):
         super().__init__(
             name=name,
             instructions="Test agent instructions",
-            max_turns=max_turns,
-            context_class=AgentContext,
+            model=MOCK_MODEL,
         )
 
     async def run_turn(
@@ -69,11 +81,11 @@ class SimpleTestAgent(BaseAgent[AgentContext]):
         agent_ctx: AgentContext,
     ) -> TurnCompletion[AgentContext]:
         """Simple turn that completes immediately."""
-        agent_ctx.turn += 1
+        agent_ctx.turn_number += 1
         return TurnCompletion(
             is_done=True,
             context=agent_ctx,
-            output={"result": "completed", "query": agent_ctx.query},
+            output={"result": "completed", "query": _first_user_content(agent_ctx)},
         )
 
 
@@ -89,8 +101,7 @@ class MultiTurnTestAgent(BaseAgent[AgentContext]):
         super().__init__(
             name=name,
             instructions="Multi-turn test agent",
-            max_turns=max_turns,
-            context_class=AgentContext,
+            model=MOCK_MODEL,
         )
         self.turns_to_complete = turns_to_complete
 
@@ -99,13 +110,13 @@ class MultiTurnTestAgent(BaseAgent[AgentContext]):
         agent_ctx: AgentContext,
     ) -> TurnCompletion[AgentContext]:
         """Run a turn, completing after turns_to_complete iterations."""
-        agent_ctx.turn += 1
+        agent_ctx.turn_number += 1
 
-        if agent_ctx.turn >= self.turns_to_complete:
+        if agent_ctx.turn_number >= self.turns_to_complete:
             return TurnCompletion(
                 is_done=True,
                 context=agent_ctx,
-                output={"result": "completed", "turns": agent_ctx.turn},
+                output={"result": "completed", "turns": agent_ctx.turn_number},
             )
 
         return TurnCompletion(
@@ -121,7 +132,7 @@ class FailingTestAgent(BaseAgent[AgentContext]):
         super().__init__(
             name=name,
             instructions="Failing test agent",
-            context_class=AgentContext,
+            model=MOCK_MODEL,
         )
         self.error_message = error_message
 
@@ -140,7 +151,7 @@ class DeferredToolTestAgent(BaseAgent[AgentContext]):
         super().__init__(
             name=name,
             instructions="Deferred tool test agent",
-            context_class=AgentContext,
+            model=MOCK_MODEL,
         )
         self._pending_tool_ids: list[str] = []
 
@@ -232,9 +243,8 @@ def agents_by_name(
 def sample_agent_context() -> AgentContext:
     """Create a sample AgentContext for testing."""
     return AgentContext(
-        query="Test query",
-        messages=[],
-        turn=0,
+        messages=[{"role": "user", "content": "Test query"}],
+        turn_number=1,
         output=None,
     )
 
@@ -619,6 +629,7 @@ class ScriptRunner:
         return await self._scheduled_recovery_script.execute(
             queue_scheduled_key=self.keys.queue_scheduled,
             queue_main_key=self.keys.queue_main,
+            queue_pending_key=self.keys.queue_pending,
             queue_orphaned_key=self.keys.queue_orphaned,
             task_statuses_key=self.keys.task_status,
             task_agents_key=self.keys.task_agent,
@@ -627,6 +638,9 @@ class ScriptRunner:
             task_retries_key=self.keys.task_retries,
             task_metas_key=self.keys.task_meta,
             scheduled_wait_meta_key=self.keys.scheduled_wait_meta,
+            activity_wait_meta_key=self.keys.activity_wait_meta,
+            signal_wait_meta_key=self.keys.signal_wait_meta,
+            signal_wake_meta_key=self.keys.signal_wake_meta,
             max_batch_size=max_batch_size,
         )
 

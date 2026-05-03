@@ -1,14 +1,18 @@
 import json
+from collections.abc import Callable
 from typing import Any
 
-from agent import IdeAgentContext, ide_agent, orchestrator
+from agent import IdeAgentState, ide_agent
 from fastapi import FastAPI
 from fastapi.exceptions import HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
+from orchestrator import orchestrator
 from pydantic import BaseModel
-from starlette.websockets import WebSocket, WebSocketDisconnect
+from starlette.requests import Request
+from vercel.headers import set_headers
 
-app = FastAPI()
+app = FastAPI(root_path="/api")
 
 app.add_middleware(
     CORSMiddleware,
@@ -19,15 +23,36 @@ app.add_middleware(
 )
 
 
-@app.websocket("/ws/{user_id}")
-async def websocket_updates(websocket: WebSocket, user_id: str):
-    await websocket.accept()
+def _build_input(
+    message_history: list[dict[str, str]],
+    query: str,
+) -> str | list[dict[str, str]]:
+    if not message_history:
+        return query
+    return [*message_history, {"role": "user", "content": query}]
 
-    try:
+@app.middleware("http")
+async def vercel_context_middleware(request: Request, call_next: Callable):
+    set_headers(request.headers)
+    return await call_next(request)
+
+
+@app.get("/events/{user_id}")
+@app.get("/api/events/{user_id}")
+async def stream_updates(user_id: str):
+    async def event_stream():
         async for update in orchestrator.subscribe_to_updates(owner_id=user_id):
-            await websocket.send_text(json.dumps(update))
-    except WebSocketDisconnect:
-        print(f"WebSocket disconnected for user_id={user_id}")
+            yield f"data: {json.dumps(update)}\n\n"
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @app.get("/")
@@ -47,24 +72,22 @@ class CancelRequest(BaseModel):
     task_id: str
 
 
+@app.post("/enqueue")
 @app.post("/api/enqueue")
 async def enqueue(request: EnqueueRequest):
-    payload = IdeAgentContext(
-        messages=request.message_history,
-        query=request.query,
-        turn=0,
-        code=request.code,
-    )
+    state = IdeAgentState(code=request.code, query=request.query)
 
-    task = await orchestrator.create_agent_task(
-        agent=ide_agent,
+    task = await orchestrator.enqueue(
+        ide_agent,
+        input=_build_input(request.message_history, request.query),
         owner_id=request.user_id,
-        payload=payload,
+        state=state,
     )
 
     return {"task_id": task.id}
 
 
+@app.post("/cancel")
 @app.post("/api/cancel")
 async def cancel_task_endpoint(request: CancelRequest) -> dict[str, Any]:
     try:
@@ -91,6 +114,7 @@ class ResolveHookRequest(BaseModel):
     idempotency_key: str | None = None
 
 
+@app.post("/resolve_hook")
 @app.post("/api/resolve_hook")
 async def resolve_hook_endpoint(request: ResolveHookRequest):
     """Resolve a pending hook with approval payload."""

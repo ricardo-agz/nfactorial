@@ -58,7 +58,7 @@ function App() {
     return runOrder.flatMap(id => runs[id]?.actions || []);
   }, [runOrder, runs]);
 
-  // Initialize WebSocket connection
+  // Initialize server-sent events connection
   useWebSocket({
     userId: USER_ID,
     setLoading,

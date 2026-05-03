@@ -25,8 +25,8 @@ from openai.types.chat.chat_completion_message_function_tool_call import (
 )
 from openai.types.completion_usage import CompletionUsage
 
-from factorial.context import AgentContext
-from factorial.llms import Model
+from factorial.agent.context import AgentContext
+from factorial.ai.models import Model
 
 
 @dataclass
@@ -125,7 +125,7 @@ class MockLLMClient:
 
         # Dynamic responses based on context
         def dynamic_response(messages, ctx):
-            if ctx.turn == 0:
+            if ctx.turn_number == 1:
                 return MockResponse(content="First turn!")
             return MockResponse(content="Done!", is_final=True)
 
@@ -165,7 +165,10 @@ class MockLLMClient:
                 "messages": messages,
                 "tools": tools,
                 "temperature": temperature,
+                "max_completion_tokens": max_completion_tokens,
                 "tool_choice": tool_choice,
+                "parallel_tool_calls": parallel_tool_calls,
+                "stream": stream,
             }
         )
 
@@ -173,8 +176,15 @@ class MockLLMClient:
         response: MockResponse
 
         if self.response_generator:
-            # Extract context from messages if possible (for dynamic responses)
-            ctx = AgentContext(query="mock")  # Default context
+            # Build minimal context for dynamic responses (turn_number defaults to 1)
+            ctx = AgentContext(
+                messages=(
+                    [{"role": "user", "content": "mock"}]
+                    if not messages
+                    else messages
+                ),
+                turn_number=1,
+            )
             response = self.response_generator(messages, ctx)
         elif self._response_index < len(self.responses):
             response = self.responses[self._response_index]
@@ -255,20 +265,6 @@ def create_multi_turn_mock(
     ]
     responses.append(MockResponse(content=final_content, is_final=True))
     return MockLLMClient(responses=responses)
-
-
-def create_final_output_tool_mock(output: dict[str, Any]) -> MockLLMClient:
-    """Create a mock that uses the final_output tool (for agents with output_type)."""
-    return MockLLMClient(
-        responses=[
-            MockResponse(
-                tool_calls=[MockToolCall(name="final_output", arguments=output)],
-                is_final=True,
-            )
-        ]
-    )
-
-
 def create_failing_mock(
     exception: Exception,
     fail_on_call: int = 1,

@@ -23,6 +23,7 @@ dependencies = [
     "python-dotenv>=1.0.0",
     "openai>=2.0.0",
     "pydantic>=2.10,<3",
+    "typing-extensions>=4.12.2",
     "redis>=6.1.0",
     "fastapi>=0.110.0,<1",
     "uvicorn[standard]>=0.34.2",
@@ -44,6 +45,10 @@ dev = [
 cli = [
     "inquirer>=3.2.4",
 ]
+vercel = [
+    "vercel>=0.5.2",
+    "vercel-workers",
+]
 
 [project.scripts]
 nfactorial = "factorial.cli.main:cli"
@@ -62,7 +67,7 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 factorial = [
-    "queue/lua/*.lua",
+    "queue/lua/scripts/*.lua",
     "dashboard/*.html",
     "dashboard/*.js",
     "dashboard/assets/*",

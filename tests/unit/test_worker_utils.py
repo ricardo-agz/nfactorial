@@ -3,44 +3,17 @@
 import asyncio
 import json
 
-from factorial.exceptions import (
+from factorial.core.exceptions import (
     FatalAgentError,
     InvalidLLMResponseError,
     RateLimitError,
     RetryableError,
 )
-from factorial.queue.worker import CompletionAction, classify_failure
-
-
-class TestCompletionAction:
-    """Tests for CompletionAction enum."""
-
-    def test_all_actions_are_strings(self) -> None:
-        """Verify all CompletionAction values are strings."""
-        for action in CompletionAction:
-            assert isinstance(action.value, str)
-
-    def test_expected_actions_exist(self) -> None:
-        """Verify all expected actions exist."""
-        expected = [
-            "continue",
-            "pending_tool_call_results",
-            "pending_child_task_results",
-            "complete",
-            "retry",
-            "backoff",
-            "fail",
-        ]
-        actual = [a.value for a in CompletionAction]
-        assert set(expected) == set(actual)
-
-    def test_action_from_string(self) -> None:
-        """Test creating CompletionAction from string value."""
-        assert CompletionAction("continue") == CompletionAction.CONTINUE
-        assert CompletionAction("complete") == CompletionAction.COMPLETE
-        assert CompletionAction("retry") == CompletionAction.RETRY
-        assert CompletionAction("backoff") == CompletionAction.BACKOFF
-        assert CompletionAction("fail") == CompletionAction.FAIL
+from factorial.queue.worker import (
+    CompletionAction,
+    classify_failure,
+    steering_message_sort_key,
+)
 
 
 class TestClassifyFailure:
@@ -172,3 +145,35 @@ class TestClassifyFailure:
         action3, output3 = classify_failure(exc, retries=5, max_retries=3)
         assert action3 == CompletionAction.FAIL
         assert output3 is not None
+
+
+class TestSteeringOrdering:
+    """Tests for steering message ordering helpers."""
+
+    def test_steering_sort_key_orders_by_timestamp_then_sequence(self) -> None:
+        message_ids = [
+            "1700000000000_12",
+            "1700000000000_2",
+            "1699999999999_99",
+            "1700000000001_1",
+        ]
+        sorted_ids = sorted(message_ids, key=steering_message_sort_key)
+        assert sorted_ids == [
+            "1699999999999_99",
+            "1700000000000_2",
+            "1700000000000_12",
+            "1700000000001_1",
+        ]
+
+    def test_steering_sort_key_handles_nonstandard_ids(self) -> None:
+        message_ids = [
+            "bad",
+            "1700000000000_x",
+            "1700000000000_1",
+        ]
+        sorted_ids = sorted(message_ids, key=steering_message_sort_key)
+        assert sorted_ids == [
+            "bad",
+            "1700000000000_x",
+            "1700000000000_1",
+        ]

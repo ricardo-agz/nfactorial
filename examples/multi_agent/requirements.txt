@@ -6,3 +6,4 @@ fastapi==0.115.12
 uvicorn[standard]==0.34.2
 websockets==15.0.1
 exa_py~=1.14.5
+vercel-workers

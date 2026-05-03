@@ -27,11 +27,12 @@ Note that `edit_code` is the only tool that does any real work in this example, 
 
 ```python
 import os
+from dataclasses import dataclass
 from typing import Annotated, Any
 from dotenv import load_dotenv
 from pydantic import BaseModel
 from factorial import (
-    BaseAgent,
+    Agent,
     AgentContext,
     Hidden,
     Hook,
@@ -45,8 +46,13 @@ from factorial import (
 load_dotenv()
 
 
-class IdeAgentContext(AgentContext):
-    code: str
+@dataclass
+class IdeAgentState:
+    code: str = ""
+    query: str = ""
+
+
+IdeAgentContext = AgentContext[IdeAgentState]
 
 
 def think(thoughts: str) -> str:
@@ -57,6 +63,8 @@ def think(thoughts: str) -> str:
 class EditResult(BaseModel):
     summary: str
     new_code: Annotated[str, Hidden]
+    old_text: Annotated[str, Hidden]
+    new_text: Annotated[str, Hidden]
 
 
 def edit_code(
@@ -75,7 +83,7 @@ def edit_code(
     find_end_line: The end line number where the 'find' text is located
     replace: The text to replace the 'find' text with
     """
-    lines = agent_ctx.code.split("\n")
+    lines = agent_ctx.state.code.split("\n")
     start_idx = find_start_line - 1
     end_idx = find_end_line - 1
     if start_idx < 0 or end_idx >= len(lines) or start_idx > end_idx:
@@ -84,26 +92,29 @@ def edit_code(
         )
 
     existing_text = "\n".join(lines[start_idx : end_idx + 1])
+    line_range = f"{find_start_line}-{find_end_line}"
 
     # Check if the find text matches what's at those line numbers
     if find not in existing_text:
         raise ValueError(
-            f"Text '{find}' not found at lines {find_start_line}-{find_end_line}. "
+            f"Text '{find}' not found at lines {line_range}. "
             f"Existing text: {existing_text}"
         )
 
     new_text = existing_text.replace(find, replace)
     new_lines = lines[:start_idx] + new_text.split("\n") + lines[end_idx + 1 :]
 
-    # Update the agent context with the modified code
-    agent_ctx.code = "\n".join(new_lines)
+    # Update the agent state with the modified code
+    agent_ctx.state.code = "\n".join(new_lines)
 
     return EditResult(
         summary=(
             f"Code successfully edited: replaced '{find}' with '{replace}' "
-            f"at lines {find_start_line}-{find_end_line}"
+            f"at lines {line_range}"
         ),
-        new_code=agent_ctx.code,
+        new_code=agent_ctx.state.code,
+        old_text=existing_text,
+        new_text=new_text,
     )
 
 
@@ -162,39 +173,25 @@ The code changes will be shown to the user in a diff editor.
 """
 
 
-class IDEAgent(BaseAgent[IdeAgentContext]):
-    def __init__(self):
-        super().__init__(
-            context_class=IdeAgentContext,
-            instructions=instructions,
-            tools=[think, edit_code, request_code_execution],
-            model=gpt_41_mini,
+def _prepare_turn(turn, agent_ctx):
+    if agent_ctx.turn_number == 1:
+        code = "\n".join(
+            [f"[{i + 1}]{line}" for i, line in enumerate(agent_ctx.state.code.split("\n"))]
+        )
+        turn.messages.append(
+            {
+                "role": "user",
+                "content": f"Code file with line numbers:\n{code}\n---\nQuery: {agent_ctx.state.query}",
+            }
         )
 
-    def prepare_messages(self, agent_ctx: IdeAgentContext) -> list[dict[str, Any]]:
-        if agent_ctx.turn == 0:
-            messages = [{"role": "system", "content": self.instructions}]
-            if agent_ctx.messages:
-                messages.extend(
-                    [message for message in agent_ctx.messages if message["content"]]
-                )
 
-            code = "\n".join(
-                [f"[{i + 1}]{line}" for i, line in enumerate(agent_ctx.code.split("\n"))]
-            )
-            messages.append(
-                {
-                    "role": "user",
-                    "content": f"Code file with line numbers:\n{code}\n---\nQuery: {agent_ctx.query}",
-                }
-            )
-        else:
-            messages = agent_ctx.messages
-
-        return messages
-
-
-ide_agent = IDEAgent()
+ide_agent = Agent[IdeAgentState](
+    instructions=instructions,
+    tools=[think, edit_code, request_code_execution],
+    model=gpt_41_mini,
+    prepare_turn=_prepare_turn,
+)
 ```
 
 The agent now has the ability to think, write code, and request the user to execute the code.
@@ -209,7 +206,7 @@ from agent import ide_agent
 
 orchestrator = Orchestrator(openai_api_key=os.getenv("OPENAI_API_KEY"))
 
-orchestrator.register_runner(
+orchestrator.register(
     agent=ide_agent,
     agent_worker_config=AgentWorkerConfig(workers=50, turn_timeout=120),
 )
@@ -218,7 +215,7 @@ if __name__ == "__main__":
     orchestrator.run()
 ```
 
-`register_runner` spins up a pool of workers that pull tasks from Redis and drive the agent.
+`register` registers the agent with the orchestrator; workers pull tasks from Redis and drive the agent.
 
 ## 3. Expose an API & WebSocket
 
@@ -231,7 +228,7 @@ from fastapi.exceptions import HTTPException
 from pydantic import BaseModel
 import json
 from starlette.websockets import WebSocket, WebSocketDisconnect
-from agent import IdeAgentContext, ide_agent, orchestrator
+from agent import IdeAgentState, ide_agent, orchestrator
 
 app = FastAPI()
 
@@ -263,16 +260,12 @@ class EnqueueRequest(BaseModel):
 
 @app.post("/api/enqueue")
 async def enqueue(request: EnqueueRequest):
-    payload = IdeAgentContext(
-        messages=request.message_history,
-        query=request.query,
-        turn=0,
-        code=request.code,
-    )
-    task = await orchestrator.create_agent_task(
-        agent=ide_agent,
+    state = IdeAgentState(code=request.code, query=request.query)
+    task = await orchestrator.enqueue(
+        ide_agent,
+        input=request.message_history if request.message_history else request.query,
         owner_id=request.user_id,
-        payload=payload,
+        state=state,
     )
     return {"task_id": task.id}
 

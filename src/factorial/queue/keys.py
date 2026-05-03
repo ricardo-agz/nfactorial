@@ -14,8 +14,12 @@ TASK_PAYLOAD = "{namespace}:tasks:payload"
 TASK_PICKUPS = "{namespace}:tasks:pickups"
 # HASH: task_id -> num retries (int)
 TASK_RETRIES = "{namespace}:tasks:retries"
-# HASH: task_id -> {created_at, owner_id, parent_id, resumed_from_task_id, batch_id}
+# HASH: task_id -> {
+#   created_at, owner_id, team_id, parent_id, resumed_from_task_id, batch_id
+# }
 TASK_META = "{namespace}:tasks:meta"
+# SET: child task_ids by parent task id
+TASK_CHILDREN = "{namespace}:tasks:children:{parent_task_id}"
 # HASH: task_id -> {current_turn: int, max_turns: int | None, progress: float}
 TASK_PROGRESS = "{namespace}:tasks:progress"
 
@@ -55,10 +59,22 @@ TASK_STEERING = "{namespace}:steer:{task_id}:messages"
 PENDING_TOOL_RESULTS = "{namespace}:pending:{task_id}:tools"
 # HASH: child_task_id -> result_json or <|PENDING|>
 PENDING_CHILD_TASK_RESULTS = "{namespace}:pending:{task_id}:children"
+# HASH: resource_type_key:logical_name -> resource_binding_json
+RESOURCE_BINDINGS = "{namespace}:resources:bindings:{task_id}"
 # SET: child_task_id values currently being awaited by the parent task
 PENDING_CHILD_WAIT_IDS = "{namespace}:pending:{task_id}:children_wait_ids"
 # HASH: task_id -> scheduled wait metadata JSON
 SCHEDULED_WAIT_META = "{namespace}:scheduled:wait_meta"
+# HASH: task_id -> activity wait metadata JSON
+ACTIVITY_WAIT_META = "{namespace}:wait:activity:meta"
+# HASH: task_id -> signal wait metadata JSON
+SIGNAL_WAIT_META = "{namespace}:wait:signal:meta"
+# HASH: task_id -> signal wake metadata JSON
+SIGNAL_WAKE_META = "{namespace}:wait:signal:wake"
+# COUNTER: monotonically increasing sequence for signal delivery IDs
+SIGNAL_SEQ = "{namespace}:signals:seq"
+# HASH: signal_id -> signal envelope JSON (task scoped)
+TASK_SIGNALS = "{namespace}:signals:{task_id}:pending"
 
 # ===== HOOK STATE MANAGEMENT =====
 # HASH: hook_id -> hook_record_json
@@ -89,6 +105,34 @@ HOOK_RUNTIME_READY = "{namespace}:hooks:runtime_ready:{task_id}"
 # ===== COMMUNICATION =====
 # PUBSUB: real-time updates to task owners
 UPDATES_CHANNEL = "{namespace}:updates:{owner_id}"
+
+# ===== MESSAGING =====
+# HASH: group_name -> group_metadata_json (team scoped)
+MESSAGING_GROUP_META = "{namespace}:messaging:groups:{team_id}:meta"
+# SET: task_ids in a group (team scoped)
+MESSAGING_GROUP_MEMBERS = "{namespace}:messaging:groups:{team_id}:{group_name}:members"
+# SET: group refs (team_id:group_name) for a task
+MESSAGING_GROUPS_BY_TASK = "{namespace}:messaging:groups:by_task:{task_id}"
+# SET: task_ids currently known in a team
+MESSAGING_TEAM_TASKS = "{namespace}:messaging:teams:{team_id}:tasks"
+# STREAM: thread history entries
+MESSAGING_THREAD_HISTORY = "{namespace}:messaging:thread:{thread_id}:history"
+# STREAM: global messaging timeline
+MESSAGING_HISTORY_GLOBAL = "{namespace}:messaging:history"
+# COUNTER: monotonically increasing sequence for message IDs
+MESSAGING_MESSAGE_SEQ = "{namespace}:messaging:seq"
+# ZSET: group thread_id -> last activity timestamp_ms
+MESSAGING_GROUP_THREADS_BY_TEAM = (
+    "{namespace}:messaging:threads:group:by_team:{team_id}"
+)
+# ZSET: direct thread_id -> last activity timestamp_ms
+MESSAGING_DIRECT_THREADS_BY_TEAM = (
+    "{namespace}:messaging:threads:direct:by_team:{team_id}"
+)
+# HASH: message marker -> read metadata JSON (task scoped)
+MESSAGING_READ_BY_TASK = "{namespace}:messaging:read:{task_id}"
+# STREAM: read receipt payload entries addressed to a sender task
+MESSAGING_RECEIPTS_BY_TASK = "{namespace}:messaging:receipts:{task_id}"
 
 # ===== METRICS =====
 # Rolling (fixed-memory) metrics ring buffers.
@@ -127,6 +171,7 @@ class RedisKeys:
     _task_pickups: str
     _task_retries: str
     _task_meta: str
+    _task_children: str
     _task_cancellations: str
     # Hook keys (namespace scoped)
     _hooks_index: str
@@ -137,12 +182,28 @@ class RedisKeys:
     _batch_enqueue_idempotency: str
     _hook_sessions: str
     _scheduled_wait_meta: str
+    _activity_wait_meta: str
+    _signal_wait_meta: str
+    _signal_wake_meta: str
+    _signal_seq: str
     # Batch keys
     _batch_tasks: str
     _batch_remaining_tasks: str
     _batch_progress: str
     _batch_completed: str
     _batch_meta: str
+    # Messaging keys (namespace scoped)
+    _messaging_group_meta: str
+    _messaging_group_members: str
+    _messaging_groups_by_task: str
+    _messaging_team_tasks: str
+    _messaging_thread_history: str
+    _messaging_history_global: str
+    _messaging_message_seq: str
+    _messaging_group_threads_by_team: str
+    _messaging_direct_threads_by_team: str
+    _messaging_read_by_task: str
+    _messaging_receipts_by_task: str
 
     # Defaults after
     _queue_main: str | None = None
@@ -161,8 +222,10 @@ class RedisKeys:
 
     # Task-scoped keys (present when task_id provided)
     _task_steering: str | None = None
+    _task_signals: str | None = None
     _pending_tool_results: str | None = None
     _pending_child_task_results: str | None = None
+    _resource_bindings: str | None = None
     _pending_child_wait_ids: str | None = None
     _hooks_by_task: str | None = None
     _hook_session_by_tool_call: str | None = None
@@ -202,6 +265,10 @@ class RedisKeys:
         """{namespace}:tasks:meta"""
         return self._task_meta
 
+    def task_children(self, parent_task_id: str) -> str:
+        """{namespace}:tasks:children:{parent_task_id}"""
+        return self._task_children.format(parent_task_id=parent_task_id)
+
     @property
     def task_cancellations(self) -> str:
         """{namespace}:cancel:pending"""
@@ -222,10 +289,6 @@ class RedisKeys:
         return self._hook_idempotency.format(
             hook_id=hook_id, idempotency_key=request_key
         )
-
-    def hook_idempotency(self, hook_id: str, idempotency_key: str) -> str:
-        """Backward-compatible alias for hook_resolution()."""
-        return self.hook_resolution(hook_id=hook_id, request_key=idempotency_key)
 
     def resume_idempotency(self, source_task_id: str, idempotency_key: str) -> str:
         """{namespace}:resume:idem:{source_task_id}:{idempotency_key}"""
@@ -271,6 +334,26 @@ class RedisKeys:
         return self._scheduled_wait_meta
 
     @property
+    def activity_wait_meta(self) -> str:
+        """{namespace}:wait:activity:meta"""
+        return self._activity_wait_meta
+
+    @property
+    def signal_wait_meta(self) -> str:
+        """{namespace}:wait:signal:meta"""
+        return self._signal_wait_meta
+
+    @property
+    def signal_wake_meta(self) -> str:
+        """{namespace}:wait:signal:wake"""
+        return self._signal_wake_meta
+
+    @property
+    def signal_seq(self) -> str:
+        """{namespace}:signals:seq"""
+        return self._signal_seq
+
+    @property
     def batch_completed(self) -> str:
         """{namespace}:batches:completed"""
         return self._batch_completed
@@ -294,6 +377,55 @@ class RedisKeys:
     def batch_progress(self) -> str:
         """{namespace}:batches:progress"""
         return self._batch_progress
+
+    def messaging_group_meta(self, team_id: str) -> str:
+        """{namespace}:messaging:groups:{team_id}:meta"""
+        return self._messaging_group_meta.format(team_id=team_id)
+
+    def messaging_group_members(self, team_id: str, group_name: str) -> str:
+        """{namespace}:messaging:groups:{team_id}:{group_name}:members"""
+        return self._messaging_group_members.format(
+            team_id=team_id,
+            group_name=group_name,
+        )
+
+    def messaging_groups_by_task(self, task_id: str) -> str:
+        """{namespace}:messaging:groups:by_task:{task_id}"""
+        return self._messaging_groups_by_task.format(task_id=task_id)
+
+    def messaging_team_tasks(self, team_id: str) -> str:
+        """{namespace}:messaging:teams:{team_id}:tasks"""
+        return self._messaging_team_tasks.format(team_id=team_id)
+
+    def messaging_thread_history(self, thread_id: str) -> str:
+        """{namespace}:messaging:thread:{thread_id}:history"""
+        return self._messaging_thread_history.format(thread_id=thread_id)
+
+    @property
+    def messaging_history_global(self) -> str:
+        """{namespace}:messaging:history"""
+        return self._messaging_history_global
+
+    @property
+    def messaging_message_seq(self) -> str:
+        """{namespace}:messaging:seq"""
+        return self._messaging_message_seq
+
+    def messaging_group_threads_by_team(self, team_id: str) -> str:
+        """{namespace}:messaging:threads:group:by_team:{team_id}"""
+        return self._messaging_group_threads_by_team.format(team_id=team_id)
+
+    def messaging_direct_threads_by_team(self, team_id: str) -> str:
+        """{namespace}:messaging:threads:direct:by_team:{team_id}"""
+        return self._messaging_direct_threads_by_team.format(team_id=team_id)
+
+    def messaging_read_by_task(self, task_id: str) -> str:
+        """{namespace}:messaging:read:{task_id}"""
+        return self._messaging_read_by_task.format(task_id=task_id)
+
+    def messaging_receipts_by_task(self, task_id: str) -> str:
+        """{namespace}:messaging:receipts:{task_id}"""
+        return self._messaging_receipts_by_task.format(task_id=task_id)
 
     @property
     def queue_main(self) -> str:
@@ -416,6 +548,16 @@ class RedisKeys:
         return self._task_steering
 
     @property
+    def task_signals(self) -> str:
+        """{namespace}:signals:{task_id}:pending"""
+        if self._task_signals is None:
+            raise ValueError(
+                "task_signals is not available - "
+                "task_id was not provided during RedisKeys.format()"
+            )
+        return self._task_signals
+
+    @property
     def pending_tool_results(self) -> str:
         """{namespace}:pending:{task_id}:tools"""
         if self._pending_tool_results is None:
@@ -434,6 +576,16 @@ class RedisKeys:
                 "task_id was not provided during RedisKeys.format()"
             )
         return self._pending_child_task_results
+
+    @property
+    def resource_bindings(self) -> str:
+        """{namespace}:resources:bindings:{task_id}"""
+        if self._resource_bindings is None:
+            raise ValueError(
+                "resource_bindings is not available - "
+                "task_id was not provided during RedisKeys.format()"
+            )
+        return self._resource_bindings
 
     @property
     def pending_child_wait_ids(self) -> str:
@@ -523,6 +675,10 @@ class RedisKeys:
             _task_pickups=TASK_PICKUPS.format(namespace=namespace),
             _task_retries=TASK_RETRIES.format(namespace=namespace),
             _task_meta=TASK_META.format(namespace=namespace),
+            _task_children=TASK_CHILDREN.format(
+                namespace=namespace,
+                parent_task_id="{parent_task_id}",
+            ),
             _task_cancellations=TASK_CANCELLATIONS.format(namespace=namespace),
             _hooks_index=HOOKS_INDEX.format(namespace=namespace),
             _hooks_expiring=HOOKS_EXPIRING.format(namespace=namespace),
@@ -550,6 +706,49 @@ class RedisKeys:
             ),
             _hook_sessions=HOOK_SESSIONS.format(namespace=namespace),
             _scheduled_wait_meta=SCHEDULED_WAIT_META.format(namespace=namespace),
+            _activity_wait_meta=ACTIVITY_WAIT_META.format(namespace=namespace),
+            _signal_wait_meta=SIGNAL_WAIT_META.format(namespace=namespace),
+            _signal_wake_meta=SIGNAL_WAKE_META.format(namespace=namespace),
+            _signal_seq=SIGNAL_SEQ.format(namespace=namespace),
+            _messaging_group_meta=MESSAGING_GROUP_META.format(
+                namespace=namespace,
+                team_id="{team_id}",
+            ),
+            _messaging_group_members=MESSAGING_GROUP_MEMBERS.format(
+                namespace=namespace,
+                team_id="{team_id}",
+                group_name="{group_name}",
+            ),
+            _messaging_groups_by_task=MESSAGING_GROUPS_BY_TASK.format(
+                namespace=namespace,
+                task_id="{task_id}",
+            ),
+            _messaging_team_tasks=MESSAGING_TEAM_TASKS.format(
+                namespace=namespace,
+                team_id="{team_id}",
+            ),
+            _messaging_thread_history=MESSAGING_THREAD_HISTORY.format(
+                namespace=namespace,
+                thread_id="{thread_id}",
+            ),
+            _messaging_history_global=MESSAGING_HISTORY_GLOBAL.format(namespace=namespace),
+            _messaging_message_seq=MESSAGING_MESSAGE_SEQ.format(namespace=namespace),
+            _messaging_group_threads_by_team=MESSAGING_GROUP_THREADS_BY_TEAM.format(
+                namespace=namespace,
+                team_id="{team_id}",
+            ),
+            _messaging_direct_threads_by_team=MESSAGING_DIRECT_THREADS_BY_TEAM.format(
+                namespace=namespace,
+                team_id="{team_id}",
+            ),
+            _messaging_read_by_task=MESSAGING_READ_BY_TASK.format(
+                namespace=namespace,
+                task_id="{task_id}",
+            ),
+            _messaging_receipts_by_task=MESSAGING_RECEIPTS_BY_TASK.format(
+                namespace=namespace,
+                task_id="{task_id}",
+            ),
             # Agent-scoped keys
             _queue_main=QUEUE_MAIN.format(namespace=namespace, agent=agent)
             if agent
@@ -599,6 +798,9 @@ class RedisKeys:
             _task_steering=TASK_STEERING.format(namespace=namespace, task_id=task_id)
             if task_id
             else None,
+            _task_signals=TASK_SIGNALS.format(namespace=namespace, task_id=task_id)
+            if task_id
+            else None,
             _pending_tool_results=PENDING_TOOL_RESULTS.format(
                 namespace=namespace, task_id=task_id
             )
@@ -606,6 +808,12 @@ class RedisKeys:
             else None,
             _pending_child_task_results=PENDING_CHILD_TASK_RESULTS.format(
                 namespace=namespace, task_id=task_id
+            )
+            if task_id
+            else None,
+            _resource_bindings=RESOURCE_BINDINGS.format(
+                namespace=namespace,
+                task_id=task_id,
             )
             if task_id
             else None,

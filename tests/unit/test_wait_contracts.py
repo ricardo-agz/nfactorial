@@ -7,10 +7,10 @@ from typing import Any, cast
 
 import pytest
 
-from factorial.context import ExecutionContext, execution_context
-from factorial.events import EventPublisher
-from factorial.subagents import JobRef
-from factorial.waits import WaitInstruction, next_cron_wake_timestamp, wait
+from factorial.core.events import EventPublisher
+from factorial.execution.context import ExecutionContext, execution_context
+from factorial.execution.subagents import JobRef
+from factorial.execution.waits import WaitInstruction, next_cron_wake_timestamp, wait
 
 
 class _NoopEvents:
@@ -53,14 +53,10 @@ def test_next_cron_wake_timestamp_rejects_invalid_expression() -> None:
         next_cron_wake_timestamp("* * *", "UTC", now_ts=0)
 
 
-def test_wait_namespace_exposes_jobs_not_children() -> None:
-    assert hasattr(wait, "jobs")
-    assert not hasattr(wait, "children")
-
-
 def test_wait_namespace_builders_return_serializable_instructions() -> None:
     sleep_wait = wait.sleep(12.5, data="retry shortly")
     cron_wait = wait.cron("0 * * * *", timezone="UTC", data="hourly sync")
+    activity_wait = wait.activity(data={"reason": "awaiting activity"})
     jobs_wait = wait.jobs(
         [
             {
@@ -84,10 +80,79 @@ def test_wait_namespace_builders_return_serializable_instructions() -> None:
     assert cron_wait.timezone == "UTC"
     assert cron_wait.data == "hourly sync"
 
+    assert isinstance(activity_wait, WaitInstruction)
+    assert activity_wait.kind == "activity"
+    assert activity_wait.data == {"reason": "awaiting activity"}
+
     assert isinstance(jobs_wait, WaitInstruction)
     assert jobs_wait.kind == "jobs"
     assert jobs_wait.child_task_ids == ["child-task-1"]
     assert jobs_wait.data == "waiting for child tasks"
+
+
+def test_wait_activity_timeout_sleep_builder() -> None:
+    instruction = wait.activity(timeout=wait.sleep(12.0), data="awaiting input")
+    assert instruction.kind == "activity"
+    assert instruction.data == "awaiting input"
+    assert instruction.activity_timeout_kind == "sleep"
+    assert instruction.activity_timeout_s == 12.0
+    assert instruction.activity_timeout_cron is None
+
+
+def test_wait_activity_timeout_cron_builder() -> None:
+    instruction = wait.activity(
+        timeout=wait.cron("*/5 * * * *", timezone="UTC"),
+        data={"mode": "tick"},
+    )
+    assert instruction.kind == "activity"
+    assert instruction.data == {"mode": "tick"}
+    assert instruction.activity_timeout_kind == "cron"
+    assert instruction.activity_timeout_cron == "*/5 * * * *"
+    assert instruction.activity_timeout_timezone == "UTC"
+
+
+def test_wait_activity_timeout_rejects_non_scheduled_waits() -> None:
+    with pytest.raises(ValueError, match="only supports wait.sleep"):
+        wait.activity(timeout=wait.activity())
+
+
+def test_wait_until_signal_builder_without_timeout() -> None:
+    instruction = wait.until_signal("day_vote_open:2", data={"phase": "day_vote"})
+    assert instruction.kind == "signal"
+    assert instruction.signal_id == "day_vote_open:2"
+    assert instruction.data == {"phase": "day_vote"}
+    assert instruction.signal_timeout_kind is None
+
+
+def test_wait_until_signal_builder_with_sleep_timeout() -> None:
+    instruction = wait.until_signal(
+        "night_action_open:3",
+        timeout=wait.sleep(15.0),
+        data={"phase": "night_action"},
+    )
+    assert instruction.kind == "signal"
+    assert instruction.signal_id == "night_action_open:3"
+    assert instruction.signal_timeout_kind == "sleep"
+    assert instruction.signal_timeout_s == 15.0
+
+
+def test_wait_until_signal_builder_with_cron_timeout() -> None:
+    instruction = wait.until_signal(
+        "night_action_open:3",
+        timeout=wait.cron("*/2 * * * *", timezone="UTC"),
+    )
+    assert instruction.kind == "signal"
+    assert instruction.signal_id == "night_action_open:3"
+    assert instruction.signal_timeout_kind == "cron"
+    assert instruction.signal_timeout_cron == "*/2 * * * *"
+    assert instruction.signal_timeout_timezone == "UTC"
+
+
+def test_wait_until_signal_rejects_invalid_inputs() -> None:
+    with pytest.raises(ValueError, match="non-empty signal_id"):
+        wait.until_signal("   ")
+    with pytest.raises(ValueError, match="only supports wait.sleep"):
+        wait.until_signal("x", timeout=wait.activity())
 
 
 def test_wait_jobs_rejects_empty_job_list() -> None:
@@ -99,8 +164,7 @@ def test_wait_jobs_builds_join_instruction() -> None:
     ctx = ExecutionContext(
         task_id="parent-task",
         owner_id="owner",
-        retries=0,
-        iterations=0,
+        retry_count=0,
         events=cast(EventPublisher, _NoopEvents()),
     )
     token = execution_context.set(ctx)
@@ -144,8 +208,7 @@ def test_wait_jobs_accepts_model_dump_refs() -> None:
     ctx = ExecutionContext(
         task_id="parent-task",
         owner_id="owner",
-        retries=0,
-        iterations=0,
+        retry_count=0,
         events=cast(EventPublisher, _NoopEvents()),
     )
     token = execution_context.set(ctx)
@@ -170,8 +233,7 @@ def test_wait_jobs_rejects_foreign_parent_refs() -> None:
     ctx = ExecutionContext(
         task_id="parent-task",
         owner_id="owner",
-        retries=0,
-        iterations=0,
+        retry_count=0,
         events=cast(EventPublisher, _NoopEvents()),
     )
     token = execution_context.set(ctx)
@@ -194,8 +256,7 @@ def test_wait_jobs_rejects_missing_parent_ref_in_execution_context() -> None:
     ctx = ExecutionContext(
         task_id="parent-task",
         owner_id="owner",
-        retries=0,
-        iterations=0,
+        retry_count=0,
         events=cast(EventPublisher, _NoopEvents()),
     )
     token = execution_context.set(ctx)
@@ -213,7 +274,4 @@ def test_wait_jobs_rejects_missing_parent_ref_in_execution_context() -> None:
         execution_context.reset(token)
 
 
-def test_wait_cron_rejects_conflicting_timezone_aliases() -> None:
-    with pytest.raises(ValueError, match="either 'timezone' or 'tz'"):
-        wait.cron("0 * * * *", timezone="Europe/London", tz="America/New_York")
 

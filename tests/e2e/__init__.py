@@ -1,1 +1,41 @@
-# E2E tests for nfactorial
+"""Shared runtime helpers for sandbox-backed end-to-end fixtures."""
+
+from .sdk import (
+    ProbeContext,
+    ProbeEventRecord,
+    ProbeHookResolution,
+    ProbeMessageDelivery,
+    RunHandle,
+    discover_probes,
+    event_type_is,
+    field_equals,
+    output_contains,
+    output_field_equals,
+    pending_children,
+    pending_hooks,
+    probe,
+    status_is,
+    tool_client_output,
+    tool_output,
+    wait_kind_is,
+)
+
+__all__ = [
+    "ProbeContext",
+    "ProbeEventRecord",
+    "ProbeHookResolution",
+    "ProbeMessageDelivery",
+    "RunHandle",
+    "discover_probes",
+    "event_type_is",
+    "field_equals",
+    "output_contains",
+    "output_field_equals",
+    "pending_children",
+    "pending_hooks",
+    "probe",
+    "status_is",
+    "tool_output",
+    "tool_client_output",
+    "wait_kind_is",
+]

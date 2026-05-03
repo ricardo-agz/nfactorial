@@ -1,0 +1,65 @@
+version: "3.8"
+
+services:
+  redis:
+    image: redis:latest
+    ports:
+      - "6379:6379"
+    command: redis-server --appendonly yes
+
+  agent:
+    build:
+      context: ../../
+      dockerfile: examples/group_chat_agent/Dockerfile
+      target: agent
+    environment:
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_DB=0
+      - REDIS_MAX_CONNECTIONS=1000
+    ports:
+      - "8081:8081"
+    depends_on:
+      - redis
+    volumes:
+      - ../../src:/app/src
+      - ./:/app
+    restart: unless-stopped
+
+  server:
+    build:
+      context: ../../
+      dockerfile: examples/group_chat_agent/Dockerfile
+      target: server
+    environment:
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_DB=0
+    ports:
+      - "8000:8000"
+    depends_on:
+      - redis
+    volumes:
+      - ../../src:/app/src
+      - ./:/app
+    restart: unless-stopped
+
+  ui:
+    build:
+      context: ./ui
+      dockerfile: Dockerfile
+    environment:
+      - VITE_API_BASE_URL=${VITE_API_BASE_URL:-http://localhost:8000/api}
+      - VITE_SSE_BASE_URL=${VITE_SSE_BASE_URL:-http://localhost:8000/api/events}
+    ports:
+      - "5173:5173"
+    depends_on:
+      - server
+    volumes:
+      - ./ui/src:/app/src
+      - ./ui/public:/app/public
+      - ./ui/vite.config.ts:/app/vite.config.ts
+      - ./ui/index.html:/app/index.html
+    restart: unless-stopped

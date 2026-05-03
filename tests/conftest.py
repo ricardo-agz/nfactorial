@@ -6,7 +6,7 @@ from typing import Any
 
 import pytest
 
-from factorial.context import AgentContext
+from factorial.agent.context import AgentContext
 from factorial.queue.task import Task, TaskMetadata, TaskStatus
 
 
@@ -38,9 +38,8 @@ def agent_name() -> str:
 def sample_context() -> AgentContext:
     """Create a sample AgentContext for testing."""
     return AgentContext(
-        query="Test query",
-        messages=[],
-        turn=0,
+        messages=[{"role": "user", "content": "Test query"}],
+        turn_number=1,
         output=None,
     )
 
@@ -50,6 +49,7 @@ def sample_metadata(owner_id: str) -> TaskMetadata:
     """Create sample task metadata for testing."""
     return TaskMetadata(
         owner_id=owner_id,
+        team_id=owner_id,
         parent_id=None,
         batch_id=None,
         created_at=datetime.now(timezone.utc),

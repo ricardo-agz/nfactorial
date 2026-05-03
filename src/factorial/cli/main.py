@@ -20,10 +20,9 @@ from factorial import (
     gpt_41,
     grok_4,
 )
-from factorial.llms import Model, MultiClient
+from factorial.ai.models import Model, MultiClient
 
-from .agent import CLIAgentContext, NFactorialAgent
-from .event_printer import event_printer
+from .agent import NFactorialAgent
 from .key_storage import key_storage
 
 try:
@@ -241,7 +240,7 @@ def create(path: Path, description: tuple[str, ...], model_name: str | None) -> 
         sys.exit(1)
 
     # Model preference: CLI flag → automatic based on keys → default
-    model: Model | Callable[[CLIAgentContext], Model]
+    model: Model | Callable
     if model_name:
         selected_model = model_setup.lookup.get(model_name.lower())
         if not selected_model:
@@ -285,14 +284,13 @@ def create(path: Path, description: tuple[str, ...], model_name: str | None) -> 
         cwd = os.getcwd()
         try:
             os.chdir(project_dir)
-            agent_ctx = CLIAgentContext(query=prompt)
-            completion = await agent.run_inline(agent_ctx, event_handler=event_printer)
-            return completion
+            result = await agent.run(prompt)
+            return result
         finally:
             os.chdir(cwd)
 
     click.echo("Running nfactorial agent to generate project...\n")
-    run_completion = asyncio.run(_run_agent())
+    run_result = asyncio.run(_run_agent())
 
     # Ensure __init__.py exists so the directory is a package
     (project_dir / "__init__.py").touch(exist_ok=True)
@@ -300,7 +298,7 @@ def create(path: Path, description: tuple[str, ...], model_name: str | None) -> 
     click.echo(f"\nProject generated at {project_dir.resolve()}")
 
     # Report any commands suggested by the agent (if using FinalOutput)
-    output = getattr(run_completion, "output", None)
+    output = getattr(run_result, "output", None)
     try:
         # If output is a Pydantic model (FinalOutput), convert to dict for inspection
         if isinstance(output, BaseModel):
@@ -349,7 +347,7 @@ def agent(prompt: tuple[str, ...], model_name: str | None) -> None:
         sys.exit(1)
 
     # Model preference: CLI flag → automatic based on keys → default
-    agent_model: Model | Callable[[CLIAgentContext], Model]
+    agent_model: Model | Callable
     if model_name:
         selected_model = model_setup.lookup.get(model_name.lower())
         if not selected_model:
@@ -382,19 +380,18 @@ def agent(prompt: tuple[str, ...], model_name: str | None) -> None:
         cwd = os.getcwd()
         try:
             os.chdir(project_dir)
-            agent_ctx = CLIAgentContext(query=prompt_text)
-            completion = await agent.run_inline(agent_ctx, event_handler=event_printer)
-            return completion
+            result = await agent.run(prompt_text)
+            return result
         finally:
             os.chdir(cwd)
 
     click.echo("Running nfactorial agent to work on project...\n")
-    run_completion = asyncio.run(_run_agent())
+    run_result = asyncio.run(_run_agent())
 
     click.echo(f"\nCompleted work in {project_dir.resolve()}")
 
     # Report any commands suggested by the agent (if using FinalOutput)
-    output = getattr(run_completion, "output", None)
+    output = getattr(run_result, "output", None)
     try:
         # If output is a Pydantic model (FinalOutput), convert to dict for inspection
         if isinstance(output, BaseModel):

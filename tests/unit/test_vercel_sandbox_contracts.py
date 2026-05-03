@@ -1,0 +1,281 @@
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+
+import fakeredis.aioredis
+import pytest
+
+from factorial import ResourceContext, ResourceRequest, Sandbox
+from factorial.resources import RedisResourceBindingStore, ResourceManager
+from factorial.resources.sandbox.vercel import VercelSandboxLifecycle
+
+
+@dataclass
+class _FakeCommand:
+    cmd_id: str
+    stdout_text: str = ""
+    stderr_text: str = ""
+    exit_code: int = 0
+    killed_signals: list[int] = field(default_factory=list)
+
+    async def wait(self) -> _FakeCommand:
+        return self
+
+    async def output(self, stream: str = "both") -> str:
+        if stream == "stdout":
+            return self.stdout_text
+        if stream == "stderr":
+            return self.stderr_text
+        return self.stdout_text + self.stderr_text
+
+    async def stdout(self) -> str:
+        return self.stdout_text
+
+    async def stderr(self) -> str:
+        return self.stderr_text
+
+    async def kill(self, signal: int = 15) -> None:
+        self.killed_signals.append(signal)
+
+
+@dataclass
+class _FakeSnapshot:
+    snapshot_id: str
+    source_sandbox_id: str
+    expires_at: int = 9999999999
+
+
+class _FakeAsyncSandbox:
+    created_kwargs: list[dict] = []
+    get_ids: list[str] = []
+    instances: dict[str, _FakeAsyncSandbox] = {}
+    snapshot_sources: dict[str, str] = {}
+    counter: int = 0
+
+    def __init__(self, sandbox_id: str, *, status: str = "running") -> None:
+        self.sandbox_id = sandbox_id
+        self.status = status
+        self.files: dict[str, bytes] = {}
+        self.directories: list[str] = []
+        self.commands: list[tuple[str, list[str], str | None]] = []
+        self.detached_commands: list[tuple[str, list[str], str | None]] = []
+        self.stop_calls = 0
+        _FakeAsyncSandbox.instances[sandbox_id] = self
+
+    @classmethod
+    def reset(cls) -> None:
+        cls.created_kwargs = []
+        cls.get_ids = []
+        cls.instances = {}
+        cls.snapshot_sources = {}
+        cls.counter = 0
+
+    @classmethod
+    async def create(cls, **kwargs):
+        cls.created_kwargs.append(dict(kwargs))
+        cls.counter += 1
+        sandbox = cls(f"sb-{cls.counter}")
+        if kwargs.get("source"):
+            sandbox.source_snapshot_id = kwargs["source"]["snapshot_id"]
+        else:
+            sandbox.source_snapshot_id = None
+        return sandbox
+
+    @classmethod
+    async def get(cls, *, sandbox_id: str):
+        cls.get_ids.append(sandbox_id)
+        sandbox = cls.instances.get(sandbox_id)
+        if sandbox is None:
+            raise RuntimeError("missing sandbox")
+        return sandbox
+
+    async def wait_for_status(self, status: str, *, timeout: float) -> None:
+        del timeout
+        self.status = status
+
+    async def run_command(
+        self,
+        cmd: str,
+        args: list[str] | None = None,
+        *,
+        cwd: str | None = None,
+        env: dict[str, str] | None = None,
+        sudo: bool = False,
+    ) -> _FakeCommand:
+        del env, sudo
+        args = args or []
+        self.commands.append((cmd, list(args), cwd))
+        return _FakeCommand(
+            cmd_id=f"{self.sandbox_id}-cmd-{len(self.commands)}",
+            stdout_text=f"ran {cmd} {' '.join(args)}".strip(),
+            stderr_text="",
+            exit_code=0,
+        )
+
+    async def run_command_detached(
+        self,
+        cmd: str,
+        args: list[str] | None = None,
+        *,
+        cwd: str | None = None,
+        env: dict[str, str] | None = None,
+        sudo: bool = False,
+    ) -> _FakeCommand:
+        del env, sudo
+        args = args or []
+        self.detached_commands.append((cmd, list(args), cwd))
+        return _FakeCommand(
+            cmd_id=f"{self.sandbox_id}-detached-{len(self.detached_commands)}",
+            stdout_text="detached stdout",
+            stderr_text="detached stderr",
+            exit_code=0,
+        )
+
+    async def read_file(self, path: str):
+        return self.files.get(path)
+
+    async def write_files(self, files: list[dict]) -> None:
+        for file in files:
+            self.files[str(file["path"])] = bytes(file["content"])
+
+    async def mk_dir(self, path: str) -> None:
+        self.directories.append(path)
+
+    def domain(self, port: int) -> str:
+        return f"https://{self.sandbox_id}-{port}.example.test"
+
+    async def snapshot(self) -> _FakeSnapshot:
+        snapshot_id = f"snap-{self.sandbox_id}"
+        self.status = "stopped"
+        self.snapshot_sources[snapshot_id] = self.sandbox_id
+        return _FakeSnapshot(
+            snapshot_id=snapshot_id,
+            source_sandbox_id=self.sandbox_id,
+        )
+
+    async def stop(self) -> None:
+        self.stop_calls += 1
+        self.status = "stopped"
+
+
+@pytest.mark.asyncio
+async def test_vercel_sandbox_handle_wraps_common_operations(monkeypatch) -> None:
+    _FakeAsyncSandbox.reset()
+    monkeypatch.setattr(
+        "factorial.resources.sandbox.vercel._load_vercel_async_sandbox",
+        lambda: _FakeAsyncSandbox,
+    )
+    monkeypatch.setenv("NFACTORIAL_SANDBOX_PORTS", "7000,8000")
+    monkeypatch.setenv("NFACTORIAL_SANDBOX_TIMEOUT_MS", "123000")
+
+    sandbox = await VercelSandboxLifecycle.create(
+        ResourceContext(task_id="task-1", owner_id="owner-1", agent_name="agent-1"),
+        ResourceRequest(resource_type=Sandbox, logical_name="default"),
+    )
+
+    await sandbox.write_file("README.md", "# hello")
+    await sandbox.mkdir("notes")
+    exec_result = await sandbox.exec("python", "-V", cwd="/work")
+    process = await sandbox.spawn("python", "-m", "http.server", "8000")
+    checkpoint = await sandbox.checkpoint()
+
+    assert _FakeAsyncSandbox.created_kwargs[0]["ports"] == [7000, 8000]
+    assert _FakeAsyncSandbox.created_kwargs[0]["timeout"] == 123000
+    assert await sandbox.read_file("README.md") == b"# hello"
+    assert exec_result.command_id == "sb-1-cmd-1"
+    assert exec_result.stdout_text == "ran python -V"
+    assert await process.stdout() == "detached stdout"
+    await process.kill(signal=9)
+    assert process.command.killed_signals == [9]
+    assert await sandbox.url(8000) == "https://sb-1-8000.example.test"
+    assert checkpoint.ref == "snap-sb-1"
+    assert checkpoint.metadata["source_sandbox_id"] == "sb-1"
+
+
+@pytest.mark.asyncio
+async def test_resource_manager_attaches_existing_live_vercel_sandbox(
+    monkeypatch,
+) -> None:
+    _FakeAsyncSandbox.reset()
+    monkeypatch.setattr(
+        "factorial.resources.sandbox.vercel._load_vercel_async_sandbox",
+        lambda: _FakeAsyncSandbox,
+    )
+
+    redis_client = fakeredis.aioredis.FakeRedis(decode_responses=True)
+    try:
+        manager1 = ResourceManager(
+            store=RedisResourceBindingStore(
+                redis_client=redis_client,
+                namespace="test",
+                task_id="task-attach",
+            ),
+            task_id="task-attach",
+            owner_id="owner-1",
+            agent_name="agent-1",
+        )
+        sandbox1 = await manager1.get(Sandbox)
+
+        manager2 = ResourceManager(
+            store=RedisResourceBindingStore(
+                redis_client=redis_client,
+                namespace="test",
+                task_id="task-attach",
+            ),
+            task_id="task-attach",
+            owner_id="owner-1",
+            agent_name="agent-1",
+        )
+        sandbox2 = await manager2.get(Sandbox)
+
+        assert sandbox1.id == sandbox2.id
+        assert _FakeAsyncSandbox.get_ids == [sandbox1.id]
+    finally:
+        await redis_client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_resource_manager_restores_checkpointed_vercel_sandbox(
+    monkeypatch,
+) -> None:
+    _FakeAsyncSandbox.reset()
+    monkeypatch.setattr(
+        "factorial.resources.sandbox.vercel._load_vercel_async_sandbox",
+        lambda: _FakeAsyncSandbox,
+    )
+
+    redis_client = fakeredis.aioredis.FakeRedis(decode_responses=True)
+    try:
+        manager1 = ResourceManager(
+            store=RedisResourceBindingStore(
+                redis_client=redis_client,
+                namespace="test",
+                task_id="task-restore",
+            ),
+            task_id="task-restore",
+            owner_id="owner-1",
+            agent_name="agent-1",
+        )
+        sandbox1 = await manager1.get(Sandbox)
+        await manager1.checkpoint_all()
+
+        manager2 = ResourceManager(
+            store=RedisResourceBindingStore(
+                redis_client=redis_client,
+                namespace="test",
+                task_id="task-restore",
+            ),
+            task_id="task-restore",
+            owner_id="owner-1",
+            agent_name="agent-1",
+        )
+        sandbox2 = await manager2.get(Sandbox)
+
+        assert sandbox1.id == "sb-1"
+        assert sandbox2.id == "sb-2"
+        assert _FakeAsyncSandbox.created_kwargs[-1]["source"] == {
+            "type": "snapshot",
+            "snapshot_id": "snap-sb-1",
+        }
+    finally:
+        await redis_client.aclose()

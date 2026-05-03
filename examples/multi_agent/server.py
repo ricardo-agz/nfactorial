@@ -2,19 +2,27 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 import redis.asyncio as redis
-from agent import basic_agent, orchestrator
+from agent import basic_agent
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from orchestrator import orchestrator
 from pydantic import BaseModel
 from redis.asyncio.client import PubSub, Redis as RedisType
 from starlette.websockets import WebSocket, WebSocketDisconnect
-
-from factorial import AgentContext
 
 WS_REDIS_SUB_TIMEOUT = 5.0  # seconds
 
 
 redis_client: RedisType
+
+
+def _build_input(
+    message_history: list[dict[str, str]],
+    query: str,
+) -> str | list[dict[str, str]]:
+    if not message_history:
+        return query
+    return [*message_history, {"role": "user", "content": query}]
 
 
 @asynccontextmanager
@@ -105,15 +113,10 @@ class SteerRequest(BaseModel):
 
 @app.post("/api/enqueue")
 async def enqueue(request: EnqueueRequest):
-    payload = AgentContext(
-        messages=request.message_history,
-        query=request.query,
-        turn=0,
-    )
-    task = await orchestrator.create_agent_task(
-        agent=basic_agent,
+    task = await orchestrator.enqueue(
+        basic_agent,
+        input=_build_input(request.message_history, request.query),
         owner_id=request.user_id,
-        payload=payload,
     )
 
     return {"task_id": task.id}

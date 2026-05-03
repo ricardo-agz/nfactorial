@@ -168,12 +168,12 @@ async def event_printer(event: Any) -> None:
 
             result_metadata = None
             output_content = None
-            if result_data and hasattr(result_data, "output_data"):
-                result_metadata = result_data.output_data
-                output_content = getattr(result_data, "output_str", None)
+            if result_data and hasattr(result_data, "client_output"):
+                result_metadata = result_data.client_output
+                output_content = getattr(result_data, "model_output", None)
             elif isinstance(result_data, dict):
-                result_metadata = result_data
-                output_content = result_data.get("output_str")
+                result_metadata = result_data.get("client_output", result_data)
+                output_content = result_data.get("model_output")
 
             message = _format_tool_message(
                 tool_name, parsed_args, result_metadata, output_content
@@ -186,6 +186,14 @@ async def event_printer(event: Any) -> None:
         except Exception:
             # Graceful degradation - just show basic tool execution
             click.echo(style("[agent] ", fg="blue") + "ran a tool")
+
+    elif event_type in {
+        "verification_passed",
+        "verification_rejected",
+        "verification_exhausted",
+    }:
+        _spinner.stop()
+        click.echo(_format_verification_message(event_type, event))
 
     elif event_type.endswith("_failed"):
         # Stop spinner on failure and show detailed error
@@ -294,6 +302,39 @@ def _format_error_message(event_type: str, event: Any) -> str:
         details = style(" - Unknown error", fg="bright_black")
 
     return base_msg + details
+
+
+def _format_verification_message(event_type: str, event: Any) -> str:
+    data = event.data if isinstance(getattr(event, "data", None), dict) else {}
+
+    attempts_used = data.get("attempts_used")
+    max_attempts = data.get("max_attempts")
+    attempt_suffix = ""
+    if attempts_used is not None and max_attempts is not None:
+        attempt_suffix = f" ({attempts_used}/{max_attempts} attempts)"
+
+    code = data.get("code")
+    code_suffix = f" [{code}]" if code else ""
+    detail = data.get("message") or ""
+    detail_suffix = f": {detail}" if detail else ""
+
+    if event_type == "verification_passed":
+        return style("[agent] ", fg="blue") + style(
+            f"verification passed{attempt_suffix}",
+            fg="green",
+        )
+
+    if event_type == "verification_exhausted":
+        return style("[agent] ", fg="blue") + style(
+            f"verification exhausted{attempt_suffix}{code_suffix}{detail_suffix}",
+            fg="red",
+            bold=True,
+        )
+
+    return style("[agent] ", fg="blue") + style(
+        f"verification rejected{attempt_suffix}{code_suffix}{detail_suffix}",
+        fg="yellow",
+    )
 
 
 def _format_tool_message(

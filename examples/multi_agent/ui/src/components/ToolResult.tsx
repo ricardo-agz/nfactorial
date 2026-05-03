@@ -46,14 +46,33 @@ interface ToolArgumentsProps {
 }
 
 export const ToolArguments: React.FC<ToolArgumentsProps> = ({ name, args }) => {
-  const parsed = typeof args === 'string' ? JSON.parse(args) : args;
+  let parsed: any = args;
+  if (typeof args === 'string') {
+    try {
+      parsed = JSON.parse(args);
+    } catch {
+      parsed = {};
+    }
+  }
   
   const getArgumentText = () => {
     switch (name) {
-      case 'search': return `Searching: "${parsed.query}"`;
+      case 'search': {
+        const query = typeof parsed?.query === 'string' ? parsed.query : '';
+        return query ? `Searching: "${query}"` : 'Searching...';
+      }
       case 'plan': return 'Creating plan...';
       case 'reflect': return 'Reflecting...';
-      case 'scrape': return `Reading: ${new URL(parsed.url).hostname}`;
+      case 'scrape': {
+        if (typeof parsed?.url !== 'string' || !parsed.url) {
+          return 'Reading page...';
+        }
+        try {
+          return `Reading: ${new URL(parsed.url).hostname}`;
+        } catch {
+          return `Reading: ${parsed.url}`;
+        }
+      }
       case 'research': {
         // "research" arguments are expected to be an array of query strings or
         // an object of shape { queries: string[] }

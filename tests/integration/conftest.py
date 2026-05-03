@@ -4,7 +4,7 @@ import json
 import uuid
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, cast
 
 import fakeredis.aioredis
 import pytest
@@ -12,7 +12,8 @@ import pytest_asyncio
 import redis.asyncio as redis
 
 from factorial.agent import BaseAgent, TurnCompletion
-from factorial.context import AgentContext
+from factorial.agent.context import AgentContext
+from factorial.ai.models import Model, Provider
 from factorial.queue.keys import PENDING_SENTINEL, RedisKeys
 from factorial.queue.lua import (
     BackoffRecoveryScript,
@@ -21,32 +22,48 @@ from factorial.queue.lua import (
     CancelTaskScript,
     CancelTaskScriptResult,
     ChildTaskCompletionScript,
+    ScheduledRecoveryScript,
     StaleRecoveryScript,
     StaleRecoveryScriptResult,
     TaskCompletionScript,
+    TaskCompletionScriptResult,
     TaskExpirationScript,
     TaskExpirationScriptResult,
     TaskSteeringScript,
+    TaskSteeringScriptResult,
     ToolCompletionScript,
+    WaitScheduleScript,
     create_backoff_recovery_script,
     create_batch_pickup_script,
     create_cancel_task_script,
     create_child_task_completion_script,
     create_enqueue_batch_script,
     create_enqueue_task_script,
+    create_scheduled_recovery_script,
     create_stale_recovery_script,
     create_task_completion_script,
     create_task_expiration_script,
     create_task_steering_script,
     create_tool_completion_script,
-)
-from factorial.queue.lua._loader import (
-    TaskCompletionScriptResult,
-    TaskSteeringScriptResult,
+    create_wait_schedule_script,
 )
 from factorial.queue.operations import enqueue_task
 from factorial.queue.task import Task, TaskStatus
 from factorial.queue.worker import CompletionAction
+
+MOCK_MODEL = Model(
+    name="mock-model",
+    provider=Provider.OPENAI,
+    provider_model_id="mock-v1",
+    context_window=128000,
+)
+
+
+def _first_user_content(ctx: AgentContext) -> str:
+    for m in ctx.messages:
+        if m.get("role") == "user" and isinstance(m.get("content"), str):
+            return m["content"]
+    return ""
 
 
 class SimpleTestAgent(BaseAgent[AgentContext]):
@@ -56,8 +73,7 @@ class SimpleTestAgent(BaseAgent[AgentContext]):
         super().__init__(
             name=name,
             instructions="Test agent instructions",
-            max_turns=max_turns,
-            context_class=AgentContext,
+            model=MOCK_MODEL,
         )
 
     async def run_turn(
@@ -65,11 +81,11 @@ class SimpleTestAgent(BaseAgent[AgentContext]):
         agent_ctx: AgentContext,
     ) -> TurnCompletion[AgentContext]:
         """Simple turn that completes immediately."""
-        agent_ctx.turn += 1
+        agent_ctx.turn_number += 1
         return TurnCompletion(
             is_done=True,
             context=agent_ctx,
-            output={"result": "completed", "query": agent_ctx.query},
+            output={"result": "completed", "query": _first_user_content(agent_ctx)},
         )
 
 
@@ -85,8 +101,7 @@ class MultiTurnTestAgent(BaseAgent[AgentContext]):
         super().__init__(
             name=name,
             instructions="Multi-turn test agent",
-            max_turns=max_turns,
-            context_class=AgentContext,
+            model=MOCK_MODEL,
         )
         self.turns_to_complete = turns_to_complete
 
@@ -95,13 +110,13 @@ class MultiTurnTestAgent(BaseAgent[AgentContext]):
         agent_ctx: AgentContext,
     ) -> TurnCompletion[AgentContext]:
         """Run a turn, completing after turns_to_complete iterations."""
-        agent_ctx.turn += 1
+        agent_ctx.turn_number += 1
 
-        if agent_ctx.turn >= self.turns_to_complete:
+        if agent_ctx.turn_number >= self.turns_to_complete:
             return TurnCompletion(
                 is_done=True,
                 context=agent_ctx,
-                output={"result": "completed", "turns": agent_ctx.turn},
+                output={"result": "completed", "turns": agent_ctx.turn_number},
             )
 
         return TurnCompletion(
@@ -117,7 +132,7 @@ class FailingTestAgent(BaseAgent[AgentContext]):
         super().__init__(
             name=name,
             instructions="Failing test agent",
-            context_class=AgentContext,
+            model=MOCK_MODEL,
         )
         self.error_message = error_message
 
@@ -136,7 +151,7 @@ class DeferredToolTestAgent(BaseAgent[AgentContext]):
         super().__init__(
             name=name,
             instructions="Deferred tool test agent",
-            context_class=AgentContext,
+            model=MOCK_MODEL,
         )
         self._pending_tool_ids: list[str] = []
 
@@ -228,9 +243,8 @@ def agents_by_name(
 def sample_agent_context() -> AgentContext:
     """Create a sample AgentContext for testing."""
     return AgentContext(
-        query="Test query",
-        messages=[],
-        turn=0,
+        messages=[{"role": "user", "content": "Test query"}],
+        turn_number=1,
         output=None,
     )
 
@@ -311,6 +325,12 @@ async def backoff_recovery_script(redis_client: redis.Redis):
 
 
 @pytest_asyncio.fixture
+async def scheduled_recovery_script(redis_client: redis.Redis):
+    """Create scheduled recovery script."""
+    return await create_scheduled_recovery_script(redis_client)
+
+
+@pytest_asyncio.fixture
 async def expiration_script(redis_client: redis.Redis):
     """Create task expiration script."""
     return await create_task_expiration_script(redis_client)
@@ -320,6 +340,12 @@ async def expiration_script(redis_client: redis.Redis):
 async def child_completion_script(redis_client: redis.Redis):
     """Create child task completion script."""
     return await create_child_task_completion_script(redis_client)
+
+
+@pytest_asyncio.fixture
+async def wait_schedule_script(redis_client: redis.Redis):
+    """Create wait schedule script."""
+    return await create_wait_schedule_script(redis_client)
 
 
 # =============================================================================
@@ -350,7 +376,9 @@ class ScriptRunner:
     _steering_script: TaskSteeringScript | None = None
     _stale_recovery_script: StaleRecoveryScript | None = None
     _backoff_recovery_script: BackoffRecoveryScript | None = None
+    _scheduled_recovery_script: ScheduledRecoveryScript | None = None
     _expiration_script: TaskExpirationScript | None = None
+    _wait_schedule_script: WaitScheduleScript | None = None
 
     # Configuration
     metrics_ttl: int = 3600
@@ -427,7 +455,11 @@ class ScriptRunner:
             metrics_ttl=self.metrics_ttl,
             pending_sentinel=PENDING_SENTINEL,
             current_turn=current_turn,
+            pending_child_wait_ids_key=task_keys.pending_child_wait_ids,
             parent_pending_child_task_results_key=parent_keys.pending_child_task_results
+            if parent_keys
+            else None,
+            parent_pending_child_wait_ids_key=parent_keys.pending_child_wait_ids
             if parent_keys
             else None,
             pending_tool_call_ids_json=json.dumps(pending_tool_call_ids)
@@ -465,6 +497,9 @@ class ScriptRunner:
             global_metrics_bucket_key=self.keys.global_metrics_bucket,
             task_id=task_id,
             metrics_ttl=self.metrics_ttl,
+            queue_scheduled_key=self.keys.queue_scheduled,
+            scheduled_wait_meta_key=self.keys.scheduled_wait_meta,
+            pending_child_wait_ids_key=task_keys.pending_child_wait_ids,
         )
 
     async def complete_tool(
@@ -507,6 +542,7 @@ class ScriptRunner:
             queue_orphaned_key=self.keys.queue_orphaned,
             queue_pending_key=self.keys.queue_pending,
             pending_child_task_results_key=task_keys.pending_child_task_results,
+            pending_child_wait_ids_key=task_keys.pending_child_wait_ids,
             task_statuses_key=self.keys.task_status,
             task_agents_key=self.keys.task_agent,
             task_payloads_key=self.keys.task_payload,
@@ -587,6 +623,56 @@ class ScriptRunner:
             max_batch_size=max_batch_size,
         )
 
+    async def recover_scheduled(self, max_batch_size: int = 100) -> list[str]:
+        """Recover tasks from scheduled queue."""
+        assert self._scheduled_recovery_script is not None
+        return await self._scheduled_recovery_script.execute(
+            queue_scheduled_key=self.keys.queue_scheduled,
+            queue_main_key=self.keys.queue_main,
+            queue_pending_key=self.keys.queue_pending,
+            queue_orphaned_key=self.keys.queue_orphaned,
+            task_statuses_key=self.keys.task_status,
+            task_agents_key=self.keys.task_agent,
+            task_payloads_key=self.keys.task_payload,
+            task_pickups_key=self.keys.task_pickups,
+            task_retries_key=self.keys.task_retries,
+            task_metas_key=self.keys.task_meta,
+            scheduled_wait_meta_key=self.keys.scheduled_wait_meta,
+            activity_wait_meta_key=self.keys.activity_wait_meta,
+            signal_wait_meta_key=self.keys.signal_wait_meta,
+            signal_wake_meta_key=self.keys.signal_wake_meta,
+            max_batch_size=max_batch_size,
+        )
+
+    async def schedule_wait(
+        self,
+        *,
+        task_id: str,
+        payload_json: str,
+        wake_timestamp: float,
+        wait_metadata: dict[str, Any],
+    ) -> tuple[bool, str]:
+        """Park a processing task in scheduled wait state."""
+        assert self._wait_schedule_script is not None
+        result = await self._wait_schedule_script.execute(
+            queue_scheduled_key=self.keys.queue_scheduled,
+            queue_pending_key=self.keys.queue_pending,
+            queue_orphaned_key=self.keys.queue_orphaned,
+            processing_heartbeats_key=self.keys.processing_heartbeats,
+            task_statuses_key=self.keys.task_status,
+            task_agents_key=self.keys.task_agent,
+            task_payloads_key=self.keys.task_payload,
+            task_pickups_key=self.keys.task_pickups,
+            task_retries_key=self.keys.task_retries,
+            task_metas_key=self.keys.task_meta,
+            scheduled_wait_meta_key=self.keys.scheduled_wait_meta,
+            task_id=task_id,
+            updated_task_payload_json=payload_json,
+            wake_timestamp=wake_timestamp,
+            wait_metadata_json=json.dumps(wait_metadata),
+        )
+        return result.success, result.message
+
     async def expire_tasks(
         self,
         completed_cutoff: float,
@@ -630,12 +716,15 @@ class ScriptRunner:
 
     async def get_task_status(self, task_id: str) -> TaskStatus | None:
         """Get the current status of a task."""
-        status_str = await self.redis_client.hget(self.keys.task_status, task_id)
+        status_str = await cast(
+            Any,
+            self.redis_client.hget(self.keys.task_status, task_id),
+        )
         return TaskStatus(status_str) if status_str else None
 
     async def mark_for_cancellation(self, task_id: str) -> None:
         """Mark a task for cancellation."""
-        await self.redis_client.sadd(self.keys.task_cancellations, task_id)
+        await cast(Any, self.redis_client.sadd(self.keys.task_cancellations, task_id))
 
     async def set_tool_result(
         self, task_id: str, tool_call_id: str, result: Any
@@ -646,8 +735,13 @@ class ScriptRunner:
             agent=self.agent_name,
             task_id=task_id,
         )
-        await self.redis_client.hset(
-            task_keys.pending_tool_results, tool_call_id, json.dumps(result)
+        await cast(
+            Any,
+            self.redis_client.hset(
+                task_keys.pending_tool_results,
+                tool_call_id,
+                json.dumps(result),
+            ),
         )
 
     async def set_child_result(
@@ -659,8 +753,13 @@ class ScriptRunner:
             agent=self.agent_name,
             task_id=task_id,
         )
-        await self.redis_client.hset(
-            task_keys.pending_child_task_results, child_task_id, json.dumps(result)
+        await cast(
+            Any,
+            self.redis_client.hset(
+                task_keys.pending_child_task_results,
+                child_task_id,
+                json.dumps(result),
+            ),
         )
 
     async def add_steering_message(
@@ -671,8 +770,13 @@ class ScriptRunner:
             namespace=self.namespace,
             task_id=task_id,
         )
-        await self.redis_client.hset(
-            task_keys.task_steering, message_id, json.dumps(message)
+        await cast(
+            Any,
+            self.redis_client.hset(
+                task_keys.task_steering,
+                message_id,
+                json.dumps(message),
+            ),
         )
 
 
@@ -689,7 +793,9 @@ async def script_runner(
     steering_script: TaskSteeringScript,
     stale_recovery_script: StaleRecoveryScript,
     backoff_recovery_script: BackoffRecoveryScript,
+    scheduled_recovery_script: ScheduledRecoveryScript,
     expiration_script: TaskExpirationScript,
+    wait_schedule_script: WaitScheduleScript,
 ) -> ScriptRunner:
     """
     Create a ScriptRunner with all scripts pre-loaded.
@@ -717,5 +823,7 @@ async def script_runner(
     runner._steering_script = steering_script
     runner._stale_recovery_script = stale_recovery_script
     runner._backoff_recovery_script = backoff_recovery_script
+    runner._scheduled_recovery_script = scheduled_recovery_script
     runner._expiration_script = expiration_script
+    runner._wait_schedule_script = wait_schedule_script
     return runner

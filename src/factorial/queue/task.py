@@ -1,5 +1,6 @@
 import json
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
@@ -7,15 +8,15 @@ from typing import Any, Generic, cast
 
 import redis.asyncio as redis
 
-from factorial.context import ContextType
-from factorial.exceptions import (
+from factorial.agent.context import ContextType
+from factorial.core.exceptions import (
     BatchNotFoundError,
     CorruptedTaskDataError,
     InvalidTaskIdError,
     TaskNotFoundError,
 )
+from factorial.core.utils import decode, is_valid_task_id
 from factorial.queue.keys import RedisKeys
-from factorial.utils import decode, is_valid_task_id
 
 
 class TaskStatus(str, Enum):
@@ -34,7 +35,9 @@ class TaskStatus(str, Enum):
 @dataclass
 class TaskMetadata:
     owner_id: str
+    team_id: str | None = None
     parent_id: str | None = None
+    resumed_from_task_id: str | None = None
     batch_id: str | None = None
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     max_turns: int | None = None
@@ -42,7 +45,9 @@ class TaskMetadata:
     def to_dict(self) -> dict[str, Any]:
         return {
             "owner_id": self.owner_id,
+            "team_id": self.team_id,
             "parent_id": self.parent_id,
+            "resumed_from_task_id": self.resumed_from_task_id,
             "batch_id": self.batch_id,
             "created_at": self.created_at.timestamp(),
             "max_turns": self.max_turns,
@@ -50,10 +55,11 @@ class TaskMetadata:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "TaskMetadata":
-        data["created_at"] = datetime.fromtimestamp(
-            float(data["created_at"]), tz=timezone.utc
+        normalized = dict(data)
+        normalized["created_at"] = datetime.fromtimestamp(
+            float(normalized["created_at"]), tz=timezone.utc
         )
-        return cls(**data)
+        return cls(**normalized)
 
     def to_json(self) -> str:
         return json.dumps(self.to_dict())
@@ -81,6 +87,7 @@ class Task(Generic[ContextType]):
         payload: ContextType,
         batch_id: str | None = None,
         max_turns: int | None = None,
+        team_id: str | None = None,
     ) -> "Task[ContextType]":
         return Task(
             status=TaskStatus.QUEUED,
@@ -88,6 +95,7 @@ class Task(Generic[ContextType]):
             payload=payload,
             metadata=TaskMetadata(
                 owner_id=owner_id,
+                team_id=team_id,
                 batch_id=batch_id,
                 max_turns=max_turns,
             ),
@@ -111,25 +119,28 @@ class Task(Generic[ContextType]):
     def from_dict(
         cls,
         data: dict[str, Any],
-        context_class: type[ContextType],
+        payload_parser: Callable[[dict[str, Any]], ContextType],
     ) -> "Task[ContextType]":
+        task_id = str(data["id"])
         status = TaskStatus(data["status"])
         metadata = TaskMetadata.from_dict(data["metadata"])
+        if not isinstance(metadata.team_id, str) or not metadata.team_id:
+            raise CorruptedTaskDataError(task_id, ["metadata.team_id"])
 
         payload: ContextType
         if data["payload"]:
             if isinstance(data["payload"], dict):
                 payload_dict = cast(dict[str, Any], data["payload"])
-                payload = cast(ContextType, context_class.from_dict(payload_dict))
+                payload = payload_parser(payload_dict)
             else:
                 payload_str = decode(data["payload"])
                 payload_dict = json.loads(payload_str)
-                payload = cast(ContextType, context_class.from_dict(payload_dict))
+                payload = payload_parser(payload_dict)
         else:
-            payload = cast(ContextType, context_class.from_dict({}))
+            payload = payload_parser({})
 
         return cls(
-            id=data["id"],
+            id=task_id,
             status=status,
             agent=data["agent"],
             payload=payload,
@@ -140,10 +151,20 @@ class Task(Generic[ContextType]):
 
     @classmethod
     def from_json(
-        cls, json_str: str | bytes, context_class: type[ContextType]
+        cls,
+        json_str: str | bytes,
+        payload_parser: Callable[[dict[str, Any]], ContextType],
     ) -> "Task[ContextType]":
         data = json.loads(decode(json_str))
-        return cls.from_dict(data, context_class)
+        return cls.from_dict(data, payload_parser)
+
+
+def task_team_id(*, task_id: str, metadata: dict[str, Any]) -> str:
+    """Return a task's persisted team id or raise on malformed task data."""
+    raw_team_id = metadata.get("team_id")
+    if isinstance(raw_team_id, str) and raw_team_id:
+        return raw_team_id
+    raise CorruptedTaskDataError(task_id, ["metadata.team_id"])
 
 
 async def get_task_data(

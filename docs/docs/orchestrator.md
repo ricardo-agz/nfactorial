@@ -1,32 +1,38 @@
 # Orchestrator
 
-The Orchestrator manages agent execution, scaling, and observability. It handles task queuing, worker management, and provides real-time monitoring.
+The `Orchestrator` powers Factorial's queued and distributed runtime. Use it when you need:
+
+- Redis-backed task execution
+- waits, hooks, signals, or subagents
+- human control-plane actions
+- retries and recovery
+- task handles, batches, and streaming updates
 
 ## Basic Setup
 
 ```python
-from factorial import Orchestrator, AgentWorkerConfig, MaintenanceWorkerConfig
+from factorial import AgentWorkerConfig, MaintenanceWorkerConfig, Orchestrator
+
 
 orchestrator = Orchestrator(
     redis_host="localhost",
     redis_port=6379,
-    openai_api_key="sk-...",
 )
 
-# Register your agent
-orchestrator.register_runner(
+orchestrator.register(
     agent=my_agent,
     agent_worker_config=AgentWorkerConfig(workers=10),
     maintenance_worker_config=MaintenanceWorkerConfig(),
 )
 
-# Start the system
-orchestrator.run()
+
+if __name__ == "__main__":
+    orchestrator.run()
 ```
 
-## Configuration
+## Common Configuration
 
-### Redis Configuration
+### Redis
 
 ```python
 orchestrator = Orchestrator(
@@ -37,122 +43,266 @@ orchestrator = Orchestrator(
 )
 ```
 
-### Worker Configuration
-
-Control how many workers process tasks:
+### Agent workers
 
 ```python
 from factorial import AgentWorkerConfig
 
+
 config = AgentWorkerConfig(
-    workers=10,              # Number of concurrent async workers (coroutines)
-    batch_size=25,           # Tasks processed per batch
-    max_retries=5,           # How many times to requeue failed tasks
-    heartbeat_interval=5,    # Heartbeat frequency (seconds)
-    turn_timeout=120,        # Timeout for a single agent turn (seconds)
+    workers=10,
+    batch_size=25,
+    max_retries=5,
+    heartbeat_interval=5,
+    turn_timeout=120,
 )
 ```
 
-### Maintenance Worker Configuration
+### Maintenance workers
 
-Maintenance workers clean up expired tasks and recover any failed tasks that have been dropped by a crashed worker.
+Maintenance workers recover dropped tasks and clean up expired data.
 
 ```python
 from factorial import MaintenanceWorkerConfig, TaskTTLConfig
 
+
 config = MaintenanceWorkerConfig(
-    interval=10,             # Maintenance check interval
-    workers=1,               # Maintenance workers
+    interval=10,
+    workers=1,
     task_ttl=TaskTTLConfig(
-        completed_ttl=3600,  # Keep completed tasks for 1 hour
-        failed_ttl=86400,    # Keep failed tasks for 24 hours
-        cancelled_ttl=1800,  # Keep cancelled tasks for 30 minutes
+        completed_ttl=3600,
+        failed_ttl=86400,
+        cancelled_ttl=1800,
     ),
 )
 ```
 
-## Task Management
+## Enqueueing Work
 
-### Enqueue Tasks
-
-```python
-import asyncio
-from factorial import AgentContext
-
-async def submit_task():
-    context = AgentContext(query="Analyze this data")
-    task = agent.create_task(owner_id="user123", payload=context)
-    
-    await orchestrator.enqueue_task(agent, task)
-    return task.id
-
-task_id = asyncio.run(submit_task())
-```
-
-### Check Task Status
+### Single task
 
 ```python
-async def check_status(task_id: str):
-    status = await orchestrator.get_task_status(task_id)
-    print(f"Status: {status}")  # queued, processing, completed, failed, cancelled
-
-asyncio.run(check_status(task_id))
+task = await orchestrator.enqueue(
+    my_agent,
+    input="Analyze this data.",
+    owner_id="user123",
+    state={"priority": 1},
+    metadata={"source": "api"},
+    idempotency_key="request-123",
+)
 ```
 
-### Get Task Data
+`enqueue(...)` returns a `TaskHandle`.
+
+If you retry the same enqueue call with the same `idempotency_key` and payload, the orchestrator returns the same task instead of creating a duplicate. Reusing the same key with a different payload raises a conflict.
+
+### Batch enqueue
+
+Use `enqueue_many(...)` when you want one agent run per item:
 
 ```python
-async def get_task_data(task_id: str):
-    task_data = await orchestrator.get_task_data(task_id)
-    if task_data:
-        print(f"Data: {task_data}")
+from factorial import with_context
 
-asyncio.run(get_task_data(task_id))
+
+batch = await orchestrator.enqueue_many(
+    my_agent,
+    [
+        with_context("First item.", state={"priority": 1}),
+        with_context("Second item.", metadata={"source": "batch-override"}),
+        "Third item.",
+    ],
+    owner_id="user123",
+    state={"priority": 0},
+    metadata={"source": "default"},
+)
+
+results = await batch.wait()
 ```
 
-### Get Task Result
+`enqueue_many(...)` returns a `BatchHandle`.
+
+## `TaskHandle`
+
+The `TaskHandle` API is the main way to inspect and control queued runs.
+
+### Inspect state
 
 ```python
-async def get_task_result(task_id: str):
-    task_data = await orchestrator.get_task_data(task_id)
-    if task_data:
-        result = task_data["payload"].get("output")
-        print(f"Result: {result}")
-
-asyncio.run(get_results(task_id))
+snapshot = await task.snapshot()
+print(snapshot.status)
+print(snapshot.wait)
+print(snapshot.pending_hooks)
 ```
 
-### Cancel Tasks
+Snapshots include the task status, current state/metadata, last turn summary, any active wait, pending hook snapshots, and pending child task IDs.
+
+### Wait for completion
 
 ```python
-async def cancel_task(task_id: str):
-    await orchestrator.cancel_task(task_id)
-
-asyncio.run(cancel_task(task_id))
+result = await task.wait()
+print(result.output)
 ```
 
-### Steer Tasks
-
-Inject messages into running tasks:
+### Stream typed updates
 
 ```python
-async def steer_task(task_id: str):
-    messages = [
-        {"role": "user", "content": "Please focus on the financial aspects"}
-    ]
-    await orchestrator.steer_task(task_id, messages)
-
-asyncio.run(steer_task(task_id))
+async for event in task.updates():
+    print(type(event).__name__)
 ```
+
+### Steer a task
+
+Use steering to inject additional user input into an active run:
+
+```python
+await task.steer("Focus on the financial risks.")
+```
+
+You can also pass an explicit message list instead of a plain string.
+
+### Cancel a task
+
+```python
+await task.cancel()
+```
+
+### Wake a waiting task
+
+If a task is parked on a wakeable wait, you can resume it manually:
+
+```python
+woke = await task.wake("Approval granted. Continue.")
+print(woke)
+```
+
+`wake()` only applies to tasks that are currently waiting. It does not replace hook resolution and it does not wake tasks blocked on pending child tasks.
+
+### Branch from a terminal task
+
+Create a new queued task from a completed, failed, or cancelled source task while reusing its context:
+
+```python
+branched = await task.branch(
+    "Revise with stronger evidence.",
+    state={"priority": 8},
+    metadata={"source": "branch"},
+)
+```
+
+### Work with pending hooks
+
+```python
+pending_hooks = await task.hooks()
+first_hook = pending_hooks[0]
+
+result = await first_hook.complete({"approved": True})
+print(result.status, result.task_resumed)
+```
+
+You can also look up a specific hook by ID with `await task.hook(hook_id)`.
+
+## `BatchHandle`
+
+`BatchHandle` exposes the batch-level control surface:
+
+```python
+snapshot = await batch.snapshot()
+print(snapshot.total_tasks, snapshot.remaining_tasks)
+
+async for event in batch.updates():
+    print(type(event).__name__)
+
+results = await batch.wait()
+await batch.cancel()
+```
+
+Each batch also exposes `batch.tasks` if you want the individual `TaskHandle` objects.
+
+## Resuming terminal tasks
+
+Resume a terminal task as a brand-new queued task:
+
+```python
+resumed = await orchestrator.resume_task(
+    task_id=task.id,
+    messages=[{"role": "user", "content": "Please revise with stricter evidence."}],
+    idempotency_key="resume:task-123:revision-1",
+)
+```
+
+`resume_task(...)` creates a new task ID, carries forward prior context, appends your new messages, preserves ancestry, and resets run-scoped fields such as output and verification counters.
+
+## Human control-plane messaging
+
+The orchestrator can also deliver human-originated messages into active tasks and groups.
+
+### Message a specific task
+
+```python
+report = await orchestrator.message_task(
+    task_id=task.id,
+    owner_id="user123",
+    content="Please respond to the latest comment.",
+    data={"kind": "human_followup"},
+)
+```
+
+### Message a group
+
+```python
+report = await orchestrator.message_group(
+    owner_id="user123",
+    content="Discussion is now open.",
+    data={"kind": "moderator_broadcast"},
+    group_name="research",
+    task_id=task.id,
+)
+```
+
+Both methods return delivery metadata such as `delivered_task_ids`, `skipped_inactive_task_ids`, and `failed_task_ids`.
+
+## Hook resolution APIs
+
+External servers and UIs can resolve pending hooks directly:
+
+```python
+resolution = await orchestrator.resolve_hook(
+    hook_id=hook_id,
+    payload={"approved": True},
+    token=token,
+    idempotency_key="approve:123",
+)
+```
+
+If you need a fresh token for an already-pending hook, rotate it first:
+
+```python
+token = await orchestrator.rotate_hook_token(
+    hook_id=hook_id,
+    revoke_previous=False,
+)
+```
+
+## Subscribing to updates
+
+Use `owner_id` to subscribe to the raw update stream for a user or session:
+
+```python
+async for update in orchestrator.subscribe_to_updates(owner_id="user123"):
+    print(update["event_type"], update["task_id"])
+```
+
+See [Events](events.md) for the streaming model and filters.
 
 ## Observability
 
 ### Dashboard
 
-The orchestrator includes a built-in web dashboard:
+The orchestrator includes a built-in dashboard:
 
 ```python
 from factorial import ObservabilityConfig
+
 
 orchestrator = Orchestrator(
     observability_config=ObservabilityConfig(
@@ -164,18 +314,17 @@ orchestrator = Orchestrator(
 )
 ```
 
-Access at: http://localhost:8080/observability
+Open [http://localhost:8080/observability](http://localhost:8080/observability).
 
-### Metrics
-
-Configure metrics collection:
+### Metrics timeline
 
 ```python
 from factorial import MetricsTimelineConfig
 
+
 config = MetricsTimelineConfig(
-    timeline_duration=3600,      # 1 hour timeline
-    bucket_size="minutes",       # Bucket by minutes
-    retention_multiplier=2.0,    # Keep data for 2x timeline
+    timeline_duration=3600,
+    bucket_size="minutes",
+    retention_multiplier=2.0,
 )
 ```

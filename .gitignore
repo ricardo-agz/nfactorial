@@ -9,7 +9,17 @@ __pycache__/
 dist/
 build/
 .mypy_cache/
+.pytest_cache/
+.ruff_cache/
 .venv/
+.uvenv/
+.uv-cache/
+.tox/
+.nox/
+.hypothesis/
+.coverage
+.coverage.*
+htmlcov/
 
 # React and Vite
 ui/node_modules/
@@ -26,7 +36,9 @@ examples/**/build/
 examples/**/__pycache__/
 examples/**/*.pyc
 examples/**/.venv/
+examples/**/.vercel/
 examples/**/.mypy_cache/
+examples/**/wheels/
 examples/**/vite/dist/
 examples/**/vite/.cache/
 examples/**/vite/.temp/
@@ -93,3 +105,5 @@ example_agents/
 scratchpad/
 
 uv.lock
+
+plans/

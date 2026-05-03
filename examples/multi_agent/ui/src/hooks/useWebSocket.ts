@@ -1,20 +1,132 @@
-import { useCallback, useRef, useEffect } from 'react';
-import { AgentEvent, ThinkingProgress, Message } from '../types';
+import { useCallback, useEffect, useRef } from 'react';
+import { AgentEvent, Message, ThinkingProgress } from '../types';
 import { WS_BASE_URL } from '../constants';
 
 interface UseWebSocketProps {
   userId: string;
-  setCurrentThinking: (updater: (prev: ThinkingProgress | null) => ThinkingProgress | null) => void;
+  setCurrentThinking: (
+    updater: (prev: ThinkingProgress | null) => ThinkingProgress | null,
+  ) => void;
   setMessages: React.Dispatch<React.SetStateAction<Message[]>>;
   setLoading: (loading: boolean) => void;
   setCurrentTaskId: (taskId: string | null) => void;
   setCancelling: (cancelling: boolean) => void;
   setSteering: (steering: boolean) => void;
   setSteerMode: (steerMode: boolean) => void;
-  setSteeringStatus: (status: 'idle' | 'sending' | 'applied' | 'failed' | null) => void;
-  setSubAgentProgress?: React.Dispatch<React.SetStateAction<Record<string, ThinkingProgress>>>;
+  setSteeringStatus: (
+    status: 'idle' | 'sending' | 'applied' | 'failed' | null,
+  ) => void;
+  setSubAgentProgress?: React.Dispatch<
+    React.SetStateAction<Record<string, ThinkingProgress>>
+  >;
   setResearchProgress?: React.Dispatch<React.SetStateAction<number | null>>;
 }
+
+const HIDDEN_TOOL_NAMES = new Set(['done']);
+
+const createThinkingProgress = (
+  taskId: string,
+  previous: ThinkingProgress | null,
+): ThinkingProgress => ({
+  task_id: taskId,
+  tool_calls: previous?.tool_calls ?? {},
+  is_complete: previous?.is_complete ?? false,
+  final_output: previous?.final_output,
+  error: previous?.error,
+});
+
+const resolveToolCallId = (event: AgentEvent): string =>
+  event.tool_call_id ?? `${event.task_id}:${event.tool_name ?? 'tool'}`;
+
+const resolveToolName = (event: AgentEvent): string => event.tool_name ?? 'tool';
+
+const resolveEventError = (event: AgentEvent): string | undefined => {
+  if (typeof event.error === 'string' && event.error.trim()) {
+    return event.error;
+  }
+
+  if (
+    event.run_error &&
+    typeof event.run_error === 'object' &&
+    typeof event.run_error.message === 'string' &&
+    event.run_error.message.trim()
+  ) {
+    return event.run_error.message;
+  }
+
+  if (event.is_error && typeof event.output === 'string' && event.output.trim()) {
+    return event.output;
+  }
+
+  return undefined;
+};
+
+const formatOutputForDisplay = (output: unknown): string => {
+  if (typeof output === 'string') {
+    return output.trim();
+  }
+
+  if (output && typeof output === 'object') {
+    const payload = output as Record<string, unknown>;
+    if (typeof payload.final_output === 'string') {
+      return payload.final_output.trim();
+    }
+    if (typeof payload.summary === 'string') {
+      return payload.summary.trim();
+    }
+    try {
+      return JSON.stringify(output, null, 2);
+    } catch {
+      return String(output);
+    }
+  }
+
+  if (output == null) {
+    return '';
+  }
+
+  return String(output);
+};
+
+const extractResearchTaskIds = (outputData: unknown): string[] => {
+  if (Array.isArray(outputData)) {
+    return Array.from(
+      new Set(
+        outputData.filter(
+          (id: unknown): id is string => typeof id === 'string' && id.length > 0,
+        ),
+      ),
+    );
+  }
+
+  if (!outputData || typeof outputData !== 'object') {
+    return [];
+  }
+
+  const payload = outputData as Record<string, unknown>;
+  const childTaskIds = Array.isArray(payload.child_task_ids)
+    ? payload.child_task_ids.filter(
+        (id: unknown): id is string => typeof id === 'string' && id.length > 0,
+      )
+    : [];
+
+  if (childTaskIds.length) {
+    return Array.from(new Set(childTaskIds));
+  }
+
+  const jobRefs = Array.isArray(payload.job_refs) ? payload.job_refs : [];
+  return Array.from(
+    new Set(
+      jobRefs
+        .map((job) =>
+          typeof (job as { task_id?: unknown })?.task_id === 'string'
+            ? (job as { task_id: string }).task_id
+            : null,
+        )
+        .filter((id): id is string => Boolean(id)),
+    ),
+  );
+};
 
 export const useWebSocket = ({
   userId,
@@ -34,435 +146,340 @@ export const useWebSocket = ({
   const processedTasksRef = useRef<Set<string>>(new Set());
   const subAgentProgressRef = useRef<Record<string, ThinkingProgress>>({});
 
-  const handleWSMessage = useCallback((evt: MessageEvent) => {
-    const event: AgentEvent = JSON.parse(evt.data);
-    console.log('WS event:', event);
-
-    const updateThinking = (updater: (prev: ThinkingProgress | null) => ThinkingProgress | null) => {
-      setCurrentThinking(prev => {
+  const updateThinking = useCallback(
+    (updater: (prev: ThinkingProgress | null) => ThinkingProgress | null) => {
+      setCurrentThinking((prev) => {
         const next = updater(prev);
         thinkingRef.current = next;
         return next;
       });
-    };
+    },
+    [setCurrentThinking],
+  );
 
-    const updateSubAgentThinking = (
+  const updateSubAgentThinking = useCallback(
+    (
       taskId: string,
       updater: (prev: ThinkingProgress | null) => ThinkingProgress | null,
     ) => {
-      setSubAgentProgress?.(prev => {
-        const current = prev[taskId] ?? null;
-        const next    = updater(current);
-        if (!next) return prev; // do nothing if null
+      setSubAgentProgress?.((prev) => {
+        const next = updater(prev[taskId] ?? null);
+        if (!next) {
+          return prev;
+        }
         const updated = { ...prev, [taskId]: next };
         subAgentProgressRef.current = updated;
         return updated;
       });
-    };
+    },
+    [setSubAgentProgress],
+  );
 
-    if (subAgentProgressRef.current[event.task_id]) {
-      switch (event.event_type) {
-
-        case "batch_progress": {
-          const batchId = event.data?.batch_id;
-          const newProgress = event.data?.progress;
-        }
-
-        case "batch_completed": {
-          const batchId = event.data?.batch_id;
-        }
-        
-        case 'progress_update_tool_action_started': {
-          const toolCall = event.data?.args?.[0];
-          if (!toolCall) break;
-
-          updateSubAgentThinking(event.task_id, prev => {
-            const base: ThinkingProgress = prev ?? {
-              task_id    : event.task_id,
-              tool_calls : {},
+  const ensureResearchTaskCards = useCallback(
+    (taskIds: string[]) => {
+      if (!taskIds.length) {
+        return;
+      }
+      setResearchProgress?.(0);
+      setSubAgentProgress?.((prev) => {
+        const updated = { ...prev };
+        for (const taskId of taskIds) {
+          if (!updated[taskId]) {
+            updated[taskId] = {
+              task_id: taskId,
+              tool_calls: {},
               is_complete: false,
             };
-            return {
-              ...base,
-              tool_calls: {
-                ...base.tool_calls,
-                [toolCall.id]: {
-                  id       : toolCall.id,
-                  tool_name: toolCall.function.name,
-                  arguments: toolCall.function.arguments,
-                  status   : 'started',
-                },
-              },
-            };
-          });
-          break;
+          }
         }
+        subAgentProgressRef.current = updated;
+        return updated;
+      });
+    },
+    [setResearchProgress, setSubAgentProgress],
+  );
 
-        case 'progress_update_tool_action_completed': {
-          const resp     = event.data?.result;
-          const toolCall = resp?.tool_call;
-          if (!toolCall) break;
+  const resetRunUi = useCallback(() => {
+    setCurrentThinking(() => null);
+    thinkingRef.current = null;
+    setLoading(false);
+    setCancelling(false);
+    setCurrentTaskId(null);
+    setSteering(false);
+    setSteerMode(false);
+    setSteeringStatus(null);
+    setResearchProgress?.(null);
+  }, [
+    setCurrentThinking,
+    setLoading,
+    setCancelling,
+    setCurrentTaskId,
+    setSteering,
+    setSteerMode,
+    setSteeringStatus,
+    setResearchProgress,
+  ]);
 
-          updateSubAgentThinking(event.task_id, prev => {
-            if (!prev) return null;
-            return {
-              ...prev,
-              tool_calls: {
-                ...prev.tool_calls,
-                [toolCall.id]: {
-                  ...prev.tool_calls[toolCall.id],
-                  status: 'completed',
-                  result: resp.output_data,
-                },
-              },
-            };
-          });
-          break;
-        }
-
-        case 'progress_update_tool_action_failed': {
-          const toolCall = event.data?.args?.[0];
-          if (!toolCall) break;
-
-          updateSubAgentThinking(event.task_id, prev => {
-            if (!prev) return null;
-            return {
-              ...prev,
-              tool_calls: {
-                ...prev.tool_calls,
-                [toolCall.id]: {
-                  ...prev.tool_calls[toolCall.id],
-                  status: 'failed',
-                  error : event.error,
-                },
-              },
-            };
-          });
-          break;
-        }
-
-        case 'progress_update_completion_failed':
-          updateSubAgentThinking(event.task_id, prev => (prev ? { ...prev, error: event.error } : null));
-          break;
-
-        case 'agent_output': {
-          const finalData = event.data;
-
-          updateSubAgentThinking(event.task_id, prev => {
-            if (!prev) return null;
-            return {
-              ...prev,
-              is_complete : true,
-              final_output: finalData,
-            };
-          });
-
-          processedTasksRef.current.add(event.task_id);
-          break;
-        }
-
-        case 'run_cancelled': {
-          updateSubAgentThinking(event.task_id, prev => (
-            prev ? { ...prev, is_complete: true, error: 'Task cancelled by user' } : null
-          ));
-          processedTasksRef.current.add(event.task_id);
-          break;
-        }
-
-        case 'run_failed': {
-          updateSubAgentThinking(event.task_id, prev => (
-            prev ? { ...prev, is_complete: true, error: event.error || 'Agent failed to complete the task' } : null
-          ));
-          processedTasksRef.current.add(event.task_id);
-          break;
-        }
-
-        default:
-          console.log('Unhandled sub-agent event:', event);
-      }
-
-      return; // We've handled the event as sub-agent, stop processing further for main agent path
-    }
-
-    // Handle batch-level events (e.g., progress updates for research batches)
-    switch (event.event_type) {
-      case 'batch_progress': {
-        const pct =
-          typeof (event as any).progress === 'number'
-            ? (event as any).progress
-            : event.data?.progress;
-        if (pct !== undefined && setResearchProgress) {
-          setResearchProgress(pct);
-        }
-        return; // handled
-      }
-      case 'batch_completed':
-        if (setResearchProgress) setResearchProgress(100);
+  const handleToolStart = useCallback(
+    (
+      event: AgentEvent,
+      updateProgress: (
+        updater: (prev: ThinkingProgress | null) => ThinkingProgress | null,
+      ) => void,
+    ) => {
+      const toolName = resolveToolName(event);
+      if (HIDDEN_TOOL_NAMES.has(toolName)) {
         return;
-      default:
-        // continue below
-        break;
-    }
-
-    switch (event.event_type) {
-      case 'progress_update_tool_action_started': {
-        const toolCall = event.data?.args?.[0];
-        if (!toolCall) break;
-
-        updateThinking(prev => {
-          const base: ThinkingProgress = prev ?? {
-            task_id    : event.task_id,
-            tool_calls : {},
-            is_complete: false,
-          };
-          return {
-            ...base,
-            tool_calls: {
-              ...base.tool_calls,
-              [toolCall.id]: {
-                id       : toolCall.id,
-                tool_name: toolCall.function.name,
-                arguments: toolCall.function.arguments,
-                status   : 'started',
-              },
-            },
-          };
-        });
-        break;
       }
 
-      case 'progress_update_tool_action_completed': {
-        const resp      = event.data?.result;
-        const toolCall  = resp?.tool_call;
-        if (!toolCall) break;
-
-        updateThinking(prev => {
-          if (!prev) return null;
-          return {
-            ...prev,
-            tool_calls: {
-              ...prev.tool_calls,
-              [toolCall.id]: {
-                ...prev.tool_calls[toolCall.id],
-                status: 'completed',
-                result: resp.output_data,
-              },
+      updateProgress((prev) => {
+        const base = createThinkingProgress(event.task_id, prev);
+        const toolCallId = resolveToolCallId(event);
+        const existing = base.tool_calls[toolCallId];
+        return {
+          ...base,
+          tool_calls: {
+            ...base.tool_calls,
+            [toolCallId]: {
+              id: toolCallId,
+              tool_name: toolName,
+              arguments: existing?.arguments,
+              status: 'started',
+              result: undefined,
+              error: undefined,
             },
-          };
-        });
+          },
+        };
+      });
+    },
+    [],
+  );
 
-        if (resp?.tool_call?.function?.name === 'research' && Array.isArray(resp.output_data)) {
-          // Reset batch progress when a new research batch starts
-          setResearchProgress?.(0);
-          const taskIds: string[] = resp.output_data;
-          setSubAgentProgress?.(prev => {
-            const updated = { ...prev };
-            taskIds.forEach(id => {
-              if (!updated[id]) {
-                updated[id] = {
-                  task_id    : id,
-                  tool_calls : {},
-                  is_complete: false,
-                };
-              }
-            });
-            subAgentProgressRef.current = updated;
-            return updated;
-          });
+  const handleToolFinish = useCallback(
+    (
+      event: AgentEvent,
+      updateProgress: (
+        updater: (prev: ThinkingProgress | null) => ThinkingProgress | null,
+      ) => void,
+    ) => {
+      const toolName = resolveToolName(event);
+      if (toolName === 'research' && !event.is_error) {
+        ensureResearchTaskCards(extractResearchTaskIds(event.output));
+      }
+      if (HIDDEN_TOOL_NAMES.has(toolName)) {
+        return;
+      }
+
+      updateProgress((prev) => {
+        const base = createThinkingProgress(event.task_id, prev);
+        const toolCallId = resolveToolCallId(event);
+        const existing = base.tool_calls[toolCallId];
+        return {
+          ...base,
+          tool_calls: {
+            ...base.tool_calls,
+            [toolCallId]: {
+              id: toolCallId,
+              tool_name: toolName,
+              arguments: existing?.arguments,
+              status: event.is_error ? 'failed' : 'completed',
+              result: event.is_error ? existing?.result : event.output,
+              error: event.is_error ? resolveEventError(event) : undefined,
+            },
+          },
+        };
+      });
+    },
+    [ensureResearchTaskCards],
+  );
+
+  const handleSubAgentFinish = useCallback(
+    (event: AgentEvent) => {
+      if (processedTasksRef.current.has(event.task_id)) {
+        return;
+      }
+      const isFailure = event.status === 'failed';
+      const isCancelled = event.status === 'cancelled';
+      updateSubAgentThinking(event.task_id, (prev) => ({
+        ...createThinkingProgress(event.task_id, prev),
+        is_complete: true,
+        final_output: event.output,
+        error: isFailure
+          ? resolveEventError(event) ?? 'Agent failed to complete the task'
+          : isCancelled
+            ? 'Task cancelled by user'
+            : undefined,
+      }));
+      processedTasksRef.current.add(event.task_id);
+    },
+    [updateSubAgentThinking],
+  );
+
+  const appendAssistantMessage = useCallback(
+    (content: string, thinking?: ThinkingProgress) => {
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: Date.now(),
+          role: 'assistant',
+          content,
+          timestamp: new Date(),
+          thinking,
+        },
+      ]);
+    },
+    [setMessages],
+  );
+
+  const handleMainFinish = useCallback(
+    (event: AgentEvent) => {
+      if (processedTasksRef.current.has(event.task_id)) {
+        return;
+      }
+
+      const isFailure = event.status === 'failed';
+      const isCancelled = event.status === 'cancelled';
+      const snapshotThinking = thinkingRef.current
+        ? {
+            ...thinkingRef.current,
+            is_complete: true,
+            final_output: event.output,
+            error: isFailure
+              ? resolveEventError(event) ?? 'Agent failed to complete the task'
+              : isCancelled
+                ? 'Task cancelled by user'
+                : undefined,
+          }
+        : undefined;
+
+      const content = isFailure
+        ? 'Failed to get agent response.'
+        : isCancelled
+          ? 'Task was cancelled.'
+          : formatOutputForDisplay(event.output) || 'Completed.';
+
+      appendAssistantMessage(content, snapshotThinking);
+      processedTasksRef.current.add(event.task_id);
+      resetRunUi();
+    },
+    [appendAssistantMessage, resetRunUi],
+  );
+
+  const handleWSMessage = useCallback(
+    (evt: MessageEvent) => {
+      const event: AgentEvent = JSON.parse(evt.data);
+
+      if (event.event_type === 'batch_progress') {
+        if (typeof event.progress === 'number') {
+          setResearchProgress?.(event.progress);
         }
-        break;
+        return;
       }
 
-      case 'progress_update_tool_action_failed': {
-        const toolCall = event.data?.args?.[0];
-        if (!toolCall) break;
-
-        updateThinking(prev => {
-          if (!prev) return null;
-          return {
-            ...prev,
-            tool_calls: {
-              ...prev.tool_calls,
-              [toolCall.id]: {
-                ...prev.tool_calls[toolCall.id],
-                status: 'failed',
-                error : event.error,
-              },
-            },
-          };
-        });
-        break;
+      if (event.event_type === 'batch_completed') {
+        setResearchProgress?.(100);
+        return;
       }
 
-      case 'progress_update_completion_failed':
-        updateThinking(prev => (prev ? { ...prev, error: event.error } : null));
-        break;
-
-      case 'run_steering_applied':
+      if (event.event_type === 'run_steering_applied') {
         setSteeringStatus('applied');
         setSteering(false);
-        setTimeout(() => setSteeringStatus(null), 2000);
-        break;
+        window.setTimeout(() => setSteeringStatus(null), 2000);
+        return;
+      }
 
-      case 'run_steering_failed':
+      if (event.event_type === 'run_steering_failed') {
         setSteeringStatus('failed');
         setSteering(false);
         setSteerMode(false);
-        setTimeout(() => setSteeringStatus(null), 3000);
-        break;
-
-      case 'agent_output': {
-        if (processedTasksRef.current.has(event.task_id)) break;
-
-        const content =
-          typeof event.data === 'string'
-            ? event.data
-            : event.data?.final_output ?? JSON.stringify(event.data, null, 2);
-
-        setMessages(prev => [
-          ...prev,
-          {
-            id: Date.now(),
-            role: 'assistant',
-            content,
-            timestamp: new Date(),
-          },
-        ]);
-
-        const finished = thinkingRef.current
-          ? { ...thinkingRef.current, is_complete: true, final_output: event.data }
-          : null;
-
-        if (finished) {
-          setMessages(prev => {
-            const last = prev[prev.length - 1];
-            return [
-              ...prev.slice(0, -1),
-              { ...last, thinking: finished },
-            ];
-          });
-        }
-
-        setCurrentThinking(() => null);
-        setLoading(false);
-        setCurrentTaskId(null);
-        setSteering(false);
-        setSteerMode(false);
-        setSteeringStatus(null);
-
-        // Clear research progress when main agent run completes
-        setResearchProgress?.(null);
-        processedTasksRef.current.add(event.task_id);
-        break;
+        window.setTimeout(() => setSteeringStatus(null), 3000);
+        return;
       }
 
-      case 'run_cancelled': {
-        if (processedTasksRef.current.has(event.task_id)) break;
+      const isTrackedSubAgentTask = Boolean(subAgentProgressRef.current[event.task_id]);
+      const isResearchSubAgentEvent = event.agent_name === 'research_subagent';
 
-        const snap = thinkingRef.current;
-        let message = 'Task was cancelled.';
-        let snapshotThinking: ThinkingProgress | undefined;
-
-        if (snap && Object.keys(snap.tool_calls).length) {
-          message = "Task was cancelled."
-
-          snapshotThinking = {
-            ...snap,
-            is_complete: true,
-            error: 'Task cancelled by user',
-          };
+      if (isTrackedSubAgentTask || isResearchSubAgentEvent) {
+        if (event.event_type === 'tool_start') {
+          handleToolStart(event, (updater) =>
+            updateSubAgentThinking(event.task_id, updater),
+          );
+          return;
         }
 
-        setMessages(prev => [
-          ...prev,
-          {
-            id: Date.now(),
-            role: 'assistant',
-            content: message,
-            timestamp: new Date(),
-            thinking: snapshotThinking,
-          },
-        ]);
-
-        setCurrentThinking(() => null);
-        setLoading(false);
-        setCancelling(false);
-        setCurrentTaskId(null);
-        setSteering(false);
-        setSteerMode(false);
-        setSteeringStatus(null);
-        setResearchProgress?.(null);
-        processedTasksRef.current.add(event.task_id);
-        break;
-      }
-
-      case 'run_failed': {
-        if (processedTasksRef.current.has(event.task_id)) break;
-
-        const snap = thinkingRef.current;
-        let message = 'Failed to get agent response.';
-        let snapshotThinking: ThinkingProgress | undefined;
-
-        if (snap && Object.keys(snap.tool_calls).length) {
-          message = "Failed to get agent response."
-
-          snapshotThinking = {
-            ...snap,
-            is_complete: true,
-            error: event.error || 'Agent failed to complete the task',
-          };
+        if (event.event_type === 'tool_finish') {
+          handleToolFinish(event, (updater) =>
+            updateSubAgentThinking(event.task_id, updater),
+          );
+          return;
         }
 
-        setMessages(prev => [
-          ...prev,
-          {
-            id: Date.now(),
-            role: 'assistant',
-            content: message,
-            timestamp: new Date(),
-            thinking: snapshotThinking,
-          },
-        ]);
-
-        setCurrentThinking(() => null);
-        setLoading(false);
-        setCancelling(false);
-        setCurrentTaskId(null);
-        setSteering(false);
-        setSteerMode(false);
-        setSteeringStatus(null);
-        setResearchProgress?.(null);
-        processedTasksRef.current.add(event.task_id);
-        break;
+        if (event.event_type === 'finish') {
+          handleSubAgentFinish(event);
+          return;
+        }
       }
 
-      default:
-        console.log('Unhandled event:', event);
-    }
-  }, [setCurrentThinking, setMessages, setLoading, setCurrentTaskId, setCancelling, setSteering, setSteerMode, setSteeringStatus, setSubAgentProgress, setResearchProgress]);
+      if (event.event_type === 'tool_start') {
+        handleToolStart(event, updateThinking);
+        return;
+      }
+
+      if (event.event_type === 'tool_finish') {
+        handleToolFinish(event, updateThinking);
+        return;
+      }
+
+      if (event.event_type === 'finish') {
+        handleMainFinish(event);
+        return;
+      }
+
+      if (event.event_type === 'turn_finish' && event.output && !thinkingRef.current) {
+        updateThinking((prev) => createThinkingProgress(event.task_id, prev));
+      }
+    },
+    [
+      handleMainFinish,
+      handleSubAgentFinish,
+      handleToolFinish,
+      handleToolStart,
+      setResearchProgress,
+      setSteering,
+      setSteerMode,
+      setSteeringStatus,
+      updateSubAgentThinking,
+      updateThinking,
+    ],
+  );
 
   useEffect(() => {
-    const ws = new WebSocket(`${WS_BASE_URL}/${userId}`);
-    ws.onmessage = handleWSMessage;
-    wsRef.current = ws;
-    return () => ws.close();
-  }, [userId, handleWSMessage]);
+    let disposed = false;
+    let reconnectTimer: number | null = null;
 
-  // Keep thinkingRef in sync
-  useEffect(() => {
-    return setCurrentThinking(prev => {
-      thinkingRef.current = prev;
-      return prev;
-    });
-  }, [setCurrentThinking]);
+    const connect = () => {
+      const ws = new WebSocket(`${WS_BASE_URL}/${userId}`);
+      ws.onmessage = handleWSMessage;
+      ws.onerror = () => ws.close();
+      ws.onclose = () => {
+        if (disposed) {
+          return;
+        }
+        reconnectTimer = window.setTimeout(connect, 1000);
+      };
+      wsRef.current = ws;
+    };
 
-  // Keep subAgentProgressRef in sync
-  useEffect(() => {
-    return setSubAgentProgress?.(prev => {
-      subAgentProgressRef.current = prev;
-      return prev;
-    });
-  }, [setSubAgentProgress]);
+    connect();
+
+    return () => {
+      disposed = true;
+      if (reconnectTimer !== null) {
+        window.clearTimeout(reconnectTimer);
+      }
+      wsRef.current?.close();
+    };
+  }, [handleWSMessage, userId]);
 
   return wsRef;
-}; 
+};

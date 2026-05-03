@@ -9,14 +9,21 @@ from factorial.agent import BaseAgent
 from factorial.logging import colored, get_logger
 from factorial.queue.keys import RedisKeys
 from factorial.queue.lua import (
+    ScheduledRecoveryScript,
     StaleRecoveryScript,
     StaleRecoveryScriptResult,
     TaskExpirationScript,
     TaskExpirationScriptResult,
     create_backoff_recovery_script,
+    create_scheduled_recovery_script,
     create_stale_recovery_script,
     create_task_expiration_script,
 )
+from factorial.queue.operations import (
+    expire_pending_hooks,
+    resume_if_no_remaining_child_tasks,
+)
+from factorial.queue.task import TaskStatus
 
 logger = get_logger(__name__)
 
@@ -122,6 +129,84 @@ async def recover_backoff_tasks(
 
     except Exception as e:
         logger.error(f"Error during backoff task recovery: {e}")
+        return 0
+
+
+async def recover_scheduled_tasks(
+    scheduled_recovery_script: ScheduledRecoveryScript,
+    namespace: str,
+    agent: BaseAgent[Any],
+    batch_size: int,
+) -> int:
+    """Move due paused tasks from scheduled queue back to main queue."""
+    keys = RedisKeys.format(namespace=namespace, agent=agent.name)
+
+    try:
+        recovered_task_ids = await scheduled_recovery_script.execute(
+            queue_scheduled_key=keys.queue_scheduled,
+            queue_main_key=keys.queue_main,
+            queue_orphaned_key=keys.queue_orphaned,
+            task_statuses_key=keys.task_status,
+            task_agents_key=keys.task_agent,
+            task_payloads_key=keys.task_payload,
+            task_pickups_key=keys.task_pickups,
+            task_retries_key=keys.task_retries,
+            task_metas_key=keys.task_meta,
+            scheduled_wait_meta_key=keys.scheduled_wait_meta,
+            max_batch_size=batch_size,
+        )
+
+        recovered_count = len(recovered_task_ids)
+        if recovered_count > 0:
+            logger.info(f"⏰ Recovered {recovered_count} tasks from scheduled queue")
+
+        return recovered_count
+    except Exception as e:
+        logger.error(f"Error during scheduled task recovery: {e}")
+        return 0
+
+
+async def recover_ready_pending_child_tasks(
+    redis_client: redis.Redis,
+    namespace: str,
+    agent: BaseAgent[Any],
+    batch_size: int,
+) -> int:
+    """Resume pending-child tasks whose awaited children already completed."""
+    keys = RedisKeys.format(namespace=namespace, agent=agent.name)
+    try:
+        pending_task_ids = await redis_client.zrange(
+            keys.queue_pending,
+            0,
+            max(batch_size - 1, 0),
+        )
+        if not pending_task_ids:
+            return 0
+
+        resumed = 0
+        agents_by_name = {agent.name: agent}
+        for pending_task_id in pending_task_ids:
+            task_id = (
+                pending_task_id.decode("utf-8")
+                if isinstance(pending_task_id, bytes)
+                else str(pending_task_id)
+            )
+            status = await redis_client.hget(keys.task_status, task_id)  # type: ignore[misc]
+            if status != TaskStatus.PENDING_CHILD_TASKS:
+                continue
+            if await resume_if_no_remaining_child_tasks(
+                redis_client=redis_client,
+                namespace=namespace,
+                agents_by_name=agents_by_name,
+                task_id=task_id,
+            ):
+                resumed += 1
+
+        if resumed > 0:
+            logger.info(f"🔁 Recovered {resumed} pending-child tasks")
+        return resumed
+    except Exception as e:
+        logger.error(f"Error during pending-child recovery: {e}")
         return 0
 
 
@@ -254,6 +339,7 @@ async def maintenance_loop(
     redis_client = redis.Redis(connection_pool=redis_pool, decode_responses=True)
     recovery_script = await create_stale_recovery_script(redis_client)
     task_expiration_script = await create_task_expiration_script(redis_client)
+    scheduled_recovery_script = await create_scheduled_recovery_script(redis_client)
 
     logger.info(
         f"Maintenance worker started (checking every {interval}s for "
@@ -280,6 +366,31 @@ async def maintenance_loop(
                     batch_size=batch_size,
                     namespace=namespace,
                 )
+
+                # Recover tasks whose time-based wait has elapsed.
+                await recover_scheduled_tasks(
+                    scheduled_recovery_script=scheduled_recovery_script,
+                    agent=agent,
+                    batch_size=batch_size,
+                    namespace=namespace,
+                )
+
+                await recover_ready_pending_child_tasks(
+                    redis_client=redis_client,
+                    agent=agent,
+                    batch_size=batch_size,
+                    namespace=namespace,
+                )
+
+                # Expire timed-out hook waits and wake affected tasks so workers
+                # can clear parked states deterministically.
+                expired_hooks = await expire_pending_hooks(
+                    redis_client=redis_client,
+                    namespace=namespace,
+                    max_cleanup_batch=max_cleanup_batch,
+                )
+                if expired_hooks > 0:
+                    logger.info(f"⏰ Expired {expired_hooks} pending hooks")
 
                 # Then, remove expired tasks
                 await remove_expired_tasks(

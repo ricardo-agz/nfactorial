@@ -18,6 +18,10 @@ services:
       - REDIS_PORT=6379
       - REDIS_DB=0
       - REDIS_MAX_CONNECTIONS=1000
+      - VERCEL_OIDC_TOKEN=${VERCEL_OIDC_TOKEN}
+      - VERCEL_TOKEN=${VERCEL_TOKEN}
+      - VERCEL_PROJECT_ID=${VERCEL_PROJECT_ID}
+      - VERCEL_TEAM_ID=${VERCEL_TEAM_ID}
     ports:
       - "8080:8080"
     depends_on:
@@ -37,6 +41,10 @@ services:
       - REDIS_HOST=redis
       - OPENAI_API_KEY=${OPENAI_API_KEY}
       - XAI_API_KEY=${XAI_API_KEY}
+      - VERCEL_OIDC_TOKEN=${VERCEL_OIDC_TOKEN}
+      - VERCEL_TOKEN=${VERCEL_TOKEN}
+      - VERCEL_PROJECT_ID=${VERCEL_PROJECT_ID}
+      - VERCEL_TEAM_ID=${VERCEL_TEAM_ID}
     ports:
       - "8000:8000"
     depends_on:

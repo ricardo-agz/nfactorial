@@ -1,3 +1,14 @@
+--[[
+-- Resume a task after pending tool-call results are resolved.
+--
+-- Tool-result completion needs atomic cleanup of pending tool markers and a
+-- guarded requeue so duplicate completions do not enqueue the task twice.
+--
+-- State transitions:
+-- - pending_tool_results -> active (and LPUSH to main queue)
+-- - missing task data -> orphaned queue marker
+-- - any other status -> no transition (returns already_completed)
+]]--
 local queue_main_key = KEYS[1]
 local queue_orphaned_key = KEYS[2]
 local queue_pending_key = KEYS[3]

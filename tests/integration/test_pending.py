@@ -468,6 +468,70 @@ class TestPendingChildTasks:
         status = await get_task_status(redis_client, test_namespace, task_id)
         assert status == TaskStatus.PENDING_CHILD_TASKS
 
+    async def test_pending_child_requires_explicit_pending_action(
+        self,
+        redis_client: redis.Redis,
+        test_namespace: str,
+        test_agent: SimpleTestAgent,
+        sample_task,
+        pickup_script: BatchPickupScript,
+        completion_script: TaskCompletionScript,
+    ) -> None:
+        """Reject implicit pending transitions from non-pending actions."""
+        keys = RedisKeys.format(
+            namespace=test_namespace,
+            agent=test_agent.name,
+            task_id=sample_task.id,
+        )
+
+        task_id = await self._setup_processing_task(
+            redis_client, test_namespace, test_agent, sample_task, pickup_script
+        )
+        child_task_id = str(uuid.uuid4())
+
+        result = await completion_script.execute(
+            queue_main_key=keys.queue_main,
+            queue_completions_key=keys.queue_completions,
+            queue_failed_key=keys.queue_failed,
+            queue_backoff_key=keys.queue_backoff,
+            queue_orphaned_key=keys.queue_orphaned,
+            queue_pending_key=keys.queue_pending,
+            task_statuses_key=keys.task_status,
+            task_agents_key=keys.task_agent,
+            task_payloads_key=keys.task_payload,
+            task_pickups_key=keys.task_pickups,
+            task_retries_key=keys.task_retries,
+            task_metas_key=keys.task_meta,
+            processing_heartbeats_key=keys.processing_heartbeats,
+            pending_tool_results_key=keys.pending_tool_results,
+            pending_child_task_results_key=keys.pending_child_task_results,
+            agent_metrics_bucket_key=keys.agent_metrics_bucket,
+            global_metrics_bucket_key=keys.global_metrics_bucket,
+            batch_meta_key=keys.batch_meta,
+            batch_progress_key=keys.batch_progress,
+            batch_remaining_tasks_key=keys.batch_remaining_tasks,
+            batch_completed_key=keys.batch_completed,
+            task_id=task_id,
+            action=CompletionAction.CONTINUE.value,
+            updated_task_payload_json=sample_task.payload.to_json(),
+            metrics_ttl=3600,
+            pending_sentinel=PENDING_SENTINEL,
+            current_turn=0,
+            pending_child_task_ids_json=json.dumps([child_task_id]),
+        )
+
+        assert not result.success
+        status = await get_task_status(redis_client, test_namespace, task_id)
+        assert status == TaskStatus.PROCESSING
+
+        pending_score = await redis_client.zscore(keys.queue_pending, task_id)
+        assert pending_score is None
+
+        pending_entry = await redis_client.hget(
+            keys.pending_child_task_results, child_task_id
+        )
+        assert pending_entry is None
+
     async def test_pending_child_creates_sentinel_entries(
         self,
         redis_client: redis.Redis,

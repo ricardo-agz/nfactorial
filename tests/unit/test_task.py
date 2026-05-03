@@ -56,6 +56,7 @@ class TestTaskMetadata:
 
         assert data["owner_id"] == sample_metadata.owner_id
         assert data["parent_id"] == sample_metadata.parent_id
+        assert data["resumed_from_task_id"] == sample_metadata.resumed_from_task_id
         assert data["batch_id"] == sample_metadata.batch_id
         assert data["max_turns"] == sample_metadata.max_turns
         assert isinstance(data["created_at"], float)
@@ -67,6 +68,7 @@ class TestTaskMetadata:
 
         assert restored.owner_id == sample_metadata.owner_id
         assert restored.parent_id == sample_metadata.parent_id
+        assert restored.resumed_from_task_id == sample_metadata.resumed_from_task_id
         assert restored.batch_id == sample_metadata.batch_id
         assert restored.max_turns == sample_metadata.max_turns
         # Timestamps should be close (within 1 second)
@@ -108,22 +110,26 @@ class TestTaskMetadata:
         data = metadata.to_dict()
 
         assert data["parent_id"] is None
+        assert data["resumed_from_task_id"] is None
         assert data["batch_id"] is None
         assert data["max_turns"] is None
 
         restored = TaskMetadata.from_dict(data)
         assert restored.parent_id is None
+        assert restored.resumed_from_task_id is None
         assert restored.batch_id is None
         assert restored.max_turns is None
 
     def test_with_parent_and_batch(self, owner_id: str) -> None:
         """Test TaskMetadata with parent and batch IDs."""
         parent_id = str(uuid.uuid4())
+        resumed_from_task_id = str(uuid.uuid4())
         batch_id = str(uuid.uuid4())
 
         metadata = TaskMetadata(
             owner_id=owner_id,
             parent_id=parent_id,
+            resumed_from_task_id=resumed_from_task_id,
             batch_id=batch_id,
             max_turns=5,
         )
@@ -132,6 +138,7 @@ class TestTaskMetadata:
         restored = TaskMetadata.from_dict(data)
 
         assert restored.parent_id == parent_id
+        assert restored.resumed_from_task_id == resumed_from_task_id
         assert restored.batch_id == batch_id
 
 

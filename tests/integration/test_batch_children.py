@@ -393,6 +393,7 @@ class TestMixedBatchAndSingleChildren:
             await redis_client.hset(
                 parent_keys.pending_child_task_results, child_id, PENDING_SENTINEL
             )
+            await redis_client.sadd(parent_keys.pending_child_wait_ids, child_id)
 
         await redis_client.zadd(
             parent_keys.queue_pending, {parent_id: time.time()}
@@ -456,6 +457,7 @@ class TestMixedBatchAndSingleChildren:
                 parent_pending_child_task_results_key=(
                     parent_keys.pending_child_task_results
                 ),
+                parent_pending_child_wait_ids_key=parent_keys.pending_child_wait_ids,
                 pending_tool_call_ids_json=None,
                 pending_child_task_ids_json=None,
                 final_output_json=json.dumps({"batch_value": i * 10}),

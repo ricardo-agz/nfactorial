@@ -23,6 +23,7 @@ const sidebars: SidebarsConfig = {
         'agents',
         'orchestrator',
         'tools',
+        'hooks-design',
         'context',
         'events',
       ],

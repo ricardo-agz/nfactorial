@@ -1,3 +1,13 @@
+--[[
+-- Garbage-collect old terminal tasks from completed/failed/cancelled queues.
+--
+-- Retention cleanup removes queue entries and task hash fields together so old
+-- data does not leak, while preserving orphan visibility when data is missing.
+--
+-- State transitions:
+-- - no active task lifecycle transitions; this is terminal-data cleanup only
+-- - missing task data during cleanup -> orphaned queue marker
+]]--
 local queue_completions_key = KEYS[1]
 local queue_failed_key = KEYS[2]
 local queue_cancelled_key = KEYS[3]

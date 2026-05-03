@@ -1,4 +1,17 @@
 --[[
+-- Shared helper functions used by all queue Lua scripts.
+--
+-- These helpers centralize canonical task loading semantics and bounded metrics
+-- updates so behavior stays consistent across scripts.
+--
+-- State model returned by load_task():
+-- - missing: no task hash fields found
+-- - corrupted: partial task hash fields found
+-- - ok: all required task hash fields found
+--
+-- This file does not perform task-state transitions directly.
+]]--
+--[[
 ---------------------------------------------------------------------
 Usage:
 local task_result = load_task(

@@ -34,32 +34,6 @@ export const useWebSocket = ({
   const processedTasksRef = useRef<Set<string>>(new Set());
   const subAgentProgressRef = useRef<Record<string, ThinkingProgress>>({});
 
-  const extractResearchTaskIds = (outputData: any): string[] => {
-    if (Array.isArray(outputData)) {
-      return Array.from(
-        new Set(outputData.filter((id: any): id is string => typeof id === 'string' && id.length > 0)),
-      );
-    }
-
-    if (!outputData || typeof outputData !== 'object') return [];
-
-    const idsFromChildTaskIds = Array.isArray(outputData.child_task_ids)
-      ? outputData.child_task_ids.filter((id: any): id is string => typeof id === 'string' && id.length > 0)
-      : [];
-
-    if (idsFromChildTaskIds.length) {
-      return Array.from(new Set(idsFromChildTaskIds));
-    }
-
-    const idsFromJobRefs = Array.isArray(outputData.job_refs)
-      ? outputData.job_refs
-          .map((job: any) => (typeof job?.task_id === 'string' ? job.task_id : null))
-          .filter((id: string | null): id is string => Boolean(id))
-      : [];
-
-    return Array.from(new Set(idsFromJobRefs));
-  };
-
   const handleWSMessage = useCallback((evt: MessageEvent) => {
     const event: AgentEvent = JSON.parse(evt.data);
     console.log('WS event:', event);
@@ -86,10 +60,7 @@ export const useWebSocket = ({
       });
     };
 
-    const isTrackedSubAgentTask = Boolean(subAgentProgressRef.current[event.task_id]);
-    const isResearchSubAgentEvent = event.agent_name === 'research_subagent';
-
-    if (isTrackedSubAgentTask || isResearchSubAgentEvent) {
+    if (subAgentProgressRef.current[event.task_id]) {
       switch (event.event_type) {
 
         case "batch_progress": {
@@ -133,19 +104,15 @@ export const useWebSocket = ({
           if (!toolCall) break;
 
           updateSubAgentThinking(event.task_id, prev => {
-            const base: ThinkingProgress = prev ?? {
-              task_id    : event.task_id,
-              tool_calls : {},
-              is_complete: false,
-            };
+            if (!prev) return null;
             return {
-              ...base,
+              ...prev,
               tool_calls: {
-                ...base.tool_calls,
+                ...prev.tool_calls,
                 [toolCall.id]: {
-                  ...base.tool_calls[toolCall.id],
+                  ...prev.tool_calls[toolCall.id],
                   status: 'completed',
-                  result: resp.client_output,
+                  result: resp.output_data,
                 },
               },
             };
@@ -158,17 +125,13 @@ export const useWebSocket = ({
           if (!toolCall) break;
 
           updateSubAgentThinking(event.task_id, prev => {
-            const base: ThinkingProgress = prev ?? {
-              task_id    : event.task_id,
-              tool_calls : {},
-              is_complete: false,
-            };
+            if (!prev) return null;
             return {
-              ...base,
+              ...prev,
               tool_calls: {
-                ...base.tool_calls,
+                ...prev.tool_calls,
                 [toolCall.id]: {
-                  ...base.tool_calls[toolCall.id],
+                  ...prev.tool_calls[toolCall.id],
                   status: 'failed',
                   error : event.error,
                 },
@@ -179,26 +142,16 @@ export const useWebSocket = ({
         }
 
         case 'progress_update_completion_failed':
-          updateSubAgentThinking(event.task_id, prev => ({
-            task_id    : event.task_id,
-            tool_calls : prev?.tool_calls ?? {},
-            is_complete: prev?.is_complete ?? false,
-            final_output: prev?.final_output,
-            error: event.error,
-          }));
+          updateSubAgentThinking(event.task_id, prev => (prev ? { ...prev, error: event.error } : null));
           break;
 
         case 'agent_output': {
           const finalData = event.data;
 
           updateSubAgentThinking(event.task_id, prev => {
-            const base: ThinkingProgress = prev ?? {
-              task_id    : event.task_id,
-              tool_calls : {},
-              is_complete: false,
-            };
+            if (!prev) return null;
             return {
-              ...base,
+              ...prev,
               is_complete : true,
               final_output: finalData,
             };
@@ -209,25 +162,17 @@ export const useWebSocket = ({
         }
 
         case 'run_cancelled': {
-          updateSubAgentThinking(event.task_id, prev => ({
-            task_id    : event.task_id,
-            tool_calls : prev?.tool_calls ?? {},
-            is_complete: true,
-            final_output: prev?.final_output,
-            error: 'Task cancelled by user',
-          }));
+          updateSubAgentThinking(event.task_id, prev => (
+            prev ? { ...prev, is_complete: true, error: 'Task cancelled by user' } : null
+          ));
           processedTasksRef.current.add(event.task_id);
           break;
         }
 
         case 'run_failed': {
-          updateSubAgentThinking(event.task_id, prev => ({
-            task_id    : event.task_id,
-            tool_calls : prev?.tool_calls ?? {},
-            is_complete: true,
-            final_output: prev?.final_output,
-            error: event.error || 'Agent failed to complete the task',
-          }));
+          updateSubAgentThinking(event.task_id, prev => (
+            prev ? { ...prev, is_complete: true, error: event.error || 'Agent failed to complete the task' } : null
+          ));
           processedTasksRef.current.add(event.task_id);
           break;
         }
@@ -300,18 +245,16 @@ export const useWebSocket = ({
               [toolCall.id]: {
                 ...prev.tool_calls[toolCall.id],
                 status: 'completed',
-                result: resp.client_output,
+                result: resp.output_data,
               },
             },
           };
         });
 
-        if (resp?.tool_call?.function?.name === 'research') {
-          const taskIds = extractResearchTaskIds(resp.client_output);
-          if (!taskIds.length) break;
-
+        if (resp?.tool_call?.function?.name === 'research' && Array.isArray(resp.output_data)) {
           // Reset batch progress when a new research batch starts
           setResearchProgress?.(0);
+          const taskIds: string[] = resp.output_data;
           setSubAgentProgress?.(prev => {
             const updated = { ...prev };
             taskIds.forEach(id => {

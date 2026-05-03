@@ -33,38 +33,6 @@ class InactiveTaskError(Exception):
         super().__init__(f"Task {task_id} is not active")
 
 
-class HookNotFoundError(Exception):
-    """Exception raised when a hook is not found."""
-
-    def __init__(self, hook_id: str):
-        self.hook_id = hook_id
-        super().__init__(f"Hook {hook_id} not found")
-
-
-class HookTokenValidationError(Exception):
-    """Exception raised when a hook token is invalid."""
-
-    def __init__(self, hook_id: str):
-        self.hook_id = hook_id
-        super().__init__(f"Hook token is invalid for hook {hook_id}")
-
-
-class HookExpiredError(Exception):
-    """Exception raised when a hook is already expired."""
-
-    def __init__(self, hook_id: str):
-        self.hook_id = hook_id
-        super().__init__(f"Hook {hook_id} is expired")
-
-
-class HookAlreadyResolvedError(Exception):
-    """Exception raised when a hook was already resolved."""
-
-    def __init__(self, hook_id: str):
-        self.hook_id = hook_id
-        super().__init__(f"Hook {hook_id} is already resolved")
-
-
 class CorruptedTaskDataError(Exception):
     """Exception raised when task data is corrupted"""
 
@@ -101,21 +69,6 @@ class InvalidLLMResponseError(Exception):
     pass
 
 
-class VerificationRejected(Exception):
-    """Raised by an agent verifier when output should be revised."""
-
-    def __init__(
-        self,
-        message: str,
-        code: str | None = None,
-        metadata: dict[str, object] | None = None,
-    ):
-        self.message = message
-        self.code = code
-        self.metadata = metadata
-        super().__init__(message)
-
-
 class FatalAgentError(Exception):
     """Exception for unrecoverable errors that should fail the task immediately.
 
@@ -142,10 +95,6 @@ __all__ = [
     "TaskNotFoundError",
     "InvalidTaskIdError",
     "InactiveTaskError",
-    "HookNotFoundError",
-    "HookTokenValidationError",
-    "HookExpiredError",
-    "HookAlreadyResolvedError",
     "CorruptedTaskDataError",
     "BatchNotFoundError",
     "RetryableError",
@@ -157,5 +106,4 @@ __all__ = [
     "OpenAIConnectionError",
     "FatalAgentError",
     "InvalidLLMResponseError",
-    "VerificationRejected",
 ]

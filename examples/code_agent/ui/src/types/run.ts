@@ -39,8 +39,6 @@ export interface ToolFailedAction extends BaseAction {
 export interface ExecRequestAction extends BaseAction {
   kind: 'exec_request';
   responseOnReject?: string;
-  hookId?: string;
-  hookToken?: string;
 }
 
 export interface ExecResultAction extends BaseAction {

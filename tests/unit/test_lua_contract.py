@@ -1,6 +1,6 @@
 import pytest
 
-from factorial.queue.lua._core import LuaScriptContract
+from factorial.queue.lua_core import LuaScriptContract
 
 
 def test_materialize_rejects_unexpected_bindings() -> None:

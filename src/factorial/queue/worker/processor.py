@@ -37,6 +37,7 @@ from factorial.queue.lua import (
 from factorial.queue.task import Task, get_task_data
 from factorial.resources import (
     RedisResourceBindingStore,
+    ResourceLease,
     ResourceManager,
     ResourcesExecutionNamespace,
 )
@@ -188,6 +189,13 @@ async def process_task(
 
     task_failed = False
     final_action = None
+    execution_ctx = ExecutionContext(
+        task_id=task.id,
+        owner_id=task.metadata.owner_id,
+        agent_name=agent.name,
+        retry_count=task.retries,
+        events=event_publisher,
+    )
 
     async with heartbeat_context(
         redis_client=redis_client,
@@ -197,63 +205,58 @@ async def process_task(
         interval=heartbeat_interval,
     ):
         try:
-            execution_ctx = ExecutionContext(
-                task_id=task.id,
-                owner_id=task.metadata.owner_id,
-                agent_name=agent.name,
-                retry_count=task.retries,
-                events=event_publisher,
-                subagents=SubagentsExecutionNamespace(
-                    enqueue_callback=runtime.enqueue_child_task,
-                    enqueue_batch_callback=runtime.enqueue_batch,
-                    cancel_callback=runtime.cancel_child_task,
-                    cancel_many_callback=runtime.cancel_child_tasks,
-                    signal_callback=runtime.signal_child_task,
-                    signal_many_callback=runtime.signal_child_tasks,
+            execution_ctx.subagents = SubagentsExecutionNamespace(
+                enqueue_callback=runtime.enqueue_child_task,
+                enqueue_batch_callback=runtime.enqueue_batch,
+                cancel_callback=runtime.cancel_child_task,
+                cancel_many_callback=runtime.cancel_child_tasks,
+                signal_callback=runtime.signal_child_task,
+                signal_many_callback=runtime.signal_child_tasks,
+            )
+            execution_ctx.hooks = HooksExecutionNamespace(
+                persist_runtime_callback=runtime.persist_hook_runtime
+            )
+            execution_ctx.messaging = MessagingExecutionNamespace(
+                send_callback=runtime.messaging_send_direct,
+                groups=MessagingGroupsExecutionNamespace(
+                    create_callback=runtime.messaging_create_group,
+                    get_callback=runtime.messaging_get_group,
+                    list_callback=runtime.messaging_list_groups,
+                    find_callback=runtime.messaging_find_groups,
+                    add_members_callback=runtime.messaging_add_group_members,
+                    remove_members_callback=runtime.messaging_remove_group_members,
+                    leave_callback=runtime.messaging_leave_group,
+                    send_callback=runtime.messaging_send_group,
                 ),
-                hooks=HooksExecutionNamespace(
-                    persist_runtime_callback=runtime.persist_hook_runtime
+            )
+            execution_ctx.inbox = InboxExecutionNamespace(
+                direct=InboxDirectExecutionNamespace(
+                    peek_callback=runtime.inbox_direct_peek,
+                    mark_read_callback=runtime.inbox_direct_mark_read,
                 ),
-                messaging=MessagingExecutionNamespace(
-                    send_callback=runtime.messaging_send_direct,
-                    groups=MessagingGroupsExecutionNamespace(
-                        create_callback=runtime.messaging_create_group,
-                        get_callback=runtime.messaging_get_group,
-                        list_callback=runtime.messaging_list_groups,
-                        find_callback=runtime.messaging_find_groups,
-                        add_members_callback=runtime.messaging_add_group_members,
-                        remove_members_callback=runtime.messaging_remove_group_members,
-                        leave_callback=runtime.messaging_leave_group,
-                        send_callback=runtime.messaging_send_group,
-                    ),
+                group=InboxGroupExecutionNamespace(
+                    peek_callback=runtime.inbox_group_peek,
+                    mark_read_callback=runtime.inbox_group_mark_read,
                 ),
-                inbox=InboxExecutionNamespace(
-                    direct=InboxDirectExecutionNamespace(
-                        peek_callback=runtime.inbox_direct_peek,
-                        mark_read_callback=runtime.inbox_direct_mark_read,
-                    ),
-                    group=InboxGroupExecutionNamespace(
-                        peek_callback=runtime.inbox_group_peek,
-                        mark_read_callback=runtime.inbox_group_mark_read,
-                    ),
-                    receipts=InboxReceiptsExecutionNamespace(
-                        peek_callback=runtime.inbox_receipts_peek,
-                        mark_read_callback=runtime.inbox_receipts_mark_read,
-                    ),
+                receipts=InboxReceiptsExecutionNamespace(
+                    peek_callback=runtime.inbox_receipts_peek,
+                    mark_read_callback=runtime.inbox_receipts_mark_read,
                 ),
-                signals=SignalsExecutionNamespace(),
-                resources=ResourcesExecutionNamespace(
-                    manager=ResourceManager(
-                        store=RedisResourceBindingStore(
-                            redis_client=redis_client,
-                            namespace=namespace,
-                            task_id=task.id,
-                        ),
+            )
+            execution_ctx.signals = SignalsExecutionNamespace()
+            execution_ctx.resources = ResourcesExecutionNamespace(
+                manager=ResourceManager(
+                    store=RedisResourceBindingStore(
+                        redis_client=redis_client,
+                        namespace=namespace,
                         task_id=task.id,
-                        owner_id=task.metadata.owner_id,
-                        agent_name=agent.name,
-                    )
+                    ),
+                    task_id=task.id,
+                    owner_id=task.metadata.owner_id,
+                    agent_name=agent.name,
+                    lease=ResourceLease.worker(task.pickups),
                 ),
+                default_sandbox_provider=agent.default_sandbox_provider,
             )
 
             if task.payload.turn_number == 1 and task.retries == 0:
@@ -332,6 +335,11 @@ async def process_task(
                 failure_output=output,
                 event_publisher=event_publisher,
                 complete=runtime.complete,
+                park_or_resume_child_wait=runtime.park_or_resume_child_wait,
+                park_activity_wait=runtime.park_activity_wait,
+                park_signal_wait=runtime.park_signal_wait,
+                park_scheduled_wait=runtime.park_scheduled_wait,
+                publish_batch_progress=runtime.publish_batch_progress,
             )
 
         finally:

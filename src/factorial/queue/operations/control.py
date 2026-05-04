@@ -36,6 +36,12 @@ from factorial.queue.task import (
     get_task_agent,
     get_task_data,
 )
+from factorial.resources import (
+    RedisResourceBindingStore,
+    ResourceLease,
+    ResourceManager,
+    ResourcesExecutionNamespace,
+)
 
 logger = get_logger(__name__)
 
@@ -183,10 +189,34 @@ async def cancel_task(
     # pending_tool_results), the worker loop will never see it.  The Lua script returns
     # owner_id in this case so we can emit the run_cancelled event right here.
     if result.owner_id is not None:
+        agent = agents_by_name.get(agent_name)
+        if agent is None:
+            logger.error(
+                "Cancelled task %s references unregistered agent %r; "
+                "publishing cancellation event without agent callbacks.",
+                task_id,
+                agent_name,
+            )
+            await EventPublisher(
+                redis_client=redis_client,
+                channel=RedisKeys.format(
+                    namespace=namespace,
+                    owner_id=result.owner_id,
+                ).updates_channel,
+            ).publish_event(
+                FinishEvent(
+                    task_id=task_id,
+                    owner_id=result.owner_id,
+                    agent_name=agent_name,
+                    status=RunStatus.CANCELLED,
+                )
+            )
+            return
+
         await run_agent_cancellation(
             redis_client=redis_client,
             namespace=namespace,
-            agent=agents_by_name[agent_name],
+            agent=agent,
             task_id=task_id,
         )
 
@@ -336,7 +366,14 @@ async def resume_if_no_remaining_child_tasks(
         return False
 
     agent_name = task_data["agent"]
-    agent = agents_by_name[agent_name]
+    agent = agents_by_name.get(agent_name)
+    if agent is None:
+        logger.error(
+            "Cannot resume parent task %s: agent %r is not registered",
+            task_id,
+            agent_name,
+        )
+        return False
     keys = RedisKeys.format(namespace=namespace, task_id=task_id, agent=agent_name)
 
     try:
@@ -363,39 +400,53 @@ async def resume_if_no_remaining_child_tasks(
         list[str | bytes | None],
         await redis_client.hmget(keys.pending_child_task_results, wait_child_ids),  # type: ignore[arg-type,misc]
     )
+    child_status_values = cast(
+        list[str | bytes | None],
+        await redis_client.hmget(keys.task_status, wait_child_ids),  # type: ignore[arg-type,misc]
+    )
+    child_activity_values = cast(
+        list[str | bytes | None],
+        await redis_client.hmget(keys.activity_wait_meta, wait_child_ids),  # type: ignore[arg-type,misc]
+    )
 
     completed_results: list[tuple[str, Any]] = []
     unresolved_child_ids: list[str] = []
-    for child_task_id, result_json in zip(wait_child_ids, result_values, strict=True):
+    unresolved_child_states: list[tuple[str, str | None, bool]] = []
+    for child_task_id, result_json, status_raw, activity_wait_raw in zip(
+        wait_child_ids,
+        result_values,
+        child_status_values,
+        child_activity_values,
+        strict=True,
+    ):
         if result_json is None:
             unresolved_child_ids.append(child_task_id)
+            unresolved_child_states.append(
+                (
+                    child_task_id,
+                    decode(status_raw) if status_raw is not None else None,
+                    activity_wait_raw is not None,
+                )
+            )
             continue
         result_str = decode(result_json)
         if result_str == PENDING_SENTINEL:
             unresolved_child_ids.append(child_task_id)
+            unresolved_child_states.append(
+                (
+                    child_task_id,
+                    decode(status_raw) if status_raw is not None else None,
+                    activity_wait_raw is not None,
+                )
+            )
             continue
         completed_results.append((child_task_id, json.loads(result_str)))
 
     if unresolved_child_ids:
-        unresolved_status_values = cast(
-            list[str | bytes | None],
-            await redis_client.hmget(keys.task_status, unresolved_child_ids),  # type: ignore[arg-type,misc]
-        )
-        unresolved_activity_values = cast(
-            list[str | bytes | None],
-            await redis_client.hmget(keys.activity_wait_meta, unresolved_child_ids),  # type: ignore[arg-type,misc]
-        )
-
         synthesized_results: list[tuple[str, Any]] = []
-        for child_task_id, status_raw, activity_wait_raw in zip(
-            unresolved_child_ids,
-            unresolved_status_values,
-            unresolved_activity_values,
-            strict=True,
-        ):
-            child_status = decode(status_raw) if status_raw is not None else None
-            is_activity_wait = child_status == TaskStatus.PAUSED.value and (
-                activity_wait_raw is not None
+        for child_task_id, child_status, is_activity_wait_present in unresolved_child_states:
+            is_activity_wait = (
+                child_status == TaskStatus.PAUSED.value and is_activity_wait_present
             )
             is_terminal = child_status in _TERMINAL_CHILD_STATUSES
             if not (is_activity_wait or is_terminal):
@@ -423,7 +474,7 @@ async def resume_if_no_remaining_child_tasks(
     child_task_completion_script = await create_child_task_completion_script(
         redis_client
     )
-    success, message = await child_task_completion_script.execute(
+    success, _message = await child_task_completion_script.execute(
         queue_main_key=keys.queue_main,
         queue_orphaned_key=keys.queue_orphaned,
         queue_pending_key=keys.queue_pending,
@@ -435,8 +486,21 @@ async def resume_if_no_remaining_child_tasks(
         task_pickups_key=keys.task_pickups,
         task_retries_key=keys.task_retries,
         task_metas_key=keys.task_meta,
+        activity_wait_meta_key=keys.activity_wait_meta,
         task_id=task.id,
         updated_task_context_json=updated_context.to_json(),
+        expected_wait_child_ids=wait_child_ids,
+        expected_result_values=[
+            decode(result_value) if result_value is not None else None
+            for result_value in result_values
+        ],
+        expected_child_statuses=[
+            decode(status_value) if status_value is not None else None
+            for status_value in child_status_values
+        ],
+        expected_child_activity_waiting=[
+            activity_value is not None for activity_value in child_activity_values
+        ],
     )
 
     return success
@@ -473,17 +537,39 @@ async def run_agent_cancellation(
         channel=keys.updates_channel,
     )
 
+    execution_ctx = ExecutionContext(
+        task_id=task.id,
+        owner_id=task.metadata.owner_id,
+        agent_name=agent.name,
+        retry_count=task.retries,
+        events=event_publisher,
+        resources=ResourcesExecutionNamespace(
+            manager=ResourceManager(
+                store=RedisResourceBindingStore(
+                    redis_client=redis_client,
+                    namespace=namespace,
+                    task_id=task.id,
+                ),
+                task_id=task.id,
+                owner_id=task.metadata.owner_id,
+                agent_name=agent.name,
+                lease=ResourceLease.system(),
+            ),
+            default_sandbox_provider=agent.default_sandbox_provider,
+        ),
+    )
+
     try:
-        await redis_client.delete(
-            RedisKeys.format(namespace=namespace, task_id=task.id).resource_bindings
+        await execution_ctx.resources.destroy_all()
+    except Exception as e:
+        logger.error(
+            "Error destroying resources for cancelled task %s; "
+            "cancellation event will still be emitted",
+            task.id,
+            exc_info=e,
         )
-        execution_ctx = ExecutionContext(
-            task_id=task.id,
-            owner_id=task.metadata.owner_id,
-            agent_name=agent.name,
-            retry_count=task.retries,
-            events=event_publisher,
-        )
+
+    try:
         logger.info(f"🚫 Task cancelled {colored(f'[{task.id}]', 'dim')}")
 
         await agent._emit_event(

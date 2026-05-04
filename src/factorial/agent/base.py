@@ -151,6 +151,7 @@ class BaseAgent(Generic[ContextType]):
         prepare_turn: PrepareTurnHook | None = None,
         stop_when: StopWhen | StopCondition | None = None,
         verifier: Verifier | None = None,
+        sandbox: str | None = None,
         callbacks: Callbacks | None = None,
         http_client: httpx.AsyncClient | None = None,
         client: MultiClient | None = None,
@@ -173,6 +174,7 @@ class BaseAgent(Generic[ContextType]):
             turn_count_is(10),
         )
         self.verifier = verifier
+        self.default_sandbox_provider = sandbox
         self.callbacks = callbacks or Callbacks()
         self.max_turns = _infer_turn_limit_hint(self.stop_when)
 
@@ -853,7 +855,8 @@ class BaseAgent(Generic[ContextType]):
                     task_id=task_id,
                     owner_id=owner_id,
                     agent_name=self.name,
-                )
+                ),
+                default_sandbox_provider=self.default_sandbox_provider,
             ),
         )
         token = execution_context.set(execution_ctx)
@@ -1029,7 +1032,8 @@ class BaseAgent(Generic[ContextType]):
                         task_id=task_id,
                         owner_id=owner_id,
                         agent_name=self.name,
-                    )
+                    ),
+                    default_sandbox_provider=self.default_sandbox_provider,
                 ),
             )
             token = execution_context.set(execution_ctx)

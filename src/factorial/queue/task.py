@@ -152,15 +152,6 @@ class Task(Generic[ContextType]):
         data = json.loads(decode(json_str))
         return cls.from_dict(data, payload_parser)
 
-
-def task_team_id(*, task_id: str, metadata: dict[str, Any]) -> str:
-    # Compatibility helper for legacy callers. New white-box code should use
-    # factorial._internal.queue.task_store.task_team_id.
-    from factorial._internal.queue.task_store import task_team_id as _task_team_id
-
-    return _task_team_id(task_id=task_id, metadata=metadata)
-
-
 @dataclass
 class BatchMetadata:
     owner_id: str
@@ -198,63 +189,6 @@ class Batch:
     task_ids: list[str]
     remaining_task_ids: list[str] = field(default_factory=list)
     progress: float = 0.0
-
-
-# Compatibility wrappers for legacy callers. New implementation and tests should
-# import these Redis-backed helpers from factorial._internal.queue.task_store.
-async def get_task_data(
-    redis_client: Any,
-    namespace: str,
-    task_id: str,
-) -> dict[str, Any]:
-    from factorial._internal.queue.task_store import get_task_data as _get_task_data
-
-    return await _get_task_data(redis_client, namespace, task_id)
-
-
-async def get_task_status(
-    redis_client: Any,
-    namespace: str,
-    task_id: str,
-) -> TaskStatus:
-    from factorial._internal.queue.task_store import (
-        get_task_status as _get_task_status,
-    )
-
-    return await _get_task_status(redis_client, namespace, task_id)
-
-
-async def get_task_agent(
-    redis_client: Any,
-    namespace: str,
-    task_id: str,
-) -> str:
-    from factorial._internal.queue.task_store import get_task_agent as _get_task_agent
-
-    return await _get_task_agent(redis_client, namespace, task_id)
-
-
-async def get_task_steering_messages(
-    redis_client: Any,
-    namespace: str,
-    task_id: str,
-) -> list[tuple[str, dict[str, Any]]]:
-    from factorial._internal.queue.task_store import (
-        get_task_steering_messages as _get_task_steering_messages,
-    )
-
-    return await _get_task_steering_messages(redis_client, namespace, task_id)
-
-
-async def get_batch_data(
-    redis_client: Any,
-    namespace: str,
-    batch_id: str,
-) -> Batch:
-    from factorial._internal.queue.task_store import get_batch_data as _get_batch_data
-
-    return await _get_batch_data(redis_client, namespace, batch_id)
-
 
 
 __all__ = [

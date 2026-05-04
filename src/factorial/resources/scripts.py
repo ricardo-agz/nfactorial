@@ -124,6 +124,11 @@ class ResourceCommitLiveScriptResult:
 
 
 @dataclass(frozen=True)
+class ResourceAttachUnavailableScriptResult:
+    status: str
+
+
+@dataclass(frozen=True)
 class ResourceCommitLiveScriptInput:
     task_statuses_key: str
     task_pickups_key: str
@@ -177,6 +182,55 @@ class ResourceCommitLiveScript(_TypedLuaScript):
     ) -> ResourceCommitLiveScriptResult:
         result: str | bytes = await self._execute_input(input_value)
         return ResourceCommitLiveScriptResult(status=decode(result))
+
+
+@dataclass(frozen=True)
+class ResourceAttachUnavailableScriptInput:
+    task_statuses_key: str
+    task_pickups_key: str
+    resource_bindings_key: str
+    task_id: str
+    resource_field: str
+    expected_pickups: int
+    operation_id: str
+    now_timestamp: float
+
+    def to_lua_values(self) -> Mapping[str, Any]:
+        return {
+            "task_statuses_key": self.task_statuses_key,
+            "task_pickups_key": self.task_pickups_key,
+            "resource_bindings_key": self.resource_bindings_key,
+            "task_id": self.task_id,
+            "resource_field": self.resource_field,
+            "expected_pickups": str(self.expected_pickups),
+            "operation_id": self.operation_id,
+            "now_timestamp": repr(self.now_timestamp),
+        }
+
+
+class ResourceAttachUnavailableScript(_TypedLuaScript):
+    _CONTRACT = LuaScriptContract(
+        script_name="ResourceAttachUnavailableScript.execute",
+        key_fields=(
+            "task_statuses_key",
+            "task_pickups_key",
+            "resource_bindings_key",
+        ),
+        arg_fields=(
+            "task_id",
+            "resource_field",
+            "expected_pickups",
+            "operation_id",
+            "now_timestamp",
+        ),
+    )
+
+    async def execute(
+        self,
+        input_value: ResourceAttachUnavailableScriptInput,
+    ) -> ResourceAttachUnavailableScriptResult:
+        result: str | bytes = await self._execute_input(input_value)
+        return ResourceAttachUnavailableScriptResult(status=decode(result))
 
 
 @dataclass(frozen=True)
@@ -242,6 +296,16 @@ async def create_resource_commit_live_script(
     )
 
 
+async def create_resource_attach_unavailable_script(
+    redis_client: redis.Redis,
+) -> ResourceAttachUnavailableScript:
+    return get_cached_script(
+        redis_client,
+        "resource_attach_unavailable",
+        ResourceAttachUnavailableScript,
+    )
+
+
 async def create_resource_finish_script(
     redis_client: redis.Redis,
 ) -> ResourceFinishScript:
@@ -254,6 +318,9 @@ __all__ = [
     "ResourceBeginScript",
     "ResourceBeginScriptInput",
     "ResourceBeginScriptResult",
+    "ResourceAttachUnavailableScript",
+    "ResourceAttachUnavailableScriptInput",
+    "ResourceAttachUnavailableScriptResult",
     "ResourceCommitLiveScript",
     "ResourceCommitLiveScriptInput",
     "ResourceCommitLiveScriptResult",
@@ -261,6 +328,7 @@ __all__ = [
     "ResourceFinishScript",
     "ResourceFinishScriptInput",
     "ResourceFinishScriptResult",
+    "create_resource_attach_unavailable_script",
     "create_resource_begin_script",
     "create_resource_commit_live_script",
     "create_resource_finish_script",

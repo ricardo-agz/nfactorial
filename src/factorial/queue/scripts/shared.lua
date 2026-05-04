@@ -73,6 +73,7 @@ local function load_task(keys, args)
     }
 end
 
+local RESOURCE_PHASE_FRESH = "fresh"
 local RESOURCE_PHASE_LIVE = "live"
 local RESOURCE_PHASE_CHECKPOINTED = "checkpointed"
 local RESOURCE_PHASE_CREATING = "creating"
@@ -210,6 +211,7 @@ local function resource_recover_binding(binding, now_timestamp, operation_timeou
     end
 
     if binding.phase ~= RESOURCE_PHASE_LIVE
+        and binding.phase ~= RESOURCE_PHASE_FRESH
         and not resource_binding_has_live_ref(binding)
         and not resource_binding_has_checkpoint(binding)
     then

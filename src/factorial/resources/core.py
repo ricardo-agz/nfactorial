@@ -281,6 +281,7 @@ class ResourceBindingRecord:
 
         if (
             self.phase != RESOURCE_PHASE_LIVE
+            and self.phase != RESOURCE_PHASE_FRESH
             and not self.has_live_ref()
             and not self.has_checkpoint()
         ):

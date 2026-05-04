@@ -630,3 +630,135 @@ async def test_verifier_supports_runtime_resource_injection() -> None:
         "browser_session": "browser-verify",
         "output": "Verified.",
     }
+
+
+@pytest.mark.asyncio
+async def test_in_memory_manager_falls_back_when_live_ref_is_unavailable() -> None:
+    @dataclass
+    class LocalSession:
+        session_id: str
+
+    calls: dict[str, int] = {
+        "create": 0,
+        "restore": 0,
+        "attach": 0,
+    }
+    attach_available = True
+
+    @resource(LocalSession)
+    class LocalSessionLifecycle:
+        @classmethod
+        async def create(
+            cls,
+            ctx: ResourceContext,
+            request: ResourceRequest[LocalSession],
+        ) -> LocalSession:
+            del ctx, request
+            calls["create"] += 1
+            return LocalSession(session_id=f"created-{calls['create']}")
+
+        @classmethod
+        async def restore(
+            cls,
+            checkpoint: ResourceCheckpoint,
+            ctx: ResourceContext,
+            request: ResourceRequest[LocalSession],
+        ) -> LocalSession:
+            del ctx, request
+            calls["restore"] += 1
+            return LocalSession(
+                session_id=f"restored-{checkpoint.ref}-{calls['restore']}"
+            )
+
+        @classmethod
+        async def checkpoint(
+            cls,
+            resource_value: LocalSession,
+            ctx: ResourceContext,
+            request: ResourceRequest[LocalSession],
+        ) -> ResourceCheckpoint | None:
+            del ctx, request
+            return ResourceCheckpoint(
+                provider="local",
+                kind="session",
+                ref=resource_value.session_id,
+            )
+
+        @classmethod
+        async def destroy(
+            cls,
+            resource_value: LocalSession,
+            ctx: ResourceContext,
+            request: ResourceRequest[LocalSession],
+        ) -> None:
+            del resource_value, ctx, request
+
+        @classmethod
+        async def attach_live(
+            cls,
+            live_ref: LiveResourceRef,
+            ctx: ResourceContext,
+            request: ResourceRequest[LocalSession],
+        ) -> LocalSession | None:
+            del ctx, request
+            calls["attach"] += 1
+            if not attach_available:
+                return None
+            return LocalSession(session_id=live_ref.ref)
+
+        @classmethod
+        def capture_live_ref(
+            cls,
+            resource_value: LocalSession,
+            ctx: ResourceContext,
+            request: ResourceRequest[LocalSession],
+        ) -> LiveResourceRef | None:
+            del ctx, request
+            return LiveResourceRef(
+                provider="local",
+                kind="session",
+                ref=resource_value.session_id,
+            )
+
+    store = InMemoryResourceBindingStore()
+    manager1 = ResourceManager(
+        store=store,
+        task_id="task-local",
+        owner_id="owner-local",
+        agent_name="agent-local",
+    )
+    first = await manager1.get(LocalSession)
+    await manager1.checkpoint(LocalSession)
+    restored_live = await manager1.get(LocalSession)
+
+    attach_available = False
+    manager2 = ResourceManager(
+        store=store,
+        task_id="task-local",
+        owner_id="owner-local",
+        agent_name="agent-local",
+    )
+    restored_after_unavailable = await manager2.get(LocalSession)
+
+    fresh_store = InMemoryResourceBindingStore()
+    manager3 = ResourceManager(
+        store=fresh_store,
+        task_id="task-local-fresh",
+        owner_id="owner-local",
+        agent_name="agent-local",
+    )
+    live_without_checkpoint = await manager3.get(LocalSession)
+    manager4 = ResourceManager(
+        store=fresh_store,
+        task_id="task-local-fresh",
+        owner_id="owner-local",
+        agent_name="agent-local",
+    )
+    recreated_after_unavailable = await manager4.get(LocalSession)
+
+    assert first.session_id == "created-1"
+    assert restored_live.session_id == "restored-created-1-1"
+    assert restored_after_unavailable.session_id == "restored-created-1-2"
+    assert live_without_checkpoint.session_id == "created-2"
+    assert recreated_after_unavailable.session_id == "created-3"
+    assert calls["attach"] == 2

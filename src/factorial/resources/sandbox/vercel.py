@@ -253,6 +253,19 @@ def _load_vercel_async_snapshot() -> _VercelAsyncSnapshotFactory:
     return async_snapshot
 
 
+def _is_not_found_error(exc: Exception) -> bool:
+    status_code = getattr(exc, "status_code", None)
+    if status_code is None:
+        response = getattr(exc, "response", None)
+        status_code = getattr(response, "status_code", None)
+    if status_code is None:
+        return False
+    try:
+        return int(status_code) == 404
+    except (TypeError, ValueError):
+        return False
+
+
 async def _ensure_running(native_sandbox: _VercelAsyncSandboxLike) -> None:
     if native_sandbox.status == "running":
         return
@@ -460,13 +473,16 @@ class VercelSandboxProvider(SandboxProvider):
     ) -> Sandbox | None:
         del self, ctx, request
         async_sandbox = _load_vercel_async_sandbox()
-        with suppress(Exception):
+        try:
             sandbox = await async_sandbox.get(sandbox_id=live_ref.ref)
-            if sandbox.status not in {"running", "pending"}:
+        except Exception as exc:
+            if _is_not_found_error(exc):
                 return None
-            await _ensure_running(sandbox)
-            return VercelSandboxHandle(sandbox=sandbox)
-        return None
+            raise
+        if sandbox.status not in {"running", "pending"}:
+            return None
+        await _ensure_running(sandbox)
+        return VercelSandboxHandle(sandbox=sandbox)
 
     def capture_live_ref(
         self,

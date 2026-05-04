@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 
 import fakeredis.aioredis
@@ -13,6 +14,7 @@ from factorial.resources import (
     ResourceLeaseLostError,
     ResourceManager,
 )
+from factorial.resources.core import resource_type_key
 from factorial.resources.sandbox.providers import make_sandbox_request_metadata
 from factorial.resources.sandbox.vercel import get_provider
 
@@ -370,6 +372,250 @@ async def test_resource_manager_restores_checkpointed_vercel_sandbox(
             "type": "snapshot",
             "snapshot_id": "snap-sb-1",
         }
+    finally:
+        await redis_client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_unavailable_live_sandbox_ref_restores_checkpoint(
+    monkeypatch,
+) -> None:
+    _FakeAsyncSandbox.reset()
+    _FakeAsyncSnapshotApi.reset()
+    monkeypatch.setattr(
+        "factorial.resources.sandbox.vercel._load_vercel_async_sandbox",
+        lambda: _FakeAsyncSandbox,
+    )
+    monkeypatch.setattr(
+        "factorial.resources.sandbox.vercel._load_vercel_async_snapshot",
+        lambda: _FakeAsyncSnapshotApi,
+    )
+
+    redis_client = fakeredis.aioredis.FakeRedis(decode_responses=True)
+    try:
+        await _seed_task_lease(
+            redis_client,
+            namespace="test",
+            task_id="task-stale-live-with-checkpoint",
+            pickups=1,
+        )
+        manager1 = ResourceManager(
+            store=RedisResourceBindingStore(
+                redis_client=redis_client,
+                namespace="test",
+                task_id="task-stale-live-with-checkpoint",
+            ),
+            task_id="task-stale-live-with-checkpoint",
+            owner_id="owner-1",
+            agent_name="agent-1",
+            lease=ResourceLease.worker(1),
+        )
+        sandbox1 = await manager1.get(
+            Sandbox,
+            request_metadata=_vercel_request_metadata(),
+        )
+        await manager1.checkpoint_all()
+
+        await _seed_task_lease(
+            redis_client,
+            namespace="test",
+            task_id="task-stale-live-with-checkpoint",
+            pickups=2,
+        )
+        manager2 = ResourceManager(
+            store=RedisResourceBindingStore(
+                redis_client=redis_client,
+                namespace="test",
+                task_id="task-stale-live-with-checkpoint",
+            ),
+            task_id="task-stale-live-with-checkpoint",
+            owner_id="owner-1",
+            agent_name="agent-1",
+            lease=ResourceLease.worker(2),
+        )
+        sandbox2 = await manager2.get(
+            Sandbox,
+            request_metadata=_vercel_request_metadata(),
+        )
+        _FakeAsyncSandbox.instances[sandbox2.id].status = "stopped"
+
+        manager3 = ResourceManager(
+            store=RedisResourceBindingStore(
+                redis_client=redis_client,
+                namespace="test",
+                task_id="task-stale-live-with-checkpoint",
+            ),
+            task_id="task-stale-live-with-checkpoint",
+            owner_id="owner-1",
+            agent_name="agent-1",
+            lease=ResourceLease.worker(2),
+        )
+        sandbox3 = await manager3.get(
+            Sandbox,
+            request_metadata=_vercel_request_metadata(),
+        )
+
+        assert sandbox1.id == "sb-1"
+        assert sandbox2.id == "sb-2"
+        assert sandbox3.id == "sb-3"
+        assert _FakeAsyncSandbox.get_ids[-1] == "sb-2"
+        assert _FakeAsyncSandbox.created_kwargs[-1]["source"] == {
+            "type": "snapshot",
+            "snapshot_id": "snap-sb-1",
+        }
+    finally:
+        await redis_client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_unavailable_live_sandbox_ref_without_checkpoint_creates_fresh(
+    monkeypatch,
+) -> None:
+    _FakeAsyncSandbox.reset()
+    _FakeAsyncSnapshotApi.reset()
+    monkeypatch.setattr(
+        "factorial.resources.sandbox.vercel._load_vercel_async_sandbox",
+        lambda: _FakeAsyncSandbox,
+    )
+    monkeypatch.setattr(
+        "factorial.resources.sandbox.vercel._load_vercel_async_snapshot",
+        lambda: _FakeAsyncSnapshotApi,
+    )
+
+    redis_client = fakeredis.aioredis.FakeRedis(decode_responses=True)
+    try:
+        await _seed_task_lease(
+            redis_client,
+            namespace="test",
+            task_id="task-stale-live-fresh",
+            pickups=1,
+        )
+        manager1 = ResourceManager(
+            store=RedisResourceBindingStore(
+                redis_client=redis_client,
+                namespace="test",
+                task_id="task-stale-live-fresh",
+            ),
+            task_id="task-stale-live-fresh",
+            owner_id="owner-1",
+            agent_name="agent-1",
+            lease=ResourceLease.worker(1),
+        )
+        sandbox1 = await manager1.get(
+            Sandbox,
+            request_metadata=_vercel_request_metadata(),
+        )
+        _FakeAsyncSandbox.instances[sandbox1.id].status = "stopped"
+
+        manager2 = ResourceManager(
+            store=RedisResourceBindingStore(
+                redis_client=redis_client,
+                namespace="test",
+                task_id="task-stale-live-fresh",
+            ),
+            task_id="task-stale-live-fresh",
+            owner_id="owner-1",
+            agent_name="agent-1",
+            lease=ResourceLease.worker(1),
+        )
+        sandbox2 = await manager2.get(
+            Sandbox,
+            request_metadata=_vercel_request_metadata(),
+        )
+
+        task_keys = RedisKeys.format(namespace="test", task_id="task-stale-live-fresh")
+        bindings = await redis_client.hgetall(task_keys.resource_bindings)
+        binding = json.loads(next(iter(bindings.values())))
+
+        assert sandbox1.id == "sb-1"
+        assert sandbox2.id == "sb-2"
+        assert _FakeAsyncSandbox.get_ids == ["sb-1"]
+        assert _FakeAsyncSandbox.created_kwargs[-1].get("source") is None
+        assert binding["binding_metadata"] == _vercel_request_metadata()
+    finally:
+        await redis_client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_attach_unavailable_commit_is_operation_fenced(
+    monkeypatch,
+) -> None:
+    _FakeAsyncSandbox.reset()
+    _FakeAsyncSnapshotApi.reset()
+    monkeypatch.setattr(
+        "factorial.resources.sandbox.vercel._load_vercel_async_sandbox",
+        lambda: _FakeAsyncSandbox,
+    )
+    monkeypatch.setattr(
+        "factorial.resources.sandbox.vercel._load_vercel_async_snapshot",
+        lambda: _FakeAsyncSnapshotApi,
+    )
+
+    redis_client = fakeredis.aioredis.FakeRedis(decode_responses=True)
+    try:
+        await _seed_task_lease(
+            redis_client,
+            namespace="test",
+            task_id="task-attach-conflict",
+            pickups=1,
+        )
+        manager = ResourceManager(
+            store=RedisResourceBindingStore(
+                redis_client=redis_client,
+                namespace="test",
+                task_id="task-attach-conflict",
+            ),
+            task_id="task-attach-conflict",
+            owner_id="owner-1",
+            agent_name="agent-1",
+            lease=ResourceLease.worker(1),
+        )
+        sandbox = await manager.get(
+            Sandbox,
+            request_metadata=_vercel_request_metadata(),
+        )
+
+        store = RedisResourceBindingStore(
+            redis_client=redis_client,
+            namespace="test",
+            task_id="task-attach-conflict",
+        )
+        decision = await store.begin_acquire(
+            resource_type_key_value=resource_type_key(Sandbox),
+            logical_name="default",
+            binding_metadata=_vercel_request_metadata(),
+            lease=ResourceLease.worker(1),
+            operation_id="attach-op",
+            now=1.0,
+            operation_timeout_s=15.0,
+        )
+        assert decision.outcome == "attach"
+        assert decision.reservation is not None
+
+        task_keys = RedisKeys.format(namespace="test", task_id="task-attach-conflict")
+        resource_field = f"{resource_type_key(Sandbox)}:default"
+        binding = json.loads(
+            await redis_client.hget(task_keys.resource_bindings, resource_field)
+        )
+        binding["operation_id"] = "other-op"
+        await redis_client.hset(
+            task_keys.resource_bindings,
+            resource_field,
+            json.dumps(binding),
+        )
+
+        status = await store.commit_attach_unavailable(
+            reservation=decision.reservation,
+            lease=ResourceLease.worker(1),
+            now=2.0,
+        )
+        persisted = json.loads(
+            await redis_client.hget(task_keys.resource_bindings, resource_field)
+        )
+
+        assert status == "operation_conflict"
+        assert persisted["live_ref"]["ref"] == sandbox.id
+        assert persisted["operation_id"] == "other-op"
     finally:
         await redis_client.aclose()
 

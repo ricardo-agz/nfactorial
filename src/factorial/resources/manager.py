@@ -233,6 +233,7 @@ class ResourceManager:
                 )
                 resource: R | None = None
                 should_destroy_on_failure = decision.outcome in {"create", "restore"}
+                should_abort_on_failure = True
                 try:
                     if decision.outcome == "create":
                         resource = await lifecycle.create(ctx, effective_request)
@@ -268,7 +269,11 @@ class ResourceManager:
                             else None
                         )
                         if resource is None:
-                            await self._abort(reservation)
+                            should_abort_on_failure = False
+                            await self._commit_attach_unavailable(
+                                reservation,
+                                request,
+                            )
                             continue
                         should_destroy_on_failure = False
                     else:
@@ -291,6 +296,7 @@ class ResourceManager:
                         now=time.time(),
                     )
                     if commit_status != "ok":
+                        should_abort_on_failure = False
                         raise ResourceLeaseLostError(
                             "Failed to commit live resource binding: "
                             f"{commit_status} "
@@ -303,14 +309,15 @@ class ResourceManager:
                         resource=wrapped_resource,
                     )
                 except Exception:
-                    try:
-                        await self._abort(reservation)
-                    except Exception:
-                        logger.exception(
-                            "Failed to abort resource reservation for %s/%s",
-                            request.resource_type_key,
-                            logical_name,
-                        )
+                    if should_abort_on_failure:
+                        try:
+                            await self._abort(reservation)
+                        except Exception:
+                            logger.exception(
+                                "Failed to abort resource reservation for %s/%s",
+                                request.resource_type_key,
+                                logical_name,
+                            )
                     if resource is not None and should_destroy_on_failure:
                         try:
                             await lifecycle.destroy(
@@ -613,16 +620,7 @@ class ResourceManager:
     ) -> Any | None:
         if not lifecycle_supports_live_refs(lifecycle):
             return None
-        try:
-            return await lifecycle.attach_live(live_ref, ctx, request)
-        except Exception:
-            logger.warning(
-                "Failed to attach live resource %s for %s",
-                live_ref.ref,
-                request.resource_type_key,
-                exc_info=True,
-            )
-            return None
+        return await lifecycle.attach_live(live_ref, ctx, request)
 
     def _capture_live_ref(
         self,
@@ -665,6 +663,29 @@ class ResourceManager:
                 "Failed to abort resource reservation "
                 f"{reservation.resource_type_key}/{reservation.logical_name}: {status}"
             )
+
+    async def _commit_attach_unavailable(
+        self,
+        reservation: ResourceReservation,
+        request: ResourceRequest[Any],
+    ) -> None:
+        status = await self.store.commit_attach_unavailable(
+            reservation=reservation,
+            lease=self.lease,
+            now=time.time(),
+        )
+        if status == "ok":
+            return
+        if status == "stale_owner":
+            raise ResourceLeaseLostError(
+                "Cannot mark live resource unavailable for "
+                f"{request.resource_type_key}/{request.logical_name}; "
+                "the task is no longer owned by this worker."
+            )
+        raise RuntimeError(
+            "Failed to commit unavailable live resource binding "
+            f"{request.resource_type_key}/{request.logical_name}: {status}"
+        )
 
     def _request_with_binding_metadata(
         self,

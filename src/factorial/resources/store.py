@@ -16,6 +16,7 @@ from .core import (
     RESOURCE_PHASE_CHECKPOINTING,
     RESOURCE_PHASE_CREATING,
     RESOURCE_PHASE_DESTROYING,
+    RESOURCE_PHASE_FRESH,
     RESOURCE_PHASE_LIVE,
     RESOURCE_PHASE_RESTORING,
     LiveResourceRef,
@@ -23,18 +24,23 @@ from .core import (
     ResourceCheckpoint,
 )
 from .scripts import (
+    ResourceAttachUnavailableScript,
+    ResourceAttachUnavailableScriptInput,
+    ResourceBeginMode,
     ResourceBeginScript,
     ResourceBeginScriptInput,
     ResourceCommitLiveScript,
     ResourceCommitLiveScriptInput,
     ResourceFinishScript,
     ResourceFinishScriptInput,
+    create_resource_attach_unavailable_script,
     create_resource_begin_script,
     create_resource_commit_live_script,
     create_resource_finish_script,
 )
 
 logger = get_logger(__name__)
+
 
 class ResourceLeaseLostError(RuntimeError):
     """Raised when the current worker no longer owns the task's resource lease."""
@@ -125,6 +131,14 @@ class ResourceBindingStore(Protocol):
         now: float,
     ) -> str: ...
 
+    async def commit_attach_unavailable(
+        self,
+        *,
+        reservation: ResourceReservation,
+        lease: ResourceLease,
+        now: float,
+    ) -> str: ...
+
     async def commit_checkpoint(
         self,
         *,
@@ -175,6 +189,17 @@ class InMemoryResourceBindingStore:
             operation_timeout_s=operation_timeout_s,
         ).record
 
+    def _binding_metadata_for_create(
+        self,
+        record: ResourceBindingRecord | None,
+        binding_metadata: dict[str, Any],
+    ) -> dict[str, Any]:
+        if record is not None and (
+            record.binding_metadata or not binding_metadata
+        ):
+            return dict(record.binding_metadata)
+        return dict(binding_metadata)
+
     async def begin_acquire(
         self,
         *,
@@ -206,7 +231,10 @@ class InMemoryResourceBindingStore:
             self._bindings[key] = ResourceBindingRecord(
                 resource_type_key=resource_type_key_value,
                 logical_name=logical_name,
-                binding_metadata=dict(binding_metadata),
+                binding_metadata=self._binding_metadata_for_create(
+                    record,
+                    binding_metadata,
+                ),
                 phase=RESOURCE_PHASE_CREATING,
                 owner_pickups=lease.processing_pickups,
                 operation_id=operation_id,
@@ -241,6 +269,10 @@ class InMemoryResourceBindingStore:
         self._bindings[key] = ResourceBindingRecord(
             resource_type_key=resource_type_key_value,
             logical_name=logical_name,
+            binding_metadata=self._binding_metadata_for_create(
+                record,
+                binding_metadata,
+            ),
             phase=RESOURCE_PHASE_CREATING,
             owner_pickups=lease.processing_pickups,
             operation_id=operation_id,
@@ -345,6 +377,32 @@ class InMemoryResourceBindingStore:
         self._bindings[key] = record
         return "ok"
 
+    async def commit_attach_unavailable(
+        self,
+        *,
+        reservation: ResourceReservation,
+        lease: ResourceLease,
+        now: float,
+    ) -> str:
+        del lease
+        key = self._key(reservation.resource_type_key, reservation.logical_name)
+        record = self._bindings.get(key)
+        if record is None:
+            return "missing"
+        if record.operation_id != reservation.operation_id:
+            return "operation_conflict"
+        record.live_ref = None
+        record.owner_pickups = None
+        record.operation_id = None
+        record.updated_at = now
+        record.phase = (
+            RESOURCE_PHASE_CHECKPOINTED
+            if record.has_checkpoint()
+            else RESOURCE_PHASE_FRESH
+        )
+        self._bindings[key] = record
+        return "ok"
+
     async def commit_checkpoint(
         self,
         *,
@@ -442,6 +500,7 @@ class RedisResourceBindingStore:
         self.root_keys = RedisKeys.format(namespace=namespace)
         self._begin_script: ResourceBeginScript | None = None
         self._commit_live_script: ResourceCommitLiveScript | None = None
+        self._attach_unavailable_script: ResourceAttachUnavailableScript | None = None
         self._finish_script: ResourceFinishScript | None = None
 
     def _field_name(self, resource_type_key_value: str, logical_name: str) -> str:
@@ -458,6 +517,13 @@ class RedisResourceBindingStore:
                 self.redis_client
             )
         return self._commit_live_script
+
+    async def _get_attach_unavailable_script(self) -> ResourceAttachUnavailableScript:
+        if self._attach_unavailable_script is None:
+            self._attach_unavailable_script = (
+                await create_resource_attach_unavailable_script(self.redis_client)
+            )
+        return self._attach_unavailable_script
 
     async def _get_finish_script(self) -> ResourceFinishScript:
         if self._finish_script is None:
@@ -569,7 +635,7 @@ class RedisResourceBindingStore:
         now: float,
         operation_timeout_s: float,
     ) -> ResourceDecision:
-        mode = "destroy" if lease.is_worker else "system_destroy"
+        mode: ResourceBeginMode = "destroy" if lease.is_worker else "system_destroy"
         result = await (await self._get_begin_script()).execute(
             ResourceBeginScriptInput(
                 task_statuses_key=self.root_keys.task_status,
@@ -624,6 +690,32 @@ class RedisResourceBindingStore:
                 now_timestamp=now,
                 live_ref_json=live_ref.to_json() if live_ref is not None else None,
                 checkpoint_json=checkpoint_json,
+            )
+        )
+        return result.status
+
+    async def commit_attach_unavailable(
+        self,
+        *,
+        reservation: ResourceReservation,
+        lease: ResourceLease,
+        now: float,
+    ) -> str:
+        if not lease.is_worker or lease.processing_pickups is None:
+            return "not_allowed"
+        result = await (await self._get_attach_unavailable_script()).execute(
+            ResourceAttachUnavailableScriptInput(
+                task_statuses_key=self.root_keys.task_status,
+                task_pickups_key=self.root_keys.task_pickups,
+                resource_bindings_key=self.keys.resource_bindings,
+                task_id=self.task_id,
+                resource_field=self._field_name(
+                    reservation.resource_type_key,
+                    reservation.logical_name,
+                ),
+                expected_pickups=lease.processing_pickups,
+                operation_id=reservation.operation_id,
+                now_timestamp=now,
             )
         )
         return result.status

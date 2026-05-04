@@ -199,17 +199,17 @@ async def park_command(
             timeout_cron_expression=command.timeout_cron_expression,
             timeout_cron_timezone=command.timeout_cron_timezone,
         )
-        event_data: dict[str, Any] = {
+        activity_event_data: dict[str, Any] = {
             "wait_kind": "activity",
             "source_tool_call_ids": list(command.source_tool_call_ids),
         }
         if command.timeout_wake_timestamp is not None:
-            event_data["timeout_kind"] = command.timeout_kind
-            event_data["wake_timestamp"] = command.timeout_wake_timestamp
+            activity_event_data["timeout_kind"] = command.timeout_kind
+            activity_event_data["wake_timestamp"] = command.timeout_wake_timestamp
             if command.timeout_cron_expression is not None:
-                event_data["timeout_cron"] = command.timeout_cron_expression
+                activity_event_data["timeout_cron"] = command.timeout_cron_expression
             if command.timeout_cron_timezone is not None:
-                event_data["timeout_timezone"] = command.timeout_cron_timezone
+                activity_event_data["timeout_timezone"] = command.timeout_cron_timezone
         await event_publisher.publish_event(
             AgentEvent(
                 event_type="task_activity_waiting",
@@ -217,7 +217,7 @@ async def park_command(
                 owner_id=task.metadata.owner_id,
                 agent_name=agent.name,
                 turn=task.payload.turn_number,
-                data=event_data,
+                data=activity_event_data,
             )
         )
         return
@@ -232,18 +232,18 @@ async def park_command(
             timeout_cron_expression=command.timeout_cron_expression,
             timeout_cron_timezone=command.timeout_cron_timezone,
         )
-        event_data: dict[str, Any] = {
+        signal_event_data: dict[str, Any] = {
             "wait_kind": "signal",
             "signal_id": command.signal_id,
             "source_tool_call_ids": list(command.source_tool_call_ids),
         }
         if command.timeout_wake_timestamp is not None:
-            event_data["timeout_kind"] = command.timeout_kind
-            event_data["wake_timestamp"] = command.timeout_wake_timestamp
+            signal_event_data["timeout_kind"] = command.timeout_kind
+            signal_event_data["wake_timestamp"] = command.timeout_wake_timestamp
             if command.timeout_cron_expression is not None:
-                event_data["timeout_cron"] = command.timeout_cron_expression
+                signal_event_data["timeout_cron"] = command.timeout_cron_expression
             if command.timeout_cron_timezone is not None:
-                event_data["timeout_timezone"] = command.timeout_cron_timezone
+                signal_event_data["timeout_timezone"] = command.timeout_cron_timezone
         await event_publisher.publish_event(
             AgentEvent(
                 event_type=(
@@ -255,7 +255,7 @@ async def park_command(
                 owner_id=task.metadata.owner_id,
                 agent_name=agent.name,
                 turn=task.payload.turn_number,
-                data=event_data,
+                data=signal_event_data,
             )
         )
         return

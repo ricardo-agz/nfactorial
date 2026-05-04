@@ -67,10 +67,12 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 factorial = [
-    "queue/lua/scripts/*.lua",
-    "dashboard/*.html",
-    "dashboard/*.js",
-    "dashboard/assets/*",
+    "py.typed",
+    "queue/scripts/*.lua",
+    "queue/scripts/**/*.lua",
+    "observability/dashboard/*.html",
+    "observability/dashboard/*.js",
+    "observability/dashboard/assets/*",
 ]
 
 [tool.black]

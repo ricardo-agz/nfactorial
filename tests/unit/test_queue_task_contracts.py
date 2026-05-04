@@ -6,9 +6,10 @@ import uuid
 
 import pytest
 
+from factorial._internal.queue.task_store import task_team_id
 from factorial.agent.context import AgentContext
 from factorial.core.exceptions import CorruptedTaskDataError
-from factorial.queue.task import Task, TaskMetadata, TaskStatus, task_team_id
+from factorial.queue.task import Task, TaskMetadata, TaskStatus
 
 
 def test_task_status_rejects_invalid_value() -> None:

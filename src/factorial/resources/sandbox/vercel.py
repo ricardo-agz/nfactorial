@@ -12,7 +12,6 @@ from ..core import (
     ResourceCheckpoint,
     ResourceContext,
     ResourceRequest,
-    register_resource_lifecycle,
 )
 from .base import (
     Sandbox,
@@ -22,6 +21,7 @@ from .base import (
     SandboxWriteFile,
     encode_sandbox_file_content,
 )
+from .providers import SandboxProvider
 
 _DEFAULT_EXPOSED_PORTS = [
     3000,
@@ -56,6 +56,8 @@ class _VercelSnapshotLike(Protocol):
 
     @property
     def expires_at(self) -> int: ...
+
+    async def delete(self) -> None: ...
 
 
 class _VercelCommandResultLike(Protocol):
@@ -153,6 +155,17 @@ class _VercelAsyncSandboxFactory(Protocol):
     ) -> _VercelAsyncSandboxLike: ...
 
 
+class _VercelAsyncSnapshotFactory(Protocol):
+    @staticmethod
+    async def get(
+        *,
+        snapshot_id: str,
+        token: str | None = None,
+        project_id: str | None = None,
+        team_id: str | None = None,
+    ) -> _VercelSnapshotLike: ...
+
+
 def _configured_ports() -> list[int]:
     raw = os.getenv("NFACTORIAL_SANDBOX_PORTS")
     if raw is None or not raw.strip():
@@ -214,6 +227,43 @@ def _load_vercel_async_sandbox() -> _VercelAsyncSandboxFactory:
             "Installed `vercel` package does not expose `vercel.sandbox.AsyncSandbox`."
         )
     return async_sandbox
+
+
+def _is_vercel_async_snapshot_factory(
+    value: object,
+) -> TypeGuard[_VercelAsyncSnapshotFactory]:
+    get = getattr(value, "get", None)
+    return callable(get)
+
+
+def _load_vercel_async_snapshot() -> _VercelAsyncSnapshotFactory:
+    try:
+        module = importlib.import_module("vercel.sandbox.snapshot")
+    except ImportError as exc:  # pragma: no cover
+        raise RuntimeError(
+            "Sandbox checkpoint cleanup requires the `vercel` package. "
+            'Install it with `pip install "nfactorial[vercel]"`.'
+        ) from exc
+    async_snapshot: object = getattr(module, "AsyncSnapshot", None)
+    if not _is_vercel_async_snapshot_factory(async_snapshot):
+        raise RuntimeError(
+            "Installed `vercel` package does not expose "
+            "`vercel.sandbox.snapshot.AsyncSnapshot`."
+        )
+    return async_snapshot
+
+
+def _is_not_found_error(exc: Exception) -> bool:
+    status_code = getattr(exc, "status_code", None)
+    if status_code is None:
+        response = getattr(exc, "response", None)
+        status_code = getattr(response, "status_code", None)
+    if status_code is None:
+        return False
+    try:
+        return int(status_code) == 404
+    except (TypeError, ValueError):
+        return False
 
 
 async def _ensure_running(native_sandbox: _VercelAsyncSandboxLike) -> None:
@@ -356,14 +406,13 @@ class VercelSandboxHandle(Sandbox):
         )
 
 
-class VercelSandboxLifecycle:
-    @classmethod
+class VercelSandboxProvider(SandboxProvider):
     async def create(
-        cls,
+        self,
         ctx: ResourceContext,
         request: ResourceRequest[Sandbox],
     ) -> Sandbox:
-        del ctx, request
+        del self, ctx, request
         async_sandbox = _load_vercel_async_sandbox()
         sandbox = await async_sandbox.create(
             ports=_configured_ports(),
@@ -373,14 +422,13 @@ class VercelSandboxLifecycle:
         await _ensure_running(sandbox)
         return VercelSandboxHandle(sandbox=sandbox)
 
-    @classmethod
     async def restore(
-        cls,
+        self,
         checkpoint: ResourceCheckpoint,
         ctx: ResourceContext,
         request: ResourceRequest[Sandbox],
     ) -> Sandbox:
-        del ctx, request
+        del self, ctx, request
         async_sandbox = _load_vercel_async_sandbox()
         source: _VercelSnapshotSource = {
             "type": "snapshot",
@@ -395,65 +443,85 @@ class VercelSandboxLifecycle:
         await _ensure_running(sandbox)
         return VercelSandboxHandle(sandbox=sandbox)
 
-    @classmethod
     async def checkpoint(
-        cls,
+        self,
         resource: Sandbox,
         ctx: ResourceContext,
         request: ResourceRequest[Sandbox],
     ) -> ResourceCheckpoint | None:
-        del ctx, request
+        del self, ctx, request
         return await resource.checkpoint()
 
-    @classmethod
     async def destroy(
-        cls,
+        self,
         resource: Sandbox,
         ctx: ResourceContext,
         request: ResourceRequest[Sandbox],
     ) -> None:
-        del ctx, request
-        if isinstance(resource, VercelSandboxHandle):
+        del self, ctx, request
+        native = resource.native
+        stop = getattr(native, "stop", None)
+        if callable(stop):
             with suppress(Exception):
-                await resource.sandbox.stop()
+                await stop()
 
-    @classmethod
     async def attach_live(
-        cls,
+        self,
         live_ref: LiveResourceRef,
         ctx: ResourceContext,
         request: ResourceRequest[Sandbox],
     ) -> Sandbox | None:
-        del ctx, request
+        del self, ctx, request
         async_sandbox = _load_vercel_async_sandbox()
-        with suppress(Exception):
+        try:
             sandbox = await async_sandbox.get(sandbox_id=live_ref.ref)
-            if sandbox.status not in {"running", "pending"}:
+        except Exception as exc:
+            if _is_not_found_error(exc):
                 return None
-            await _ensure_running(sandbox)
-            return VercelSandboxHandle(sandbox=sandbox)
-        return None
+            raise
+        if sandbox.status not in {"running", "pending"}:
+            return None
+        await _ensure_running(sandbox)
+        return VercelSandboxHandle(sandbox=sandbox)
 
-    @classmethod
     def capture_live_ref(
-        cls,
+        self,
         resource: Sandbox,
         ctx: ResourceContext,
         request: ResourceRequest[Sandbox],
     ) -> LiveResourceRef | None:
-        del ctx, request
+        del self, ctx, request
         return LiveResourceRef(
             provider="vercel",
             kind="sandbox",
             ref=resource.id,
         )
 
+    async def delete_checkpoint(
+        self,
+        checkpoint: ResourceCheckpoint,
+        ctx: ResourceContext,
+        request: ResourceRequest[Sandbox],
+    ) -> None:
+        del self, ctx, request
+        async_snapshot = _load_vercel_async_snapshot()
+        with suppress(Exception):
+            snapshot = await async_snapshot.get(snapshot_id=checkpoint.ref)
+            await snapshot.delete()
 
-register_resource_lifecycle(Sandbox, VercelSandboxLifecycle)
+_VERCEL_PROVIDER: VercelSandboxProvider | None = None
+
+
+def get_provider() -> SandboxProvider:
+    global _VERCEL_PROVIDER
+    if _VERCEL_PROVIDER is None:
+        _VERCEL_PROVIDER = VercelSandboxProvider()
+    return _VERCEL_PROVIDER
 
 
 __all__ = [
     "VercelSandboxHandle",
-    "VercelSandboxLifecycle",
+    "VercelSandboxProvider",
     "VercelSandboxProcess",
+    "get_provider",
 ]

@@ -2,7 +2,10 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-from .maintenance_runner import run_maintenance_invocation
+from factorial._internal.platforms.vercel.maintenance_runner import (
+    run_maintenance_invocation,
+)
+
 from .settings import VercelRuntimeSettings
 
 if TYPE_CHECKING:

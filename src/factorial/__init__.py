@@ -182,8 +182,11 @@ from factorial.resources import (
     Sandbox,
     SandboxCheckpoint,
     SandboxExecResult,
+    SandboxLifecycle,
     SandboxProcess,
+    SandboxProvider,
     SandboxWriteFile,
+    register_sandbox_provider,
     resource,
 )
 
@@ -260,8 +263,11 @@ __all__ = [
     "Sandbox",
     "SandboxCheckpoint",
     "SandboxExecResult",
+    "SandboxLifecycle",
+    "SandboxProvider",
     "SandboxProcess",
     "SandboxWriteFile",
+    "register_sandbox_provider",
     "InboxMessage",
     "InboxMessagePage",
     "InboxReceipt",

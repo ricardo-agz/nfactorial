@@ -73,6 +73,154 @@ local function load_task(keys, args)
     }
 end
 
+local RESOURCE_PHASE_FRESH = "fresh"
+local RESOURCE_PHASE_LIVE = "live"
+local RESOURCE_PHASE_CHECKPOINTED = "checkpointed"
+local RESOURCE_PHASE_CREATING = "creating"
+local RESOURCE_PHASE_RESTORING = "restoring"
+local RESOURCE_PHASE_ATTACHING = "attaching"
+local RESOURCE_PHASE_CHECKPOINTING = "checkpointing"
+local RESOURCE_PHASE_DESTROYING = "destroying"
+
+
+local function resource_decode_binding(raw)
+    if not raw or raw == "" then
+        return nil
+    end
+
+    local ok, decoded = pcall(cjson.decode, raw)
+    if not ok or type(decoded) ~= "table" then
+        return nil
+    end
+
+    if type(decoded.resource_type_key) ~= "string" then
+        return nil
+    end
+    if type(decoded.logical_name) ~= "string" then
+        return nil
+    end
+
+    decoded.phase = type(decoded.phase) == "string" and decoded.phase or "fresh"
+    decoded.updated_at = tonumber(decoded.updated_at) or 0
+    if decoded.owner_pickups ~= nil then
+        decoded.owner_pickups = tonumber(decoded.owner_pickups)
+    end
+    if type(decoded.operation_id) ~= "string" then
+        decoded.operation_id = nil
+    end
+    if type(decoded.live_ref) ~= "table" then
+        decoded.live_ref = nil
+    end
+    if type(decoded.checkpoint) ~= "table" then
+        decoded.checkpoint = nil
+    end
+    if type(decoded.binding_metadata) ~= "table" then
+        decoded.binding_metadata = {}
+    end
+    return decoded
+end
+
+
+local function resource_encode_binding(binding)
+    return cjson.encode(binding)
+end
+
+
+local function resource_binding_has_live_ref(binding)
+    return binding
+        and type(binding.live_ref) == "table"
+        and type(binding.live_ref.ref) == "string"
+        and binding.live_ref.ref ~= ""
+end
+
+
+local function resource_binding_has_checkpoint(binding)
+    return binding
+        and type(binding.checkpoint) == "table"
+        and type(binding.checkpoint.ref) == "string"
+        and binding.checkpoint.ref ~= ""
+end
+
+
+local function resource_checkpoint_expired(binding, now_timestamp)
+    if not resource_binding_has_checkpoint(binding) then
+        return false
+    end
+    local metadata = binding.checkpoint.metadata
+    if type(metadata) ~= "table" then
+        return false
+    end
+    if metadata.expires_at == nil then
+        return false
+    end
+    local expiry = tonumber(metadata.expires_at)
+    if expiry == nil then
+        return false
+    end
+    return expiry <= now_timestamp
+end
+
+
+local function resource_is_inflight_phase(phase)
+    return phase == RESOURCE_PHASE_CREATING
+        or phase == RESOURCE_PHASE_RESTORING
+        or phase == RESOURCE_PHASE_ATTACHING
+        or phase == RESOURCE_PHASE_CHECKPOINTING
+        or phase == RESOURCE_PHASE_DESTROYING
+end
+
+
+local function resource_recover_binding(binding, now_timestamp, operation_timeout_s)
+    if binding == nil then
+        return nil, false, false
+    end
+
+    local mutated = false
+    if resource_checkpoint_expired(binding, now_timestamp) then
+        binding.checkpoint = nil
+        mutated = true
+    end
+
+    local previous_phase = binding.phase
+    if resource_is_inflight_phase(previous_phase) then
+        local age = now_timestamp - (tonumber(binding.updated_at) or 0)
+        if age < operation_timeout_s then
+            return binding, mutated, true
+        end
+
+        binding.operation_id = nil
+        binding.owner_pickups = nil
+        if resource_binding_has_live_ref(binding)
+            or previous_phase == RESOURCE_PHASE_CHECKPOINTING
+            or previous_phase == RESOURCE_PHASE_DESTROYING
+            or previous_phase == RESOURCE_PHASE_LIVE
+        then
+            binding.phase = RESOURCE_PHASE_LIVE
+        elseif resource_binding_has_checkpoint(binding) then
+            binding.phase = RESOURCE_PHASE_CHECKPOINTED
+        else
+            return nil, true, false
+        end
+        binding.updated_at = now_timestamp
+        mutated = true
+    elseif binding.operation_id ~= nil then
+        binding.operation_id = nil
+        binding.owner_pickups = nil
+        binding.updated_at = now_timestamp
+        mutated = true
+    end
+
+    if binding.phase ~= RESOURCE_PHASE_LIVE
+        and binding.phase ~= RESOURCE_PHASE_FRESH
+        and not resource_binding_has_live_ref(binding)
+        and not resource_binding_has_checkpoint(binding)
+    then
+        return nil, true, false
+    end
+
+    return binding, mutated, false
+end
+
 --[[
 ---------------------------------------------------------------------
 Usage:

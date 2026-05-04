@@ -11,11 +11,7 @@ import pytest
 import pytest_asyncio
 import redis.asyncio as redis
 
-from factorial.agent import BaseAgent, TurnCompletion
-from factorial.agent.context import AgentContext
-from factorial.ai.models import Model, Provider
-from factorial.queue.keys import PENDING_SENTINEL, RedisKeys
-from factorial.queue.lua import (
+from factorial._internal.lua.queue import (
     BackoffRecoveryScript,
     BatchPickupScript,
     BatchPickupScriptResult,
@@ -47,9 +43,13 @@ from factorial.queue.lua import (
     create_tool_completion_script,
     create_wait_schedule_script,
 )
-from factorial.queue.operations import enqueue_task
+from factorial._internal.queue.keys import PENDING_SENTINEL, RedisKeys
+from factorial._internal.queue.operations import enqueue_task
+from factorial._internal.queue.worker import CompletionAction
+from factorial.agent import BaseAgent, TurnCompletion
+from factorial.agent.context import AgentContext
+from factorial.ai.models import Model, Provider
 from factorial.queue.task import Task, TaskStatus
-from factorial.queue.worker import CompletionAction
 
 MOCK_MODEL = Model(
     name="mock-model",
@@ -527,15 +527,31 @@ class ScriptRunner:
             updated_task_context_json=payload_json,
         )
 
-    async def complete_child(
-        self, task_id: str, payload_json: str
-    ) -> tuple[bool, str]:
+    async def complete_child(self, task_id: str, payload_json: str) -> tuple[bool, str]:
         """Complete child task results for a task."""
         assert self._child_completion_script is not None
         task_keys = RedisKeys.format(
             namespace=self.namespace,
             agent=self.agent_name,
             task_id=task_id,
+        )
+        wait_child_ids = sorted(
+            str(child_id)
+            for child_id in await self.redis_client.smembers(
+                task_keys.pending_child_wait_ids
+            )
+        )
+        result_values = await self.redis_client.hmget(
+            task_keys.pending_child_task_results,
+            wait_child_ids,
+        )
+        status_values = await self.redis_client.hmget(
+            self.keys.task_status,
+            wait_child_ids,
+        )
+        activity_values = await self.redis_client.hmget(
+            self.keys.activity_wait_meta,
+            wait_child_ids,
         )
         return await self._child_completion_script.execute(
             queue_main_key=self.keys.queue_main,
@@ -549,8 +565,19 @@ class ScriptRunner:
             task_pickups_key=self.keys.task_pickups,
             task_retries_key=self.keys.task_retries,
             task_metas_key=self.keys.task_meta,
+            activity_wait_meta_key=self.keys.activity_wait_meta,
             task_id=task_id,
             updated_task_context_json=payload_json,
+            expected_wait_child_ids=wait_child_ids,
+            expected_result_values=[
+                str(value) if value is not None else None for value in result_values
+            ],
+            expected_child_statuses=[
+                str(value) if value is not None else None for value in status_values
+            ],
+            expected_child_activity_waiting=[
+                value is not None for value in activity_values
+            ],
         )
 
     async def steer(

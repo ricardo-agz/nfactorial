@@ -8,8 +8,8 @@ from typing import Any, Generic
 from pydantic import TypeAdapter
 from typing_extensions import TypeVar
 
+from factorial._internal.serialization import serialize_data
 from factorial.ai.messages import Message
-from factorial.core.utils import serialize_data
 
 
 @dataclass

@@ -3,12 +3,14 @@ from __future__ import annotations
 import os
 from typing import Literal
 
+from factorial._internal.platforms.vercel.wake_dispatcher import (
+    build_vercel_wake_dispatch,
+)
 from factorial.core.logging import get_logger
 from factorial.orchestrator import Orchestrator
 from factorial.orchestrator.wake_dispatch import NoopWakeDispatch
 
 from .settings import VercelRuntimeSettings
-from .wake_dispatcher import build_vercel_wake_dispatch
 
 logger = get_logger(__name__)
 

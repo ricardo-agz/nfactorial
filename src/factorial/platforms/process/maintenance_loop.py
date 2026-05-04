@@ -1,3 +1,3 @@
-from factorial.queue.maintenance.loop import maintenance_loop
+from factorial._internal.queue.maintenance.loop import maintenance_loop
 
 __all__ = ["maintenance_loop"]

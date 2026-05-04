@@ -23,8 +23,13 @@ class Resources:
 
 
 class Sandboxes:
-    async def get(self, name: str = "default") -> Sandbox:
-        return await _resource_namespace().get_resource(Sandbox, name)
+    async def get(
+        self,
+        name: str = "default",
+        *,
+        provider: str | None = None,
+    ) -> Sandbox:
+        return await _resource_namespace().get_sandbox(name, provider=provider)
 
     async def checkpoint(self, name: str = "default") -> SandboxCheckpoint | None:
         checkpoint = await _resource_namespace().checkpoint_resource(Sandbox, name)

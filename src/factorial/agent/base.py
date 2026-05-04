@@ -13,8 +13,6 @@ from typing import (
     Generic,
     Literal,
     cast,
-    get_args,
-    get_origin,
 )
 
 import httpx
@@ -25,22 +23,33 @@ from openai.types.chat import (
 from openai.types.chat.chat_completion_message_function_tool_call import (
     ChatCompletionMessageFunctionToolCall,
 )
-from pydantic import TypeAdapter
 from typing_extensions import TypeVar
 
-from factorial.agent.context import (
-    AgentContext,
-    ContextType,
-    EmptyMetadata,
-    EmptyState,
+from factorial._internal.agent.context_types import (
+    coerce_typed_payload,
+    default_typed_payload,
+    resolve_state_and_metadata_types,
 )
-from factorial.agent.helpers import (
+from factorial._internal.agent.helpers import (
     _DirectEventPublisher,
     _maybe_call_prepare_turn,
     _RunFailureError,
     chain_prepare_turn,
     invoke_callable_non_blocking,
     retry,
+)
+from factorial._internal.agent.tools.runtime import execute_tools
+from factorial._internal.agent.tools.types import _ToolResultInternal
+from factorial._internal.agent.types import ToolExecutionResults
+from factorial._internal.execution.dependencies import (
+    inject_runtime_kwargs,
+    is_runtime_injected_annotation,
+)
+from factorial._internal.serialization import serialize_data
+from factorial.agent.context import (
+    AgentContext,
+    ContextType,
+    EmptyMetadata,
 )
 from factorial.agent.stop import (
     StopCondition,
@@ -56,16 +65,13 @@ from factorial.agent.stop import (
 )
 from factorial.agent.tools.core import (
     ToolDefinition,
-    _ToolResultInternal,
     convert_tools_list,
 )
-from factorial.agent.tools.runtime import execute_tools
 from factorial.agent.types import (
     Callbacks,
     EventCallback,
     PrepareTurnHook,
     ToolChoice,
-    ToolExecutionResults,
     Turn,
     TurnCompletion,
 )
@@ -110,14 +116,10 @@ from factorial.core.run_types import (
     VerifierRetry,
     verify,
 )
-from factorial.core.utils import serialize_data, to_snake_case
+from factorial.core.utils import to_snake_case
 from factorial.execution.context import (
     ExecutionContext,
     execution_context,
-)
-from factorial.execution.dependencies import (
-    inject_runtime_kwargs,
-    is_runtime_injected_annotation,
 )
 from factorial.execution.waits import WaitInstruction
 from factorial.resources import (
@@ -151,6 +153,7 @@ class BaseAgent(Generic[ContextType]):
         prepare_turn: PrepareTurnHook | None = None,
         stop_when: StopWhen | StopCondition | None = None,
         verifier: Verifier | None = None,
+        sandbox: str | None = None,
         callbacks: Callbacks | None = None,
         http_client: httpx.AsyncClient | None = None,
         client: MultiClient | None = None,
@@ -173,6 +176,7 @@ class BaseAgent(Generic[ContextType]):
             turn_count_is(10),
         )
         self.verifier = verifier
+        self.default_sandbox_provider = sandbox
         self.callbacks = callbacks or Callbacks()
         self.max_turns = _infer_turn_limit_hint(self.stop_when)
 
@@ -181,54 +185,18 @@ class BaseAgent(Generic[ContextType]):
         self.model: Model | Callable[[ContextType], Model] = model
 
     def _resolve_state_and_metadata_types(self) -> tuple[Any, Any]:
-        original = getattr(self, "__orig_class__", None)
-        if original is None:
-            return EmptyState, EmptyMetadata
-
-        original_args = get_args(original)
-        if len(original_args) >= 2:
-            return original_args[0], original_args[1]
-
-        if len(original_args) == 1:
-            first_arg = original_args[0]
-            context_origin = get_origin(first_arg)
-            context_args = get_args(first_arg)
-            if context_origin is AgentContext:
-                if len(context_args) >= 2:
-                    return context_args[0], context_args[1]
-                if len(context_args) == 1:
-                    return context_args[0], EmptyMetadata
-                return EmptyState, EmptyMetadata
-            if isinstance(first_arg, type) and issubclass(first_arg, AgentContext):
-                return EmptyState, EmptyMetadata
-            return first_arg, EmptyMetadata
-
-        return EmptyState, EmptyMetadata
+        return resolve_state_and_metadata_types(self)
 
     def _default_typed_payload(self, target_type: Any, *, label: str) -> Any:
-        if target_type in (Any, object, None, EmptyState, EmptyMetadata):
-            return EmptyState() if label == "state" else EmptyMetadata()
-        if isinstance(target_type, type):
-            try:
-                return target_type()
-            except Exception as exc:
-                raise ValueError(
-                    f"{label} must be provided because {target_type!r} "
-                    "does not have a default constructor"
-                ) from exc
-        raise ValueError(f"{label} must be provided")
+        return default_typed_payload(target_type, label=label)
 
     def _coerce_typed_payload(self, value: Any, target_type: Any, *, label: str) -> Any:
-        if value is None:
-            return self._default_typed_payload(target_type, label=label)
-        if target_type in (Any, object, None):
-            return value
-        if isinstance(target_type, type) and isinstance(value, target_type):
-            return value
-        try:
-            return TypeAdapter(target_type).validate_python(value)
-        except Exception as exc:
-            raise TypeError(f"Invalid {label} for agent {self.name}: {exc}") from exc
+        return coerce_typed_payload(
+            value,
+            target_type,
+            label=label,
+            agent_name=self.name,
+        )
 
     def build_context(
         self,
@@ -853,7 +821,8 @@ class BaseAgent(Generic[ContextType]):
                     task_id=task_id,
                     owner_id=owner_id,
                     agent_name=self.name,
-                )
+                ),
+                default_sandbox_provider=self.default_sandbox_provider,
             ),
         )
         token = execution_context.set(execution_ctx)
@@ -1029,7 +998,8 @@ class BaseAgent(Generic[ContextType]):
                         task_id=task_id,
                         owner_id=owner_id,
                         agent_name=self.name,
-                    )
+                    ),
+                    default_sandbox_provider=self.default_sandbox_provider,
                 ),
             )
             token = execution_context.set(execution_ctx)

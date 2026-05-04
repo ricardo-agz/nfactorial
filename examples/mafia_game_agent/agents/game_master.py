@@ -1,14 +1,11 @@
 from __future__ import annotations
 
 import math
-import os
 import random
 import time
 from collections import Counter
-from functools import lru_cache
 from typing import Any
 
-import redis.asyncio as redis
 from constants import HUMAN_PLAYER_ID
 from models import (
     DayVoteHistoryEntry,
@@ -24,14 +21,11 @@ from factorial import (
     ExecutionContext,
     FatalAgentError,
     WaitInstruction,
+    inbox,
     messaging,
     subagents,
     tool,
     wait,
-)
-from factorial.queue.operations.messaging import (
-    messaging_inbox_direct_mark_read,
-    messaging_inbox_direct_peek,
 )
 
 _player_agent_ref: Any | None = None
@@ -280,25 +274,6 @@ def _deterministic_choice(options: list[str], seed: str) -> str:
     return rng.choice(options)
 
 
-@lru_cache(maxsize=1)
-def _direct_inbox_redis_client() -> redis.Redis:
-    redis_url = os.getenv("REDIS_URL") or os.getenv("UPSTASH_REDIS_URL")
-    max_connections = int(os.getenv("REDIS_MAX_CONNECTIONS", "50"))
-    if redis_url:
-        return redis.Redis.from_url(
-            redis_url,
-            decode_responses=True,
-            max_connections=max_connections,
-        )
-    return redis.Redis(
-        host=os.getenv("REDIS_HOST", "localhost"),
-        port=int(os.getenv("REDIS_PORT", "6379")),
-        db=int(os.getenv("REDIS_DB", "0")),
-        decode_responses=True,
-        max_connections=max_connections,
-    )
-
-
 def _message_field(message: Any, field_name: str) -> Any:
     if isinstance(message, dict):
         return message.get(field_name)
@@ -311,25 +286,22 @@ async def _peek_direct_inbox_page(
     limit: int = 100,
     cursor: str | None = None,
 ) -> dict[str, Any]:
-    execution_ctx = ExecutionContext.current()
-    return await messaging_inbox_direct_peek(
-        redis_client=_direct_inbox_redis_client(),
-        namespace=os.getenv("FACTORIAL_NAMESPACE", "factorial"),
-        task_id=execution_ctx.task_id,
+    page = await inbox.direct.peek(
         unread_only=unread_only,
         limit=limit,
         cursor=cursor,
     )
+    return {
+        "messages": page.messages,
+        "next_cursor": page.next_cursor,
+        "has_more": page.has_more,
+    }
 
 
 async def _mark_direct_inbox_read(message_ids: list[str]) -> None:
     if not message_ids:
         return
-    execution_ctx = ExecutionContext.current()
-    await messaging_inbox_direct_mark_read(
-        redis_client=_direct_inbox_redis_client(),
-        namespace=os.getenv("FACTORIAL_NAMESPACE", "factorial"),
-        task_id=execution_ctx.task_id,
+    await inbox.direct.mark_read(
         message_ids=message_ids,
         notify_sender=False,
         data=None,

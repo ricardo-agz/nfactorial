@@ -17,7 +17,7 @@ except Exception:
             allow_module_level=True,
         )
 
-from factorial.platforms.vercel.maintenance_heartbeat import (
+from factorial._internal.platforms.vercel.maintenance_heartbeat import (
     dispatch_maintenance_continuation,
     ensure_maintenance_heartbeat,
 )

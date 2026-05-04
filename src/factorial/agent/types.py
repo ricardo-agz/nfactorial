@@ -7,7 +7,7 @@ from typing import Any, Generic
 from openai.types.chat import ChatCompletionMessageToolCall
 
 from factorial.agent.context import ContextType
-from factorial.agent.tools.core import ToolDefinition, _ToolResultInternal
+from factorial.agent.tools.core import ToolDefinition
 from factorial.ai.messages import Message
 from factorial.ai.models import Model
 from factorial.core.run_types import TurnSummary, UsageSummary, VerificationSummary
@@ -47,17 +47,6 @@ class TurnCompletion(Generic[ContextType]):
 
 
 @dataclass
-class ToolExecutionResults:
-    new_messages: list[Message]
-    tool_call_results: list[tuple[ChatCompletionMessageToolCall, Any | BaseException]]
-    resolved_results: list[
-        tuple[ChatCompletionMessageToolCall, _ToolResultInternal | BaseException]
-    ]
-    pending_tool_call_ids: list[str]
-    pending_child_task_ids: list[str]
-
-
-@dataclass
 class Callbacks:
     on_start: EventCallback | None = None
     on_turn_start: EventCallback | None = None
@@ -75,7 +64,6 @@ __all__ = [
     "EventCallback",
     "PrepareTurnHook",
     "ToolChoice",
-    "ToolExecutionResults",
     "Turn",
     "TurnCompletion",
 ]

@@ -11,11 +11,7 @@ import pytest
 import pytest_asyncio
 import redis.asyncio as redis
 
-from factorial.agent import BaseAgent, TurnCompletion
-from factorial.agent.context import AgentContext
-from factorial.ai.models import Model, Provider
-from factorial.queue.keys import PENDING_SENTINEL, RedisKeys
-from factorial.queue.lua import (
+from factorial._internal.lua.queue import (
     BackoffRecoveryScript,
     BatchPickupScript,
     BatchPickupScriptResult,
@@ -47,9 +43,13 @@ from factorial.queue.lua import (
     create_tool_completion_script,
     create_wait_schedule_script,
 )
-from factorial.queue.operations import enqueue_task
+from factorial._internal.queue.keys import PENDING_SENTINEL, RedisKeys
+from factorial._internal.queue.operations import enqueue_task
+from factorial._internal.queue.worker import CompletionAction
+from factorial.agent import BaseAgent, TurnCompletion
+from factorial.agent.context import AgentContext
+from factorial.ai.models import Model, Provider
 from factorial.queue.task import Task, TaskStatus
-from factorial.queue.worker import CompletionAction
 
 MOCK_MODEL = Model(
     name="mock-model",

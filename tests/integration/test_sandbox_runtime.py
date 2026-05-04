@@ -13,18 +13,19 @@ from openai.types.chat.chat_completion_message_function_tool_call import (
 )
 
 from factorial import BaseAgent, TurnCompletion, sandboxes
-from factorial.agent.context import AgentContext
-from factorial.ai.models import Model, Provider
-from factorial.execution.waits import wait
-from factorial.queue.keys import RedisKeys
-from factorial.queue.lua import (
+from factorial._internal.lua.queue import (
     BatchPickupScript,
     TaskCompletionScript,
     TaskSteeringScript,
 )
-from factorial.queue.operations import enqueue_task
-from factorial.queue.task import Task, TaskStatus, get_task_status
-from factorial.queue.worker import process_task
+from factorial._internal.queue.keys import RedisKeys
+from factorial._internal.queue.operations import enqueue_task
+from factorial._internal.queue.task_store import get_task_status
+from factorial._internal.queue.worker import process_task
+from factorial.agent.context import AgentContext
+from factorial.ai.models import Model, Provider
+from factorial.execution.waits import wait
+from factorial.queue.task import Task, TaskStatus
 
 MOCK_MODEL = Model(
     name="mock-model",
@@ -425,7 +426,7 @@ async def test_cancel_paused_task_cleans_persisted_sandbox_checkpoint(
         == TaskStatus.PAUSED
     )
 
-    from factorial.queue.operations import cancel_task
+    from factorial._internal.queue.operations import cancel_task
 
     await cancel_task(
         redis_client=redis_client,

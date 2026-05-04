@@ -13,11 +13,10 @@ from typing import (
     overload,
 )
 
-from openai.types.chat import ChatCompletionMessageToolCall
 from pydantic import BaseModel
 
+from factorial._internal.execution.dependencies import is_runtime_injected_annotation
 from factorial.agent.context import AgentContext
-from factorial.execution.dependencies import is_runtime_injected_annotation
 from factorial.execution.hooks import (
     HookExecutionPlan,
     compile_hook_plan,
@@ -87,17 +86,6 @@ def serialize_for_model(result: BaseModel) -> dict[str, Any]:
 def serialize_for_client(result: BaseModel) -> dict[str, Any]:
     """Serialize a BaseModel for client/event payloads (all fields)."""
     return result.model_dump()
-
-
-@dataclass
-class _ToolResultInternal:
-    """Internal representation of a tool execution result."""
-
-    tool_call: ChatCompletionMessageToolCall | None = None
-    model_output: str = ""
-    client_output: Any = None
-    pending_result: bool = False
-    pending_child_task_ids: list[str] | None = None
 
 
 ToolAction = Callable[..., Any] | Callable[..., Awaitable[Any]]

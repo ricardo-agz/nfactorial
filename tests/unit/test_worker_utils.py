@@ -3,16 +3,16 @@
 import asyncio
 import json
 
+from factorial._internal.queue.worker import (
+    CompletionAction,
+    classify_failure,
+    steering_message_sort_key,
+)
 from factorial.core.exceptions import (
     FatalAgentError,
     InvalidLLMResponseError,
     RateLimitError,
     RetryableError,
-)
-from factorial.queue.worker import (
-    CompletionAction,
-    classify_failure,
-    steering_message_sort_key,
 )
 
 

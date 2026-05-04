@@ -1,9 +1,9 @@
-from .core import (
+from .client import Orchestrator
+from .config import (
     AgentWorkerConfig,
     MaintenanceWorkerConfig,
     MetricsTimelineConfig,
     ObservabilityConfig,
-    Orchestrator,
     TaskTTLConfig,
 )
 from .handles import (

@@ -17,6 +17,7 @@ except Exception:
         )
 
 import factorial.queue as queue_module
+from factorial._internal.queue.worker.tick import WorkerTickResult
 from factorial.core.exceptions import TaskNotFoundError
 from factorial.orchestrator import Orchestrator
 from factorial.platforms import vercel as vercel_runtime
@@ -26,7 +27,6 @@ from factorial.platforms.vercel import (
     cron_service as vercel_cron_service,
     worker_service as vercel_worker_service,
 )
-from factorial.queue.worker.tick import WorkerTickResult
 
 
 def test_worker_service_requires_vercel_workers_on_vercel(monkeypatch) -> None:

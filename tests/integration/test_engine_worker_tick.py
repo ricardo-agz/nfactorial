@@ -5,12 +5,13 @@ from types import SimpleNamespace
 
 import pytest
 
+from factorial._internal.queue.operations import enqueue_task
+from factorial._internal.queue.task_store import get_task_status
+from factorial._internal.queue.worker.tick import WorkerTickContext, worker_tick
 from factorial.agent.context import AgentContext
-from factorial.queue.operations import enqueue_task
-from factorial.queue.task import Task, TaskStatus, get_task_status
-from factorial.queue.worker.tick import WorkerTickContext, worker_tick
+from factorial.queue.task import Task, TaskStatus
 
-worker_tick_module = importlib.import_module("factorial.queue.worker.tick")
+worker_tick_module = importlib.import_module("factorial._internal.queue.worker.tick")
 
 
 @pytest.mark.asyncio

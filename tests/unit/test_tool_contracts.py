@@ -25,14 +25,14 @@ from factorial import (
     ToolDefinition,
     tool,
 )
+from factorial._internal.agent.tools.runtime import tool_action as run_tool_action
+from factorial._internal.agent.tools.types import _ToolResultInternal
 from factorial.agent.tools.core import (
-    _ToolResultInternal,
     convert_tools_list,
     has_hidden_annotation,
     serialize_for_client,
     serialize_for_model,
 )
-from factorial.agent.tools.runtime import tool_action as run_tool_action
 from factorial.ai.models import Model, Provider
 from factorial.core.events import EventPublisher
 from factorial.execution.context import execution_context

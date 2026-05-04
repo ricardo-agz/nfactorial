@@ -1,4 +1,4 @@
-from factorial.core.lua import (
+from factorial._internal.lua import (
     LuaScriptContract,
     _decode_json_string_list,
     _execute_contract,

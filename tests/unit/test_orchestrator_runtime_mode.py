@@ -4,6 +4,7 @@ import pytest
 
 import factorial.orchestrator.core as orchestrator_module
 from factorial.orchestrator import Orchestrator
+from factorial.orchestrator.wake_dispatch import NoopWakeDispatch
 
 
 def test_orchestrator_defaults_to_process_mode_when_not_on_vercel(
@@ -22,13 +23,10 @@ def test_orchestrator_forces_vercel_mode_when_vercel_env_present(
 ) -> None:
     monkeypatch.setenv("VERCEL", "1")
     monkeypatch.delenv("NFACTORIAL_WAKE_TRANSPORT", raising=False)
-    monkeypatch.setattr(
-        orchestrator_module,
-        "_build_wake_dispatch",
-        lambda **_: orchestrator_module.NoopWakeDispatch(),
+    orchestrator = Orchestrator(
+        runtime_mode="process",
+        wake_dispatch=NoopWakeDispatch(),
     )
-
-    orchestrator = Orchestrator(runtime_mode="process")
     assert orchestrator.runtime_mode == "vercel"
     assert orchestrator.wake_transport == "vercel_queue"
 
@@ -51,7 +49,7 @@ def test_orchestrator_requires_vercel_workers_when_running_on_vercel(
     monkeypatch.delenv("NFACTORIAL_WAKE_TRANSPORT", raising=False)
     monkeypatch.setattr(
         orchestrator_module,
-        "_build_wake_dispatch",
+        "build_wake_dispatch",
         lambda **_: (_ for _ in ()).throw(RuntimeError("vercel-workers")),
     )
 

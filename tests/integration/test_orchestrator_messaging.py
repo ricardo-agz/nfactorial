@@ -3,6 +3,12 @@ from __future__ import annotations
 import pytest
 import redis.asyncio as redis
 
+from factorial._internal.queue.operations import (
+    enqueue_task,
+    messaging_groups_create,
+    messaging_groups_send,
+    messaging_send_direct,
+)
 from factorial.agent.context import AgentContext
 from factorial.orchestrator import Orchestrator
 from factorial.orchestrator.messaging import (
@@ -10,12 +16,6 @@ from factorial.orchestrator.messaging import (
     DirectMessageHistoryPage,
     GroupConversationListPage,
     GroupMessageHistoryPage,
-)
-from factorial.queue.operations import (
-    enqueue_task,
-    messaging_groups_create,
-    messaging_groups_send,
-    messaging_send_direct,
 )
 from factorial.queue.task import Task
 

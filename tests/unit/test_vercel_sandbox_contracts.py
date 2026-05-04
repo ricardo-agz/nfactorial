@@ -7,7 +7,7 @@ import fakeredis.aioredis
 import pytest
 
 from factorial import ResourceContext, ResourceRequest, Sandbox
-from factorial.queue.keys import RedisKeys
+from factorial._internal.queue.keys import RedisKeys
 from factorial.resources import (
     RedisResourceBindingStore,
     ResourceLease,

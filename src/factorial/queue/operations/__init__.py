@@ -1,30 +1,13 @@
-from factorial.core.events import EventPublisher
-from factorial.queue.keys import PENDING_SENTINEL
-from factorial.queue.operations.control import (
+from factorial._internal.queue.operations import (
+    PENDING_SENTINEL,
+    EventPublisher,
+    HookRuntimeTickOutcome,
     cancel_batch,
     cancel_task,
-    get_task_batch,
-    process_cancelled_tasks,
-    resume_if_no_remaining_child_tasks,
-    run_agent_cancellation,
-    signal_task,
-    steer_task,
-)
-from factorial.queue.operations.enqueue import (
     create_batch_and_enqueue,
     enqueue_task,
-    resume_task,
-)
-from factorial.queue.operations.hooks import (
-    HookRuntimeTickOutcome,
     expire_pending_hooks,
-    persist_hook_runtime_payload,
-    process_hook_runtime_wake_requests,
-    register_pending_hook,
-    resolve_hook,
-    rotate_hook_token,
-)
-from factorial.queue.operations.messaging import (
+    get_task_batch,
     messaging_direct_history,
     messaging_direct_list_threads,
     messaging_groups_add_members,
@@ -46,6 +29,17 @@ from factorial.queue.operations.messaging import (
     messaging_inbox_receipts_mark_read,
     messaging_inbox_receipts_peek,
     messaging_send_direct,
+    persist_hook_runtime_payload,
+    process_cancelled_tasks,
+    process_hook_runtime_wake_requests,
+    register_pending_hook,
+    resolve_hook,
+    resume_if_no_remaining_child_tasks,
+    resume_task,
+    rotate_hook_token,
+    run_agent_cancellation,
+    signal_task,
+    steer_task,
 )
 
 __all__ = [

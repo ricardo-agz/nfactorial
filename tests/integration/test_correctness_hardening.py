@@ -6,25 +6,26 @@ from typing import Any
 import pytest
 import redis.asyncio as redis
 
-import factorial.queue.operations.control as control_module
-import factorial.queue.worker.processor as processor_module
-from factorial.agent.context import AgentContext
-from factorial.core.events import FinishEvent
-from factorial.core.run_types import RunStatus
-from factorial.queue.keys import RedisKeys
-from factorial.queue.lua import (
+import factorial._internal.queue.operations.control as control_module
+import factorial._internal.queue.worker.processor as processor_module
+from factorial._internal.lua.queue import (
     BatchPickupScript,
     TaskCompletionScript,
     TaskSteeringScript,
 )
-from factorial.queue.operations import (
+from factorial._internal.queue.keys import RedisKeys
+from factorial._internal.queue.operations import (
     cancel_task,
     enqueue_task,
     get_task_batch,
     run_agent_cancellation,
 )
-from factorial.queue.task import Task, TaskStatus, get_task_status
-from factorial.queue.worker import process_task
+from factorial._internal.queue.task_store import get_task_status
+from factorial._internal.queue.worker import process_task
+from factorial.agent.context import AgentContext
+from factorial.core.events import FinishEvent
+from factorial.core.run_types import RunStatus
+from factorial.queue.task import Task, TaskStatus
 
 from .conftest import SimpleTestAgent
 

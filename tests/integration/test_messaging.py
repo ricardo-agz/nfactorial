@@ -4,14 +4,8 @@ from typing import Any
 import pytest
 import redis.asyncio as redis
 
-from factorial.agent.context import AgentContext
-from factorial.core.exceptions import (
-    MessagingGroupAlreadyExistsError,
-    MessagingPermissionError,
-    MessagingScopeError,
-)
-from factorial.queue.keys import RedisKeys
-from factorial.queue.operations import (
+from factorial._internal.queue.keys import RedisKeys
+from factorial._internal.queue.operations import (
     enqueue_task,
     messaging_direct_history,
     messaging_direct_list_threads,
@@ -33,6 +27,12 @@ from factorial.queue.operations import (
     messaging_inbox_receipts_mark_read,
     messaging_inbox_receipts_peek,
     messaging_send_direct,
+)
+from factorial.agent.context import AgentContext
+from factorial.core.exceptions import (
+    MessagingGroupAlreadyExistsError,
+    MessagingPermissionError,
+    MessagingScopeError,
 )
 from factorial.queue.task import Task, TaskStatus
 

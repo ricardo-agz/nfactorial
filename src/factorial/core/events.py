@@ -7,8 +7,8 @@ from typing import Any, TypeAlias, TypedDict, cast
 
 from redis.asyncio import Redis
 
+from factorial._internal.serialization import serialize_data
 from factorial.core.run_types import RunError, RunStatus, UsageSummary
-from factorial.core.utils import serialize_data
 
 
 def _utcnow() -> datetime:

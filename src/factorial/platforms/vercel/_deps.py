@@ -1,3 +1,3 @@
-from __future__ import annotations
+from factorial._internal.platforms.vercel import deps as deps
 
-import vercel.workers  # type: ignore  # noqa: F401
+__all__ = ["deps"]

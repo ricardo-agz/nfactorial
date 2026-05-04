@@ -3,10 +3,11 @@ import time
 import pytest
 import redis.asyncio as redis
 
+from factorial._internal.queue.operations import enqueue_task
+from factorial._internal.queue.task_store import get_task_status
+from factorial._internal.queue.worker import CompletionAction
 from factorial.agent.context import AgentContext
-from factorial.queue.operations import enqueue_task
-from factorial.queue.task import Task, TaskStatus, get_task_status
-from factorial.queue.worker import CompletionAction
+from factorial.queue.task import Task, TaskStatus
 
 from .conftest import ScriptRunner, SimpleTestAgent
 

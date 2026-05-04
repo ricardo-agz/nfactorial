@@ -35,17 +35,17 @@ from factorial import (
     verify,
     with_context,
 )
-from factorial.agent import BaseAgent, TurnCompletion
-from factorial.ai.models import Model, Provider
-from factorial.execution.signals import signals
-from factorial.execution.waits import wait
-from factorial.queue.keys import RedisKeys
-from factorial.queue.lua import (
+from factorial._internal.lua.queue import (
     BatchPickupScript,
     TaskCompletionScript,
     TaskSteeringScript,
 )
-from factorial.queue.worker import process_task
+from factorial._internal.queue.keys import RedisKeys
+from factorial._internal.queue.worker import process_task
+from factorial.agent import BaseAgent, TurnCompletion
+from factorial.ai.models import Model, Provider
+from factorial.execution.signals import signals
+from factorial.execution.waits import wait
 from factorial.testing import MockAgent, tool_call
 from tests.mocks.llm import MockLLMClient, MockResponse
 

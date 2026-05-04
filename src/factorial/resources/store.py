@@ -7,23 +7,8 @@ from typing import Any, Literal, Protocol
 
 import redis.asyncio as redis
 
-from factorial.core.logging import get_logger
-from factorial.core.utils import decode, resolve_awaitable
-
-from .core import (
-    RESOURCE_PHASE_ATTACHING,
-    RESOURCE_PHASE_CHECKPOINTED,
-    RESOURCE_PHASE_CHECKPOINTING,
-    RESOURCE_PHASE_CREATING,
-    RESOURCE_PHASE_DESTROYING,
-    RESOURCE_PHASE_FRESH,
-    RESOURCE_PHASE_LIVE,
-    RESOURCE_PHASE_RESTORING,
-    LiveResourceRef,
-    ResourceBindingRecord,
-    ResourceCheckpoint,
-)
-from .scripts import (
+from factorial._internal.compat import resolve_awaitable
+from factorial._internal.resources.scripts import (
     ResourceAttachUnavailableScript,
     ResourceAttachUnavailableScriptInput,
     ResourceBeginMode,
@@ -37,6 +22,22 @@ from .scripts import (
     create_resource_begin_script,
     create_resource_commit_live_script,
     create_resource_finish_script,
+)
+from factorial._internal.serialization import decode
+from factorial.core.logging import get_logger
+
+from .core import (
+    RESOURCE_PHASE_ATTACHING,
+    RESOURCE_PHASE_CHECKPOINTED,
+    RESOURCE_PHASE_CHECKPOINTING,
+    RESOURCE_PHASE_CREATING,
+    RESOURCE_PHASE_DESTROYING,
+    RESOURCE_PHASE_FRESH,
+    RESOURCE_PHASE_LIVE,
+    RESOURCE_PHASE_RESTORING,
+    LiveResourceRef,
+    ResourceBindingRecord,
+    ResourceCheckpoint,
 )
 
 logger = get_logger(__name__)
@@ -493,7 +494,7 @@ class RedisResourceBindingStore:
         task_id: str,
     ) -> None:
         self.redis_client = redis_client
-        from factorial.queue.keys import RedisKeys
+        from factorial._internal.queue.keys import RedisKeys
 
         self.task_id = task_id
         self.keys = RedisKeys.format(namespace=namespace, task_id=task_id)

@@ -11,7 +11,7 @@ from typing import Any, Literal, TypeAlias, TypedDict, TypeGuard, cast
 
 from typing_extensions import NotRequired
 
-from factorial.core.utils import serialize_data
+from factorial._internal.serialization import serialize_data
 
 
 class InputTextDict(TypedDict):

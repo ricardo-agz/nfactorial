@@ -6,8 +6,8 @@ import uuid
 from dataclasses import dataclass
 from typing import Any
 
+from factorial._internal.serialization import serialize_data
 from factorial.agent.context import AgentContext
-from factorial.core.utils import serialize_data
 from factorial.execution.context import ExecutionContext
 from factorial.execution.waits import WaitInstruction, wait
 

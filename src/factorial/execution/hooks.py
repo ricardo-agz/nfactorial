@@ -23,8 +23,8 @@ from typing import (
 
 from pydantic import BaseModel, ConfigDict
 
-from factorial.core.utils import decode
-from factorial.execution.dependencies import is_runtime_injected_annotation
+from factorial._internal.execution.dependencies import is_runtime_injected_annotation
+from factorial._internal.serialization import decode
 
 HookT = TypeVar("HookT", bound="Hook")
 HookRequestBuilder = Callable[..., "PendingHook[Any] | Awaitable[PendingHook[Any]]"]

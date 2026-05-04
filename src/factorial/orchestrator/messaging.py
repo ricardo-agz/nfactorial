@@ -162,7 +162,7 @@ class OrchestratorMessagingGroupsNamespace:
         after: str | None = None,
         order: Literal["asc", "desc"] = "desc",
     ) -> GroupMessageHistoryPage:
-        from factorial.queue import (
+        from factorial._internal.queue.operations import (
             messaging_groups_history as q_messaging_groups_history,
         )
 
@@ -200,7 +200,7 @@ class OrchestratorMessagingGroupsNamespace:
         limit: int = 50,
         cursor: str | None = None,
     ) -> GroupConversationListPage:
-        from factorial.queue import (
+        from factorial._internal.queue.operations import (
             messaging_groups_list_threads as q_messaging_groups_list_threads,
         )
 
@@ -247,7 +247,7 @@ class OrchestratorMessagingDirectNamespace:
         after: str | None = None,
         order: Literal["asc", "desc"] = "desc",
     ) -> DirectMessageHistoryPage:
-        from factorial.queue import (
+        from factorial._internal.queue.operations import (
             messaging_direct_history as q_messaging_direct_history,
         )
 
@@ -284,7 +284,7 @@ class OrchestratorMessagingDirectNamespace:
         limit: int = 50,
         cursor: str | None = None,
     ) -> DirectConversationListPage:
-        from factorial.queue import (
+        from factorial._internal.queue.operations import (
             messaging_direct_list_threads as q_messaging_direct_list_threads,
         )
 

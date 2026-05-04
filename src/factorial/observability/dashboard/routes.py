@@ -11,6 +11,7 @@ from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
+from factorial._internal.assets import package_file
 from factorial.agent import BaseAgent
 from factorial.core.logging import get_logger
 
@@ -603,19 +604,20 @@ def add_observability_routes(
     )
 
     # Mount static files
-    import os
-
-    dashboard_dir = os.path.dirname(__file__)
+    dashboard_dir = package_file("factorial.observability.dashboard")
     app.mount(
         "/observability/static",
-        StaticFiles(directory=dashboard_dir),
+        StaticFiles(directory=str(dashboard_dir)),
         name="dashboard_static",
     )
 
     @app.get("/observability", response_class=HTMLResponse)
     async def dashboard() -> str:
         """Serve the dashboard HTML"""
-        dashboard_path = os.path.join(os.path.dirname(__file__), "dashboard.html")
+        dashboard_path = package_file(
+            "factorial.observability.dashboard",
+            "dashboard.html",
+        )
         try:
             with open(dashboard_path, encoding="utf-8") as f:
                 html_content = f.read()

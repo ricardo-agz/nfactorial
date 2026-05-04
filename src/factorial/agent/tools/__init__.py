@@ -1,7 +1,6 @@
 from .core import (
     Hidden,
     ToolDefinition,
-    _ToolResultInternal as _ToolResultInternal,
     serialize_for_client as serialize_for_client,
     serialize_for_model as serialize_for_model,
     tool,

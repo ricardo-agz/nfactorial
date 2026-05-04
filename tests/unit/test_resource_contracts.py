@@ -31,7 +31,7 @@ from factorial import (
     tool,
     verify,
 )
-from factorial.agent.tools.runtime import tool_action as run_tool_action
+from factorial._internal.agent.tools.runtime import tool_action as run_tool_action
 from factorial.ai.models import Model, Provider
 from factorial.core.events import EventPublisher
 from factorial.execution.context import execution_context

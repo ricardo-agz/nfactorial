@@ -5,7 +5,6 @@ import signal
 import weakref
 from collections.abc import AsyncGenerator, AsyncIterator
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Literal, cast
 
@@ -14,6 +13,15 @@ import redis.asyncio as redis
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from factorial._internal.compat import resolve_awaitable
+from factorial._internal.orchestrator.runner import Runner
+from factorial._internal.orchestrator.runtime import (
+    build_wake_dispatch,
+    default_maintenance_reason,
+    resolve_runtime_mode,
+    resolve_wake_transport,
+)
+from factorial._internal.queue.keys import RedisKeys
 from factorial.agent import BaseAgent
 from factorial.agent.context import ContextType
 from factorial.ai.messages import Message, normalize_messages_input, system
@@ -25,8 +33,14 @@ from factorial.core.exceptions import (
 )
 from factorial.core.logging import get_logger
 from factorial.core.run_types import RunResult, RunStatus, UsageSummary
-from factorial.core.utils import resolve_awaitable, to_snake_case
 from factorial.execution.hooks import HookRecord, HookResolutionResult, PendingHook
+from factorial.orchestrator.config import (
+    AgentWorkerConfig,
+    MaintenanceWorkerConfig,
+    MetricsTimelineConfig,
+    ObservabilityConfig,
+    TaskTTLConfig as TaskTTLConfig,
+)
 from factorial.orchestrator.handles import (
     BatchHandle,
     BatchSnapshot,
@@ -40,248 +54,15 @@ from factorial.orchestrator.handles import (
     WaitSnapshot,
 )
 from factorial.orchestrator.messaging import OrchestratorMessagingNamespace
-from factorial.platforms.process.maintenance_loop import maintenance_loop
-from factorial.platforms.process.worker_loop import worker_loop
 from factorial.queue import Task, TaskStatus
-from factorial.queue.keys import RedisKeys
 
-from .wake_dispatch import NoopWakeDispatch, WakeDispatch
+from .wake_dispatch import WakeDispatch
 
 logger = get_logger(__name__)
 
 if TYPE_CHECKING:
     from factorial.platforms.vercel import VercelRuntimeSettings
     from factorial.queue.task import Batch
-
-
-@dataclass
-class AgentWorkerConfig:
-    workers: int = 1
-    batch_size: int = 25
-    max_retries: int = 5
-    heartbeat_interval: int = 5
-    missed_heartbeats_threshold: int = 5
-    missed_heartbeats_grace_period: int = 5
-    turn_timeout: int = 120
-
-
-@dataclass
-class TaskTTLConfig:
-    """TTL configuration for finished tasks (in seconds)"""
-
-    completed_ttl: int = 3600  # 1 hour for completed tasks
-    failed_ttl: int = 86400  # 24 hours for failed tasks (longer for debugging)
-    cancelled_ttl: int = 1800  # 30 minutes for cancelled tasks
-
-
-@dataclass
-class MetricsTimelineConfig:
-    """Configuration for metrics timeline and bucketing"""
-
-    # Timeline duration in seconds
-    timeline_duration: int = 3600  # 1 hour default
-
-    # Bucket size in seconds (auto-calculated if None)
-    bucket_size: Literal["seconds", "minutes", "hours", "days"] = "minutes"
-
-    # Retention multiplier - how long to keep metrics data relative to timeline
-    retention_multiplier: float = 2.0  # Keep data for 2x the timeline duration
-
-    def __post_init__(self) -> None:
-        """Calculate bucket size if not provided"""
-        # Validate that timeline duration provides enough buckets
-        min_buckets = 50
-        if self.bucket_size == "seconds":
-            min_duration = min_buckets
-        elif self.bucket_size == "minutes":
-            min_duration = min_buckets * 60  # 50 minutes minimum
-        elif self.bucket_size == "hours":
-            min_duration = min_buckets * 60 * 60  # 50 hours minimum
-        elif self.bucket_size == "days":
-            min_duration = min_buckets * 60 * 60 * 24  # 50 days minimum
-        else:
-            raise ValueError(f"Invalid bucket_size: {self.bucket_size}")
-
-        if self.timeline_duration < min_duration:
-            raise ValueError(
-                f"Timeline duration ({self.timeline_duration}s) is too short "
-                f"for bucket size '{self.bucket_size}'. "
-                f"Minimum duration required: {min_duration}s "
-                f"to ensure at least {min_buckets} buckets."
-            )
-
-    @property
-    def retention_duration(self) -> int:
-        """Get the retention duration for metrics data"""
-        return int(self.timeline_duration * self.retention_multiplier)
-
-    @property
-    def bucket_duration(self) -> int:
-        if self.bucket_size == "seconds":
-            return 1
-        elif self.bucket_size == "minutes":
-            return 60
-        elif self.bucket_size == "hours":
-            return 3600
-        elif self.bucket_size == "days":
-            return 86400
-        else:
-            raise ValueError(f"Invalid bucket_size: {self.bucket_size}")
-
-    @property
-    def display_name(self) -> str:
-        """Get a human-readable display name for the timeline"""
-        if self.timeline_duration < 3600:
-            minutes = self.timeline_duration // 60
-            return f"{minutes}m"
-        elif self.timeline_duration < 86400:
-            hours = self.timeline_duration // 3600
-            return f"{hours}h"
-        else:
-            days = self.timeline_duration // 86400
-            return f"{days}d"
-
-
-@dataclass
-class MaintenanceWorkerConfig:
-    """Configuration for the maintenance worker.
-
-    Handles both stale recovery and garbage collection.
-    """
-
-    interval: int = 10
-    workers: int = 1
-    task_ttl: TaskTTLConfig = field(default_factory=TaskTTLConfig)
-    max_cleanup_batch: int = 100  # Maximum tasks to clean up per queue per run
-    metrics_timeline: MetricsTimelineConfig = field(
-        default_factory=MetricsTimelineConfig
-    )
-
-
-@dataclass
-class ObservabilityConfig:
-    """Configuration for the observability dashboard"""
-
-    enabled: bool = True
-    host: str = "0.0.0.0"
-    port: int = 8080
-    cors_origins: list[str] = field(default_factory=lambda: ["*"])
-    dashboard_name: str | None = None
-
-
-def _resolve_runtime_mode(
-    runtime_mode: Literal["process", "vercel"] | None,
-) -> Literal["process", "vercel"]:
-    if os.getenv("VERCEL") == "1":
-        return "vercel"
-    if runtime_mode in {"process", "vercel"}:
-        return runtime_mode
-    return "process"
-
-
-def _resolve_wake_transport(
-    *,
-    runtime_mode: Literal["process", "vercel"],
-    wake_transport: Literal["none", "vercel_queue"] | None,
-) -> Literal["none", "vercel_queue"]:
-    env_transport = os.getenv("NFACTORIAL_WAKE_TRANSPORT")
-    selected = wake_transport or env_transport
-    if selected == "none":
-        return "none"
-    if selected == "vercel_queue":
-        return "vercel_queue"
-    return "vercel_queue" if runtime_mode == "vercel" else "none"
-
-
-def _build_wake_dispatch(
-    *,
-    wake_transport: Literal["none", "vercel_queue"],
-    dispatch_topic: str,
-    namespace: str,
-) -> WakeDispatch:
-    if wake_transport == "none":
-        return NoopWakeDispatch()
-    if wake_transport == "vercel_queue":
-        from factorial.platforms.vercel.wake_dispatch import VercelQueueWakeDispatch
-
-        return VercelQueueWakeDispatch(topic=dispatch_topic, namespace=namespace)
-    return NoopWakeDispatch()
-
-
-class Runner:
-    def __init__(
-        self,
-        redis_pool: redis.ConnectionPool,
-        llm_client: MultiClient,
-        agent: BaseAgent[Any],
-        metrics_config: MetricsTimelineConfig,
-        agent_worker_config: AgentWorkerConfig,
-        maintenance_worker_config: MaintenanceWorkerConfig,
-        namespace: str,
-    ):
-        agent.client = agent.client or llm_client
-
-        self.shutdown_event = asyncio.Event()
-        self.redis_pool = redis_pool
-        self.llm_client = llm_client
-        self.agent = agent
-        self.queue = to_snake_case(agent.__class__.__name__)
-        self.metrics_config = metrics_config
-        self.agent_worker_config = agent_worker_config
-        self.maintenance_worker_config = maintenance_worker_config
-        self.namespace = namespace
-
-    def set_shutdown_event(self, shutdown_event: asyncio.Event) -> None:
-        self.shutdown_event = shutdown_event
-
-    def create_worker_tasks(
-        self,
-        shutdown_event: asyncio.Event,
-        agents: list[BaseAgent[Any]],
-    ) -> list[asyncio.Task[Any]]:
-        heartbeat_timeout = (
-            self.agent_worker_config.heartbeat_interval
-            * self.agent_worker_config.missed_heartbeats_threshold
-            + self.agent_worker_config.missed_heartbeats_grace_period
-        )
-
-        agents_by_name = {agent.name: agent for agent in agents}
-
-        return [
-            asyncio.create_task(
-                worker_loop(
-                    shutdown_event=shutdown_event,
-                    redis_pool=self.redis_pool,
-                    worker_id=f"{self.queue}-worker-{i + 1}",
-                    agent=self.agent,
-                    agents_by_name=agents_by_name,
-                    batch_size=self.agent_worker_config.batch_size,
-                    max_retries=self.agent_worker_config.max_retries,
-                    heartbeat_interval=self.agent_worker_config.heartbeat_interval,
-                    task_timeout=self.agent_worker_config.turn_timeout,
-                    metrics_retention_duration=self.metrics_config.retention_duration,
-                    namespace=self.namespace,
-                )
-            )
-            for i in range(self.agent_worker_config.workers)
-        ] + [
-            asyncio.create_task(
-                maintenance_loop(
-                    shutdown_event=shutdown_event,
-                    redis_pool=self.redis_pool,
-                    agent=self.agent,
-                    heartbeat_timeout=heartbeat_timeout,
-                    max_retries=self.agent_worker_config.max_retries,
-                    batch_size=self.agent_worker_config.batch_size,
-                    interval=self.maintenance_worker_config.interval,
-                    task_ttl_config=self.maintenance_worker_config.task_ttl,
-                    max_cleanup_batch=self.maintenance_worker_config.max_cleanup_batch,
-                    metrics_retention_duration=self.maintenance_worker_config.metrics_timeline.retention_duration,
-                    namespace=self.namespace,
-                )
-            )
-            for _ in range(self.maintenance_worker_config.workers)
-        ]
 
 
 class Orchestrator:
@@ -369,15 +150,15 @@ class Orchestrator:
         self.metrics_config = metrics_config
         self.agents_by_name: dict[str, BaseAgent[Any]] = {}
         self.namespace = namespace or "factorial"
-        self.runtime_mode = _resolve_runtime_mode(runtime_mode)
-        self.wake_transport = _resolve_wake_transport(
+        self.runtime_mode = resolve_runtime_mode(runtime_mode)
+        self.wake_transport = resolve_wake_transport(
             runtime_mode=self.runtime_mode,
             wake_transport=wake_transport,
         )
         self.wake_dispatch: WakeDispatch = (
             wake_dispatch
             if wake_dispatch is not None
-            else _build_wake_dispatch(
+            else build_wake_dispatch(
                 wake_transport=self.wake_transport,
                 dispatch_topic=os.getenv(
                     "NFACTORIAL_DISPATCH_TOPIC",
@@ -689,7 +470,7 @@ class Orchestrator:
 
         runtime_settings = settings or VercelRuntimeSettings.from_env()
         configure_orchestrator(self, settings=runtime_settings)
-        resolved_reason = reason or _default_maintenance_reason()
+        resolved_reason = reason or default_maintenance_reason()
         return await trigger_maintenance_once(
             orchestrator=self,
             settings=runtime_settings,
@@ -900,7 +681,7 @@ class Orchestrator:
         idempotency_key: str | None = None,
     ) -> str:
         """Enqueue a task using the control plane's configuration"""
-        from factorial.queue import enqueue_task as q_enqueue_task
+        from factorial._internal.queue.operations import enqueue_task as q_enqueue_task
 
         async with self.redis_client_context() as redis_client:
             task_id = await q_enqueue_task(
@@ -924,7 +705,7 @@ class Orchestrator:
         idempotency_key: str | None = None,
     ) -> "Batch":
         """Create and enqueue a batch using task objects."""
-        from factorial.queue import (
+        from factorial._internal.queue.operations import (
             create_batch_and_enqueue as q_create_batch_and_enqueue,
         )
 
@@ -986,9 +767,9 @@ class Orchestrator:
         idempotency_key: str | None = None,
     ) -> Task[Any]:
         """Resume a terminal task as a new queued task."""
-        from factorial.queue import (
+        from factorial._internal.queue.operations import resume_task as q_resume_task
+        from factorial._internal.queue.task_store import (
             get_task_data as q_get_task_data,
-            resume_task as q_resume_task,
         )
 
         async with self.redis_client_context() as redis_client:
@@ -1074,7 +855,7 @@ class Orchestrator:
         task_id: str,
     ) -> None:
         """Cancel a task using the control plane's configuration"""
-        from factorial.queue import cancel_task as q_cancel_task
+        from factorial._internal.queue.operations import cancel_task as q_cancel_task
 
         async with self.redis_client_context() as redis_client:
             await q_cancel_task(
@@ -1086,7 +867,9 @@ class Orchestrator:
             )
 
     async def cancel_batch(self, batch_id: str) -> None:
-        from factorial.queue.operations.control import cancel_batch as q_cancel_batch
+        from factorial._internal.queue.operations.control import (
+            cancel_batch as q_cancel_batch,
+        )
 
         async with self.redis_client_context() as redis_client:
             await q_cancel_batch(
@@ -1103,9 +886,9 @@ class Orchestrator:
         messages: list[dict[str, Any]],
     ) -> None:
         """Steer a task using the control plane's configuration"""
-        from factorial.queue import (
+        from factorial._internal.queue.operations import steer_task as q_steer_task
+        from factorial._internal.queue.task_store import (
             get_task_data as q_get_task_data,
-            steer_task as q_steer_task,
         )
 
         async with self.redis_client_context() as redis_client:
@@ -1189,7 +972,9 @@ class Orchestrator:
             input=input,
         )
         if snapshot.wait.kind is WaitKind.SIGNAL:
-            from factorial.queue import signal_task as q_signal_task
+            from factorial._internal.queue.operations import (
+                signal_task as q_signal_task,
+            )
 
             if snapshot.wait.signal_id is None:
                 raise ValueError("signal waits require a pending signal_id")
@@ -1225,7 +1010,9 @@ class Orchestrator:
         data: Any = None,
         metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        from factorial.queue import messaging_human_send_direct as q_message_task
+        from factorial._internal.queue.operations import (
+            messaging_human_send_direct as q_message_task,
+        )
 
         async with self.redis_client_context() as redis_client:
             return await q_message_task(
@@ -1250,7 +1037,9 @@ class Orchestrator:
         team_id: str | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        from factorial.queue import messaging_human_send_group as q_message_group
+        from factorial._internal.queue.operations import (
+            messaging_human_send_group as q_message_group,
+        )
 
         async with self.redis_client_context() as redis_client:
             return await q_message_group(
@@ -1281,7 +1070,9 @@ class Orchestrator:
         hook_type_name: str | None = None,
     ) -> bool:
         """Register a pending hook ticket for a task/tool call."""
-        from factorial.queue import register_pending_hook as q_register_pending_hook
+        from factorial._internal.queue.operations import (
+            register_pending_hook as q_register_pending_hook,
+        )
 
         async with self.redis_client_context() as redis_client:
             return await q_register_pending_hook(
@@ -1308,7 +1099,7 @@ class Orchestrator:
         idempotency_key: str | None = None,
     ) -> HookResolutionResult:
         """Resolve a hook by id using token-authenticated payload."""
-        from factorial.queue import resolve_hook as q_resolve_hook
+        from factorial._internal.queue.operations import resolve_hook as q_resolve_hook
 
         async with self.redis_client_context() as redis_client:
             resolution = await q_resolve_hook(
@@ -1333,7 +1124,9 @@ class Orchestrator:
         revoke_previous: bool = True,
     ) -> str:
         """Rotate token for a pending hook."""
-        from factorial.queue import rotate_hook_token as q_rotate_hook_token
+        from factorial._internal.queue.operations import (
+            rotate_hook_token as q_rotate_hook_token,
+        )
 
         async with self.redis_client_context() as redis_client:
             return await q_rotate_hook_token(
@@ -1345,7 +1138,9 @@ class Orchestrator:
 
     async def get_task_status(self, task_id: str) -> Any:
         """Get task status using the control plane's configuration"""
-        from factorial.queue import get_task_status as q_get_task_status
+        from factorial._internal.queue.task_store import (
+            get_task_status as q_get_task_status,
+        )
 
         async with self.redis_client_context() as redis_client:
             return await q_get_task_status(
@@ -1354,7 +1149,9 @@ class Orchestrator:
 
     async def get_task_data(self, task_id: str) -> dict[str, Any] | None:
         """Get task data using the control plane's configuration"""
-        from factorial.queue import get_task_data as q_get_task_data
+        from factorial._internal.queue.task_store import (
+            get_task_data as q_get_task_data,
+        )
 
         async with self.redis_client_context() as redis_client:
             try:
@@ -1470,13 +1267,19 @@ class Orchestrator:
     ) -> tuple[PendingHookSnapshot, ...]:
         task_keys = RedisKeys.format(namespace=self.namespace, task_id=task_id)
         hook_ids: list[Any] = sorted(
-            await resolve_awaitable(redis_client.smembers(task_keys.hooks_by_task))
+            cast(
+                set[Any],
+                await resolve_awaitable(redis_client.smembers(task_keys.hooks_by_task)),
+            )
         )
         if not hook_ids:
             return ()
 
-        records_raw: list[Any] = await resolve_awaitable(
-            redis_client.hmget(task_keys.hooks_index, hook_ids)
+        records_raw = cast(
+            list[Any],
+            await resolve_awaitable(
+                redis_client.hmget(task_keys.hooks_index, hook_ids)
+            ),
         )
         snapshots: list[PendingHookSnapshot] = []
         for record_raw in records_raw:
@@ -1526,8 +1329,11 @@ class Orchestrator:
                 task_id=task_id,
                 agent=agent_name,
             )
-            pending_child_members: set[Any] = await resolve_awaitable(
-                redis_client.smembers(task_keys.pending_child_wait_ids)
+            pending_child_members = cast(
+                set[Any],
+                await resolve_awaitable(
+                    redis_client.smembers(task_keys.pending_child_wait_ids)
+                ),
             )
             pending_child_task_ids = tuple(
                 sorted(pending_child_members)
@@ -1552,7 +1358,9 @@ class Orchestrator:
         )
 
     async def snapshot_batch(self, batch_id: str) -> BatchSnapshot:
-        from factorial.queue.task import get_batch_data as q_get_batch_data
+        from factorial._internal.queue.task_store import (
+            get_batch_data as q_get_batch_data,
+        )
 
         async with self.redis_client_context() as redis_client:
             try:
@@ -1812,9 +1620,3 @@ class Orchestrator:
 
             loop.close()
 
-
-def _default_maintenance_reason() -> str:
-    service_type = (os.getenv("VERCEL_SERVICE_TYPE") or "").strip().lower()
-    if service_type == "cron":
-        return "cron_schedule"
-    return "manual"
